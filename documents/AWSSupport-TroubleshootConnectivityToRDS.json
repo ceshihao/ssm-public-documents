@@ -1,0 +1,461 @@
+{
+  "description": "The AWSSupport-TroubleshootConnectivityToRDS will help diagnose connectivity issues with the database running on the Relational Database Service. The document requires two parameters, one is the DBInstanceIdentifier and the second one is the SourceInstance for the connection. The first step will try to check the status of the service and then performs the checks over the Security groups and the associated Network ACLs.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, executescript won't work.",
+      "default": ""
+    },
+    "DBInstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) Specify the DB Instance Identifier here if you want to test the connectivity with any specific DB instance.",
+      "default": ""
+    },
+    "SourceInstance": {
+      "type": "String",
+      "description": "(Required) Instance ID from where you are attempting to connect with the RDS server.",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "assertDBInstanceStatus",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ DBInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "nextStep": "getRDSInstanceProperties"
+    },
+    {
+      "name": "getRDSInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ DBInstanceIdentifier }}"
+      },
+      "outputs": [
+        {
+          "Name": "DBInstanceStatus",
+          "Selector": "$.DBInstances[0].DBInstanceStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "PubliclyAccessible",
+          "Selector": "$.DBInstances[0].PubliclyAccessible",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "EndpointPort",
+          "Selector": "$.DBInstances[0].Endpoint.Port",
+          "Type": "Integer"
+        },
+        {
+          "Name": "EndpointAddress",
+          "Selector": "$.DBInstances[0].Endpoint.Address",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.DBInstances[0].DBSubnetGroup.VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcSecurityGroups",
+          "Selector": "$.DBInstances[0].VpcSecurityGroups..VpcSecurityGroupId",
+          "Type": "StringList"
+        },
+        {
+          "Name": "DBInstanceIdentifier",
+          "Selector": "$.DBInstances[0].DBInstanceIdentifier",
+          "Type": "String"
+        },
+        {
+          "Name": "Subnets",
+          "Selector": "$.DBInstances[0].DBSubnetGroup.Subnets..SubnetIdentifier",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "getRDSNetworkAclRules"
+    },
+    {
+      "name": "getRDSNetworkAclRules",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeNetworkAcls",
+        "Filters": [
+          {
+            "Name": "association.subnet-id",
+            "Values": "{{ getRDSInstanceProperties.Subnets }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "NetworkAcls",
+          "Selector": "$.NetworkAcls",
+          "Type": "MapList"
+        },
+        {
+          "Name": "NetworkAclIds",
+          "Selector": "$.NetworkAcls..NetworkAclId",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "getRDSSubnetCidrs"
+    },
+    {
+      "name": "getRDSSubnetCidrs",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSubnets",
+        "SubnetIds": [
+          "{{ getRDSInstanceProperties.Subnets }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CidrBlocks",
+          "Selector": "$.Subnets..CidrBlock",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "getEC2InstanceProperties"
+    },
+    {
+      "name": "getEC2InstanceProperties",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ SourceInstance }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups..GroupId",
+          "Type": "StringList"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Reservations[0].Instances[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Reservations[0].Instances[0].VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "PrivateIpAddress",
+          "Selector": "$.Reservations[0].Instances[0].NetworkInterfaces..PrivateIpAddresses..PrivateIpAddress",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "getEC2NetworkAclRules"
+    },
+    {
+      "name": "getEC2NetworkAclRules",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeNetworkAcls",
+        "Filters": [
+          {
+            "Name": "association.subnet-id",
+            "Values": [
+              "{{ getEC2InstanceProperties.SubnetId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "NetworkAcls",
+          "Selector": "$.NetworkAcls",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getEC2SecurityGroups"
+    },
+    {
+      "name": "getEC2SecurityGroups",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSecurityGroups",
+        "GroupIds": [
+          "{{ getEC2InstanceProperties.SecurityGroupIds }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroups",
+          "Selector": "$.SecurityGroups",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getRDSSecurityGroups"
+    },
+    {
+      "name": "getRDSSecurityGroups",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSecurityGroups",
+        "GroupIds": [
+          "{{ getRDSInstanceProperties.VpcSecurityGroups }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroups",
+          "Selector": "$.SecurityGroups",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getEC2RouteTables"
+    },
+    {
+      "name": "getEC2RouteTables",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeRouteTables",
+        "Filters": [
+          {
+            "Name": "association.subnet-id",
+            "Values": [
+              "{{ getEC2InstanceProperties.SubnetId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "RouteTables",
+          "Selector": "$.RouteTables",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getEC2VpcRouteTables"
+    },
+    {
+      "name": "getEC2VpcRouteTables",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeRouteTables",
+        "Filters": [
+          {
+            "Name": "vpc-id",
+            "Values": [
+              "{{ getEC2InstanceProperties.VpcId }}"
+            ]
+          },
+          {
+            "Name": "association.main",
+            "Values": [
+              "true"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "RouteTables",
+          "Selector": "$.RouteTables",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getRDSRouteTables"
+    },
+    {
+      "name": "getRDSRouteTables",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeRouteTables",
+        "Filters": [
+          {
+            "Name": "association.subnet-id",
+            "Values": [
+              "{{ getRDSInstanceProperties.Subnets }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "RouteTables",
+          "Selector": "$.RouteTables",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getRDSVpcRouteTables"
+    },
+    {
+      "name": "getRDSVpcRouteTables",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeRouteTables",
+        "Filters": [
+          {
+            "Name": "vpc-id",
+            "Values": [
+              "{{ getRDSInstanceProperties.VpcId }}"
+            ]
+          },
+          {
+            "Name": "association.main",
+            "Values": [
+              "true"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "RouteTables",
+          "Selector": "$.RouteTables",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "evalSecurityGroupRules"
+    },
+    {
+      "name": "evalSecurityGroupRules",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "description": "Evaluating security group rules",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "evalSecGroups",
+        "InputPayload": {
+          "RDSEndpointPort": "{{ getRDSInstanceProperties.EndpointPort }}",
+          "RDSSecurityGroups": "{{getRDSSecurityGroups.SecurityGroups}}",
+          "RDSSecurityGroupIds": "{{getRDSInstanceProperties.VpcSecurityGroups}}",
+          "RDSSubnetCidrs": "{{ getRDSSubnetCidrs.CidrBlocks }}",
+          "EC2SecurityGroups": "{{ getEC2SecurityGroups.SecurityGroups }}",
+          "EC2InstanceIPs": "{{ getEC2InstanceProperties.PrivateIpAddress }}",
+          "EC2SecurityGroupIds": "{{getEC2InstanceProperties.SecurityGroupIds}}"
+        },
+        "Script": "def evalSecGroups(events, context):\n\timport json\n\tfrom ipaddress import ip_network, ip_address\n\n\tclass TrafficNotAllowedError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\tclass ValidationError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\tdef evaluate_security_group_rules_basedon_cidr(sg_rules, remote_cidrs, remote_sg, protocol, port, sg_id):\n\t\trequired_cidrs = list(remote_cidrs)\n\t\tfor rule in sg_rules:\n\t\t\tif (rule['IpProtocol'] == protocol and port in range(rule['FromPort'],rule['ToPort']+1)) or (rule['IpProtocol'] == '-1'):\n\t\t\t\tfor group in rule['UserIdGroupPairs']:\n\t\t\t\t\tif group['GroupId'] in remote_sg:\n\t\t\t\t\t\treturn True\n\t\t\t\tfor remote_cidr in remote_cidrs:\n\t\t\t\t\tfor cidrs in rule['IpRanges']:\n\t\t\t\t\t\tif (ip_network(cidrs['CidrIp'], strict=False).overlaps(ip_network(remote_cidr, strict=False))):\n\t\t\t\t\t\t\trequired_cidrs.remove(remote_cidr)\n\t\t\t\t\t\t\tbreak\n\t\tif len(required_cidrs) > 0:\n\t\t\tprint(\"Security group {} is not allowing {} traffic to/from IP ranges {} for port(s) {}.\".format(sg_id, protocol, required_cidrs, port))\n\t\t\treturn\n\t\telse:\n\t\t\treturn True\n\t# evaluate_security_group_rules_basedon_cidr\n\n\tdef evaluate_security_group_rules_basedon_ip(sg_rules, remote_ip, remote_sg, protocol, port, sg_id):\n\t\tfor rule in sg_rules:\n\t\t\tif (rule['IpProtocol'] == protocol and port in range(rule['FromPort'],rule['ToPort']+1)) or (rule['IpProtocol'] == '-1'):\n\t\t\t\tfor group in rule['UserIdGroupPairs']:\n\t\t\t\t\tif group['GroupId'] in remote_sg:\n\t\t\t\t\t\treturn True\n\t\t\t\tfor cidrs in rule['IpRanges']:\n\t\t\t\t\tif ip_address(remote_ip) in ip_network(cidrs['CidrIp'], strict=False):\n\t\t\t\t\t\treturn True\n\t\tprint(\"Security group {} is not allowing {} traffic to/from IP {} for port(s) {}.\".format(sg_id, protocol, remote_ip, port))\n\t\treturn\n\t# evaluate_security_group_rules_basedon_ip\n\n\t# Input Parameters\n\t# evaluate_traffic_basedon_cidr(sg_rules, remote_cidrs, remote_sg, protocol, port)\n\t# evaluate_traffic_basedon_ip(sg_rules, remote_ip, remote_sg, protocol, port)\n\t#\n\t# sg_rules: list\n\t# remote_network: list\n\t# remote_ip: string\n\t# remote_sg: string\n\t# protocol: string\n\t# port: integer\n\t# sg_id: string\n\n\ttry:\n\t\t# RDS Info\n\t\tdbPort = int(events['RDSEndpointPort'])\n\t\tingressRules= events['RDSSecurityGroups']#[0]['IpPermissions']\n\t\tdbSecurityGroup = events['RDSSecurityGroupIds']\n\t\tdbSubnetCidrs = events['RDSSubnetCidrs']\n\n\t\tprint(ingressRules)\n\n\t\t# EC2 Instance Info\n\t\tec2InstanceIP = events['EC2InstanceIPs'][0]\n\t\tegressRules = events['EC2SecurityGroups']#[0]['IpPermissionsEgress']\n\t\tec2InstanceSecurityGroup = events['EC2SecurityGroupIds']\n\n\t\t# Verify Egress traffic from EC2 Instance to RDS subnets\n\t\tfor egressRule in egressRules:\n\t\t\tprint(\"Checking egress traffic for security group {}\".format(ec2InstanceSecurityGroup))\n\t\t\tresult = evaluate_security_group_rules_basedon_cidr(egressRule['IpPermissionsEgress'], dbSubnetCidrs, dbSecurityGroup, 'tcp', dbPort, egressRule['GroupId'])\n\t\t\tif result:\n\t\t\t\tbreak\n\t\tif not result:\n\t\t\traise TrafficNotAllowedError(\"Please review security group(s) {} for rules allowing egress TCP traffic to port {}\".format(ec2InstanceSecurityGroup, dbPort))\n\n\t\t# Verify Ingress traffic to RDS from EC2 Instance IP\n\t\tfor ingressRule in ingressRules:\n\t\t\tprint(\"Checking ingress traffic for security group {}\".format(dbSecurityGroup))\n\t\t\tresult = evaluate_security_group_rules_basedon_ip(ingressRule['IpPermissions'], ec2InstanceIP, ec2InstanceSecurityGroup, 'tcp', dbPort, ingressRule['GroupId'])\n\t\t\tif result:\n\t\t\t\tbreak\n\t\tif not result:\n\t\t\traise TrafficNotAllowedError(\"Please review security group(s) {} for rules allowing ingress TCP traffic from port {}\".format(dbSecurityGroup, dbPort))\n\n\t\tprint(\"Security Group validation successful\")\n\t\treturn(\"Security Group validation successful\")\n\n\texcept TrafficNotAllowedError:\n\t\traise\n\n\texcept:\n\t\traise ValidationError(\"Security Group validation failed\")\n"
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroupEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "evalNetworkAclRules"
+    },
+    {
+      "name": "evalNetworkAclRules",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "description": "Evaluating network acl entries",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "evalNacls",
+        "InputPayload": {
+          "RDSEndpointPort": "{{ getRDSInstanceProperties.EndpointPort }}",
+          "RDSNetworkAclRules": "{{ getRDSNetworkAclRules.NetworkAcls }}",
+          "RDSSubnetCidrs": "{{ getRDSSubnetCidrs.CidrBlocks }}",
+          "EC2NetworkAclRules": "{{ getEC2NetworkAclRules.NetworkAcls }}",
+          "EC2InstanceIPs": "{{ getEC2InstanceProperties.PrivateIpAddress }}"
+        },
+        "Script": "def evalNacls(events, context):\n\timport json\n\tfrom ipaddress import ip_network, ip_address\n\n\tclass TrafficNotAllowedError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\tclass ValidationError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\tdef evaluate_traffic_basedon_cidr(acl_entries, egress, required_ports, remote_cidr, acl_id):\n\t\tallowed_ports = []\n\t\tdenied_ports = []\n\t\tallowed_cidrs = {}\n\t\tdenied_cidrs = {}\n\t\ttry:\n\t\t\tfor port in required_ports:\n\t\t\t\tif not (port in allowed_ports or port in denied_ports):\n\t\t\t\t\tfor entry in acl_entries:\n\t\t\t\t\t\tif not (port in allowed_ports or port in denied_ports):\n\t\t\t\t\t\t\tif entry['Egress'] == egress:\n\t\t\t\t\t\t\t\tif entry['Protocol'] == '-1' or entry['Protocol'] == required_ports[port]:\n\t\t\t\t\t\t\t\t\tfor cidr in remote_cidr:\n\t\t\t\t\t\t\t\t\t\tif not (port in allowed_ports or port in denied_ports):\n\t\t\t\t\t\t\t\t\t\t\tif ip_network(entry['CidrBlock'], strict=False).overlaps(ip_network(cidr, strict=False)):\n\t\t\t\t\t\t\t\t\t\t\t\tif 'PortRange' in entry.keys():\n\t\t\t\t\t\t\t\t\t\t\t\t\tif port in range(entry['PortRange']['From'],entry['PortRange']['To']+1):\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tif entry['RuleAction'] == \"allow\":\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_cidrs[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_cidrs[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\tif entry['RuleAction'] == \"allow\":\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_cidrs[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_cidrs[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\telse:\n\t\t\t\t\t\t\tbreak\n\t\t\t\telse:\n\t\t\t\t\tcontinue\n\n\n\t\t\t\tcontinue\n\t\t\tif len(denied_ports) > 0:\n\t\t\t\tprint(\"Network acl {} is not allowing traffic for port(s) {}\".format(acl_id,denied_ports))\n\t\t\t\treturn denied_ports\n\t\texcept Exception:\n\t\t\tprint(\"Failed to evaluate network acl\")\n\t\treturn\n\t# evaluate_traffic_basedon_cidr\n\n\tdef evaluate_traffic_basedon_ip(acl_entries, egress, required_ports, remote_ips, acl_id):\n\t\tallowed_ports = []\n\t\tdenied_ports = []\n\t\tallowed_ips = {}\n\t\tdenied_ips = {}\n\t\ttry:\n\t\t\tfor port in required_ports:\n\t\t\t\tif not (port in allowed_ports or port in denied_ports):\n\t\t\t\t\tfor entry in acl_entries:\n\t\t\t\t\t\tif not (port in allowed_ports or port in denied_ports):\n\t\t\t\t\t\t\tif entry['Egress'] == egress:\n\t\t\t\t\t\t\t\tif entry['Protocol'] == '-1' or entry['Protocol'] == required_ports[port]:\n\t\t\t\t\t\t\t\t\tfor ip in remote_ips:\n\t\t\t\t\t\t\t\t\t\tif not (port in allowed_ports or port in denied_ports):\n\t\t\t\t\t\t\t\t\t\t\tif ip_address(ip) in ip_network(entry['CidrBlock'], strict=False):\n\t\t\t\t\t\t\t\t\t\t\t\tif 'PortRange' in entry.keys():\n\t\t\t\t\t\t\t\t\t\t\t\t\tif port in range(entry['PortRange']['From'],entry['PortRange']['To']+1):\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tif entry['RuleAction'] == \"allow\":\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_ips[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_ips[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\tif entry['RuleAction'] == \"allow\":\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tallowed_ips[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_ports.append(port)\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tdenied_ips[port] = [entry['CidrBlock'],entry['RuleNumber']]\n\t\t\t\t\t\t\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\telse:\n\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\telse:\n\t\t\t\t\t\t\tbreak\n\t\t\t\telse:\n\t\t\t\t\tcontinue\n\n\t\t\t\tcontinue\n\t\t\tif len(denied_ports) > 0:\n\t\t\t\tprint(\"Network acl {} is not allowing traffic for port(s) {}\".format(acl_id,denied_ports))\n\t\t\t\treturn denied_ports\n\t\texcept Exception:\n\t\t\tprint(\"Failed to evaluate network acl\")\n\t\treturn\n\t# evaluate_traffic_basedon_ip\n\n\t# Input Parameters\n\t# evaluate_traffic_basedon_cidr(acl_entries, egress, required_ports, remote_cidr, acl_id)\n\t# evaluate_traffic_basedon_ip(acl_entries, required_ports, remote_ips, acl_id)\n\t#\n\t# acl_entries: list\n\t# egress: boolean\n\t# required_ports: dict {int_port_number:'PROTOCOL'}\n\t# remote_cidr / remote_ips: list\n\t# acl_id: string\n\n\ttry:\n\t\t# RDS Info\n\t\treqPorts = {events['RDSEndpointPort']:'6'}\n\t\trdsNacls = events['RDSNetworkAclRules']\n\t\trdsCidrs = events['RDSSubnetCidrs']\n\n\t\t# EC2 Instance Info\n\t\tec2Nacls = events['EC2NetworkAclRules']\n\t\tec2InstanceIPs = events['EC2InstanceIPs']\n\n\t\t# Verify Egress traffic from EC2 Instance to RDS subnets\n\t\tfor acl in ec2Nacls:\n\t\t\tprint(\"Checking egress traffic for network acl {}\".format(acl['NetworkAclId']))\n\t\t\tresult = evaluate_traffic_basedon_cidr(acl['Entries'], True, reqPorts, rdsCidrs, acl['NetworkAclId'])\n\t\t\tif result:\n\t\t\t\traise TrafficNotAllowedError(\"Please review network acl {} for egress rules allowing port(s) {}\".format(acl['NetworkAclId'],result))\n\n\t\t# Verify Ingress traffic to RDS from EC2 Instance IP\n\t\tfor acl in rdsNacls:\n\t\t\tprint(\"Checking ingress traffic for network acl {}\".format(acl['NetworkAclId']))\n\t\t\tresult = evaluate_traffic_basedon_ip(acl['Entries'], False, reqPorts, ec2InstanceIPs, acl['NetworkAclId'])\n\t\t\tif result:\n\t\t\t\traise TrafficNotAllowedError(\"Please review network acl {} for ingress rules allowing port(s) {}\".format(acl['NetworkAclId'],result))\n\n\t\tprint(\"Network ACL validation successful\")\n\t\treturn(\"Network ACL validation successful\")\n\n\texcept TrafficNotAllowedError:\n\t\traise\n\n\texcept:\n\t\traise ValidationError(\"Network ACL validation failed\")\n\n"
+      },
+      "outputs": [
+        {
+          "Name": "NetworkAclEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "evalRouteTableEntries"
+    },
+    {
+      "name": "evalRouteTableEntries",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "description": "Evaluating route table entries",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "evalRouteTables",
+        "InputPayload": {
+          "RDSSubnetIds": "{{ getRDSInstanceProperties.Subnets }}",
+          "RDSSubnetCidrs": "{{ getRDSSubnetCidrs.CidrBlocks }}",
+          "RDSVpcId": "{{ getRDSInstanceProperties.VpcId }}",
+          "RDSRouteTables": "{{ getRDSRouteTables.RouteTables }}",
+          "RDSVpcRouteTables": "{{ getRDSVpcRouteTables.RouteTables }}",
+          "EC2SubnetId": "{{ getEC2InstanceProperties.SubnetId }}",
+          "EC2InstanceIPs": "{{ getEC2InstanceProperties.PrivateIpAddress }}",
+          "EC2VpcId": "{{ getEC2InstanceProperties.VpcId }}",
+          "EC2RouteTables": "{{ getEC2RouteTables.RouteTables }}",
+          "EC2VpcRouteTables": "{{ getEC2VpcRouteTables.RouteTables }}"
+        },
+        "Script": "def evalRouteTables(events, context):\n\timport json\n\tfrom ipaddress import ip_network, ip_address\n\n\tclass MissingRouteError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\tclass CidrOverlapeError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\tclass RouteTableAssociationError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\tclass ValidationError(Exception):\n\t\tdef __init__(self, message):\n\t\t\tself.message = message\n\t\tdef __str__(self):\n\t\t\treturn str(self.message)\n\n\ttry:\n\t\t# RDS Info\n\t\trdsSubnetIds = events['RDSSubnetIds']\n\t\trdsCidrs = events['RDSSubnetCidrs']\n\t\trdsRouteTables = events['RDSRouteTables']\n\t\trdsVpcRouteTables = events['RDSVpcRouteTables']\n\t\trdsVpcId = events['RDSVpcId']\n\n\t\t# EC2 Instance Info\n\t\tec2SubnetId = [events['EC2SubnetId']]\n\t\tec2InstanceIPs = events['EC2InstanceIPs']\n\t\tec2RouteTables = events['EC2RouteTables']\n\t\tec2VpcRouteTables = events['EC2VpcRouteTables']\n\t\tec2VpcId = events['EC2VpcId']\n\n\t\trds_rtb_list = []\n\t\tec2_rtb_list = []\n\t\tb_check_vpc_rtb_rds = False\n\t\tb_check_vpc_rtb_ec2 = False\n\n\t\trds_rtb_subnet_list = [] # All subnets that contain a valid rtb\n\t\tec2_rtb_subnet_list = []\n\n\t\t# Initializing RouteTables\n\t\tfor rtb in rdsRouteTables:\n\t\t\tfor assoc in rtb['Associations']:\n\t\t\t\tif assoc['SubnetId'] in rdsSubnetIds:\n\t\t\t\t\trds_rtb_subnet_list.append(assoc['SubnetId'])\n\t\tif len(rds_rtb_subnet_list) < len(rdsSubnetIds):\n\t\t\tb_check_vpc_rtb_rds = True\n\n\t\tfor rtb in ec2RouteTables:\n\t\t\tfor assoc in rtb['Associations']:\n\t\t\t\tif assoc['SubnetId'] in ec2SubnetId:\n\t\t\t\t\tec2_rtb_subnet_list.append(assoc['SubnetId'])\n\t\tif len(ec2_rtb_subnet_list) < len(ec2SubnetId):\n\t\t\tb_check_vpc_rtb_ec2 = True\n\n\t\t# First verification: Check whether resources are in the same VPC. If not, Cidr cannot overlap\n\t\tif not rdsVpcId == ec2VpcId:\n\t\t\tfor rdsCidr in rdsCidrs:\n\t\t\t\tfor ec2InstanceIP in ec2InstanceIPs:\n\t\t\t\t\tif ip_network(rdsCidr, strict=False).overlaps(ip_network(ec2InstanceIP, strict=False)):\n\t\t\t\t\t\traise CidrOverlapeError(\"Resources are located in different VPCs, however, Cidrs are overlapping\")\n\t\telse:\n\t\t\tprint(\"Resources located in the same VPC\")\n\t\t\treturn(\"Resources located in the same VPC\")\n\n\t\t# Second verification: Check whether resources are using the same route table\n\t\tfor rtb in rdsRouteTables:\n\t\t\t\trds_rtb_list.append(rtb['RouteTableId'])\n\n\t\tfor rtb in ec2RouteTables:\n\t\t\t\tec2_rtb_list.append(rtb['RouteTableId'])\n\n\t\tif (rdsRouteTables == ec2RouteTables) and b_check_vpc_rtb_ec2 == False and b_check_vpc_rtb_rds == False:\n\t\t\t\tprint(\"Source and destination resources are using the same route table(s): {}\".format(ec2_rtb_list))\n\t\t\t\treturn(\"Source and destination resources are using the same route table(s): {}\".format(ec2_rtb_list))\n\n\t\t# Third verification: Check wheter route is through a peering connection\n\t\t# Verify whether RDS RTBs contains route to EC2 network\n\t\tfor rtb in rdsRouteTables:\n\t\t\t\trequired_ips = list(ec2InstanceIPs)\n\t\t\t\tfor route in rtb['Routes']:\n\t\t\t\t\t\tif not 'VpcPeeringConnectionId' in route.keys():\n\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\tif len(required_ips) == 0:\n\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\tfor remote_ip in ec2InstanceIPs:\n\t\t\t\t\t\t\t\tif ip_network(route['DestinationCidrBlock'], strict=False).overlaps(ip_network(remote_ip, strict=False)):\n\t\t\t\t\t\t\t\t\t\trequired_ips.remove(remote_ip)\n\t\t\t\tif len(required_ips) == 0:\n\t\t\t\t\t\trds_rtb_list.remove(rtb['RouteTableId'])\n\n\t\tif b_check_vpc_rtb_rds == True:\n\t\t\tfor rtb in rdsVpcRouteTables:\n\t\t\t\t\trequired_ips = list(ec2InstanceIPs)\n\t\t\t\t\tfor route in rtb['Routes']:\n\t\t\t\t\t\t\tif not 'VpcPeeringConnectionId' in route.keys():\n\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\tif len(required_ips) == 0:\n\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\tfor remote_ip in ec2InstanceIPs:\n\t\t\t\t\t\t\t\t\tif ip_network(route['DestinationCidrBlock'], strict=False).overlaps(ip_network(remote_ip, strict=False)):\n\t\t\t\t\t\t\t\t\t\t\tif remote_ip in required_ips:\n\t\t\t\t\t\t\t\t\t\t\t\trequired_ips.remove(remote_ip)\n\t\t\t\t\tif len(required_ips) == 0:\n\t\t\t\t\t\t\trds_rtb_list.remove(rtb['RouteTableId'])\n\n\t\t# Verify whether EC2 RTB contains route to RDS network\n\t\tfor rtb in ec2RouteTables:\n\t\t\t\trequired_cidrs = list(rdsCidrs)\n\t\t\t\tfor route in rtb['Routes']:\n\t\t\t\t\tif not 'VpcPeeringConnectionId' in route.keys():\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tif len(required_cidrs) == 0:\n\t\t\t\t\t\tbreak\n\t\t\t\t\tfor remote_cidr in rdsCidrs:\n\t\t\t\t\t\t\tif ip_network(route['DestinationCidrBlock'], strict=False).overlaps(ip_network(remote_cidr, strict=False)):\n\t\t\t\t\t\t\t\t\tif remote_cidr in required_cidrs:\n\t\t\t\t\t\t\t\t\t\trequired_cidrs.remove(remote_cidr)\n\t\t\t\tif len(required_cidrs) == 0:\n\t\t\t\t\t\tec2_rtb_list.remove(rtb['RouteTableId'])\n\n\t\tif b_check_vpc_rtb_ec2 == True:\n\t\t\tfor rtb in ec2VpcRouteTables:\n\t\t\t\t\trequired_ips = list(rdsCidrs)\n\t\t\t\t\tfor route in rtb['Routes']:\n\t\t\t\t\t\t\tif not 'VpcPeeringConnectionId' in route.keys():\n\t\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\t\tif len(required_cidrs) == 0:\n\t\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t\tfor remote_cidr in rdsCidrs:\n\t\t\t\t\t\t\t\t\tif ip_network(route['DestinationCidrBlock'], strict=False).overlaps(ip_network(remote_cidr, strict=False)):\n\t\t\t\t\t\t\t\t\t\t\trequired_cidrs.remove(remote_cidr)\n\t\t\t\t\tif len(required_ips) == 0:\n\t\t\t\t\t\t\tec2_rtb_list.remove(rtb['RouteTableId'])\n\n\t\tif (len(rds_rtb_list) > 0):\n\t\t\traise MissingRouteError(\"Please review route table(s) {} for entries matching {} Cidr\".format(rds_rtb_list,ec2InstanceIPs))\n\n\t\tif (len(ec2_rtb_list) > 0):\n\t\t\traise MissingRouteError(\"Please review route table(s) {} for entries matching {} Cidr\".format(ec2_rtb_list,rdsCidrs))\n\n\t\tprint(\"Route table validation successful\")\n\t\treturn(\"Route table validation successful\")\n\n\texcept MissingRouteError:\n\t\traise\n\n\texcept CidrOverlapeError:\n\t\traise\n\n\texcept:\n\t\traise ValidationError(\"Route table validation failed\")\n"
+      },
+      "outputs": [
+        {
+          "Name": "RouteTableEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "Sleep"
+    },
+    {
+      "name": "Sleep",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT3S"
+      },
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "getRDSInstanceProperties.DBInstanceIdentifier",
+    "getRDSInstanceProperties.DBInstanceStatus",
+    "evalSecurityGroupRules.SecurityGroupEvaluation",
+    "evalNetworkAclRules.NetworkAclEvaluation",
+    "evalRouteTableEntries.RouteTableEvaluation"
+  ]
+}

@@ -1,0 +1,242 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Tutorial: Hosting a WordPress Blog with Amazon Linux 2\n===\n\nThis Automation document helps you install, configure, and secure a WordPress blog on your Amazon Linux 2 instance created by using the Automation document [```AWS-InstallALAMPServer-AL2```](https://console.aws.amazon.com/systems-manager/documents/AWS-InstallALAMPServer-AL2/description). This tutorial is a good introduction to using Amazon Elastic Compute Cloud (Amazon EC2) in that you have full control over a web server that hosts your WordPress blog, which is not typical with a traditional hosting service. This Automation document automates the procedure described in [Tutorial: Hosting a WordPress Blog with Amazon Linux](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hosting-wordpress.html) in the *Amazon Elastic Compute Cloud User Guide for Linux Instances*.\n\nPrerequisites\n---\n\nTo run the following Automation document, you must have permissions to run Automation workflows. The Automation workflow runs in the context of the current AWS Identity and Access Management (IAM) user. Additionally, you must run the Automation document [```AWS-InstallALAMPServer-AL2```](https://console.aws.amazon.com/systems-manager/documents/AWS-InstallALAMPServer-AL2/description) before using this document. This document installs a WordPress blog on the instance launched in ```AWS-InstallALAMPServer-AL2```.\n\nOutputs\n---\n\nAfter the Automation is complete, go to the WordPress blog dashboard by navigating to the public DNS address (or the public IP address) of the launched instance. For example:\n\n>http://my.public.dns.amazonaws.com/\n\nCleanup\n---\n\nTo remove resources created by this Automation document, navigate to the [AWS CloudFormation console](https://console.aws.amazon.com/cloudformation/home) and delete the stack that was created by the preceding Automation document. \n\n**Important:**\n\nIf you delete or modify the stack that was created, then you must run the document ```AWS-InstallALAMPServer-AL2``` document again before using this Automation document.",
+  "mainSteps": [
+    {
+      "name": "checkForCloudFormationStack",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "step:RunInstallALAMPServerAL2",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "LAMPStack-AL2",
+        "PropertySelector": "$.Stacks[0].StackStatus",
+        "DesiredValues": [
+          "CREATE_COMPLETE"
+        ]
+      },
+      "nextStep": "outputPublicDNS"
+    },
+    {
+      "name": "RunInstallALAMPServerAL2",
+      "action": "aws:executeAutomation",
+      "maxAttempts": 3,
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSDocs-InstallALAMPServer-AL2"
+      },
+      "nextStep": "outputPublicDNS"
+    },
+    {
+      "name": "outputPublicDNS",
+      "action": "aws:runCommand",
+      "onFailure": "step:deleteStackOnCompletion",
+      "inputs": {
+        "Comment": "Outputting public DNS address of EC2 instance",
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "tag:Name",
+            "Values": [
+              "Automation-LAMPStack-AL2"
+            ]
+          }
+        ],
+        "Parameters": {
+          "commands": [
+            "curl -H \"X-aws-ec2-metadata-token: $(curl -X PUT 'http://169.254.169.254/latest/api/token' -sq -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' 2>/dev/null)\" -sq http://169.254.169.254/latest/meta-data/public-hostname"
+          ],
+          "executionTimeout": "3600",
+          "workingDirectory": ""
+        }
+      },
+      "description": "**Output the public DNS address for the launched EC2 instance**\n\nThis step outputs the public DNS address for the EC2 instance launched. You can use this public DNS address to connect to the WordPress blog setup once the Automation workflow has completed. Select the radio button next to the Step execution ID to display the public DNS address of the EC2 instance."
+    },
+    {
+      "name": "downloadWordPress",
+      "action": "aws:runCommand",
+      "onFailure": "step:deleteStackOnCompletion",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "tag:Name",
+            "Values": [
+              "Automation-LAMPStack-AL2"
+            ]
+          }
+        ],
+        "Comment": "Downloading WordPress",
+        "Parameters": {
+          "commands": [
+            "wget https://wordpress.org/latest.tar.gz",
+            "tar -xzf latest.tar.gz"
+          ],
+          "workingDirectory": "",
+          "executionTimeout": "3600"
+        }
+      },
+      "description": "**Download and Unzip WordPress**\n\nThis step downloads the latest WordPress installation package and unzips the package."
+    },
+    {
+      "name": "createDatabaseforWordPress",
+      "onFailure": "step:deleteStackOnCompletion",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "tag:Name",
+            "Values": [
+              "Automation-LAMPStack-AL2"
+            ]
+          }
+        ],
+        "Comment": "Creating a WordPress user and database",
+        "Parameters": {
+          "commands": [
+            "sudo systemctl start mariadb",
+            "az=$(wget -q -O - --header=\"X-aws-ec2-metadata-token: $(curl -X PUT 'http://169.254.169.254/latest/api/token' -sq -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' 2>/dev/null)\" http://169.254.169.254/latest/meta-data/placement/availability-zone)",
+            "root=$(aws ssm get-parameter --name \"/Tutorials/Passwords/AL2/MySQL/root\" --with-decryption --region \"${az::-1}\" --output text --query 'Parameter.Value')",
+            "wpuserpw=$(tr -cd '[:alnum:]' < /dev/urandom | fold -w30 | head -n1)",
+            "mysql --user=root --password=$root <<_EOF_",
+            "CREATE USER \"wpuser\"@\"localhost\" IDENTIFIED BY \"$wpuserpw\";",
+            "CREATE DATABASE wordpressdb;",
+            "GRANT ALL PRIVILEGES ON wordpressdb.* TO \"wpuser\"@\"localhost\";",
+            "FLUSH PRIVILEGES;",
+            "_EOF_",
+            "aws ssm put-parameter --name \"/Tutorials/Passwords/AL2/MySQL/wpuser\" --type \"SecureString\" --value $wpuserpw --description \"MySQL wp-user DB Password\" --region \"${az::-1}\" --overwrite"
+          ],
+          "executionTimeout": "3600"
+        }
+      },
+      "description": "**Create a Database User and Database for WordPress**\n\nThis step creates your blog's database and a user that is authorized to read and save information to it. After this step completes, you can access your WordPress blog by entering the public DNS address (or the public IP address of your instance). For example:\n\n>http://my.public.dns.amazonaws.com/\n\nYou should see the WordPress login page. To login, enter ```wpuser``` as the user name and the value of the Parameter Store parameter [```/Tutorials/Passwords/AL/MySQL/wpuser```](https://console.aws.amazon.com/systems-manager/parameters/%252FTutorials%252FPasswords%252FAL%252FMySQL%252Fwpuser/description)."
+    },
+    {
+      "name": "createWordPressConfig",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "tag:Name",
+            "Values": [
+              "Automation-LAMPStack-AL2"
+            ]
+          }
+        ],
+        "Comment": "Creating wp-config.php file",
+        "Parameters": {
+          "commands": [
+            "cp wordpress/wp-config-sample.php wordpress/wp-config.php",
+            "lineNo=23",
+            "var=\"define( 'DB_NAME', 'wordpressdb' );\"",
+            "sed -i \"${lineNo}s/.*/$var/\" wordpress/wp-config.php",
+            "lineNo=26",
+            "var=\"define( 'DB_USER', 'wpuser' );\"",
+            "sed -i \"${lineNo}s/.*/$var/\" wordpress/wp-config.php",
+            "az=$(wget -q -O - --header=\"X-aws-ec2-metadata-token: $(curl -X PUT 'http://169.254.169.254/latest/api/token' -sq -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' 2>/dev/null)\" http://169.254.169.254/latest/meta-data/placement/availability-zone)",
+            "wpuserpw=$(aws ssm get-parameter --name \"/Tutorials/Passwords/AL2/MySQL/wpuser\" --with-decryption --region \"${az::-1}\" --output text --query 'Parameter.Value')",
+            "lineNo=29",
+            "var=\"define( 'DB_PASSWORD', '$wpuserpw' );\"",
+            "sed -i \"${lineNo}s/.*/$var/\" wordpress/wp-config.php",
+            "curl https://api.wordpress.org/secret-key/1.1/salt/ > salt.txt",
+            "sed -i -e '49r salt.txt' -e '49,56d' wordpress/wp-config.php",
+            "cat wordpress/wp-config.php",
+            "cat salt.txt"
+          ],
+          "executionTimeout": "3600"
+        }
+      },
+      "description": "**Create and configure the wp-config.php file**\n\nThe WordPress installation folder contains a sample configuration file called wp-config-sample.php. In this step, you copy this file and edit it to fit your specific configuration."
+    },
+    {
+      "name": "installWordpress",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "tag:Name",
+            "Values": [
+              "Automation-LAMPStack-AL2"
+            ]
+          }
+        ],
+        "Comment": "Installing WordPress files to Apache document root",
+        "Parameters": {
+          "commands": [
+            "cp -r wordpress/* /var/www/html/",
+            "lineNo=151",
+            "var=\"    AllowOverride All\"",
+            "sed -i \"${lineNo}s/.*/$var/\" /etc/httpd/conf/httpd.conf"
+          ],
+          "executionTimeout": "3600"
+        }
+      },
+      "description": "**Install your WordPress files under the Apache document root**\n\nThis step configures WordPress to run at the document root, ```/var/www/html/```. Following this, this step allows WordPress to use permalinks."
+    },
+    {
+      "name": "fixFilePermissions",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "tag:Name",
+            "Values": [
+              "Automation-LAMPStack-AL2"
+            ]
+          }
+        ],
+        "Comment": "Fixing file permissions for the Apache web server",
+        "Parameters": {
+          "commands": [
+            "sudo chown -R apache /var/www",
+            "sudo chgrp -R apache /var/www",
+            "sudo systemctl restart httpd"
+          ],
+          "executionTimeout": "3600"
+        }
+      },
+      "description": "**Fix file permissions for the Apache web server**\n\nThis step provides WordPress write access to the Apache document root which features such as uploading media through the Administrative screen."
+    },
+    {
+      "name": "runWordPressInstallationScript",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "tag:Name",
+            "Values": [
+              "Automation-LAMPStack-AL2"
+            ]
+          }
+        ],
+        "Comment": "Running the WordPress installation script",
+        "Parameters": {
+          "commands": [
+            "sudo systemctl enable httpd && sudo systemctl enable mariadb",
+            "sudo systemctl start mariadb",
+            "sudo systemctl start httpd"
+          ],
+          "executionTimeout": "3600"
+        }
+      },
+      "description": "**Fix file permissions for the Apache web server**\n\nThis step runs the WordPress installation script. Following this step, you can continue the installation process for WordPress by navigating to the public DNS address of your EC2 instance. This will be available as output from the step **outputPublicDNS**.",
+      "isEnd": true
+    },
+    {
+      "name": "deleteStackOnCompletion",
+      "action": "aws:deleteStack",
+      "maxAttempts": 1,
+      "inputs": {
+        "StackName": "LAMPStack-AL2"
+      },
+      "description": "**Remove the CloudFormation Template and Associated Resources**\n\nThis step deletes the CloudFormation stack and the associated resources originally launched using the Automation document ```AWS-InstallALAMPServer-AL2```.\n\n**Note**\n\nIf you run this step, the WordPress blog instance will be removed. If you would like to keep the resources running, choose **Complete and view results**. ",
+      "isEnd": true
+    }
+  ]
+}

@@ -1,0 +1,2029 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## This Document is not intended to run by itself, but to be invoked from the main document AWSEC2-CloneInstanceAndUpgradeWindows Given a running Instance with SSM Agent installed, upgrade to Windows Server 2016 or 2019. This document will create an AMI from the running instance and launch a new instance from the Image and will upgrade the new instance. Note that if the running instance does not have SSM installed, we will attempt to install SSM in the new instance before it is upgraded. The running instance remains untouched.",
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) The Instance running Windows Server 2012 R2 with the SSM agent installed.",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$"
+    },
+    "IamInstanceProfile": {
+      "type": "String",
+      "description": "(Required) The IAM profile having access to run SSM on EC2 Instance. Please refer https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-configuring-access-role.html"
+    },
+    "SubnetId": {
+      "type": "String",
+      "description": "(Required) Provide a subnet for the upgrade process to use. Please ensure the subnet has outbound connectivity to AWS services, S3, and Microsoft for download patches. ",
+      "allowedPattern": "^subnet-[a-z0-9]{8,17}$"
+    },
+    "TargetWindowVersion": {
+      "type": "String",
+      "description": "(Required) Select the target Windows version",
+      "default": "2019",
+      "allowedValues": [
+        "2016",
+        "2019"
+      ]
+    },
+    "amiName": {
+      "type": "String",
+      "description": "(Optional) Name of the image with upgraded OS",
+      "default": "",
+      "allowedPattern": "^$|^([a-zA-Z0-9\\.\\/\\[\\]\\(\\)\\ '@_-]){3,128}$"
+    },
+    "BYOLWindowsMediaSnapshotId": {
+      "type": "String",
+      "description": "(Optional) Required only if you are upgrading a BYOL instance. Please create an EBS snapshot of Windows Server Installation media using the steps detailed in the automation doc page.",
+      "default": "",
+      "allowedPattern": "^$|^snap-[a-z0-9]{8,17}$"
+    },
+    "AlternativeKeyPairName": {
+      "type": "String",
+      "description": "(Optional) The name of an alternative key pair to use during the upgrade process. Useful in situations where the key pair used on the original instance is not available.",
+      "default": ""
+    },
+    "KeepPreUpgradeImageBackUp": {
+      "type": "String",
+      "description": "(Optional) If set True SSM will keep the pre-upgrade image created from the instance and it's your responsibility to delete the Image. Default is False. ",
+      "default": "False",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "RebootInstanceBeforeTakingImage": {
+      "type": "String",
+      "description": "(Optional) Default is False (no reboot). If set True, SSM will reboot the instance before creating an AMI for the upgrade. ",
+      "default": "False",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "describeOriginalInstanceDetails",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "RootDeviceName",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+          "Type": "String"
+        },
+        {
+          "Name": "KeyName",
+          "Selector": "$.Reservations[0].Instances[0].KeyName",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups..GroupId",
+          "Type": "StringList"
+        },
+        {
+          "Name": "BlockDeviceMappings",
+          "Selector": "$.Reservations[0].Instances[0].BlockDeviceMappings..DeviceName",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "assertRootVolumeIsEbs"
+    },
+    {
+      "name": "assertRootVolumeIsEbs",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].RootDeviceType",
+        "DesiredValues": [
+          "ebs"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "assertSubnetHasAutoAssignIPV4"
+    },
+    {
+      "name": "assertSubnetHasAutoAssignIPV4",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSubnets",
+        "Filters": [
+          {
+            "Name": "subnet-id",
+            "Values": [
+              "{{ SubnetId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Subnets[0].MapPublicIpOnLaunch",
+        "DesiredValues": [
+          "True"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "branchOnRebootInstanceBeforeTakingImage"
+    },
+    {
+      "name": "branchOnRebootInstanceBeforeTakingImage",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "createImageWithReboot",
+            "Variable": "{{ RebootInstanceBeforeTakingImage }}",
+            "EqualsIgnoreCase": "True"
+          }
+        ],
+        "Default": "createImageWithNoReboot"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "createImageWithReboot",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateImage",
+        "InstanceId": "{{ InstanceId }}",
+        "Name": "AWSEC2_ImageFromOriginalInstance_{{ automation:EXECUTION_ID }}",
+        "NoReboot": false
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.ImageId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "describeOriginalInstanceImage"
+    },
+    {
+      "name": "createImageWithNoReboot",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateImage",
+        "InstanceId": "{{ InstanceId }}",
+        "Name": "AWSEC2_ImageFromOriginalInstance_{{ automation:EXECUTION_ID }}",
+        "NoReboot": true
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.ImageId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "describeOriginalInstanceImage"
+    },
+    {
+      "name": "describeOriginalInstanceImage",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "Filters": [
+          {
+            "Name": "name",
+            "Values": [
+              "AWSEC2_ImageFromOriginalInstance_{{ automation:EXECUTION_ID }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Images[0].ImageId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "waitTillOriginalInstanceImageImageReady"
+    },
+    {
+      "name": "waitTillOriginalInstanceImageImageReady",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "ImageIds": [
+          "{{ describeOriginalInstanceImage.ImageId }}"
+        ],
+        "PropertySelector": "$.Images[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "nextStep": "branchUseAlternativeKeyPair"
+    },
+    {
+      "name": "branchUseAlternativeKeyPair",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "serverUpgradeInstanceWithAlternativeKeyPair",
+            "Not": {
+              "Variable": "{{ AlternativeKeyPairName }}",
+              "StringEquals": ""
+            }
+          }
+        ],
+        "Default": "serverUpgradeInstanceWithOriginalKeyPair"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "serverUpgradeInstanceWithAlternativeKeyPair",
+      "action": "aws:runInstances",
+      "timeoutSeconds": 7200,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
+        "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "IamInstanceProfileName": "{{ IamInstanceProfile }}",
+        "SubnetId": "{{ SubnetId }}",
+        "KeyName": "{{ AlternativeKeyPairName }}",
+        "SecurityGroupIds": [
+          "{{ describeOriginalInstanceDetails.SecurityGroupIds }}"
+        ],
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "AWSEC2_UpgradeInstance_{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ],
+        "UserData": "PHBvd2Vyc2hlbGw+CiRzZXJ2aWNlTmFtZSA9ICJBbWF6b25TU01BZ2VudCIKJHNlcnZpY2VEb3dubG9hZFBhdGggPSAiQzpcdGVtcFxBbWF6b25TU01BZ2VudFNldHVwLmV4ZSIKCklmIChHZXQtU2VydmljZSAkc2VydmljZU5hbWUgLUVycm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUgLVdhcm5pbmdBY3Rpb24gU2lsZW50bHlDb250aW51ZSkgewogICAgSWYgKChHZXQtU2VydmljZSAkc2VydmljZU5hbWUpLlN0YXR1cyAtbmUgIlJ1bm5pbmciKSB7CiAgICAgICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgICAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgZm91bmQsIGJ1dCBpdCBpcyBub3QgcnVubmluZywgc28gc3RhcnRlZCBpdC4iCiAgICB9Cn0gRWxzZSB7CiAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgbm90IGZvdW5kLCB0cnlpbmcgdG8gaW5zdGFsbC4iCiAgICAgTmV3LUl0ZW0gLUl0ZW1UeXBlIERpcmVjdG9yeSAtRm9yY2UgLVBhdGggIkM6XHRlbXAiICAKICAgIChOZXctT2JqZWN0IFN5c3RlbS5OZXQuV2ViQ2xpZW50KS5Eb3dubG9hZEZpbGUoImh0dHBzOi8vczMuYW1hem9uYXdzLmNvbS9lYzItZG93bmxvYWRzLXdpbmRvd3MvU1NNQWdlbnQvbGF0ZXN0L3dpbmRvd3NfYW1kNjQvQW1hem9uU1NNQWdlbnRTZXR1cC5leGUiLCAiJHNlcnZpY2VEb3dubG9hZFBhdGgiKQogICAgU3RhcnQtUHJvY2VzcyAtRmlsZVBhdGggIiRzZXJ2aWNlRG93bmxvYWRQYXRoIiAgLUFyZ3VtZW50TGlzdCBAKCIvcXVpZXQiLCAiL25vcmVzdGFydCIsICIvbG9nIiwgInNzbS1pbnN0YWxsLmxvZyIsICJBTExPV0VDMklOU1RBTEw9WUVTIikgLVdhaXQKICAgIFN0YXJ0LVNsZWVwIC1zIDEwCiAgICBTdGFydC1TZXJ2aWNlICRzZXJ2aWNlTmFtZQogICAgV3JpdGUtSG9zdCAiJHNlcnZpY2VOYW1lIGluc3RhbGxlZCBhbmQgc3RhcnRlZC4iCn0KPC9wb3dlcnNoZWxsPgo8cGVyc2lzdD50cnVlPC9wZXJzaXN0Pg=="
+      },
+      "isCritical": "true",
+      "nextStep": "getServerUpgradeInstance"
+    },
+    {
+      "name": "serverUpgradeInstanceWithOriginalKeyPair",
+      "action": "aws:runInstances",
+      "timeoutSeconds": 7200,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
+        "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "IamInstanceProfileName": "{{ IamInstanceProfile }}",
+        "SubnetId": "{{ SubnetId }}",
+        "KeyName": "{{ describeOriginalInstanceDetails.KeyName }}",
+        "SecurityGroupIds": [
+          "{{ describeOriginalInstanceDetails.SecurityGroupIds }}"
+        ],
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "AWSEC2_UpgradeInstance_{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ],
+        "UserData": "PHBvd2Vyc2hlbGw+CiRzZXJ2aWNlTmFtZSA9ICJBbWF6b25TU01BZ2VudCIKJHNlcnZpY2VEb3dubG9hZFBhdGggPSAiQzpcdGVtcFxBbWF6b25TU01BZ2VudFNldHVwLmV4ZSIKCklmIChHZXQtU2VydmljZSAkc2VydmljZU5hbWUgLUVycm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUgLVdhcm5pbmdBY3Rpb24gU2lsZW50bHlDb250aW51ZSkgewogICAgSWYgKChHZXQtU2VydmljZSAkc2VydmljZU5hbWUpLlN0YXR1cyAtbmUgIlJ1bm5pbmciKSB7CiAgICAgICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgICAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgZm91bmQsIGJ1dCBpdCBpcyBub3QgcnVubmluZywgc28gc3RhcnRlZCBpdC4iCiAgICB9Cn0gRWxzZSB7CiAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgbm90IGZvdW5kLCB0cnlpbmcgdG8gaW5zdGFsbC4iCiAgICAgTmV3LUl0ZW0gLUl0ZW1UeXBlIERpcmVjdG9yeSAtRm9yY2UgLVBhdGggIkM6XHRlbXAiICAKICAgIChOZXctT2JqZWN0IFN5c3RlbS5OZXQuV2ViQ2xpZW50KS5Eb3dubG9hZEZpbGUoImh0dHBzOi8vczMuYW1hem9uYXdzLmNvbS9lYzItZG93bmxvYWRzLXdpbmRvd3MvU1NNQWdlbnQvbGF0ZXN0L3dpbmRvd3NfYW1kNjQvQW1hem9uU1NNQWdlbnRTZXR1cC5leGUiLCAiJHNlcnZpY2VEb3dubG9hZFBhdGgiKQogICAgU3RhcnQtUHJvY2VzcyAtRmlsZVBhdGggIiRzZXJ2aWNlRG93bmxvYWRQYXRoIiAgLUFyZ3VtZW50TGlzdCBAKCIvcXVpZXQiLCAiL25vcmVzdGFydCIsICIvbG9nIiwgInNzbS1pbnN0YWxsLmxvZyIsICJBTExPV0VDMklOU1RBTEw9WUVTIikgLVdhaXQKICAgIFN0YXJ0LVNsZWVwIC1zIDEwCiAgICBTdGFydC1TZXJ2aWNlICRzZXJ2aWNlTmFtZQogICAgV3JpdGUtSG9zdCAiJHNlcnZpY2VOYW1lIGluc3RhbGxlZCBhbmQgc3RhcnRlZC4iCn0KPC9wb3dlcnNoZWxsPgo8cGVyc2lzdD50cnVlPC9wZXJzaXN0Pg=="
+      },
+      "isCritical": "true",
+      "nextStep": "getServerUpgradeInstance"
+    },
+    {
+      "name": "getServerUpgradeInstance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "Filters": [
+          {
+            "Name": "tag:Name",
+            "Values": [
+              "AWSEC2_UpgradeInstance_{{ automation:EXECUTION_ID }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Reservations[0].Instances[0].InstanceId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "waitForInstanceToReady"
+    },
+    {
+      "name": "waitForInstanceToReady",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:rebootToMakeItReady",
+      "timeoutSeconds": 600,
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceStatus.Details[0].Status",
+        "DesiredValues": [
+          "passed"
+        ]
+      },
+      "isCritical": "false",
+      "nextStep": "checkForSSMAgent"
+    },
+    {
+      "name": "rebootToMakeItReady",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:waitForInstanceToBeReadyAfterReboot",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "RebootInstances",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ]
+      },
+      "isCritical": "false",
+      "nextStep": "waitForInstanceToBeReadyAfterReboot"
+    },
+    {
+      "name": "waitForInstanceToBeReadyAfterReboot",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 600,
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceStatus.Details[0].Status",
+        "DesiredValues": [
+          "passed"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "checkForSSMAgent"
+    },
+    {
+      "name": "checkForSSMAgent",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "onFailure": "step:prepareServerInstanceForSSMInstall",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ getServerUpgradeInstance.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": "false",
+      "nextStep": "getUpgradeServerInstanceDetails"
+    },
+    {
+      "name": "prepareServerInstanceForSSMInstall",
+      "action": "aws:executeAutomation",
+      "maxAttempts": 3,
+      "timeoutSeconds": 3600,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DocumentName": "AWSSupport-StartEC2RescueWorkflow",
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ getServerUpgradeInstance.InstanceId }}"
+          ],
+          "OfflineScript": [
+            "JEVDMlNldHRpbmdzRmlsZT0iJHtlbnY6RUMyUkVTQ1VFX09GRkxJTkVfUFJPR1JBTV9GSUxFU19ESVJ9XEFtYXpvblxFYzJDb25maWdTZXJ2aWNlXFNldHRpbmdzXENvbmZpZy54bWwiCndyaXRlLWhvc3QgIkZvdW5kIEVDMiBTZXR0aW5ncyBmaWxlIGluICQoJEVDMlNldHRpbmdzRmlsZSkiCiR4bWwgPSBbeG1sXShnZXQtY29udGVudCAkRUMyU2V0dGluZ3NGaWxlKQokeG1sRWxlbWVudCA9ICR4bWwuZ2V0X0RvY3VtZW50RWxlbWVudCgpCiR4bWxFbGVtZW50VG9Nb2RpZnkgPSAkeG1sRWxlbWVudC5QbHVnaW5zCndyaXRlLWhvc3QgIlNldHRpbmcgQ29uZmlnLnhtbCIKZm9yZWFjaCAoJGVsZW1lbnQgaW4gJHhtbEVsZW1lbnRUb01vZGlmeS5QbHVnaW4pCnsKCXdyaXRlLWhvc3QgIiAkKCRlbGVtZW50Lm5hbWUpIgoJaWYgKCRlbGVtZW50Lm5hbWUgLWVxICJFYzJIYW5kbGVVc2VyRGF0YSIpCgl7CgkJd3JpdGUtaG9zdCAiYWJvdXQgdG8gdXBkYXRlICQoJGVsZW1lbnQubmFtZSkiCgkJJGVsZW1lbnQuU3RhdGU9IkVuYWJsZWQiCgl9CgkJCgl3cml0ZS1ob3N0ICIgICQoJGVsZW1lbnQuU3RhdGUpIgp9CiR4bWwuU2F2ZSgkRUMyU2V0dGluZ3NGaWxlKQ=="
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "startServerInstanceWithSSMInstall"
+    },
+    {
+      "name": "startServerInstanceWithSSMInstall",
+      "action": "aws:changeInstanceState",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      },
+      "isCritical": "true",
+      "nextStep": "waitSSMAgentOnlineOnServerUpgradeInstance"
+    },
+    {
+      "name": "waitSSMAgentOnlineOnServerUpgradeInstance",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ getServerUpgradeInstance.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "getUpgradeServerInstanceDetails"
+    },
+    {
+      "name": "getUpgradeServerInstanceDetails",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Reservations[0].Instances[0].NetworkInterfaces[0].SubnetId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "assertSupportedWindowsVersion2019"
+    },
+    {
+      "name": "assertSupportedWindowsVersion2019",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 600,
+      "isCritical": "true",
+      "nextStep": "runScriptBeforeWindowServerUpgrade2019",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "executionTimeout": "600",
+          "commands": [
+            "function Validate-InstanceLicensing([string]$WindowSnapshotId) {",
+            "\t$IsError = $True",
+            "\ttry {",
+            "\t\t# compatible with PS2.0",
+            "\t\t$webrequest = [System.Net.WebRequest]::Create(\"http://169.254.169.254/latest/dynamic/instance-identity/document\")",
+            "\t\t$response = $webrequest.GetResponse()",
+            "\t\t$stream = $response.GetResponseStream()",
+            "\t\t$sr = new-object System.IO.StreamReader($stream)",
+            "\t\t$content = $sr.ReadToEnd();",
+            "\t\t[System.Reflection.Assembly]::LoadWithPartialName(\"System.Web.Extensions\") | out-null",
+            "\t\t$ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer",
+            "\t\t$billingProduct = $ser.DeserializeObject($content).billingProducts",
+            "\t\tif (($billingProduct -eq \"bp-6ba54002\") -or ($billingProduct -eq \"bp-68a54001\")) {",
+            "\t\t\t$IsError = $False",
+            "\t\t\tWrite-Host \"Instance has license included\"",
+            "\t\t}",
+            "\t\telseif (-not [string]::IsNullOrEmpty($WindowSnapshotId)) {",
+            "\t\t\t$IsError = $False",
+            "\t\t\tWrite-Host \"Instance will use $WindowSnapshotId for BYOL\"",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\t$IsError = $True",
+            "\t\t\tWrite-Host \"Your instance is BYOL, but you did not provide a BYOL Windows installation media snapshot id. Please re-run this automation with the necessary paramaters.\"",
+            "\t\t}",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Error $_.Exception.Message",
+            "\t}",
+            "\tfinally {",
+            "\t\tif ($sr -ne $null) { $sr.Close(); }",
+            "\t\tif ($response -ne $null) { $response.Close(); }",
+            "\t\tif ($IsError) {",
+            "\t\t\texit 1",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\texit 0",
+            "\t\t}",
+            "\t}",
+            "}",
+            "",
+            "function Check-OSUpgradeCompatibility {",
+            "\t$osInfo = (Get-WmiObject -class Win32_OperatingSystem)",
+            "\t# ProductType 3 = Server OS - Not a Domain Controller",
+            "\tif ($osInfo.ProductType -ne 3) {",
+            "\t\tWrite-Host \"This upgrade automation is not supported on Domain Controller or Work Station role.\"",
+            "\t\texit 1",
+            "\t}",
+            "\t$OSVersion = $osInfo.Caption.ToUpper()",
+            "\tif (($OSVersion.indexOf(\"2012 R2\") -ge 0) -or ($OSVersion.indexOf(\"2016\") -ge 0)) {",
+            "\t\tWrite-Host \"OSVersion : $OSVersion\"",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host \"This upgrade automation only supports Windows 2012 R2/2016.\"",
+            "\t\texit 1",
+            "\t}",
+            "\t$Space = (Get-WMIObject Win32_Logicaldisk -filter \"deviceid='$($osInfo.systemdrive)'\").FreeSpace",
+            "\t$AvailableGBSpace = [math]::floor($Space / 1GB)",
+            "\tif ($AvailableGBSpace -le 20 ) {",
+            "\t\tWrite-Host \"Not enough space to continue upgrade. Available space $AvailableGBSpace GB, minimum required is 20 GB\"",
+            "\t\texit 1",
+            "\t}",
+            "}",
+            "",
+            "Check-OSUpgradeCompatibility",
+            "$WindowSnapShotId = \"{{ BYOLWindowsMediaSnapshotId }}\"",
+            "Validate-InstanceLicensing($WindowSnapShotId)"
+          ]
+        }
+      }
+    },
+    {
+      "name": "runScriptBeforeWindowServerUpgrade2019",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "function Enable-OfflineDisk {",
+            "\t$offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" }",
+            "\tif ($offlinedisk) {",
+            "\t\tforeach ($offdisk in $offlinedisk) {",
+            "\t\t\t$offdiskS = $offdisk.Substring(2, 6)",
+            "\t\t\t$OnlineDisk = @\"",
+            "select $offdiskS",
+            "attributes disk clear readonly",
+            "online disk",
+            "attributes disk clear readonly",
+            "\"@",
+            "\t\t\t$noOut = $OnlineDisk | diskpart",
+            "\t\t\tStart-Sleep 5",
+            "\t\t}",
+            "\t\tif (($offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" } )) {",
+            "\t\t\tWrite-Host \"Failed to bring the following disk(s) online\"",
+            "\t\t\t$offlinedisk",
+            "\t\t\tExit 1",
+            "\t\t}",
+            "\t}",
+            "}",
+            "",
+            "function GetSnapshot-ForCulture {",
+            "\t$culture = Get-Culture",
+            "\tif ($culture.Name -eq \"de-DE\") {",
+            "\t\tWrite-Host -NoNewline \"Windows {{ TargetWindowVersion }} German Installation Media\"",
+            "\t}",
+            "\telseif ($culture.Name -eq \"fr-FR\") {",
+            "\t\tWrite-Host -NoNewline \"Windows {{ TargetWindowVersion }} French Installation Media\"",
+            "\t}",
+            "\telseif ($culture.Name -eq \"ja-JP\") {",
+            "\t\tWrite-Host -NoNewline \"Windows {{ TargetWindowVersion }} Japanese Installation Media\"",
+            "\t}",
+            "\telseif ($culture.Name -eq \"cs-CZ\") {",
+            "\t\tWrite-Host -NoNewline \"Windows {{ TargetWindowVersion }} Czech Installation Media\"",
+            "\t}",
+            "\telseif ($culture.Name -eq \"pt-BR\") {",
+            "\t\tWrite-Host -NoNewline \"Windows {{ TargetWindowVersion }} Portuguese_Brazil Installation Media\"",
+            "\t}",
+            "\telseif ($culture.Name -eq \"nl-NL\") {",
+            "\t\tWrite-Host -NoNewline \"Windows {{ TargetWindowVersion }} Dutch Installation Media\"",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host -NoNewline \"Windows {{ TargetWindowVersion }} English Installation Media\"",
+            "\t}",
+            "}",
+            "",
+            "$TEMPSTORAGE = \"C:\\WindowsUpgrade\\{{ automation:EXECUTION_ID }}\"",
+            "$TEMPSTOGAREFILE = \"$TEMPSTORAGE\\drive.txt\"",
+            "Enable-OfflineDisk",
+            "New-Item -ItemType directory -Path $TEMPSTORAGE | out-null",
+            "([System.IO.DriveInfo]::getdrives() | select-object -ExpandProperty Name) -join ',' | Out-File \"$TEMPSTOGAREFILE\" | out-null",
+            "GetSnapshot-ForCulture"
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "getAmazonOwnedWindowsServerSnapShotId"
+    },
+    {
+      "name": "getAmazonOwnedWindowsServerSnapShotId",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSnapshots",
+        "OwnerIds": [
+          "amazon"
+        ],
+        "Filters": [
+          {
+            "Name": "description",
+            "Values": [
+              "{{ runScriptBeforeWindowServerUpgrade2019.Output }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SnapShotId",
+          "Selector": "$.Snapshots[0].SnapshotId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "branchOnLicensingToGetWindowMediaSnapshot"
+    },
+    {
+      "name": "branchOnLicensingToGetWindowMediaSnapshot",
+      "action": "aws:branch",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ assertSupportedWindowsVersion2019.Output }}",
+                "Contains": "BYOL"
+              },
+              {
+                "Variable": "{{ BYOLWindowsMediaSnapshotId }}",
+                "StringEquals": "{{ getAmazonOwnedWindowsServerSnapShotId.SnapShotId }}"
+              }
+            ],
+            "NextStep": "assertFailBecauseSameSnapshotOwnedByAmazon"
+          },
+          {
+            "Variable": "{{ assertSupportedWindowsVersion2019.Output }}",
+            "Contains": "BYOL",
+            "NextStep": "useCustomerWindowMediaSnapshotToCreateVolume"
+          }
+        ],
+        "Default": "useAmazonProvidedWindowMediaSnapshotToCreateVolume"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "assertFailBecauseSameSnapshotOwnedByAmazon",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSnapshots",
+        "SnapshotIds": [
+          "{{ BYOLWindowsMediaSnapshotId }}"
+        ],
+        "PropertySelector": "$.Snapshots[0].SnapshotId",
+        "DesiredValues": [
+          "{{ automation:EXECUTION_ID }}"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "deleteServerUpgradeInstance"
+    },
+    {
+      "name": "useCustomerWindowMediaSnapshotToCreateVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateVolume",
+        "AvailabilityZone": "{{ getUpgradeServerInstanceDetails.AvailabilityZone }}",
+        "SnapshotId": "{{ BYOLWindowsMediaSnapshotId }}",
+        "VolumeType": "gp2",
+        "TagSpecifications": [
+          {
+            "ResourceType": "volume",
+            "Tags": [
+              {
+                "Key": "ServerUpgradeKeyVolume-{{ automation:EXECUTION_ID }}",
+                "Value": "Volume-{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ]
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "describeWindowMediaSnapshotVolume"
+    },
+    {
+      "name": "useAmazonProvidedWindowMediaSnapshotToCreateVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateVolume",
+        "AvailabilityZone": "{{ getUpgradeServerInstanceDetails.AvailabilityZone }}",
+        "SnapshotId": "{{ getAmazonOwnedWindowsServerSnapShotId.SnapShotId }}",
+        "VolumeType": "gp2",
+        "TagSpecifications": [
+          {
+            "ResourceType": "volume",
+            "Tags": [
+              {
+                "Key": "ServerUpgradeKeyVolume-{{ automation:EXECUTION_ID }}",
+                "Value": "Volume-{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ]
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "sleepForVolumetoBeCreated"
+    },
+    {
+      "name": "sleepForVolumetoBeCreated",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT2M"
+      },
+      "isCritical": "false",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "nextStep": "tryToGetWindowMediaSnapshotVolume"
+    },
+    {
+      "name": "tryToGetWindowMediaSnapshotVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "tag-key",
+            "Values": [
+              "ServerUpgradeKeyVolume-{{ automation:EXECUTION_ID }}"
+            ]
+          },
+          {
+            "Name": "availability-zone",
+            "Values": [
+              "{{ getUpgradeServerInstanceDetails.AvailabilityZone }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VolumeId",
+          "Selector": "$.Volumes[0].VolumeId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "false",
+      "nextStep": "describeWindowMediaSnapshotVolume"
+    },
+    {
+      "name": "describeWindowMediaSnapshotVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "tag-key",
+            "Values": [
+              "ServerUpgradeKeyVolume-{{ automation:EXECUTION_ID }}"
+            ]
+          },
+          {
+            "Name": "availability-zone",
+            "Values": [
+              "{{ getUpgradeServerInstanceDetails.AvailabilityZone }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VolumeId",
+          "Selector": "$.Volumes[0].VolumeId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "false",
+      "nextStep": "waitUntilWindowMediaSnapshotVolumeIsAvailable"
+    },
+    {
+      "name": "waitUntilWindowMediaSnapshotVolumeIsAvailable",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Volumes[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "findAvailableDeviceMapping2019"
+    },
+    {
+      "name": "findAvailableDeviceMapping2019",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "PowerShell Core 6.0",
+        "Script": "$inputPayload = $env:InputPayload | ConvertFrom-Json\n$instanceMappings = $inputPayload.mappedDevices\n\nfunction Get-DeviceList {\n\tforeach ($letterMapping in 98..122) {\n\t\tif (-not ($instanceMappings -match \"sd$([char]$letterMapping)\" -or $instanceMappings -match \"xvd$([char]$letterMapping)\")) {\n\t\t\treturn \"xvd$([char]$letterMapping)\"\n\t\t}\n\t}\n}\n$availableDevice = Get-DeviceList\n\nif (-not $availableDevice) {\n\tWrite-Host \"ERROR: No free device available.\"\n\tExit 1\n}\nelse {\n\treturn @{availableDevice = \"$availableDevice\" }\n\tExit 0\n}",
+        "InputPayload": {
+          "mappedDevices": "{{ describeOriginalInstanceDetails.BlockDeviceMappings }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "availableDevice",
+          "Selector": "$.Payload.availableDevice",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "attachInstallationMediaToUpgradeInstance"
+    },
+    {
+      "name": "attachInstallationMediaToUpgradeInstance",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "AttachVolume",
+        "Device": "{{ findAvailableDeviceMapping2019.availableDevice }}",
+        "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
+        "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "waitTillAttachedInstallationMediaToUpgradeInstance"
+    },
+    {
+      "name": "waitTillAttachedInstallationMediaToUpgradeInstance",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1800,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
+            ]
+          },
+          {
+            "Name": "attachment.instance-id",
+            "Values": [
+              "{{ getServerUpgradeInstance.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Volumes[0].State",
+        "DesiredValues": [
+          "in-use"
+        ]
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "sleepBeforeWindowUpgradeAndStart"
+    },
+    {
+      "name": "sleepBeforeWindowUpgradeAndStart",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT5M"
+      },
+      "isCritical": "false",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "nextStep": "runWindowsServerUpgrade2019"
+    },
+    {
+      "name": "runWindowsServerUpgrade2019",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "function Write-Log {",
+            "\tPARAM",
+            "\t(",
+            "\t\t[Parameter(Mandatory = $true)] [string] $logMessage",
+            "\t\t, [ValidateSet(\"Green\", \"Yellow\", \"Red\")] [string] $Color",
+            "\t)",
+            "\t$Datestamp = [datetime]::Now.ToString(\"yyyy-MM-dd HH:mm:ss.fff\")",
+            "\t$FullMessage = \"$Datestamp $logMessage\"",
+            "\tif ($Color) {",
+            "\t\tWrite-Host $FullMessage -ForegroundColor $Color",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host $FullMessage",
+            "\t}",
+            "\tWrite-Host $FullMessage | out-file -encoding ASCII $LogFilePath -Append",
+            "",
+            "}",
+            "function Enable-OfflineDisk {",
+            "\t$offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" }",
+            "\tif ($offlinedisk) {",
+            "\t\tWrite-Host \"Following Offline disk(s) found..Trying to bring Online.\"",
+            "\t\tforeach ($offdisk in $offlinedisk) {",
+            "\t\t\t$offdiskS = $offdisk.Substring(2, 6)",
+            "\t\t\tWrite-Host \"Enabling $offdiskS\"",
+            "\t\t\t$OnlineDisk = @\"",
+            "select $offdiskS",
+            "attributes disk clear readonly",
+            "online disk",
+            "attributes disk clear readonly",
+            "\"@",
+            "",
+            "\t\t\t$noOut = $OnlineDisk | diskpart",
+            "\t\t\tStart-Sleep 5",
+            "\t\t}",
+            "",
+            "\t\tif (($offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" } )) {",
+            "\t\t\tWrite-Host \"Failed to bring the following disk(s) online\"",
+            "\t\t\t$offlinedisk",
+            "\t\t\tExit 1",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\tWrite-Host \"Disk(s) are now online.\"",
+            "\t\t}",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host \"All disk(s) are online!\"",
+            "\t}",
+            "}",
+            "",
+            "function Find-WindowSetupPath {",
+            "\tEnable-OfflineDisk",
+            "\t$CurrentDrives = ([System.IO.DriveInfo]::getdrives() | select-object -ExpandProperty Name) -join ','",
+            "\tWrite-host \"Current drives are $CurrentDrives\"",
+            "\t$OldDrives = Get-Content -Path \"C:\\WindowsUpgrade\\{{ automation:EXECUTION_ID }}\\drive.txt\" -TotalCount 1",
+            "\t$oldDriveArray = $OldDrives.split(',')",
+            "\t$newDriveArray = $CurrentDrives.split(',')",
+            "\tforeach ($drive in $newDriveArray) {",
+            "\t\tif (-not ($oldDriveArray -contains $drive)) {",
+            "\t\t\t$NewDrive = $drive",
+            "\t\t\tbreak",
+            "\t\t}",
+            "\t}",
+            "\tif (-not $NewDrive) {",
+            "\t\tWrite-Log \"Can't find the new drive\"",
+            "\t\texit -1",
+            "\t}",
+            "\t$SetupLocation = \"$NewDrive\\setup.exe\"",
+            "\tif ((Test-Path $SetupLocation) -eq $false) {",
+            "\t\t$isomount = $(Mount-DiskImage -ImagePath \"$NewDrive$(Get-Childitem -Path $NewDrive -Include *.ISO -Recurse | Select-Object Name -ExpandProperty Name)\" -PassThru | Get-DiskImage | Get-Volume).DriveLetter",
+            "\t\t$SetupLocation = \"{0}:\\setup.exe\" -f $isomount",
+            "\t\tWrite-Host \"Found ISO in the installation media $NewDrive . ISO Mounted as\"$isomount\":\\ .\"",
+            "\t}",
+            "\tWrite-host \"Olddrives $OldDrives , Currentdrives $CurrentDrives, Newdrive $NewDrive, Setup location is $SetupLocation \"",
+            "\tif ((Test-Path $SetupLocation) -eq $false) {",
+            "\t\tWrite-Log \"Error: Couldn't find Windows Server {{ TargetWindowVersion }} installation media snapshot. Please contact AWS Premium Support.\" \"Red\"",
+            "\t\texit -1",
+            "\t}",
+            "\tReturn $SetupLocation",
+            "}",
+            "",
+            "function Extract-WindowsImage {",
+            "\t$OriginalWim = $UpgradeSetUpPath.TrimEnd(\"setup.exe\") + \"sources\\install.wim\"",
+            "\tif ((Test-Path $OriginalWim) -eq $false) {",
+            "\t\tWrite-Log \"Error: Couldn't find Windows Server 2016 installation image (WIM file) on media. Please contact AWS Premium Support.\" \"Red\"",
+            "\t\texit -1",
+            "\t}",
+            "\t$ExportedWim = $UpgradeDirectory + \"\\install.wim\"",
+            "\tExport-WindowsImage -SourceImagePath $OriginalWim -SourceIndex $version -DestinationImagePath $ExportedWim | Out-Null",
+            "\tReturn $ExportedWim",
+            "}",
+            "",
+            "function Upgrade-Server {",
+            "\tsc.exe config AmazonSSMAgent start= delayed-auto",
+            "\tStart-sleep -s 5",
+            "\t$CommandFile = \"$UpgradeDirectory\\upgrade.cmd\"",
+            "\t$osInfo = (Get-WmiObject -class Win32_OperatingSystem)",
+            "\t$OSVersion = $osInfo.Caption.ToUpper()",
+            "\tif ($OSVersion.indexOf(\"DATACENTER\") -ge 0) { $version = 4 }",
+            "\telse { $version = 2 }",
+            "\t$TargetVersion = \"{{ TargetWindowVersion }}\"",
+            "\tSet-Content -Path $CommandFile -Value \"@echo off\" -Force",
+            "\tif ($TargetVersion -eq \"2016\") {",
+            "\t\t$ExportedImagePath = Extract-WindowsImage",
+            "\t\tAdd-Content -Path $CommandFile -Value \"$UpgradeSetUpPath /installfrom $ExportedImagePath /auto upgrade /quiet /compat ignorewarning /showoobe none\" -Force",
+            "\t}",
+            "\telse {",
+            "\t\tAdd-Content -Path $CommandFile -Value \"$UpgradeSetUpPath /auto upgrade /imageindex $version /compat ignorewarning /showoobe none\" -Force",
+            "\t}",
+            "\tAdd-Content -Path $CommandFile -Value \"echo %ERRORLEVEL% > $UpgradeDirectory\\check.txt\" -Force",
+            "\tcmd.exe /c \"$CommandFile\" | Out-Null",
+            "}",
+            "",
+            "try {",
+            "\t$UpgradeDirectory = \"C:\\WindowsUpgrade\\{{ automation:EXECUTION_ID }}\"",
+            "\t$Global:LogFilePath = $UpgradeDirectory + \"\\Logfile.txt\"",
+            "\t$UpgradeSetUpPath = Find-WindowSetupPath",
+            "\tUpgrade-Server",
+            "}",
+            "catch {",
+            "\tWrite-Host $_.Exception.Message",
+            "\texit 1",
+            "}"
+          ]
+        }
+      },
+      "onFailure": "step:getTheErrorDetails",
+      "isCritical": "true",
+      "nextStep": "sleepForWindowUpgradeAndStart"
+    },
+    {
+      "name": "getTheErrorDetails",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "executionTimeout": "300",
+          "commands": [
+            " get-content   'C:\\$WINDOWS.~BT\\Sources\\Panther\\setuperr.log' ",
+            " get-content   'C:\\$WINDOWS.~BT\\Sources\\Rollback\\setuperr.log' "
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "deleteServerUpgradeInstance"
+    },
+    {
+      "name": "sleepForWindowUpgradeAndStart",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ getServerUpgradeInstance.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": true,
+      "timeoutSeconds": 3600,
+      "nextStep": "checkAfterWindowsUpgrade2019"
+    },
+    {
+      "name": "checkAfterWindowsUpgrade2019",
+      "action": "aws:runCommand",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "function Check-ServerUpgrade {",
+            "\t$osInfo = (Get-WmiObject -class Win32_OperatingSystem)",
+            "\t$OSVersion = $osInfo.Caption.ToUpper()",
+            "\tif ($OSVersion.indexOf(\"{{ TargetWindowVersion }}\") -ge 0) {",
+            "\t\treturn $true",
+            "\t}",
+            "\telse {",
+            "\t\treturn $false",
+            "\t}",
+            "}",
+            "",
+            "function Write-Log {",
+            "\tPARAM",
+            "\t(",
+            "\t\t[Parameter(Mandatory = $true)] [string] $logMessage",
+            "\t\t, [ValidateSet(\"Green\", \"Yellow\", \"Red\")] [string] $Color",
+            "\t)",
+            "\t$Datestamp = [datetime]::Now.ToString(\"yyyy-MM-dd HH:mm:ss.fff\")",
+            "\t$FullMessage = \"$Datestamp $logMessage\"",
+            "\tif ($Color) {",
+            "\t\tWrite-Host $FullMessage -ForegroundColor $Color",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host $FullMessage",
+            "\t}",
+            "\tWrite-Host $FullMessage | out-file -encoding ASCII $LogFilePath -Append",
+            "}",
+            "",
+            "function Start-Services {",
+            "\tparam([string[]]$serviceNames)",
+            "",
+            "\tForeach ($service in $serviceNames) {",
+            "\t\t$startUpType = Get-WmiObject -Class Win32_Service -Property StartMode -Filter \"Name='$service'\" | Findstr \"StartMode\"",
+            "\t\tif ($startUpType) {",
+            "\t\t\tif ($startUpType.indexOf(\"Disabled\") -gt 0) {",
+            "\t\t\t\tSet-Service $service -StartupType Automatic",
+            "\t\t\t\tStart-Sleep -Seconds 5",
+            "\t\t\t}",
+            "\t\t\telse {",
+            "\t\t\t\tWrite-Log \"$service start up type is $startUpType\"",
+            "\t\t\t}",
+            "",
+            "\t\t\tIf (Get-Service $service -ErrorAction SilentlyContinue) {",
+            "\t\t\t\tIf ((Get-Service $service).Status -eq \"Running\") {",
+            "\t\t\t\t\tWrite-Log \"Service is up\"",
+            "\t\t\t\t}",
+            "\t\t\t\tElse {",
+            "\t\t\t\t\tStart-Service $service",
+            "\t\t\t\t\tWrite-Log \"$service found, but it is not running, so started\"",
+            "\t\t\t\t\tStart-Sleep -Seconds 5",
+            "\t\t\t\t}",
+            "\t\t\t}",
+            "\t\t\telse {",
+            "\t\t\t\tWrite-Log \"$serviceName not found\" -Color Red",
+            "\t\t\t}",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\tWrite-Log \"Can't find Startup type for service $service\" -Color Red",
+            "\t\t}",
+            "\t}",
+            "}",
+            "",
+            "$UpgradeDirectory = \"C:\\WindowsUpgrade\\{{ automation:EXECUTION_ID }}\"",
+            "$Global:LogFilePath = $UpgradeDirectory + \"\\Logfile.txt\"",
+            "try {",
+            "\tif (Check-ServerUpgrade) {",
+            "\t\tStart-Services -serviceNames \"MSSQLSERVER\" , \"SQLSERVERAGENT\"",
+            "\t\tRemove-Item -path \"$UpgradeDirectory\" -recurse",
+            "\t\texit 0",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Log \"Error: Upgrade failed with following error\"",
+            "\t\tIf ((Test-Path \"C:\\$WINDOWS.~BT\\Sources\\Panther\\setuperr.log\") -eq $true) {",
+            "\t\t\tget-content \"C:\\$WINDOWS.~BT\\Sources\\Panther\\setuperr.log\"",
+            "\t\t}",
+            "",
+            "\t\tIf ((Test-Path \"C:\\$WINDOWS.~BT\\Sources\\Rollback\\setuperr.log\") -eq $true) {",
+            "\t\t\tget-content \"C:\\$WINDOWS.~BT\\Sources\\Rollback\\setuperr.log\"",
+            "\t\t}",
+            "\t\texit 1",
+            "\t}",
+            "}",
+            "catch {",
+            "\tWrite-Error $_.Exception.Message",
+            "\tIf ((Test-Path \"$UpgradeDirectory\") -eq $true) {",
+            "\t\tRemove-Item -path \"$UpgradeDirectory\" -recurse",
+            "\t}",
+            "\texit 1",
+            "}",
+            ""
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "branchOnWindowsUpgradeSuccess"
+    },
+    {
+      "name": "branchOnWindowsUpgradeSuccess",
+      "action": "aws:branch",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ checkAfterWindowsUpgrade2019.Output }}",
+            "Contains": "Error: Upgrade failed",
+            "NextStep": "deleteServerUpgradeInstance"
+          }
+        ],
+        "Default": "branchOnLicensingTypeToActivateLicense"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "branchOnLicensingTypeToActivateLicense",
+      "action": "aws:branch",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DetachVolume",
+            "Variable": "{{ assertSupportedWindowsVersion2019.Output }}",
+            "Contains": "BYOL"
+          }
+        ],
+        "Default": "activateWindowsWithAmazonLicense"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "activateWindowsWithAmazonLicense",
+      "action": "aws:executeAutomation",
+      "maxAttempts": 3,
+      "timeoutSeconds": 3600,
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWSSupport-ActivateWindowsWithAmazonLicense",
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ getServerUpgradeInstance.InstanceId }}"
+          ],
+          "ForceActivation": [
+            "True"
+          ]
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "DetachVolume"
+    },
+    {
+      "name": "DetachVolume",
+      "action": "aws:executeAwsApi",
+      "isCritical": "true",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DetachVolume",
+        "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
+        "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}",
+        "Force": true
+      },
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 1800,
+      "nextStep": "waitUntilInstallationMediaIsDetached"
+    },
+    {
+      "name": "waitUntilInstallationMediaIsDetached",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Volumes[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 1800,
+      "nextStep": "DeleteVolume"
+    },
+    {
+      "name": "DeleteVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteVolume",
+        "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 300,
+      "nextStep": "UpdateEC2Launch"
+    },
+    {
+      "name": "UpdateEC2Launch",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "timeoutSeconds": 7200,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "$zipFilename = \"AWSUpdateWindowsInstance_1_4_4_0.zip\"",
+            "$zipFileHash = \"CD337ADCFBA463DE895B8D8248A3991940ABB03ADF8525ECA1302385D6A1DDA6\"",
+            "$moduleName = \"AWSUpdateWindowsInstance\"",
+            "$tempPath = $env:TEMP",
+            "$moduleDirectory = Join-Path $tempPath -ChildPath $moduleName",
+            "$moduleZipFilePath = Join-Path $tempPath -ChildPath $zipFilename",
+            "$moduleManifestPath = Join-Path $moduleDirectory -ChildPath ('{0}.psd1' -f $moduleName)",
+            "",
+            "$ssmAgentService = Get-ItemProperty \"HKLM:SYSTEM\\CurrentControlSet\\Services\\AmazonSSMAgent\\\" -ErrorAction SilentlyContinue",
+            "if ($ssmAgentService -and $ssmAgentService.Version -ge \"2.0.533.0\") {",
+            "\t$region = $env:AWS_SSM_REGION_NAME",
+            "}",
+            "",
+            "if (-not $region) {",
+            "\ttry {",
+            "\t\t$identityDocumentUrl = \"http://169.254.169.254/latest/dynamic/instance-identity/document\"",
+            "\t\t$region = ((Invoke-WebRequest -UseBasicParsing -uri $identityDocumentUrl).Content | ConvertFrom-Json).region",
+            "\t}",
+            "\tcatch {",
+            "\t\t$region = \"us-east-1\"",
+            "\t}",
+            "}",
+            "",
+            "function Main {",
+            "\tTest-PreCondition",
+            "\tClear-WindowsUpdateModule",
+            "\tGet-WindowsUpdateModule",
+            "\tExpand-WindowsUpdateModule",
+            "\tif ([Environment]::OSVersion.Version.Major -ge 10) {",
+            "\t\tInvoke-UpdateEC2Launch",
+            "\t}",
+            "\telse {",
+            "\t\tInvoke-UpdateEC2Config",
+            "\t}",
+            "}",
+            "",
+            "function Test-PreCondition {",
+            "\ttry {",
+            "\t\t$osversion = [Environment]::OSVersion.Version",
+            "\t\tif ($osversion.Major -le 5) {",
+            "\t\t\tWrite-Host \"This document is not supported on Windows Server 2003 or earlier.\"",
+            "\t\t\tExit -1",
+            "\t\t}",
+            "",
+            "\t\tif ($osversion.Version -ge \"10.0\") {",
+            "\t\t\t$sku = (Get-CimInstance -ClassName Win32_OperatingSystem).OperatingSystemSKU",
+            "\t\t\tif ($sku -eq 143 -or $sku -eq 144) {",
+            "\t\t\t\tWrite-Host \"This document is not supported on Windows 2016 Nano\t Server.\"",
+            "\t\t\t\tExit -1",
+            "\t\t\t}",
+            "\t\t}",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Host \"Executing Test-PreCondition resulted in error: $($_)\"",
+            "\t\tExit -1",
+            "\t}",
+            "}",
+            "",
+            "function Clear-WindowsUpdateModule {",
+            "\ttry {",
+            "\t\tif (Test-Path $moduleDirectory) {",
+            "\t\t\tRemove-Item $moduleDirectory -Force -Recurse",
+            "\t\t}",
+            "\t\tif (Test-Path $moduleZipFilePath) {",
+            "\t\t\tRemove-Item $moduleZipFilePath -Force",
+            "\t\t}",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Host \"Cleaning Windows update module resulted in error: $($_)\"",
+            "\t}",
+            "}",
+            "",
+            "function Get-WindowsUpdateModule {",
+            "\ttry {",
+            "\t\tif ($region.StartsWith(\"cn-\")) {",
+            "\t\t\t$s3Location = \"https://s3.{0}.amazonaws.com.cn/aws-windows-downloads-{0}/PSModules/AWSUpdateWindowsInstance/{1}\"",
+            "\t\t}",
+            "\t\telseif ($region.StartsWith(\"us-gov-\")) {",
+            "\t\t\t$s3Location = \"https://s3-fips-{0}.amazonaws.com/aws-windows-downloads-{0}/PSModules/AWSUpdateWindowsInstance/{1}\"",
+            "\t\t}",
+            "\t\telseif ($region -eq \"us-east-1\") {",
+            "\t\t\t$s3Location = \"https://s3.amazonaws.com/aws-windows-downloads-{0}/PSModules/AWSUpdateWindowsInstance/{1}\"",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\t$s3Location = \"https://aws-windows-downloads-{0}.s3.amazonaws.com/PSModules/AWSUpdateWindowsInstance/{1}\"",
+            "\t\t}",
+            "",
+            "\t\t$source = $s3Location -f $region, $zipFilename",
+            "\t\t$moduleLocalPath = Join-Path $tempPath -ChildPath $zipFilename",
+            "\t\tStart-BitsTransfer -Source $source -Destination $moduleLocalPath",
+            "",
+            "\t\t$fileStream = New-Object System.IO.FileStream($moduleLocalPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)",
+            "\t\t$sha256 = [System.Security.Cryptography.HashAlgorithm]::Create(\"System.Security.Cryptography.SHA256CryptoServiceProvider\")",
+            "\t\t$currentHash = [System.BitConverter]::ToString($sha256.ComputeHash($fileStream), 0).Replace(\"-\", \"\").ToLowerInvariant()",
+            "\t\t$sha256.Dispose()",
+            "\t\t$fileStream.Dispose()",
+            "",
+            "\t\tif ($currentHash -ne $zipFileHash) {",
+            "\t\t\tWrite-Host \"The SHA hash of the module does not match the expected value.\"",
+            "\t\t\tExit -1",
+            "\t\t}",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Host (\"Error encountered while getting the module: {0}.\" -f $_.Exception.Message)",
+            "\t\tExit -1",
+            "\t}",
+            "}",
+            "",
+            "function Expand-WindowsUpdateModule {",
+            "\ttry {",
+            "\t\t[System.Reflection.Assembly]::LoadWithPartialName(\"System.IO.Compression.FileSystem\") | Out-Null",
+            "\t\t$zip = [System.IO.Compression.ZipFile]::OpenRead($moduleZipFilePath)",
+            "\t\tforeach ($item in $zip.Entries) {",
+            "\t\t\t$extractPath = Join-Path $tempPath -ChildPath $item.FullName",
+            "\t\t\tif ($item.Length -eq 0) {",
+            "\t\t\t\tif (-not (Test-Path $extractPath)) {",
+            "\t\t\t\t\tNew-Item $extractPath -ItemType Directory | Out-Null",
+            "\t\t\t\t}",
+            "\t\t\t}",
+            "\t\t\telse {",
+            "\t\t\t\t$parentPath = Split-Path $extractPath",
+            "\t\t\t\tif (-not (Test-Path $parentPath)) {",
+            "\t\t\t\t\tNew-Item $parentPath -ItemType Directory | Out-Null",
+            "\t\t\t\t}",
+            "\t\t\t\t[System.IO.Compression.ZipFileExtensions]::ExtractToFile($item, $extractPath, $true)",
+            "\t\t\t}",
+            "\t\t}",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Host (\"Error encountered when extracting module file: {0}.\" -f $_.Exception.Message)",
+            "\t\tExit -1",
+            "\t}",
+            "\tfinally {",
+            "\t\t$zip.Dispose()",
+            "\t}",
+            "}",
+            "",
+            "function Invoke-UpdateEC2Config {",
+            "\ttry {",
+            "\t\tImport-Module $moduleManifestPath",
+            "\t\t$command = \"Install-AwsUwiEC2Config -Region $region\"",
+            "\t\tif ($id) { $command += \" -Id $($id)\" }",
+            "\t\tInvoke-Expression $command",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Host \"Executing Invoke-AwsUwiEC2Config resulted in error: $($_)\"",
+            "\t\tExit -1",
+            "\t}",
+            "}",
+            "",
+            "function Invoke-UpdateEC2Launch {",
+            "\ttry {",
+            "\t\tImport-Module $moduleManifestPath",
+            "\t\t$command = \"Install-AwsUwiEC2Launch\"",
+            "\t\tif ($id) { $command += \" -Id $($id)\" }",
+            "\t\tInvoke-Expression $command",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Host \"Executing Invoke-AwsUwiEC2Launch resulted in error: $($_)\"",
+            "\t\tExit -1",
+            "\t}",
+            "}",
+            "",
+            "Main"
+          ]
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "UpdateSSMAgent"
+    },
+    {
+      "name": "UpdateSSMAgent",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-UpdateSSMAgent",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "allowDowngrade": "false"
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "removeEC2Config"
+    },
+    {
+      "name": "removeEC2Config",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "Get-ChildItem \"HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\\" -rec -ea SilentlyContinue | ForEach-Object {",
+            "\t$item = Get-ItemProperty -Path $_.PsPath",
+            "\tif ($item.DisplayName -match \"EC2ConfigService\") {",
+            "\t\t$exec = $item.QuietUninstallString.Split('\"')[1]",
+            "\t\t$arg = $item.QuietUninstallString.Split('\"')[2]",
+            "\t\tWrite-host \"Executing... $exec $arg\"",
+            "\t\t$process = Start-Process -Wait -FilePath $exec -ArgumentList \"$arg\" -PassThru",
+            "\t\tif ($process.ExitCode -gt 0) {",
+            "\t\t\tWrite-host \"Removing... $_\"",
+            "\t\t\tRemove-Item -Path $_.PsPath -Recurse",
+            "\t\t}",
+            "\t}",
+            "}"
+          ]
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "UpgradeIntel82599VF2019"
+    },
+    {
+      "name": "UpgradeIntel82599VF2019",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "$sourceFile = $env:TEMP + \"\\PROWinx64.zip\"",
+            "$targetFolder = $env:TEMP + \"\\PROWinx64\"",
+            "",
+            "[Net.ServicePointManager]::SecurityProtocol = \"tls12, tls11, tls\"",
+            "$Ethernet = Invoke-WebRequest -UseBasicParsing -uri \"https://downloadcenter.intel.com/json/pageresults?pageNumber=1&productId=36773&keyword=&filterOS=Windows+Server+2019*&filterType=&hitsPerPage=20&offset=0\"",
+            "$Http = Invoke-WebRequest -UseBasicParsing -URI $(\"https://downloadcenter.intel.com{0}\" -f $( $Ethernet | Select -ExpandProperty Content | ConvertFrom-Json | Select -ExpandProperty ResultsForDisplay | Select -ExpandProperty FullDescriptionUrl))",
+            "$download = $($($Http.Links | Where-Object { $_.outerHTML -like \"*>Download<*\" } | Select-Object -ExpandProperty href).split('=')[1] -replace \"%2F\", \"/\" -replace \"%3A\", \":\")",
+            "",
+            "$retryCount = 0",
+            "$Retries = 2",
+            "$completed = $false",
+            "$response = $null",
+            "",
+            "while (-not $completed) {",
+            "\ttry {",
+            "\t\t$response = Invoke-WebRequest -UseBasicParsing -Uri $download -OutFile $sourceFile -Passthru",
+            "\t\tif ($response.StatusCode -ne 200) {",
+            "\t\t\tthrow \"Expecting response code 200, was: $($response.StatusCode)\"",
+            "\t\t}",
+            "\t\t$completed = $true",
+            "\t}",
+            "\tcatch {",
+            "\t\tif ($retrycount -ge $Retries) {",
+            "\t\t\tWrite-Warning \"Request to $download failed the maximum number of $retryCount times.\"",
+            "\t\t\tthrow",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\tWrite-Warning \"Request to $download failed. Retrying in 5 seconds.\"",
+            "\t\t\tStart-Sleep 5",
+            "\t\t\t$retrycount++",
+            "\t\t}",
+            "\t}",
+            "}",
+            "",
+            "New-Item -ItemType directory -Path $targetFolder | out-null",
+            "  ",
+            "[System.Reflection.Assembly]::LoadWithPartialName(\"System.IO.Compression.FileSystem\") | out-null",
+            "[System.IO.Compression.ZipFile]::ExtractToDirectory($sourceFile, $targetFolder) | out-null",
+            " ",
+            "Remove-Item -Path $sourceFile | out-null",
+            " ",
+            "$osInfo = (Get-WmiObject -class Win32_OperatingSystem)",
+            "$OSVersion = $osInfo.Caption.ToUpper()",
+            "",
+            "If ( $OSVersion.indexOf(\"2019\") -ge 0 ) {",
+            "\t& pnputil -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS68\\vxn68x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver added successfully on Windows 2019\" } else { Write-Host \"Driver addition failed on Windows 2019\" }",
+            "\t& pnputil -i -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS68\\vxn68x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver installed successfully on Windows 2019\" } else { Write-Host \"Driver installation failed on Windows 2019\" }",
+            "}",
+            "elseif ( $OSVersion.indexOf(\"2016\") -gt 0 ) {",
+            "\t& pnputil -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS65\\vxn65x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver added successfully on Windows 2016\" } else { Write-Host \"Driver addition failed on Windows 2016\" }",
+            "\t& pnputil -i -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS65\\vxn65x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver installed successfully on Windows 2016\" } else { Write-Host \"Driver installation failed on Windows 2016\" }",
+            "}",
+            "elseif ( $OSVersion.indexOf(\"2012 R2\") -gt 0 ) {",
+            "\t& pnputil -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS64\\vxn64x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver added successfully on Windows 2012 R2\" } else { Write-Host \"Driver addition failed on Windows 2012 R2\" }",
+            "\t& pnputil -i -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS64\\vxn64x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver installed successfully on Windows 2012 R2\" } else { Write-Host \"Driver installation failed on Windows 2012 R2\" }",
+            "}",
+            "elseif ( $OSVersion.indexOf(\"2012\") -gt 0 ) {",
+            "\t& pnputil -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS63\\vxn63x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver added successfully on Windows 2012\" } else { Write-Host \"Driver addition failed on Windows 2012\" }",
+            "\t& pnputil -i -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS63\\vxn63x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver installed successfully on Windows 2012\" } else { Write-Host \"Driver installation failed on Windows 2012\" }",
+            "}",
+            "elseif ( $OSVersion.indexOf(\"2008 R2\") -gt 0 ) {",
+            "\t& pnputil -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS62\\vxn62x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver added successfully on Windows 2008 R2\" } else { Write-Host \"Driver addition failed on Windows 2008 R2\" }",
+            "\t& pnputil -i -a $($targetFolder + \"\\PROXGB\\Winx64\\NDIS62\\vxn62x64.inf\")",
+            "\tif ($LASTEXITCODE -eq 0) { Write-Host \"Driver installed successfully on Windows 2008 R2\" } else { Write-Host \"Driver installation failed on Windows 2008 R2\" }",
+            "}",
+            "",
+            "Remove-Item -Path $targetFolder -Recurse -Force:$True | out-null"
+          ]
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "upgradeWindowsAWSDrivers"
+    },
+    {
+      "name": "upgradeWindowsAWSDrivers",
+      "action": "aws:executeAutomation",
+      "timeoutSeconds": 3600,
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWSSupport-UpgradeWindowsAWSDrivers",
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ getServerUpgradeInstance.InstanceId }}"
+          ]
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "getPreBackUpAMIFromDriverUpgrade"
+    },
+    {
+      "name": "getPreBackUpAMIFromDriverUpgrade",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetAutomationExecution",
+        "AutomationExecutionId": "{{ upgradeWindowsAWSDrivers.ExecutionId }}"
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.AutomationExecution.Outputs.'preUpgradeBackup.ImageId'[0]",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "false",
+      "nextStep": "deletePreBackupAMIFromDriverUpgrade"
+    },
+    {
+      "name": "deletePreBackupAMIFromDriverUpgrade",
+      "action": "aws:deleteImage",
+      "inputs": {
+        "ImageId": "{{ getPreBackUpAMIFromDriverUpgrade.ImageId }}"
+      },
+      "maxAttempts": 3,
+      "isCritical": "false",
+      "onFailure": "Continue",
+      "timeoutSeconds": 600,
+      "nextStep": "installWindowUpdates"
+    },
+    {
+      "name": "installWindowUpdates",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "DocumentName": "AWS-InstallWindowsUpdates",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "Action": "Install",
+          "Categories": "CriticalUpdates,SecurityUpdates",
+          "SeverityLevels": "Critical,Important"
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "enableEC2Launch"
+    },
+    {
+      "name": "enableEC2Launch",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "$LaunchConfig = \"C:\\ProgramData\\Amazon\\EC2-Windows\\Launch\\Config\\LaunchConfig.json\"",
+            "if ((Test-Path $LaunchConfig) -eq $true) {",
+            "\t$Launch = Get-Content $LaunchConfig | ConvertFrom-Json",
+            "\t$Launch.addDnsSuffixList = $false",
+            "\t$Launch.handleUserData = $false",
+            "\t$Launch.adminPasswordType = \"DoNothing\"",
+            "\t$Launch | ConvertTo-Json | Set-Content $LaunchConfig",
+            "\t& C:\\ProgramData\\Amazon\\EC2-Windows\\Launch\\Scripts\\InitializeInstance.ps1 -Schedule",
+            "} else {",
+            "\tWrite-Host \"EC2Launch is not installed!\"",
+            "\tExit 1",
+            "}"
+          ]
+        }
+      },
+      "isCritical": "false",
+      "nextStep": "amiName"
+    },
+    {
+      "name": "amiName",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "PowerShell Core 6.0",
+        "Script": "$inputPayload = $env:InputPayload | ConvertFrom-Json\n$amiName = $inputPayload.amiName\n$targetVersion = $inputPayload.TargetVersion\n$instanceId = $inputPayload.InstanceId\n$executionId = $inputPayload.executionId\nif ([string]::IsNullOrWhitespace($amiName)) {\n\treturn @{message = \"AWSEC2_UPGRADED_AMI_TO_{0}_FOR_INSTANCE_{1}_{2}\" -f $targetVersion, $instanceId, $executionId }\n}\nelse {\n\treturn @{message = \"$amiName\" }\n}",
+        "InputPayload": {
+          "amiName": "{{ amiName }}",
+          "TargetVersion": "{{ TargetWindowVersion }}",
+          "InstanceId": "{{ InstanceId }}",
+          "executionId": "{{ automation:EXECUTION_ID }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "createImageServerUpgradeInstance"
+    },
+    {
+      "name": "createImageServerUpgradeInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateImage",
+        "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
+        "Name": "{{ amiName.message }}",
+        "NoReboot": false
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.ImageId",
+          "Type": "String"
+        }
+      ],
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 600,
+      "nextStep": "waitTillImageReadyForInterim"
+    },
+    {
+      "name": "waitTillImageReadyForInterim",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "ImageIds": [
+          "{{ createImageServerUpgradeInstance.ImageId }}"
+        ],
+        "PropertySelector": "$.Images[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "nextStep": "deleteServerUpgradeInstance"
+    },
+    {
+      "name": "deleteServerUpgradeInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "TerminateInstances",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ]
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "Continue",
+      "timeoutSeconds": 1800,
+      "nextStep": "branchOnDeletingImageFromOriginalInstance"
+    },
+    {
+      "name": "branchOnDeletingImageFromOriginalInstance",
+      "action": "aws:branch",
+      "onFailure": "step:describeInstallationMediaVolume",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "deleteImageFromOriginalInstance",
+            "Variable": "{{ KeepPreUpgradeImageBackUp }}",
+            "EqualsIgnoreCase": "False"
+          }
+        ],
+        "Default": "describeInstallationMediaVolume"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "deleteImageFromOriginalInstance",
+      "action": "aws:deleteImage",
+      "inputs": {
+        "ImageId": "{{ describeOriginalInstanceImage.ImageId }}"
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "Continue",
+      "timeoutSeconds": 600,
+      "nextStep": "describeInstallationMediaVolume"
+    },
+    {
+      "name": "describeInstallationMediaVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "State",
+          "Selector": "$.Volumes[0].State",
+          "Type": "String"
+        }
+      ],
+      "maxAttempts": 3,
+      "isCritical": "false",
+      "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "nextStep": "branchOnInstallationMediaVolumeStatus"
+    },
+    {
+      "name": "branchOnInstallationMediaVolumeStatus",
+      "action": "aws:branch",
+      "onFailure": "step:getUpgradedImageDetails",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "retryDeletingInstallationMediaVolume",
+            "Or": [
+              {
+                "Variable": "{{ describeInstallationMediaVolume.State }}",
+                "EqualsIgnoreCase": "available"
+              },
+              {
+                "Variable": "{{ describeInstallationMediaVolume.State }}",
+                "EqualsIgnoreCase": "in-use"
+              }
+            ]
+          }
+        ],
+        "Default": "getUpgradedImageDetails"
+      },
+      "isCritical": "false"
+    },
+    {
+      "name": "retryDeletingInstallationMediaVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteVolume",
+        "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
+      },
+      "maxAttempts": 3,
+      "isCritical": "false",
+      "onFailure": "step:getUpgradedImageDetails",
+      "timeoutSeconds": 600,
+      "nextStep": "getUpgradedImageDetails"
+    },
+    {
+      "name": "getUpgradedImageDetails",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "ImageIds": [
+          "{{ createImageServerUpgradeInstance.ImageId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Images[0].ImageId",
+          "Type": "String"
+        },
+        {
+          "Name": "Name",
+          "Selector": "$.Images[0].Name",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "isEnd": "true"
+    }
+  ],
+  "outputs": [
+    "getUpgradedImageDetails.ImageId",
+    "getUpgradedImageDetails.Name"
+  ]
+}

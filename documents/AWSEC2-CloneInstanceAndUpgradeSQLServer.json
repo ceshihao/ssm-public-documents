@@ -1,0 +1,1775 @@
+{
+  "schemaVersion": "0.3",
+  "description": "SSM Automation for upgrading SQL Server 2008 (or later) to SQL Server 2016. The running instance remains untouched, while the automation upgrades a cloned instance. If the instance is running Windows Server 2008 R2, the automation will upgrade the operating system to Windows Server 2012 R2.",
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) The instance running Windows Server 2008 R2 or above, SQL Server 2008 or above, with the SSM agent installed."
+    },
+    "IamInstanceProfile": {
+      "type": "String",
+      "description": "(Required) The IAM instance profile managed policy attached. Please refer to https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-configuring-access-role.html for more information."
+    },
+    "SubnetId": {
+      "type": "String",
+      "description": "(Required) Provide a subnet for the upgrade process. Verify that the subnet has outbound connectivity to AWS services, Amazon S3, and Microsoft (to download patches).",
+      "allowedPattern": "^subnet-[a-z0-9]{8,17}$"
+    },
+    "SQLServerSnapshotId": {
+      "type": "String",
+      "description": "(Conditional) The snapshot id for SQL Server 2016 installation media. This parameter is optional for SQL Server license-included instances (instances launched using an AWS provided Amazon Machine Image for Windows Server with Microsoft SQL Server.",
+      "default": ""
+    },
+    "KeepPreUpgradeImageBackUp": {
+      "type": "String",
+      "description": "(Optional) If set to True, the Automation doesn't delete the AMI created from the instance before the upgrade. By default, the AMI is deleted.",
+      "default": "False",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "RebootInstanceBeforeTakingImage": {
+      "type": "String",
+      "description": "(Optional) If set to True, the Automation reboots the instance before creating a pre-upgrade AMI. By default, the Automation doesn't reboot before upgrade.",
+      "default": "False",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "putSSMInvocationMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "Invocations",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "assertSSMAgentOnline"
+    },
+    {
+      "name": "assertSSMAgentOnline",
+      "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "assertReadyToUpgradeSQLServer"
+    },
+    {
+      "name": "assertReadyToUpgradeSQLServer",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "executionTimeout": "300",
+          "commands": [
+            "function Check-SqlUpgradeEligibility {",
+            "\t$osInfo = (Get-WmiObject -class Win32_OperatingSystem)",
+            "\t# https://docs.microsoft.com/en-us/windows/desktop/CIMWin32Prov/win32-operatingsystem ProductType 3 is Server\" ,",
+            "\tif ($osInfo.ProductType -ne 3) {",
+            "\t\tWrite-Host \"Server Upgrade not allowed if Server is of type Work Station OR Domain Controller.\"",
+            "\t\texit 1",
+            "\t}",
+            "",
+            "\t$OSVersion = $osInfo.Caption.ToUpper()",
+            "\t$instances = (get-itemproperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\").InstalledInstances",
+            "\tif ($instances.count -eq 0) {",
+            "\t\tWrite-Host \"Couldn't find any installed instance of SQL Server.\"",
+            "\t\texit 1",
+            "\t}",
+            "\tif ($instances.count -gt 1) {",
+            "\t\tWrite-Host \"Found multiple instances of SQL Server, presently not supported\"",
+            "\t\texit 1",
+            "\t}",
+            "\t$instance = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL\").$instances",
+            "\t$instanceDetails = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\$instance\\Setup\")",
+            "\t$edition = $instanceDetails.Edition",
+            "",
+            "\tWrite-Host \"SQL Server Edition is $edition\"",
+            "",
+            "\tif ($instanceDetails.Cluster) {",
+            "\t\tWrite-Host \"SQL Server is clustered, presently not supported\"",
+            "\t\texit 1",
+            "\t}",
+            "\t$v = $instanceDetails.Version.subString(0, $instanceDetails.Version.indexOf(\".\"))",
+            "\tif ($v -ge 10) {",
+            "\t\tif ($v -eq 10 ) {",
+            "\t\t\tif ($instanceDetails.SP -lt 3) {",
+            "\t\t\t\tWrite-host \"SQL Server Version 2008 , apply patch for SQL Server 2008\"",
+            "\t\t\t}",
+            "\t\t\tElseIf ($instanceDetails.SP -eq 3) {",
+            "\t\t\t\tWrite-host \"Supported SQL Version 2008 R2 SP3\"",
+            "\t\t\t}",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\tWrite-host \"Supported SQL Version\"",
+            "\t\t}",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-host \" SQL Server Version $instanceDetails.Version is presently not supported\"",
+            "\t\texit 1",
+            "\t}",
+            "\t[System.Reflection.Assembly]::LoadWithPartialName(\"Microsoft.SqlServer.SMO\") | out-null",
+            "\t$SQLServer = New-Object (\"Microsoft.SqlServer.Management.Smo.Server\")",
+            "\tForeach ($Database in $SQLServer.Databases) {",
+            "\t\tif ($Database.IsMirroringEnabled) {",
+            "\t\t\t$Name = $Database.Name",
+            "\t\t\tWrite-Host \"Mirroring is enabled for DB $Name \"",
+            "\t\t\tWrite-Host \" Presently we are not supporting Mirroring instances \"",
+            "\t\t\texit 1",
+            "\t\t}",
+            "\t}",
+            "",
+            "\tif ($OSVersion.indexOf(\"2012 R2\") -ge 0 -and (($OSVersion.indexOf(\"STANDARD\") -ge 0) -or ($OSVersion.indexOf(\"DATACENTER\") -ge 0))) {",
+            "\t\tWrite-Host \"OSVersion : $OSVersion \"",
+            "\t}",
+            "\telseif ($OSVersion.indexOf(\"2008 R2\") -ge 0 -and (($OSVersion.indexOf(\"STANDARD\") -ge 0) -or ($OSVersion.indexOf(\"DATACENTER\") -ge 0))) {",
+            "\t\tWrite-Host \"WINDOWSUPGRADE Will be done first\"",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host \"This document support upgrades of 2012 R2 Standard or 2012 R2 Datacenter\"",
+            "\t\texit 1",
+            "\t}",
+            "}",
+            "",
+            "",
+            "function Validate-InstanceLicensing([string]$SnapshotId) {",
+            "\t$IsError = $True",
+            "\ttry {",
+            "\t\t# compatible with PS2.0",
+            "\t\t$webrequest = [System.Net.WebRequest]::Create(\"http://169.254.169.254/latest/dynamic/instance-identity/document\")",
+            "\t\t$response = $webrequest.GetResponse()",
+            "\t\t$stream = $response.GetResponseStream()",
+            "\t\t$sr = new-object System.IO.StreamReader($stream)",
+            "\t\t$content = $sr.ReadToEnd();",
+            "\t\t[System.Reflection.Assembly]::LoadWithPartialName(\"System.Web.Extensions\") | out-null",
+            "\t\t$ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer",
+            "\t\t$billingProduct = $ser.DeserializeObject($content).billingProducts",
+            "\t\tif (($billingProduct -eq \"bp-6aa54003\") -or ($billingProduct -eq \"bp-62a5400b\") -or ($billingProduct -eq \"bp-65a5400c\")) {",
+            "\t\t\t$IsError = $False",
+            "\t\t\tWrite-Host \"Instance has license included\"",
+            "\t\t}",
+            "\t\telseif (-not [string]::IsNullOrEmpty($SnapshotId)) {",
+            "\t\t\t$IsError = $False",
+            "\t\t\tWrite-Host \"Instance will use $SnapshotId for BYOL\"",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\t$IsError = $True",
+            "\t\t\tWrite-Host \"Your instance is BYOL, but you did not provide a BYOL Windows installation media snapshot id. Please re-run this automation with the necessary paramaters.\"",
+            "\t\t}",
+            "\t}",
+            "\tcatch {",
+            "\t\tWrite-Error $_.Exception.Message",
+            "\t}",
+            "\tfinally {",
+            "\t\tif ($sr -ne $null) { $sr.Close(); }",
+            "\t\tif ($response -ne $null) { $response.Close(); }",
+            "\t\tif ($IsError) {",
+            "\t\t\texit 1",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\texit 0",
+            "\t\t}",
+            "\t}",
+            "}",
+            "",
+            "try {",
+            "\tCheck-SqlUpgradeEligibility",
+            "\t$SnapShotId = \"{{ SQLServerSnapshotId }}\"",
+            "\tValidate-InstanceLicensing($SnapShotId)",
+            "}",
+            "catch {",
+            "\tWrite-Error $_.Exception.Message",
+            "\texit 1",
+            "}"
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "describeOriginalInstanceDetails"
+    },
+    {
+      "name": "describeOriginalInstanceDetails",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "KeyName",
+          "Selector": "$.Reservations[0].Instances[0].KeyName",
+          "Type": "String"
+        },
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "RootDeviceName",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Reservations[0].Instances[0].NetworkInterfaces[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "Platform",
+          "Selector": "$.Reservations[0].Instances[0].Platform",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups..GroupId",
+          "Type": "StringList"
+        }
+      ],
+      "isCritical": "false",
+      "nextStep": "assertRootVolumeIsEbs"
+    },
+    {
+      "name": "assertRootVolumeIsEbs",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].RootDeviceType",
+        "DesiredValues": [
+          "ebs"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "branchIfWindowsUpgradeRequired"
+    },
+    {
+      "name": "branchIfWindowsUpgradeRequired",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "putWindowsUpgradeRequiredMetric",
+            "Variable": "{{ assertReadyToUpgradeSQLServer.Output }}",
+            "Contains": "WINDOWSUPGRADE"
+          }
+        ],
+        "Default": "branchOnRebootInstanceBeforeTakingImage"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "putWindowsUpgradeRequiredMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "Windows_Upgrade_Required",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "upgradeWindowsFirst"
+    },
+    {
+      "name": "putNoWindowsUpgradeRequiredMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "No_Windows_Upgrade_Required",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "branchOnRebootInstanceBeforeTakingImage"
+    },
+    {
+      "name": "upgradeWindowsFirst",
+      "action": "aws:executeAutomation",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSEC2-CloneInstanceAndUpgradeWindows",
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ InstanceId }}"
+          ],
+          "IamInstanceProfile": [
+            "{{ IamInstanceProfile }}"
+          ],
+          "SubnetId": [
+            "{{ SubnetId }}"
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "getWindowsUpgradeAMI"
+    },
+    {
+      "name": "getWindowsUpgradeAMI",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetAutomationExecution",
+        "AutomationExecutionId": "{{ upgradeWindowsFirst.ExecutionId }}"
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.AutomationExecution.Outputs.'UpgradedTo2012R2.ImageId'[0]",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "addUniqueTagForTheAMI"
+    },
+    {
+      "name": "addUniqueTagForTheAMI",
+      "action": "aws:createTags",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "ResourceIds": [
+          "{{ getWindowsUpgradeAMI.ImageId }}"
+        ],
+        "Tags": [
+          {
+            "Key": "AWSEC2-ORIG-IMAGE-{{ automation:EXECUTION_ID }}",
+            "Value": "AWSEC2-IMAGE: {{ InstanceId }}"
+          }
+        ],
+        "ResourceType": "EC2"
+      },
+      "isCritical": "true",
+      "nextStep": "describeOriginalInstanceImage"
+    },
+    {
+      "name": "branchOnRebootInstanceBeforeTakingImage",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "createImageWithReboot",
+            "Variable": "{{ RebootInstanceBeforeTakingImage }}",
+            "EqualsIgnoreCase": "True"
+          }
+        ],
+        "Default": "createImageWithNoReboot"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "createImageWithReboot",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateImage",
+        "InstanceId": "{{ InstanceId }}",
+        "Name": "AWSEC2SQLSERVER_ImageFromOriginalInstance_{{ automation:EXECUTION_ID }}",
+        "NoReboot": false
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.ImageId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getImageWhereNoWindowUpgradeHappen"
+    },
+    {
+      "name": "createImageWithNoReboot",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateImage",
+        "InstanceId": "{{ InstanceId }}",
+        "Name": "AWSEC2SQLSERVER_ImageFromOriginalInstance_{{ automation:EXECUTION_ID }}",
+        "NoReboot": true
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.ImageId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getImageWhereNoWindowUpgradeHappen"
+    },
+    {
+      "name": "getImageWhereNoWindowUpgradeHappen",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "Filters": [
+          {
+            "Name": "name",
+            "Values": [
+              "AWSEC2SQLSERVER_ImageFromOriginalInstance_{{ automation:EXECUTION_ID }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Images[0].ImageId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "addTagForTheAMINoWindowUpgrade"
+    },
+    {
+      "name": "addTagForTheAMINoWindowUpgrade",
+      "action": "aws:createTags",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "ResourceIds": [
+          "{{ getImageWhereNoWindowUpgradeHappen.ImageId }}"
+        ],
+        "Tags": [
+          {
+            "Key": "AWSEC2-ORIG-IMAGE-{{ automation:EXECUTION_ID }}",
+            "Value": "AWSEC2-IMAGE: {{ InstanceId }}"
+          }
+        ],
+        "ResourceType": "EC2"
+      },
+      "isCritical": "true",
+      "nextStep": "describeOriginalInstanceImage"
+    },
+    {
+      "name": "describeOriginalInstanceImage",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "Filters": [
+          {
+            "Name": "tag-key",
+            "Values": [
+              "AWSEC2-ORIG-IMAGE-{{ automation:EXECUTION_ID }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Images[0].ImageId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "waitTillOriginalInstanceImageImageReady"
+    },
+    {
+      "name": "waitTillOriginalInstanceImageImageReady",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "ImageIds": [
+          "{{ describeOriginalInstanceImage.ImageId }}"
+        ],
+        "PropertySelector": "$.Images[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "nextStep": "serverUpgradeInstance"
+    },
+    {
+      "name": "serverUpgradeInstance",
+      "action": "aws:runInstances",
+      "timeoutSeconds": 2700,
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
+        "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "IamInstanceProfileName": "{{ IamInstanceProfile }}",
+        "SubnetId": "{{ SubnetId }}",
+        "KeyName": "{{ describeOriginalInstanceDetails.KeyName }}",
+        "SecurityGroupIds": [
+          "{{ describeOriginalInstanceDetails.SecurityGroupIds }}"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "getServerUpgradeInstance"
+    },
+    {
+      "name": "getServerUpgradeInstance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ serverUpgradeInstance.InstanceIds }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Reservations[0].Instances[0].InstanceId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "waitForInstanceToReady"
+    },
+    {
+      "name": "waitForInstanceToReady",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:rebootToMakeItReady",
+      "timeoutSeconds": 600,
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceStatus.Details[0].Status",
+        "DesiredValues": [
+          "passed"
+        ]
+      },
+      "isCritical": "false",
+      "nextStep": "waitForSSMAgentOnlineOnServerUpgradeInstance"
+    },
+    {
+      "name": "rebootToMakeItReady",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:waitForInstanceToBeReadyAfterReboot",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "RebootInstances",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ]
+      },
+      "isCritical": "false",
+      "nextStep": "waitForInstanceToBeReadyAfterReboot"
+    },
+    {
+      "name": "waitForInstanceToBeReadyAfterReboot",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 600,
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceStatus.Details[0].Status",
+        "DesiredValues": [
+          "passed"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "waitForSSMAgentOnlineOnServerUpgradeInstance"
+    },
+    {
+      "name": "waitForSSMAgentOnlineOnServerUpgradeInstance",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ getServerUpgradeInstance.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "getUpgradeServerInstanceDetails"
+    },
+    {
+      "name": "getUpgradeServerInstanceDetails",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Reservations[0].Instances[0].NetworkInterfaces[0].SubnetId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "branchForRequiredPatchesBeforeUpgrade"
+    },
+    {
+      "name": "branchForRequiredPatchesBeforeUpgrade",
+      "action": "aws:branch",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "putSQL2008R2SP3Metric",
+            "Variable": "{{ assertReadyToUpgradeSQLServer.Output }}",
+            "Contains": "2008 R2 SP3"
+          },
+          {
+            "NextStep": "putSQL2008Metric",
+            "Variable": "{{ assertReadyToUpgradeSQLServer.Output }}",
+            "Contains": "apply patch for SQL Server 2008"
+          }
+        ],
+        "Default": "putSQL2012Metric"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "putSQL2008R2SP3Metric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "SQL_2008_R2_SP3",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "checkAndInstallSpecificPatchesForWindows2012R2"
+    },
+    {
+      "name": "putSQL2008Metric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "SQL_2008",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "applySQLServerPatchForUpgradeEligible"
+    },
+    {
+      "name": "putSQL2012Metric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "SQL_2012",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "runScriptBeforeSQLServerUpgrade"
+    },
+    {
+      "name": "applySQLServerPatchForUpgradeEligible",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 14400,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "function Apply-ServicePack {",
+            "\t$SMOServerDLL = \"Microsoft.SqlServer.Management.Smo.Server\"",
+            "\t[System.Reflection.Assembly]::LoadWithPartialName(\"Microsoft.SqlServer.SMO\") | out-null",
+            "\t$SQLServer = New-Object ($SMOServerDLL)",
+            "\tWrite-host \"SQLServer version $($SQLServer.VersionString)\"",
+            "\t$Versions = $SQLServer.VersionString.Split(\".\")",
+            "\t$SQLVersionObj = New-Object PSObject -Property @{",
+            "\t\tVersion = $SQLServer.VersionString",
+            "\t\tMajor = $Versions[0]",
+            "\t\tMinor = $Versions[1]",
+            "\t\tBuild = $Versions[2]",
+            "\t\tRevision = $Versions[3]",
+            "\t}",
+            "\tif ($SQLVersionObj.Major -ge 12) {",
+            "\t\tWrite-host \"Already SQL Server 2014 or above running, exiting\"",
+            "\t\texit 0",
+            "\t}",
+            "\telse {",
+            "\t\t$DownloadUrl = Get-DownloadPath $SQLVersionObj.Major $SQLVersionObj.Minor $SQLVersionObj.Build $SQLVersionObj.Revision",
+            "\t\tif (-not [string]::IsNullOrEmpty($DownloadUrl)) {",
+            "\t\t\t$FileName = $DownloadUrl.Substring($DownloadUrl.LastIndexOf(\"/\") + 1)",
+            "\t\t\t$ParentDirectory = \"C:\\SQLUpgrade\\{{ automation:EXECUTION_ID }}\"",
+            "\t\t\tif ((Test-Path $ParentDirectory) -eq $false) {",
+            "\t\t\t\tNew-Item -ItemType directory -Path $ParentDirectory",
+            "\t\t\t}",
+            "\t\t\t$FullPath = $ParentDirectory + \"\\\" + $FileName",
+            "\t\t\tDownload-AndInstall $DownloadUrl $FullPath",
+            "\t\t\t$SQLServerNew = New-Object ($SMOServerDLL)",
+            "\t\t\tWrite-Host \"After upgrade SQL Server version $($SQLServerNew.VersionString)\"",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\tWrite-host \"No need to install Service pack\"",
+            "\t\t}",
+            "\t}",
+            "}",
+            "",
+            "function Get-DownloadPath {",
+            "\tPARAM",
+            "\t(",
+            "\t\t$Major",
+            "\t\t, $Minor",
+            "\t\t, $Build",
+            "\t\t, $Revision",
+            "\t)",
+            "\tif ($Major -eq 10) {",
+            "\t\t#Microsoft SQL Server 2008 sp4, 10.0.6000.29\"",
+            "\t\tif ($Minor -eq 0 -and ($Build -lt 6000 -or ($Build -eq 6000 -and $Revision -lt 29))) {",
+            "\t\t\treturn \"https://download.microsoft.com/download/5/E/7/5E7A89F7-C013-4090-901E-1A0F86B6A94C/ENU/SQLServer2008SP4-KB2979596-x64-ENU.exe\"",
+            "\t\t}",
+            "\t\t#Microsoft SQL Server 2008 R2 sp3, 10.50.6000.234\"",
+            "\t\telseif ($Minor -lt 50 -or ($Minor -eq 50 -and $Build -lt 6000) -or ($Minor -eq 50 -and $Build -eq 6000 -and $Revision -lt 34)) {",
+            "\t\t\treturn \"https://download.microsoft.com/download/D/7/A/D7A28B6C-FCFE-4F70-A902-B109388E01E9/ENU/SQLServer2008R2SP3-KB2979597-x64-ENU.exe\"",
+            "\t\t}",
+            "\t}",
+            "\telse {",
+            "\t\t#SQL Server 2012 Sp2 , 11.0.5058.0",
+            "\t\tif ($Minor -eq 0 -and $Build -lt 5058) {",
+            "\t\t\treturn \"https://download.microsoft.com/download/D/F/7/DF7BEBF9-AA4D-4CFE-B5AE-5C9129D37EFD/SQLServer2012SP2-KB2958429-x64-ENU.exe\"",
+            "\t\t}",
+            "\t}",
+            "}",
+            "",
+            "function Download-AndInstall {",
+            "\tPARAM",
+            "\t(",
+            "\t\t$UrlToDownload",
+            "\t\t, $LocalFilePath",
+            "\t)",
+            "\t$wc = New-Object System.Net.WebClient",
+            "\t$attemptCount = 0",
+            "\tDo {",
+            "\t\t$attemptCount++",
+            "\t\t$wc.DownloadFile($UrlToDownload , $LocalFilePath)",
+            "\t} while (((Test-Path $LocalFilePath) -eq $false) -and ($attemptCount -le 3))",
+            "\tIf ((Test-Path $LocalFilePath) -eq $true) {",
+            "\t\tWrite-Host \"Downloaded service pack to\tfile to $LocalFilePath\"",
+            "\t\tif ($UrlToDownload.IndexOf(\"SQLServer2008SP4\") -ge 0) {",
+            "\t\t\t$InstallParameters = \"/allinstances /quiet \"",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\t$InstallParameters = \"/allinstances /quiet /IAcceptSQLServerLicenseTerms=True\"",
+            "\t\t}",
+            "\t\tStart-Process $LocalFilePath -ArgumentList $InstallParameters -NoNewWindow -Wait",
+            "\t\tWrite-Host \"Installation complete\"",
+            "\t}",
+            "\tElse {",
+            "\t\tWrite-Host \"Error: Couldn’t download service pack, exiting\"",
+            "\t\texit 1",
+            "\t}",
+            "}",
+            "Apply-ServicePack"
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "checkAndInstallSpecificPatchesForWindows2012R2"
+    },
+    {
+      "name": "checkAndInstallSpecificPatchesForWindows2012R2",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 14400,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "function Check-ForReboot {",
+            "\t$AUTOUPDATE = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\")",
+            "\tIf ($AUTOUPDATE.RebootRequired) {",
+            "\t\twrite-host \"Rebooting from Check-ForReboot\"",
+            "\t\texit 3010",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-host \"Reboot not required\"",
+            "\t}",
+            "}",
+            "",
+            "function Install-PreReqForSQL {",
+            "\t$HotFixPresent = Get-HotFix -id \"KB2919355\"",
+            "\tif ($HotFixPresent) {",
+            "\t\twrite-host \"Found the required hotfix, so exiting\"",
+            "\t\texit 0",
+            "\t}",
+            "\telse {",
+            "\t\t$autoupdate = New-Object -ComObject \"Microsoft.Update.AutoUpdate\"",
+            "\t\t$autoupdate.DetectNow()",
+            "\t\t$Session = New-Object -ComObject Microsoft.Update.Session",
+            "\t\t$Search = $Session.CreateUpdateSearcher()",
+            "\t\t$SearchResults = $Search.Search(\"IsInstalled=0 and IsHidden=0\")",
+            "\t\t$TotalUpdates = $SearchResults.Updates.Count",
+            "\t\tWrite-Host \"There are $TotalUpdates TOTAL updates available.\"",
+            "\t\t$AvailableUpdates = $SearchResults.Updates",
+            "\t\tif ($AvailableUpdates.count -lt 1) {",
+            "\t\t\tWrite-Host \"Can't find required updates, exiting\"",
+            "\t\t\texit 1",
+            "\t\t}",
+            "\t\t$DownloadCollection = New-Object -com \"Microsoft.Update.UpdateColl\"",
+            "\t\t$AvailableUpdates | ForEach-Object {",
+            "\t\t\tif ($_.InstallationBehavior.CanRequestUserInput -ne $TRUE) {",
+            "\t\t\t\t$DownloadCollection.Add($_) | Out-Null",
+            "\t\t\t}",
+            "\t\t}",
+            "\t\tWrite-Host \"Downloading updates...\"",
+            "\t\t$Downloader = $Session.CreateUpdateDownloader()",
+            "\t\t$Downloader.Updates = $DownloadCollection",
+            "\t\t$Downloader.Download()",
+            "\t\tWrite-Verbose \"Creating Installation Object\"",
+            "\t\t$InstallCollection = New-Object -com \"Microsoft.Update.UpdateColl\"",
+            "\t\t$AvailableUpdates | ForEach-Object {",
+            "\t\t\tif ($_.IsDownloaded) {",
+            "\t\t\t\t$InstallCollection.Add($_) | Out-Null",
+            "\t\t\t}",
+            "\t\t}",
+            "\t\tWrite-Host \"Installing updates...\"",
+            "\t\t$Installer = $Session.CreateUpdateInstaller()",
+            "\t\t$Installer.Updates = $InstallCollection",
+            "\t\t$Results = $Installer.Install()",
+            "\t\tWrite-Host \"Installation complete.\"",
+            "\t\texit 3010",
+            "\t}",
+            "}",
+            "",
+            "try {",
+            "\tCheck-ForReboot",
+            "\tInstall-PreReqForSQL",
+            "}",
+            "catch {",
+            "\tWrite-Error $_.Exception.Message",
+            "\texit 1",
+            "}"
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "runScriptBeforeSQLServerUpgrade"
+    },
+    {
+      "name": "runScriptBeforeSQLServerUpgrade",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "function Enable-OfflineDisk {",
+            "\t$offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" }",
+            "\tif ($offlinedisk) {",
+            "\t\tWrite-Host \"Following Offline disk(s) found..Trying to bring Online.\"",
+            "\t\t$offlinedisk",
+            "\t\tforeach ($offdisk in $offlinedisk) {",
+            "\t\t\t$offdiskS = $offdisk.Substring(2, 6)",
+            "\t\t\tWrite-Host \"Enabling $offdiskS\"",
+            "\t\t\t$OnlineDisk = @\"",
+            "select $offdiskS",
+            "attributes disk clear readonly",
+            "online disk",
+            "attributes disk clear readonly",
+            "\"@",
+            "",
+            "\t\t\t$noOut = $OnlineDisk | diskpart",
+            "\t\t\tStart-Sleep 5",
+            "\t\t}",
+            "",
+            "\t\tif (($offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" } )) {",
+            "\t\t\tWrite-Host \"Failed to bring the following disk(s) online\"",
+            "\t\t\t$offlinedisk",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\tWrite-Host \"Disk(s) are now online.\"",
+            "\t\t}",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host \"All disk(s) are online!\"",
+            "\t}",
+            "}",
+            "try {",
+            "\tEnable-OfflineDisk",
+            "\t$TEMPSTORAGE = \"C:\\SQLUpgrade\\{{ automation:EXECUTION_ID }}\"",
+            "\t$TEMPSTOGAREFILE = \"$TEMPSTORAGE\\drive.txt\"",
+            "\tif ((Test-Path $TEMPSTORAGE) -eq $false) {",
+            "\t\tNew-Item -ItemType directory -Path $TEMPSTORAGE",
+            "\t}",
+            "",
+            "\t([System.IO.DriveInfo]::getdrives() | Where-Object { $_.DriveType -eq \"Fixed\" } | select-object -ExpandProperty Name) -join ',' | Out-File \"$TEMPSTOGAREFILE\"",
+            "\t$OLDDRIVES = Get-Content -Path \"C:\\SQLUpgrade\\{{ automation:EXECUTION_ID }}\\drive.txt\" -TotalCount 1",
+            "\tWrite-host \"Drives are $OLDDRIVES \"",
+            "}",
+            "catch {",
+            "\tWrite-Error $_.Exception.Message",
+            "\texit 1",
+            "}",
+            ""
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "branchOnLicenseIncludedInstance"
+    },
+    {
+      "name": "branchOnLicenseIncludedInstance",
+      "action": "aws:branch",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "putLicenseIncludedInstanceMetric",
+            "Variable": "{{ assertReadyToUpgradeSQLServer.Output }}",
+            "Contains": "Instance has license included"
+          }
+        ],
+        "Default": "putBYOLInstanceMetric"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "putLicenseIncludedInstanceMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "License_Included_Instances",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "getSQLServerEdition"
+    },
+    {
+      "name": "putBYOLInstanceMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "BYOL_Instances",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "assertBYOLSQLServerSnapshotIdExist"
+    },
+    {
+      "name": "assertBYOLSQLServerSnapshotIdExist",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSnapshots",
+        "SnapshotIds": [
+          "{{ SQLServerSnapshotId }}"
+        ],
+        "PropertySelector": "$.Snapshots[0].SnapshotId",
+        "DesiredValues": [
+          "{{ SQLServerSnapshotId }}"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "createBYOLSQLServerMediaVolume"
+    },
+    {
+      "name": "createBYOLSQLServerMediaVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateVolume",
+        "AvailabilityZone": "{{ getUpgradeServerInstanceDetails.AvailabilityZone }}",
+        "SnapshotId": "{{ SQLServerSnapshotId }}",
+        "VolumeType": "gp2",
+        "TagSpecifications": [
+          {
+            "ResourceType": "volume",
+            "Tags": [
+              {
+                "Key": "SQLServerUpgradeVolumeKey",
+                "Value": "SQLServerUpgradeVolume-{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VolumeId",
+          "Selector": "$.VolumeId",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "getSQLServerMediaVolumeId"
+    },
+    {
+      "name": "getSQLServerEdition",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "executionTimeout": "300",
+          "commands": [
+            "$instances = (get-itemproperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\").InstalledInstances",
+            "$instance = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL\").$instances",
+            "$instanceDetails = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\$instance\\Setup\")",
+            "$edition = ($instanceDetails.Edition).split()[0]",
+            "Write-Host -NoNewline \"$edition\""
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "getSQLServerSnapshotForLicenseIncludedInstance"
+    },
+    {
+      "name": "getSQLServerSnapshotForLicenseIncludedInstance",
+      "action": "aws:shareSQLMedia",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "SQLServerVersion": "2016",
+        "InstanceId": "{{ InstanceId }}",
+        "SQLServerEdition": "{{ getSQLServerEdition.Output }}"
+      },
+      "outputs": [
+        {
+          "Name": "SnapshotId",
+          "Selector": "$.EBSSnapshotId"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "assertLicenseIncludedSQLServerSnapshotIdShared"
+    },
+    {
+      "name": "assertLicenseIncludedSQLServerSnapshotIdShared",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSnapshots",
+        "SnapshotIds": [
+          "{{ getSQLServerSnapshotForLicenseIncludedInstance.EBSSnapshotId }}"
+        ],
+        "PropertySelector": "$.Snapshots[0].SnapshotId",
+        "DesiredValues": [
+          "{{ getSQLServerSnapshotForLicenseIncludedInstance.EBSSnapshotId }}"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "createLicenseIncludedSQLServerMediaVolume"
+    },
+    {
+      "name": "createLicenseIncludedSQLServerMediaVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateVolume",
+        "AvailabilityZone": "{{ getUpgradeServerInstanceDetails.AvailabilityZone }}",
+        "SnapshotId": "{{ getSQLServerSnapshotForLicenseIncludedInstance.EBSSnapshotId }}",
+        "VolumeType": "gp2",
+        "TagSpecifications": [
+          {
+            "ResourceType": "volume",
+            "Tags": [
+              {
+                "Key": "SQLServerUpgradeVolumeKey",
+                "Value": "SQLServerUpgradeVolume-{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ]
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "getSQLServerMediaVolumeId"
+    },
+    {
+      "name": "getSQLServerMediaVolumeId",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "tag:SQLServerUpgradeVolumeKey",
+            "Values": [
+              "SQLServerUpgradeVolume-{{ automation:EXECUTION_ID }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VolumeId",
+          "Selector": "$.Volumes[0].VolumeId",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "waitUntilSQLServerMediaVolumeReady"
+    },
+    {
+      "name": "waitUntilSQLServerMediaVolumeReady",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ getSQLServerMediaVolumeId.VolumeId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Volumes[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "attachSQLServerMediaVolumeToInstance"
+    },
+    {
+      "name": "attachSQLServerMediaVolumeToInstance",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "AttachVolume",
+        "Device": "xvdh",
+        "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
+        "VolumeId": "{{ getSQLServerMediaVolumeId.VolumeId }}"
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "waitUntilSQLServerMediaAttached"
+    },
+    {
+      "name": "waitUntilSQLServerMediaAttached",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ getSQLServerMediaVolumeId.VolumeId }}"
+            ]
+          },
+          {
+            "Name": "attachment.instance-id",
+            "Values": [
+              "{{ getServerUpgradeInstance.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Volumes[0].State",
+        "DesiredValues": [
+          "in-use"
+        ]
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "sleepForVolumeTobeAttached"
+    },
+    {
+      "name": "sleepForVolumeTobeAttached",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT10M"
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "doRestartBeforeUpgradeStart"
+    },
+    {
+      "name": "doRestartBeforeUpgradeStart",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "Restart-Computer -Force"
+          ]
+        }
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "sleepUntillRestartToBeFinished"
+    },
+    {
+      "name": "sleepUntillRestartToBeFinished",
+      "action": "aws:sleep",
+      "maxAttempts": 3,
+      "inputs": {
+        "Duration": "PT5M"
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "runSQLServerUpgrade"
+    },
+    {
+      "action": "aws:runCommand",
+      "name": "runSQLServerUpgrade",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "function Enable-OfflineDisk {",
+            "\t$offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" }",
+            "\tif ($offlinedisk) {",
+            "\t\tWrite-Host \"Following Offline disk(s) found..Trying to bring Online.\"",
+            "\t\t$offlinedisk",
+            "\t\tforeach ($offdisk in $offlinedisk) {",
+            "\t\t\t$offdiskS = $offdisk.Substring(2, 6)",
+            "\t\t\tWrite-Host \"Enabling $offdiskS\"",
+            "\t\t\t$OnlineDisk = @\"",
+            "select $offdiskS",
+            "attributes disk clear readonly",
+            "online disk",
+            "attributes disk clear readonly",
+            "\"@",
+            "",
+            "\t\t\t$noOut = $OnlineDisk | diskpart",
+            "\t\t\tStart-Sleep 5",
+            "\t\t}",
+            "\t\tif (($offlinedisk = \"list disk\" | diskpart | Where-Object { $_ -match \"offline\" } )) {",
+            "\t\t\tWrite-Host \"Failed to bring the following disk(s) online\"",
+            "\t\t\t$offlinedisk",
+            "\t\t}",
+            "\t\telse {",
+            "\t\t\tWrite-Host \"Disk(s) are now online.\"",
+            "\t\t}",
+            "\t}",
+            "\telse {",
+            "\t\tWrite-Host \"All disk(s) are online!\"",
+            "\t}",
+            "}",
+            "",
+            "try {",
+            "\tEnable-OfflineDisk",
+            "\t$CURRENTDRIVE = ([System.IO.DriveInfo]::getdrives() | Where-Object { $_.DriveType -eq \"Fixed\" } | select-object -ExpandProperty Name) -join ','",
+            "\t$OLDDRIVES = Get-Content -Path \"C:\\SQLUpgrade\\{{ automation:EXECUTION_ID }}\\drive.txt\" -TotalCount 1",
+            "\t$oldDriveArray = $OLDDRIVES.split(',')",
+            "\t$newDriveArray = $CURRENTDRIVE.split(',')",
+            "\tforeach ($drive in $newDriveArray) {",
+            "\t\tif (-not ($oldDriveArray -contains $drive)) {",
+            "\t\t\t$NEWDRIVE = $drive",
+            "\t\t\tbreak",
+            "\t\t}",
+            "\t}",
+            "\tif (-not $NEWDRIVE) {",
+            "\t\tWrite-Log \"Can't find the new drive\"",
+            "\t\texit -1",
+            "\t}",
+            "\tWrite-host \"Olddrives $OLDDRIVES , Currentdrives $CURRENTDRIVE, Newdrive $NEWDRIVE\"",
+            "\tWrite-Host \"SQL Server Installed media present in Drive $NEWDRIVE \"",
+            "\t$INSTANCENAME = (get-itemproperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\").InstalledInstances",
+            "\tInvoke-expression \"$NEWDRIVE\\setup.exe /q /ACTION=upgrade /INSTANCEID=$INSTANCENAME /INSTANCENAME=$INSTANCENAME\t/IACCEPTSQLSERVERLICENSETERMS \"",
+            "}",
+            "catch {",
+            "\tWrite-Error $_.Exception.Message",
+            "\texit 1",
+            "}"
+          ]
+        }
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "restartSystemToFinishUpgrade"
+    },
+    {
+      "name": "restartSystemToFinishUpgrade",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{getServerUpgradeInstance.InstanceId}}"
+        ],
+        "Parameters": {
+          "commands": [
+            "Restart-Computer -Force"
+          ]
+        }
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "sleepForSQLUpgradeAndStart"
+    },
+    {
+      "name": "sleepForSQLUpgradeAndStart",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT5M"
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "waitForSSMAgentOnlineAfterUpgrade"
+    },
+    {
+      "name": "waitForSSMAgentOnlineAfterUpgrade",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ getServerUpgradeInstance.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "checkAfterSQLServerUpgrade"
+    },
+    {
+      "name": "checkAfterSQLServerUpgrade",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "$instances = (get-itemproperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\").InstalledInstances",
+            "$instance = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL\").$instances",
+            "$instanceDetails = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\$instance\\Setup\")",
+            "$v = $instanceDetails.Version.subString(0, $instanceDetails.Version.indexOf(\".\"))",
+            "if ($v -eq 13) {",
+            "\twrite-host \" SQL Server upgrades successfully\"",
+            "\texit 0",
+            "}",
+            "else {",
+            "\texit 1",
+            "}"
+          ]
+        }
+      },
+      "onFailure": "step:putServerUpgradeFailureMetric",
+      "isCritical": "true",
+      "nextStep": "branchOnSQLUpgradeSuccess"
+    },
+    {
+      "name": "branchOnSQLUpgradeSuccess",
+      "action": "aws:branch",
+      "maxAttempts": 3,
+      "onFailure": "step:putServerUpgradeFailureMetric",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ checkAfterSQLServerUpgrade.Output }}",
+            "Contains": "SQL Server upgrades successfully",
+            "NextStep": "putServerUpgradeSuccessMetric"
+          }
+        ],
+        "Default": "putServerUpgradeFailureMetric"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "putServerUpgradeSuccessMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "step:detachSQLServerMediaVolume",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "Successful_Upgrades",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "detachSQLServerMediaVolume"
+    },
+    {
+      "name": "putServerUpgradeFailureMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "step:detachSQLServerMediaVolume",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "Failed_Upgrades",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "deleteServerUpgradeInstance"
+    },
+    {
+      "name": "detachSQLServerMediaVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DetachVolume",
+        "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
+        "VolumeId": "{{ getSQLServerMediaVolumeId.VolumeId }}",
+        "Force": true
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "waitTillSQLServerMediaVolumeDetached"
+    },
+    {
+      "name": "waitTillSQLServerMediaVolumeDetached",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ getSQLServerMediaVolumeId.VolumeId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Volumes[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "deleteSQLServerMediaVolume"
+    },
+    {
+      "name": "deleteSQLServerMediaVolume",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteVolume",
+        "VolumeId": "{{ getSQLServerMediaVolumeId.VolumeId }}"
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "createImageUpgradedInstance"
+    },
+    {
+      "name": "createImageUpgradedInstance",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateImage",
+        "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
+        "Name": "AWSEC2-SQLSERVERUPGRADE-{{ getServerUpgradeInstance.InstanceId }}-{{automation:EXECUTION_ID}}",
+        "NoReboot": false
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.ImageId",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "waitTillUpgradedInstanceImageReady"
+    },
+    {
+      "name": "waitTillUpgradedInstanceImageReady",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "ImageIds": [
+          "{{ createImageUpgradedInstance.ImageId }}"
+        ],
+        "PropertySelector": "$.Images[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "nextStep": "deleteServerUpgradeInstance"
+    },
+    {
+      "name": "deleteServerUpgradeInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "TerminateInstances",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ]
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "Continue",
+      "timeoutSeconds": 1800,
+      "nextStep": "branchOnDeletingImageFromOriginalInstance"
+    },
+    {
+      "name": "branchOnDeletingImageFromOriginalInstance",
+      "action": "aws:branch",
+      "onFailure": "step:describeInstallationMediaVolume",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "deleteImageFromOriginalInstance",
+            "Variable": "{{ KeepPreUpgradeImageBackUp }}",
+            "EqualsIgnoreCase": "False"
+          }
+        ],
+        "Default": "describeInstallationMediaVolume"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "deleteImageFromOriginalInstance",
+      "action": "aws:deleteImage",
+      "inputs": {
+        "ImageId": "{{ describeOriginalInstanceImage.ImageId }}"
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "Continue",
+      "nextStep": "describeInstallationMediaVolume"
+    },
+    {
+      "name": "describeInstallationMediaVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "volume-id",
+            "Values": [
+              "{{ getSQLServerMediaVolumeId.VolumeId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "State",
+          "Selector": "$.Volumes[0].State",
+          "Type": "String"
+        }
+      ],
+      "maxAttempts": 3,
+      "isCritical": "false",
+      "onFailure": "Continue",
+      "nextStep": "branchOnInstallationMediaVolumeStatus"
+    },
+    {
+      "name": "branchOnInstallationMediaVolumeStatus",
+      "action": "aws:branch",
+      "onFailure": "step:getUpgradedImageDetails",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "retryDeletingInstallationMediaVolume",
+            "Or": [
+              {
+                "Variable": "{{ describeInstallationMediaVolume.State }}",
+                "EqualsIgnoreCase": "available"
+              },
+              {
+                "Variable": "{{ describeInstallationMediaVolume.State }}",
+                "EqualsIgnoreCase": "in-use"
+              }
+            ]
+          }
+        ],
+        "Default": "getUpgradedImageDetails"
+      },
+      "isCritical": "false"
+    },
+    {
+      "name": "retryDeletingInstallationMediaVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteVolume",
+        "VolumeId": "{{ getSQLServerMediaVolumeId.VolumeId }}"
+      },
+      "maxAttempts": 3,
+      "isCritical": "false",
+      "onFailure": "step:getUpgradedImageDetails",
+      "nextStep": "getUpgradedImageDetails"
+    },
+    {
+      "name": "getUpgradedImageDetails",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "ImageIds": [
+          "{{ createImageUpgradedInstance.ImageId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Images[0].ImageId",
+          "Type": "String"
+        },
+        {
+          "Name": "Name",
+          "Selector": "$.Images[0].Name",
+          "Type": "String"
+        },
+        {
+          "Name": "State",
+          "Selector": "$.Images[0].State",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "isEnd": "true"
+    }
+  ],
+  "outputs": [
+    "getUpgradedImageDetails.ImageId",
+    "getUpgradedImageDetails.Name",
+    "getUpgradedImageDetails.State"
+  ]
+}

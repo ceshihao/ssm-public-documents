@@ -1,0 +1,333 @@
+{
+  "description": "AWS Support - Directory Service Troubleshooter",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DirectoryId": {
+      "type": "String",
+      "description": "(Required) The Id of the directory to troubleshoot.",
+      "allowedPattern": "^d-[a-z0-9]{10}$",
+      "default": ""
+    },
+    "TrustId": {
+      "type": "String",
+      "description": "(Optional) The Id of the trust relationship to troubleshoot.",
+      "allowedPattern": "^$|^t-[0-9a-f]{10}$",
+      "default": ""
+    },
+    "RemoteDomainCidrs": {
+      "type": "StringList",
+      "description": "(Required) The CIDR(s) of the remote domain you are attempting to establish a Trust Relationship with. You can add multiple CIDRs using comma-separated values. Valid formats: 172.31.48.0/20, 192.168.1.10/32, etc.",
+      "allowedPattern": "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(3[0-2]|[1-2][0-9]|[1-9]))$"
+    },
+    "RemoteDomainName": {
+      "type": "String",
+      "description": "(Required) The FQDN of the remote domain you are attempting to establish a Trust Relationship with.",
+      "allowedPattern": "^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+[.]?$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. ",
+      "default": ""
+    },
+    "RequiredTrafficSG": {
+      "type": "String",
+      "description": "(Required) Directory Service inbound and outbound Security Group traffic requirements. These are the default required ports. You should not modify this value.",
+      "default": "{\"inbound\":{\"tcp\":[[53,53],[88,88],[135,135],[389,389],[445,445],[464,464],[636,636],[1024,65535]],\"udp\":[[53,53],[88,88],[123,123],[138,138],[389,389],[445,445],[464,464]],\"icmp\":[[-1,-1]]},\"outbound\":{\"-1\":[[0,65535]]}}"
+    },
+    "RequiredTrafficACL": {
+      "type": "String",
+      "description": "(Required) Directory Service inbound and outbound Network ACL traffic requirements. These are the default required ports. You should not modify this value.",
+      "default": "{\"inbound\":{\"tcp\":[[53,53],[88,88],[135,135],[389,389],[445,445],[464,464],[636,636],[1024,65535]],\"udp\":[[53,53],[88,88],[123,123],[138,138],[389,389],[445,445],[464,464]],\"icmp\":[[-1,-1]]},\"outbound\":{\"-1\":[[0,65535]]}}"
+    }
+  },
+  "outputs": [
+    "evaluateRemoteDomainCidr.output",
+    "evalDirectorySecurityGroup.output",
+    "evalAclEntries.output"
+  ],
+  "mainSteps": [
+    {
+      "name": "assertDirectoryType",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ds",
+        "Api": "DescribeDirectories",
+        "DirectoryIds": [
+          "{{ DirectoryId }}"
+        ],
+        "PropertySelector": "$.DirectoryDescriptions[0].Type",
+        "DesiredValues": [
+          "MicrosoftAD"
+        ]
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "getDirectoryInfo",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ds",
+        "Api": "DescribeDirectories",
+        "DirectoryIds": [
+          "{{ DirectoryId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "directoryDnsIpAddrs",
+          "Selector": "$.DirectoryDescriptions[0].DnsIpAddrs",
+          "Type": "StringList"
+        },
+        {
+          "Name": "directoryVpcId",
+          "Selector": "$.DirectoryDescriptions[0].VpcSettings.VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "directorySecurityGroupId",
+          "Selector": "$.DirectoryDescriptions[0].VpcSettings.SecurityGroupId",
+          "Type": "String"
+        },
+        {
+          "Name": "directorySubnets",
+          "Selector": "$.DirectoryDescriptions[0].VpcSettings.SubnetIds",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "branchOnGetDirectoryTrust"
+    },
+    {
+      "name": "branchOnGetDirectoryTrust",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "getDirectoryTrust",
+            "Variable": "{{ TrustId }}",
+            "StartsWith": "t-"
+          }
+        ],
+        "Default": "getDirectoryConditionalForwarder"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "getDirectoryTrust",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ds",
+        "Api": "DescribeTrusts",
+        "DirectoryId": "{{ DirectoryId }}",
+        "TrustIds": [
+          "{{ TrustId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "directoryTrustState",
+          "Selector": "$.Trusts[0].TrustState",
+          "Type": "String"
+        },
+        {
+          "Name": "directoryTrust",
+          "Selector": "$.Trusts[0]",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "getDirectoryConditionalForwarder"
+    },
+    {
+      "name": "getDirectoryConditionalForwarder",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ds",
+        "Api": "DescribeConditionalForwarders",
+        "DirectoryId": "{{ DirectoryId }}",
+        "RemoteDomainNames": [
+          "{{ RemoteDomainName }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "directoryForwarderDnsIpAddrs",
+          "Selector": "$.ConditionalForwarders[0].DnsIpAddrs",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "getDirectoryIPRoutes"
+    },
+    {
+      "name": "getDirectoryIPRoutes",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ds",
+        "Api": "ListIpRoutes",
+        "DirectoryId": "{{ DirectoryId }}"
+      },
+      "outputs": [
+        {
+          "Name": "directoryIPRoutes",
+          "Selector": "$.IpRoutesInfo",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getDirectorySubnetCidrs"
+    },
+    {
+      "name": "getDirectorySubnetCidrs",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSubnets",
+        "SubnetIds": [
+          "{{ getDirectoryInfo.directorySubnets }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "directorySubnetCidrs",
+          "Selector": "$.Subnets..CidrBlock",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "getDirectorySecurityGroup"
+    },
+    {
+      "name": "getDirectorySecurityGroup",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSecurityGroups",
+        "GroupIds": [
+          "{{ getDirectoryInfo.directorySecurityGroupId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "directorySecurityGroups",
+          "Selector": "$.SecurityGroups",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "getDirectoryAcl"
+    },
+    {
+      "name": "getDirectoryAcl",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeNetworkAcls",
+        "Filters": [
+          {
+            "Name": "association.subnet-id",
+            "Values": "{{ getDirectoryInfo.directorySubnets }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "directoryAcls",
+          "Selector": "$.NetworkAcls",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "evaluateRemoteDomainCidr"
+    },
+    {
+      "name": "evaluateRemoteDomainCidr",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 45,
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "evaluateRemoteDomainCidr",
+        "InputPayload": {
+          "remoteCidrs": "{{ RemoteDomainCidrs }}",
+          "directoryIPRoutes": "{{ getDirectoryIPRoutes.directoryIPRoutes }}"
+        },
+        "Script": "# Handler Function\ndef evaluateRemoteDomainCidr(events,context):\n    from ipaddress import ip_network\n    import re\n\n    err = False\n    directoryForwarderDnsIpAddrs = []#events['directoryForwarderDnsIpAddrs']\n    directoryIPRoutes = events['directoryIPRoutes']\n    remoteCidrs = events['remoteCidrs']\n\n    # Check if all DNS entries in the Conditional Forwarder have a valid route if public\n    # The directoryForwarderDnsIpAddrs for the RemoteDomainName\n    for dns in directoryForwarderDnsIpAddrs:\n        err = err or check_if_route_exist(dns,directoryIPRoutes)\n\n    # Check if all remote CIDR entries have a valid route if public    \n    for cidr in remoteCidrs:\n        err = err or check_if_route_exist(cidr,directoryIPRoutes)\n        \n    if err:\n        return { 'error':err, 'output':'Error: One or more CIDR/IP requires an IP route to be reachable. See ExecutionLog' }\n    else:\n        return { 'error':err, 'output':'Success: No issues with required IP routes' }\n    \n# Checks if an IP route exists for any public (non-RFC 1918) IP addresses \n# of the remote Active Directory. The function checks the CIDRs provided in the document input \n# and DNS entries of the Conditional Forwarders for the RemoteDomainName in the document input\ndef check_if_route_exist(net4, routes):\n    from ipaddress import ip_network\n    err = False\n    try:\n        net = ip_network(net4)\n        if not net.is_private:\n            while(len(routes)>0):\n                if net.overlaps(ip_network(routes[0])):\n                    print('An IP Route exists for the public DNS ', dnsIp)\n                    break\n                routes.pop(0)\n            else:\n                print('Error: No IP routes have been added for',net,'. A route must be added in order to route traffic to the remote directory.')\n                err = True\n        else:\n            print('Success:',net,'does not require an IP route because is private')\n            \n        return err\n        \n    except Exception as e:\n        print('Error: Please enter an acceptable host or network IP Address.', str(e))\n        return True\n\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        },
+        {
+          "Name": "error",
+          "Selector": "$.Payload.err",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "evalDirectorySecurityGroup"
+    },
+    {
+      "name": "evalDirectorySecurityGroup",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 45,
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "evalDirectorySecurityGroup",
+        "InputPayload": {
+          "remoteCidrs": "{{ RemoteDomainCidrs }}",
+          "directorySecurityGroups": "{{ getDirectorySecurityGroup.directorySecurityGroups }}",
+          "requiredTraffic": "{{ RequiredTrafficSG }}"
+        },
+        "Script": "# Handler Function\ndef evalDirectorySecurityGroup(events,context):\n    import json \n    \n    directorySecurityGroups = events['directorySecurityGroups']\n    remoteCidrs = events['remoteCidrs']\n    requiredTraffic = json.loads(events['requiredTraffic'])\n    print('RequiredTraffic',requiredTraffic)\n\n    #required = { \n    #    'inbound': {\n    #        'tcp':[[2,20],[636,636],[53,53],[1024,65535]],\n    #        'udp':[[2,20],[53,53],[138,138]],\n    #        'icmp':[[-1,-1]]\n    #    },\n    #    'outbound': { \n    #        '-1':[[0,65535]]\n    #   }\n    #}\n   \n    err = False\n    source = {'network-cidrs':remoteCidrs,'security-groups':[]} \n    err = eval_security_groups_traffic(directorySecurityGroups, source, requiredTraffic)\n    \n    if err:\n        return { 'error':err, 'output':'Error: Required traffic is not allowed in Security Groups. See ExecutionLog' }\n    else:\n        return { 'error':err, 'output':'Success: Required traffic is allowed in Security Groups' }\n\ndef eval_security_groups_traffic(sgs, source, traffic):\n    from ipaddress import ip_network\n    try:\n        err = False\n        for sg in sgs:\n            for protocol, ranges in traffic.get('inbound',[]).items():\n                for range in ranges:\n                    allowed = False\n                    for r in sg.get('IpPermissions', []):\n                        if r['IpProtocol'] in (protocol,'-1'): \n                            if (not 'FromPort' in r and not 'ToPort' in r) or (r['FromPort'] <= range[0] and r['ToPort'] >= range[1]): # \"Rule allows port %s\" % r['fromPort']\n                                for user_id_group_pair in r.get('UserIdGroupPairs',[]):\n                                    for group_id in source.get('security-groups', []):\n                                        if user_id_group_pair['GroupId'] == group_id:\n                                            allowed = True\n                                            break\n                                for ip_range in r['IpRanges']:\n                                    for network_cidr in source.get('network-cidrs', []):\n                                        if (ip_network(ip_range['CidrIp'], strict=False).overlaps(ip_network(network_cidr, strict=False))):\n                                            allowed = True\n                                            break\n                    if (not allowed):\n                        print('No inbound Security Group rule in', sg['GroupId'],'allows connectivity for',protocol.replace(\"-1\", \"all\").upper(),'in range:',range)\n                        err = True\n\n            for protocol, ranges in traffic.get('outbound',[]).items():\n                for range in ranges:\n                    allowed = False\n                    for r in sg.get('IpPermissionsEgress', []):\n                        if r['IpProtocol'] in (protocol,'-1'): \n                            if (not 'FromPort' in r and not 'ToPort' in r) or (r['FromPort'] <= range[0] and r['ToPort'] >= range[1]): # \"Rule allows port %s\" % r['fromPort']\n                                for user_id_group_pair in r.get('UserIdGroupPairs',[]):\n                                    for group_id in source.get('security-groups', []):\n                                        if user_id_group_pair['GroupId'] == group_id:\n                                            allowed = True\n                                            break\n                                for ip_range in r['IpRanges']:\n                                    for network_cidr in source.get('network-cidrs', []):\n                                        if (ip_network(ip_range['CidrIp'], strict=False).overlaps(ip_network(network_cidr, strict=False))):\n                                            allowed = True\n                                            break\n                    if (not allowed):\n                        print('No outbound Security Group rule in', sg['GroupId'],'allows connectivity for',protocol.replace(\"-1\", \"all\").upper(),'in range:',range)\n                        err = True\n        return err\n\n    except Exception as e:\n        print('Failed to evaluate Security Groups.', str(e))\n        return True\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        },
+        {
+          "Name": "error",
+          "Selector": "$.Payload.err",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "evalAclEntries"
+    },
+    {
+      "name": "evalAclEntries",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 45,
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "evalAclEntries",
+        "InputPayload": {
+          "remoteCidrs": "{{ RemoteDomainCidrs }}",
+          "directoryAcl": "{{ getDirectoryAcl.directoryAcls }}",
+          "requiredTraffic": "{{ RequiredTrafficACL }}"
+        },
+        "Script": "def evalAclEntries(events,context):\n    from ipaddress import ip_network\n    import json\n    err = False\n    directoryNetworkAcls = events['directoryAcl']\n    remoteCidrs = events['remoteCidrs']\n    requiredTraffic = json.loads(events['requiredTraffic'])\n    \n    source = {'network-cidrs':remoteCidrs,'security-groups':[]} \n    allows = eval_acl_rules(directoryNetworkAcls, source, requiredTraffic)\n    #print_allowed(allows)\n    err = check_allowed(allows, requiredTraffic)\n\n    if err:\n        return { 'error':err, 'output':'Error: Required traffic is not allowed in Network ACLs. See ExecutionLog' }\n    else:\n        return { 'error':err, 'output':'Success: Required traffic is allowed in Network ACLs' }\n\ndef print_allowed(allows):\n    for nacl_id, nacl in allows.items():\n        print('NetworkAclId', nacl_id, 'Inbound:', list(nacl[0].items()), ' <> Outbound:', list(nacl[1].items()))\n\ndef eval_acl_rules(rules, source, traffic): \n    from collections import defaultdict\n    from ipaddress import ip_network\n\n    in_allow = defaultdict(list)\n    out_allow = defaultdict(list)\n    allows = defaultdict(list)\n    \n    try:\n        for nacl in rules:\n                for r in sorted(nacl['Entries'], key=lambda k: k['RuleNumber'], reverse=True):\n                     #print(nacl['NetworkAclId'],out_allow)\n                     for network_cidr in source.get('network-cidrs', []):\n                         protocol = get_std_protocol(r['Protocol'])\n                         #print(r['RuleNumber'],protocol,r['RuleAction'],r['Egress'],r['CidrBlock'],network_cidr,ip_network(r['CidrBlock'], strict=False).overlaps(ip_network(network_cidr, strict=False)))\n                         if (ip_network(r['CidrBlock'], strict=False).overlaps(ip_network(network_cidr, strict=False))):\n                              if not 'PortRange' in r:\n                                   f=0\n                                   t=65535\n                              else:\n                                   f=r['PortRange']['From']\n                                   t=r['PortRange']['To']\n\n                              if not r['Egress']:\n                                   if r['RuleAction'] == 'allow':\n                                        in_allow[protocol] = range_add([f,t],in_allow[protocol])\n                                   else:\n                                        in_allow[protocol] = range_diff([f,t],in_allow[protocol])\n                              else:\n                                   if r['RuleAction'] == 'allow':\n\n                                        out_allow[protocol] = range_add([f,t],out_allow[protocol])\n                                   else:\n                                        out_allow[protocol] = range_diff([f,t],out_allow[protocol])\n               \n                allows[nacl['NetworkAclId']].append(in_allow.copy())#[0]\n                allows[nacl['NetworkAclId']].append(out_allow.copy())#[1]\n                in_allow.clear()\n                out_allow.clear()\n\n        return allows\n    \n    except Exception as e:\n        print('Failed to evaluate Network ACLs.', str(e))\n        return allows\n\ndef get_std_protocol(acl_protocol):\n    # defined at https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml\n    customprotocol = {\"-1\":\"-1\",\"hopopt\":\"0\",\"icmp\":\"1\",\"igmp\":\"2\",\"ggp\":\"3\",\"ipv4\":\"4\",\"st\":\"5\",\"tcp\":\"6\",\"cbt\":\"7\",\"egp\":\"8\",\"igp\":\"9\",\"bbn-rcc-mon\":\"10\",\"nvp-ii\":\"11\",\"pup\":\"12\",\"argus\":\"13\",\"emcon\":\"14\",\"xnet\":\"15\",\"chaos\":\"16\",\"udp\":\"17\",\"mux\":\"18\",\"dcn-meas\":\"19\",\"hmp\":\"20\",\"prm\":\"21\",\"xns-idp\":\"22\",\"trunk-1\":\"23\",\"trunk-2\":\"24\",\"leaf-1\":\"25\",\"leaf-2\":\"26\",\"rdp\":\"27\",\"irtp\":\"28\",\"iso-tp4\":\"29\",\"netblt\":\"30\",\"mfe-nsp\":\"31\",\"merit-inp\":\"32\",\"dccp\":\"33\",\"3pc\":\"34\",\"idpr\":\"35\",\"xtp\":\"36\",\"ddp\":\"37\",\"idpr-cmtp\":\"38\",\"tp++\":\"39\",\"il\":\"40\",\"ipv6\":\"41\",\"sdrp\":\"42\",\"ipv6-route\":\"43\",\"ipv6-frag\":\"44\",\"idrp\":\"45\",\"rsvp\":\"46\",\"gre\":\"47\",\"dsr\":\"48\",\"bna\":\"49\",\"esp\":\"50\",\"ah\":\"51\",\"i-nlsp\":\"52\",\"swipe\":\"53\",\"narp\":\"54\",\"mobile\":\"55\",\"tlsp\":\"56\",\"ipv6-icmp\":\"58\",\"ipv6-nonxt\":\"59\",\"ipv6-opts\":\"60\",\"61\":\"61\",\"cftp\":\"62\",\"63\":\"63\",\"sat-expak\":\"64\",\"kryptolan\":\"65\",\"rvd\":\"66\",\"ippc\":\"67\",\"68\":\"68\",\"sat-mon\":\"69\",\"visa\":\"70\",\"ipcv\":\"71\",\"cpnx\":\"72\",\"cphb\":\"73\",\"wsn\":\"74\",\"pvp\":\"75\",\"br-sat-mon\":\"76\",\"sun-nd\":\"77\",\"wb-mon\":\"78\",\"wb-expak\":\"79\",\"iso-ip\":\"80\",\"vmtp\":\"81\",\"secure-vmtp\":\"82\",\"vines\":\"83\",\"ttp\":\"84\",\"nsfnet-igp\":\"85\",\"dgp\":\"86\",\"tcf\":\"87\",\"eigrp\":\"88\",\"ospfigp\":\"89\",\"sprite-rpc\":\"90\",\"larp\":\"91\",\"mtp\":\"92\",\"ax.25\":\"93\",\"ipip\":\"94\",\"micp\":\"95\",\"scc-sp\":\"96\",\"etherip\":\"97\",\"encap\":\"98\",\"99\":\"99\",\"gmtp\":\"100\",\"ifmp\":\"101\",\"pnni\":\"102\",\"pim\":\"103\",\"aris\":\"104\",\"scps\":\"105\",\"qnx\":\"106\",\"a/n\":\"107\",\"ipcomp\":\"108\",\"snp\":\"109\",\"compaq-peer\":\"110\",\"ipx-in-ip\":\"111\",\"vrrp\":\"112\",\"pgm\":\"113\",\"114\":\"114\",\"l2tp\":\"115\",\"dd\":\"116\",\"iatp\":\"117\",\"stp\":\"118\",\"srp\":\"119\",\"uti\":\"120\",\"smp\":\"121\",\"sm\":\"122\",\"ptp\":\"123\",\"isis-over-ipv4\":\"124\",\"fire\":\"125\",\"crtp\":\"126\",\"crudp\":\"127\",\"sscopmce\":\"128\",\"iplt\":\"129\",\"sps\":\"130\",\"pipe\":\"131\",\"sctp\":\"132\",\"fc\":\"133\",\"rsvp-e2e-ignore\":\"134\",\"mobility-header\":\"135\",\"udplite\":\"136\",\"mpls-in-ip\":\"137\",\"manet\":\"138\",\"hip\":\"139\",\"shim6\":\"140\",\"wesp\":\"141\",\"rohc\":\"142\",\"253\":\"253\",\"254\":\"254\"}\n    inv_map = {v: k for k, v in customprotocol.items()}\n    return inv_map.get(acl_protocol)\n\ndef range_add(new,interv):\n    interv.append(new)\n    interv = [x for x in interv if x != [] and len(x) == 2 and all(isinstance(val, int) for val in x)]\n    interv.sort()\n    res=[]\n    while(len(interv)>0):\n        if len(interv)==1:\n            res.append(interv[0])\n            interv.pop(0)\n            continue\n        if interv[0][1]>=interv[1][0]:\n            tmp=[interv[0][0],max(interv[0][1],interv[1][1])]\n            interv[0]=tmp\n            interv.pop(1)\n            continue\n        res.append(interv[0])\n        interv.pop(0)\n    return res\n\ndef range_diff(new,interv):\n    interv = range_add([],interv)\n    if len(new)==0:\n        new = [0,0]\n    interv = [x for x in interv if x != [] and len(x) == 2 and all(isinstance(val, int) for val in x)]\n    interv.sort()\n    res=[]\n    for t in interv:\n        s1, e1 = t\n        s2, e2 = new\n        s = sorted((s1, s2, e1, e2))\n        if s[0] == s1 and s[0] != s[1]:\n            v = s[1] if e1 < s2 else s[1]-1 \n            res.append([s[0],v])\n        if s[3] == e1 and s[2] != s[3]:\n            v = s[2] if e2 < s1 else s[2]+1\n            res.append([v,s[3]])\n    if len(res)==0:\n        res = [[0,0]]\n    return res\n\ndef check_allowed(allows, traffic):\n    err = False\n    for nacl_id, nacl in allows.items():\n        for protocol, ranges in traffic.get('inbound',[]).items():\n            for range in ranges:\n                allowed = False\n                for r in nacl[0].get('-1', []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n                for r in nacl[0].get(protocol, []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n            if (not allowed):\n                print('Error: No inbound ACL rule in',nacl_id,'allows connectivity for',protocol.replace(\"-1\", \"all\").upper(),'in range:',range)\n                err = True\n            else:\n                break\n\n        for protocol, ranges in traffic.get('outbound',[]).items():\n            for range in ranges:\n                allowed = False\n                for r in nacl[1].get('-1', []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n                for r in nacl[1].get(protocol, []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n            if (not allowed):\n                print('Error: No outbound ACL rule in',nacl_id,'allows connectivity for',protocol.replace(\"-1\", \"all\").upper(),'in range:',range)\n                err = True\n            else:\n                break\n            \n    return err\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        },
+        {
+          "Name": "error",
+          "Selector": "$.Payload.err",
+          "Type": "Boolean"
+        }
+      ],
+      "isEnd": true
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "description": "Creates an RDS Snapshot for an RDS instance. This automation does not support encrypted snapshots.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "DBInstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) The DBInstanceId ID of the RDS Instance to create Snapshot from."
+    },
+    "DBSnapshotIdentifier": {
+      "type": "String",
+      "description": "(Optional) The DBSnapshotIdentifier ID of the RDS snapshot to create.",
+      "default": ""
+    },
+    "InstanceTags": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) Tags to create for instance."
+    },
+    "SnapshotTags": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) Tags to create for snapshot."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "createRDSSnapshot",
+      "action": "aws:executeScript",
+      "description": "Creates the RDS snapshot and returns the snapshot ID.",
+      "outputs": [
+        {
+          "Name": "SnapshotId",
+          "Selector": "$.Payload.snapshot_id",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBInstanceIdentifier": "{{DBInstanceIdentifier}}",
+          "DBSnapshotIdentifier": "{{DBSnapshotIdentifier}}",
+          "InstanceTags": "{{InstanceTags}}",
+          "SnapshotTags": "{{SnapshotTags}}"
+        },
+        "Script": "import json\nimport re\nfrom datetime import datetime\nimport boto3\n\nDB_INSTANCE_ID = \"DBInstanceIdentifier\"\nINSTANCE_TAGS = \"InstanceTags\"\nSNAPSHOT_ARN = \"DBSnapshotArn\"\nSNAPSHOT_ID = \"DBSnapshotIdentifier\"\nSNAPSHOT_TAGS = \"SnapshotTags\"\n\nPH_DATE = \"date\"\nPH_DATETIME = \"datetime\"\nPH_EXECUTION_ID = \"execution-id\"\nPH_INSTANCE_ID = \"db-instance-id\"\nPH_SNAPSHOT_ID = \"db-snapshot-id\"\nPH_TIME = \"time\"\n\nPH_TAG_VAL_STR = \"{{{}}}\"\nTAG_SHORTCUT_EXPR = \"Key=(.+),\\s*Value=(.*)\"\n\n\ndef parse_tags(tags_str):\n    if re.match(\"({};?)+\".format(TAG_SHORTCUT_EXPR), tags_str):\n        matches = [re.match(TAG_SHORTCUT_EXPR, t.strip()) for t in tags_str.split(\";\")]\n        return [{\"Key\": m.group(1), \"Value\": m.group(2) if m.lastindex > 1 else \"\"} for m in matches]\n    else:\n        return json.loads(tags_str)\n\n\ndef build_tags(tag_str, context, tag_vars=None):\n    if tag_str == \"\":\n        return []\n\n    placeholders = tag_data(ctx=context, tag_vars=tag_vars)\n    tags = parse_tags(tag_str)\n\n    for tag in tags:\n        value = tag.get(\"Value\")\n        for p in placeholders:\n            value = value.replace(PH_TAG_VAL_STR.format(p), str(placeholders[p]))\n        tag[\"Value\"] = value\n    return tags\n\n\ndef template_string(s, context, str_vars=None):\n    result = s\n    data = tag_data(ctx=context, tag_vars=str_vars)\n    for p in data:\n        result = result.replace(PH_TAG_VAL_STR.format(p), str(data[p]))\n    return result\n\n\ndef tag_data(ctx, tag_vars):\n    def clean(s):\n        return s.replace(\":\", \"\").replace(\"-\", \"\").replace(\"T\", \"\")\n\n    dt = datetime.now().replace(microsecond=0)\n    data = {\n        PH_DATETIME: clean(dt.isoformat()),\n        PH_DATE: clean(dt.date().isoformat()),\n        PH_TIME: clean(dt.time().isoformat()),\n        PH_EXECUTION_ID: ctx.get('automation:EXECUTION_ID')\n    }\n\n    if tag_vars is not None:\n        for t in tag_vars:\n            data[t] = tag_vars[t]\n\n    return data\n\n\ndef handler(event, context):\n    client = boto3.client('rds')\n\n    inst_id = event[DB_INSTANCE_ID]\n    snapshot_str = event.get(SNAPSHOT_ID, \"\").strip()\n    if snapshot_str == \"\":\n        snapshot_str = \"{db-instance-id}-{datetime}\"\n\n    tag_vars = {\n        PH_INSTANCE_ID: inst_id,\n        SNAPSHOT_ID: \"\"\n    }\n\n    # snapshot name\n    snapshot_id = template_string(snapshot_str, context, tag_vars)\n\n    args = {\n        DB_INSTANCE_ID: inst_id,\n        SNAPSHOT_ID: snapshot_id\n    }\n\n    response = client.create_db_snapshot(**args)\n\n    snapshot_arn = response[\"DBSnapshot\"][\"DBSnapshotArn\"]\n\n    # snapshot tags\n    snapshot_tag_str = event.get(SNAPSHOT_TAGS, \"\")\n    if len(snapshot_tag_str) > 0:\n        snapshot_tags = build_tags(snapshot_tag_str, context, tag_vars)\n        if len(snapshot_tags) > 0:\n            client.add_tags_to_resource(ResourceName=snapshot_arn, Tags=snapshot_tags)\n\n    # instance tags\n    instance_tag_str = event.get(INSTANCE_TAGS, \"\")\n    if len(instance_tag_str) > 0:\n        tag_vars[PH_SNAPSHOT_ID] = snapshot_id\n        instance_tags = build_tags(instance_tag_str, context, tag_vars)\n        if len(instance_tags) > 0:\n            db_arn = \":\".join(snapshot_arn.split(\":\")[0:5]) + \":db:\" + inst_id\n            client.add_tags_to_resource(ResourceName=db_arn, Tags=instance_tags)\n\n    return {'snapshot_id' : snapshot_id}"
+      }
+    },
+    {
+      "name": "verifyRDSSnapshot",
+      "action": "aws:executeScript",
+      "description": "Checks that the snapshot created in the previous step exists.",
+      "isEnd": true,
+      "timeoutSeconds": 500,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBSnapshotId": "{{createRDSSnapshot.SnapshotId}}"
+        },
+        "Script": "import boto3\nimport time\n\ndef handler(event, context):\n    rds_client = boto3.client('rds')\n    snapshot_id = event[\"DBSnapshotId\"]\n\n    while True:\n        try:\n            snapshots = rds_client.describe_db_snapshots(DBSnapshotIdentifier=snapshot_id).get(\"DBSnapshots\", [{}])\n            if snapshots[0].get(\"Status\", \"\") == \"available\":\n                return\n            time.sleep(6)\n\n        except Exception as e:\n            raise e"
+      }
+    }
+  ],
+  "outputs": [
+    "createRDSSnapshot.SnapshotId"
+  ]
+}

@@ -1,0 +1,223 @@
+{
+  "description": "Attach IAM to Instance",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) The ID of the instance."
+    },
+    "RoleName": {
+      "type": "String",
+      "description": "(Required) Role Name to add"
+    },
+    "ForceReplace": {
+      "type": "Boolean",
+      "description": "(Optional) Flag to specify whether to replace the existing iam profile or not.",
+      "default": true
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. ",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "DescribeInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "describe_iam_instance_profile_associations",
+        "Filters": [
+          {
+            "Name": "instance-id",
+            "Values": [
+              "{{InstanceId}}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceProfileArn",
+          "Selector": "$.IamInstanceProfileAssociations[0].IamInstanceProfile.Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "AssociationId",
+          "Selector": "$.IamInstanceProfileAssociations[0].AssociationId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckInstanceProfileAssociations",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ListInstanceProfilesForRole",
+            "Not": {
+              "Variable": "{{DescribeInstanceProfile.InstanceProfileArn}}",
+              "Contains": "arn:"
+            }
+          },
+          {
+            "NextStep": "DisassociateIamInstanceProfile",
+            "Variable": "{{ForceReplace}}",
+            "BooleanEquals": true
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "DisassociateIamInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "disassociate_iam_instance_profile",
+        "AssociationId": "{{DescribeInstanceProfile.AssociationId}}"
+      }
+    },
+    {
+      "name": "ListInstanceProfilesForRole",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "iam",
+        "Api": "list_instance_profiles_for_role",
+        "RoleName": "{{RoleName}}"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceProfileArn",
+          "Selector": "$.InstanceProfiles[0].Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileName",
+          "Selector": "$.InstanceProfiles[0].InstanceProfileName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckInstanceProfileCreated",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CreateInstanceProfileForRole",
+            "Not": {
+              "Variable": "{{ListInstanceProfilesForRole.InstanceProfileArn}}",
+              "Contains": "arn:"
+            }
+          }
+        ],
+        "Default": "AttachIAMProfileToInstance"
+      }
+    },
+    {
+      "name": "AttachIAMProfileToInstance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "associate_iam_instance_profile",
+        "InstanceId": "{{InstanceId}}",
+        "IamInstanceProfile": {
+          "Arn": "{{ListInstanceProfilesForRole.InstanceProfileArn}}",
+          "Name": "{{ListInstanceProfilesForRole.InstanceProfileName}}"
+        }
+      },
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "AssociationId",
+          "Selector": "$.IamInstanceProfileAssociation.AssociationId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateInstanceProfileForRole",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "iam",
+        "Api": "create_instance_profile",
+        "InstanceProfileName": "{{RoleName}}",
+        "Path": "/"
+      }
+    },
+    {
+      "name": "AddRoleToInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "iam",
+        "Api": "add_role_to_instance_profile",
+        "InstanceProfileName": "{{RoleName}}",
+        "RoleName": "{{RoleName}}"
+      }
+    },
+    {
+      "name": "GetInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "iam",
+        "Api": "get_instance_profile",
+        "InstanceProfileName": "{{RoleName}}"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceProfileArn",
+          "Selector": "$.InstanceProfile.Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileName",
+          "Selector": "$.InstanceProfile.InstanceProfileName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "AttachIAMProfileToInstanceWithRetry",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "maxAttempts": 20,
+      "timeoutSeconds": 2,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "associate_iam_instance_profile",
+        "InstanceId": "{{InstanceId}}",
+        "IamInstanceProfile": {
+          "Arn": "{{GetInstanceProfile.InstanceProfileArn}}",
+          "Name": "{{GetInstanceProfile.InstanceProfileName}}"
+        }
+      },
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "AssociationId",
+          "Selector": "$.IamInstanceProfileAssociation.AssociationId",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "AttachIAMProfileToInstanceWithRetry.AssociationId",
+    "GetInstanceProfile.InstanceProfileName",
+    "GetInstanceProfile.InstanceProfileArn",
+    "AttachIAMProfileToInstance.AssociationId",
+    "ListInstanceProfilesForRole.InstanceProfileName",
+    "ListInstanceProfilesForRole.InstanceProfileArn"
+  ]
+}
