@@ -1,56 +1,52 @@
 {
-  "schemaVersion": "2.2",
   "description": "Perform VSS Freeze or Thaw operation to enable application consistent snapshots on an EC2 Windows instance. The caller is responsible for initiating EBS create snapshot after Freeze completion.",
+  "schemaVersion": "2.2",
   "parameters": {
     "Action": {
-      "type": "String",
-      "description": "(Required) Freeze operation will flush pending IO to the specified EBS volume and halt IO.  Thaw operation will resume IO to the EBS volume.  Thaw must be called within 10 seconds of Freeze completion.",
       "allowedValues": [
         "Freeze",
         "Thaw"
       ],
-      "default": "Freeze"
-    },
-    "NoWriters": {
-      "type": "String",
-      "description": "(Optional) Select True to exclude application VSS writers from the snapshot process. This option may be useful to resolve conflicts with third party VSS backup solutions.",
-      "allowedValues": [
-        "True",
-        "False"
-      ],
-      "default": "False"
-    },
-    "CopyOnly": {
-      "type": "String",
-      "description": "(Optional) Select True to indicate a COPY ONLY backup operation.  By default a FULL backup operation is performed.  This option will prevent breaking the differential backup chain in SQL Server when performing a backup.",
-      "allowedValues": [
-        "True",
-        "False"
-      ],
-      "default": "False"
-    },
-    "Devices": {
-      "type": "String",
-      "description": "(Required for Freeze) Freeze IO to a comma delimited list of device names. Example: xvdb,xvdc",
-      "default": ""
+      "default": "Freeze",
+      "description": "(Required) Freeze operation will flush pending IO to the specified EBS volume and halt IO.  Thaw operation will resume IO to the EBS volume.  Thaw must be called within 10 seconds of Freeze completion.",
+      "type": "String"
     },
     "Volumes": {
-      "type": "String",
+      "default": "",
       "description": "(Required for Freeze) Freeze IO to a comma delimited list of EBS volumes IDs. Example: vol-1234567812345678,vol-2234567812345678",
-      "default": ""
+      "type": "String",
+      "allowedPattern": "^\\s*([Vv][Oo][Ll]-[0-9a-zA-Z_]+(\\s*,\\s*[Vv][Oo][Ll]-[0-9a-zA-Z_]+)*)*$"
+    },
+    "Devices": {
+      "default": "",
+      "description": "(Required for Freeze) Freeze IO to a comma delimited list of device names. Example: xvdb,xvdc",
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9/,\\s]*$"
+    },
+    "CopyOnly": {
+      "allowedValues": [
+        "True",
+        "False"
+      ],
+      "default": "False",
+      "description": "(Optional) Select True to indicate a COPY ONLY backup operation.  By default a FULL backup operation is performed.  This option will prevent breaking the differential backup chain in SQL Server when performing a backup.",
+      "type": "String"
+    },
+    "NoWriters": {
+      "allowedValues": [
+        "True",
+        "False"
+      ],
+      "default": "False",
+      "description": "(Optional) Select True to exclude application VSS writers from the snapshot process. This option may be useful to resolve conflicts with third party VSS backup solutions.",
+      "type": "String"
     }
   },
   "mainSteps": [
     {
-      "precondition": {
-        "StringEquals": [
-          "platformType",
-          "Windows"
-        ]
-      },
-      "action": "aws:runPowerShellScript",
-      "name": "runPowerShellScript",
       "inputs": {
+        "workingDirectory": "",
+        "timeoutSeconds": "400",
         "runCommand": [
           "# Copyright 2017-2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
           "",
@@ -190,7 +186,17 @@
           "#",
           "function Get-EC2InstanceMetadata {",
           "    param([string]$Path)",
-          "    Invoke-RestMethod -Uri \"http://169.254.169.254/latest/$Path\"",
+          "",
+          "    try {",
+          "        ## Attempt v1 IMDS API",
+          "        return Invoke-RestMethod -Method \"GET\" -URI \"http://169.254.169.254/latest/$Path\"",
+          "    } catch {",
+          "        ## IMDSv1 not supported, will attempt IMDSv2",
+          "        $Token = [string](Invoke-RestMethod -Method \"PUT\" -URI \"http://169.254.169.254/latest/api/token\" `",
+          "                    -Headers @{\"X-aws-ec2-metadata-token-ttl-seconds\"=\"1200\"})",
+          "        $Headers = @{\"X-aws-ec2-metadata-token\"=$Token}",
+          "        return Invoke-RestMethod -Method \"GET\" -URI \"http://169.254.169.254/latest/$Path\" -Headers $Headers",
+          "    }",
           "}",
           "",
           "",
@@ -521,9 +527,9 @@
           "Write-Host \"Starting AWSWindows-ManageVssIo $Action $(Get-Date)\"",
           "",
           "if ($Action -eq \"Freeze\") {",
-          "    $DevicesString = \"{{Devices}}\"",
+          "    $DevicesString = '{{Devices}}'",
           "    $Devices = $DevicesString.Split(\",\").Trim()",
-          "    $VolumesString = \"{{Volumes}}\"",
+          "    $VolumesString = '{{Volumes}}'",
           "    $Volumes = $VolumesString.Split(\",\").Trim()",
           "    Write-Host $Devices",
           "    Write-Host $Volumes",
@@ -539,9 +545,15 @@
           "}",
           "",
           ""
-        ],
-        "workingDirectory": "",
-        "timeoutSeconds": "400"
+        ]
+      },
+      "name": "runPowerShellScript",
+      "action": "aws:runPowerShellScript",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
       }
     }
   ]

@@ -1,58 +1,69 @@
 {
-  "schemaVersion": "2.2",
   "description": "Create an application consistent snapshot of all EBS volumes attached to an instance.",
+  "schemaVersion": "2.2",
   "parameters": {
     "ExcludeBootVolume": {
-      "type": "String",
+      "allowedValues": [
+        "True",
+        "False"
+      ],
+      "default": "False",
       "description": "(Optional) Select True to exclude the boot volume from the snapshot process.",
-      "allowedValues": [
-        "True",
-        "False"
-      ],
-      "default": "False"
-    },
-    "NoWriters": {
-      "type": "String",
-      "description": "(Optional) Select True to exclude application VSS writers from the snapshot process. This option may be useful to resolve conflicts with third party VSS backup solutions.",
-      "allowedValues": [
-        "True",
-        "False"
-      ],
-      "default": "False"
-    },
-    "CopyOnly": {
-      "type": "String",
-      "description": "(Optional) Select True to indicate a COPY ONLY backup operation.  By default a FULL backup operation is performed.  This option will prevent breaking the differential backup chain in SQL Server when performing a backup.",
-      "allowedValues": [
-        "True",
-        "False"
-      ],
-      "default": "False"
+      "type": "String"
     },
     "description": {
-      "type": "String",
       "default": "",
       "description": "(Optional) Specify a description to apply to created EBS snaphots.",
-      "maxChars": 255
+      "maxChars": 255,
+      "type": "String",
+      "allowedPattern": "^(\\n|('[^@\\n]|'$|[^'\\n]).*\\n?)*$"
+    },
+    "AmiName": {
+      "default": "",
+      "description": "(Optional) Specify a name for created AMI.  This option only has affect if the CreateAmi option is selected.",
+      "maxChars": 128,
+      "type": "String",
+      "allowedPattern": "[a-zA-Z0-9()\\[\\] .\\/\\-\"@_]*"
+    },
+    "CreateAmi": {
+      "allowedValues": [
+        "True",
+        "False"
+      ],
+      "default": "False",
+      "description": "(Optional) Select True to create an Amazon Machine Image (AMI) backup.",
+      "type": "String"
+    },
+    "CopyOnly": {
+      "allowedValues": [
+        "True",
+        "False"
+      ],
+      "default": "False",
+      "description": "(Optional) Select True to indicate a COPY ONLY backup operation.  By default a FULL backup operation is performed.  This option will prevent breaking the differential backup chain in SQL Server when performing a backup.",
+      "type": "String"
     },
     "tags": {
-      "type": "String",
       "default": "Key=Name,Value=",
       "description": "(Optional) Specify descriptive key-value pair tags to apply to created EBS snapshots.  Use a semicolon as a separator between tags pairs. Example: Key=Name,Value=VSS Snapshot;Key=BackupId,Value=01234",
+      "type": "String",
       "allowedPattern": "^([Kk]ey=(.*),[Vv]alue=(.*);?)*$"
+    },
+    "NoWriters": {
+      "allowedValues": [
+        "True",
+        "False"
+      ],
+      "default": "False",
+      "description": "(Optional) Select True to exclude application VSS writers from the snapshot process. This option may be useful to resolve conflicts with third party VSS backup solutions.",
+      "type": "String"
     }
   },
   "mainSteps": [
     {
-      "precondition": {
-        "StringEquals": [
-          "platformType",
-          "Windows"
-        ]
-      },
-      "action": "aws:runPowerShellScript",
-      "name": "runPowerShellScript",
       "inputs": {
+        "workingDirectory": "",
+        "timeoutSeconds": "400",
         "runCommand": [
           "# Copyright 2017-2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
           "",
@@ -221,7 +232,17 @@
           "#",
           "function Get-EC2InstanceMetadata {",
           "    param([string]$Path)",
-          "    Invoke-RestMethod -Uri \"http://169.254.169.254/latest/$Path\"",
+          "",
+          "    try {",
+          "        ## Attempt v1 IMDS API",
+          "        return Invoke-RestMethod -Method \"GET\" -URI \"http://169.254.169.254/latest/$Path\"",
+          "    } catch {",
+          "        ## IMDSv1 not supported, will attempt IMDSv2",
+          "        $Token = [string](Invoke-RestMethod -Method \"PUT\" -URI \"http://169.254.169.254/latest/api/token\" `",
+          "                    -Headers @{\"X-aws-ec2-metadata-token-ttl-seconds\"=\"1200\"})",
+          "        $Headers = @{\"X-aws-ec2-metadata-token\"=$Token}",
+          "        return Invoke-RestMethod -Method \"GET\" -URI \"http://169.254.169.254/latest/$Path\" -Headers $Headers",
+          "    }",
           "}",
           "",
           "",
@@ -489,6 +510,7 @@
           "function Tag-Snapshots {",
           "    param(",
           "        [System.Object[]]$SnapshotsData,",
+          "        [System.Object]$AmiData,",
           "        [boolean]$AppConsistent,",
           "        [Parameter(Mandatory = $false)][amazon.EC2.Model.Tag[]]$Tags",
           "    )",
@@ -503,6 +525,10 @@
           "        $AllTags = $Tags + $Tag",
           "        New-EC2Tag -Resources $SnapshotData.SnapshotId -Tags $AllTags",
           "    }",
+          "",
+          "    if ($AmiData) {",
+          "        New-EC2Tag -Resources $AmiData.ImageId -Tags $Tags",
+          "    }",
           "}",
           "",
           "function VssSnapshot() {",
@@ -510,6 +536,8 @@
           "        [boolean]$ExcludeBootVolume,",
           "        [boolean]$CopyOnly,",
           "        [boolean]$NoWriters,",
+          "        [boolean]$CreateAmi,",
+          "        [string]$AmiName,",
           "        [string]$Description,",
           "        [string]$Tags",
           "    )",
@@ -517,6 +545,11 @@
           "    $VolumesToFreeze = @()",
           "    $VolumesToFreezeString = @()",
           "    $DrivesToFreeze = @()",
+          "",
+          "    if ($ExcludeBootVolume -and $CreateAmi) {",
+          "        Write-Host \"The CreateAMI option is not compatible with ExcludeBootVolume.\"",
+          "        return $false",
+          "    }",
           "",
           "    if (!(Test-Path $vssAgentPath)) {",
           "        Write-Host 'ec2-vss-agent.exe is not installed. To install, run command AWS-ConfigureAWSPackage with package AwsVssComponents'",
@@ -530,6 +563,8 @@
           "    if (Test-Path $vssStdOut) {",
           "        del $vssStdOut",
           "    }",
+          "",
+          "    $InstanceId = Get-EC2InstanceMetadata \"meta-data/instance-id\"",
           "",
           "    $volumeList = Get-EbsConnectedVolume",
           "    $foundWriteableVolume = $false",
@@ -550,6 +585,13 @@
           "        return $false",
           "    }",
           "",
+          "    # AMI name is required and must be unique.  If it is not specified create a AMI name from instance ID, OS version,",
+          "    # and time stamp.",
+          "    if ($createAmi -And (-Not $amiName)) {",
+          "        $amiName = \"EC2_VSS_Backup_$($InstanceId)_$((Get-WMIObject win32_operatingsystem).Caption)_$(get-date -format yyyy-MM-ddTHH-mm-ss)\"",
+          "        $amiName = $amiName.replace(' ','')",
+          "    }",
+          "",
           "    if ($foundWriteableVolume) {",
           "        $DrivesToFreezeString = ($DrivesToFreeze | sort -Unique) -join ' '",
           "",
@@ -567,18 +609,63 @@
           "    }",
           "",
           "    $SnapshotData = @()",
-          "    foreach ($v in $VolumesToFreeze) {",
-          "        if ($SnapshotData | Where-Object {$_.EbsVolumeId -eq $v.EbsVolumeId}) {",
-          "            continue",
+          "    $AmiData = @()",
+          "    $amiId = ''",
+          "    if ($createAmi) {",
+          "         try {",
+          "            $amiId = New-EC2Image -InstanceId $InstanceId -Name $amiName -Description $Description -NoReboot $true",
+          "            $timeOut = 10",
+          "            while ($timeOut) {",
+          "                $AmiData = Get-EC2Image -ImageId $amiId",
+          "                if ($AmiData -And ($AmiData.State -Like \"pending\" -Or $AmiData.State -Like \"available\")) {",
+          "                    if ($AmiData.PSobject.Properties.name -match \"BlockDeviceMapping\") {",
+          "                        $SnapshotData = @()",
+          "                        foreach ($b in $AmiData.BlockDeviceMapping) {",
+          "                            if ($b.PSobject.Properties.name -match \"Ebs\" -And",
+          "                                $b.Ebs -And $b.Ebs.PSobject.Properties.name -match \"SnapshotId\" -And",
+          "                                $b.PSobject.Properties.name -match \"DeviceName\" -And",
+          "                                $b.Ebs.SnapshotId) {",
+          "                                $SnapshotData += New-Object PSObject -Property @{",
+          "                                    Device      = $b.DeviceName",
+          "                                    SnapshotId  = $b.Ebs.SnapshotId",
+          "                                }",
+          "                            }",
+          "                        }",
+          "                        if ($SnapshotData.Count -eq $VolumesToFreeze.Count) {",
+          "                            break;",
+          "                        }",
+          "                    }",
+          "                }",
+          "                Start-Sleep -Seconds 1",
+          "                $timeOut--",
+          "            }",
+          "            if ($timeOut -le 0) {",
+          "                Write-Host \"Error waiting for AMI\"",
+          "                return $false",
+          "            } ",
+          "         } catch {",
+          "            Write-Host \"Exception caught creating AMI:\"",
+          "            Write-Host $_",
+          "            return $false",
           "        }",
-          "        $Snapshot = New-EC2Snapshot -VolumeId $v.EbsVolumeId -Description $Description",
-          "        $SnapshotData +=",
-          "        New-Object PSObject -Property @{",
-          "            EbsVolumeId = $v.EbsVolumeId",
-          "            Device      = $v.Device",
-          "            SnapshotId  = $Snapshot.SnapshotId",
+          "    } else {",
+          "        foreach ($v in $VolumesToFreeze) {",
+          "            if ($SnapshotData | Where-Object {$_.EbsVolumeId -eq $v.EbsVolumeId}) {",
+          "                continue",
+          "            }",
+          "            try {",
+          "                $Snapshot = New-EC2Snapshot -VolumeId $v.EbsVolumeId -Description $Description",
+          "            } catch {",
+          "                Write-Host \"Exception caught creating EBS snapshot:\"",
+          "                Write-Host $_",
+          "                return $false",
+          "            }",
+          "            $SnapshotData += New-Object PSObject -Property @{",
+          "                EbsVolumeId = $v.EbsVolumeId",
+          "                Device      = $v.Device",
+          "                SnapshotId  = $Snapshot.SnapshotId",
+          "            }",
           "        }",
-          "        Write-Host \"Created\" $Snapshot.SnapshotId \"from\" $v.EbsVolumeId \" device: \" $v.Device",
           "    }",
           "",
           "    if ($foundWriteableVolume) {",
@@ -588,6 +675,12 @@
           "            Write-Host 'Thaw successful at' $(New-Timespan $startTime $(Get-Date)).TotalMilliseconds 'ms'",
           "        } else {",
           "            Write-Host 'Thaw unsuccesful, snapshots may not be app consistent, see event log for more details' $(New-Timespan $startTime $(Get-Date)).TotalMilliseconds 'ms'",
+          "        }",
+          "        if ($amiId) {",
+          "            Write-Host \"AMI: $amiId\"",
+          "        }",
+          "        foreach ($Snapshot in $SnapshotData) {",
+          "            Write-Host \"Snapshot: $($Snapshot.SnapshotId) DeviceName: $($Snapshot.Device)\"",
           "        }",
           "",
           "        PrintVssAgentOutput $process",
@@ -613,7 +706,7 @@
           "        }",
           "    }",
           "",
-          "    Tag-Snapshots $SnapshotData $AppConsistent $TagArray",
+          "    Tag-Snapshots -SnapshotsData $SnapshotData -AmiData $AmiData -AppConsistent $AppConsistent -Tags $TagArray",
           "    return $AppConsistent",
           "}",
           "",
@@ -624,20 +717,32 @@
           "",
           "[boolean]$NoWriters = [System.Convert]::ToBoolean(\"{{NoWriters}}\")",
           "",
-          "$description = @\"",
+          "[boolean]$CreateAmi = [System.Convert]::ToBoolean(\"{{CreateAmi}}\")",
+          "",
+          "$AmiName = @'",
+          "{{AmiName}}",
+          "'@",
+          "",
+          "$description = @'",
           "{{description}}",
-          "\"@",
+          "'@",
           "",
-          "    $tags = @\"",
+          "$tags = @'",
           "{{tags}}",
-          "\"@",
+          "'@",
           "",
-          "$AppConsistent = VssSnapshot $ExcludeBootVolume $CopyOnly $NoWriters $description $tags",
+          "$AppConsistent = VssSnapshot $ExcludeBootVolume $CopyOnly $NoWriters $CreateAmi $AmiName $description $tags",
           "exit [int](-not $AppConsistent)",
           ""
-        ],
-        "workingDirectory": "",
-        "timeoutSeconds": "400"
+        ]
+      },
+      "name": "runPowerShellScript",
+      "action": "aws:runPowerShellScript",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
       }
     }
   ]
