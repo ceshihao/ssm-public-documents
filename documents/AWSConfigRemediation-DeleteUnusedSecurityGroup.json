@@ -1,0 +1,102 @@
+{
+  "description": "### Document name - AWSConfigRemediation-DeleteUnusedSecurityGroup\n\n## What does this document do?\nThis document deletes a non-default security group that is not utilized by an elastic network interface. A non-default security group is defined as any security group whose name is not `default`. If the security group ID passed to this automation document belongs to a default security group, this document does not perform any changes to the AWS account.\n\n## Input Parameters\n* GroupId: (Required) The unique ID of the security group to be deleted.\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* DeleteSecurityGroup.SecurityGroupApiResponse - The standard HTTP response from the DeleteSecurityGroup API.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "GroupId": {
+      "type": "String",
+      "description": "(Required) The unique ID of the security group to be deleted.",
+      "allowedPattern": "sg-[a-z0-9]+$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$"
+    }
+  },
+  "outputs": [
+    "DeleteSecurityGroup.SecurityGroupApiResponse"
+  ],
+  "mainSteps": [
+    {
+      "name": "DescribeSecurityGroups",
+      "action": "aws:executeAwsApi",
+      "description": "## DescribeSecurityGroups\nDescribes Security Groups using security group ID.\n## Outputs\n* GroupName: The name of the security group.\n",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSecurityGroups",
+        "Filters": [
+          {
+            "Name": "group-id",
+            "Values": [
+              "{{ GroupId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "GroupName",
+          "Selector": "$.SecurityGroups[0].GroupName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckNonDefaultSecurityGroup",
+      "action": "aws:branch",
+      "description": "## CheckNonDefaultSecurityGroup\nVerifies that the security group name does not match `default`. If the group name does not match `default`, go to the next step: DeleteSecurityGroup.\n",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DeleteSecurityGroup",
+            "Not": {
+              "Variable": "{{ DescribeSecurityGroups.GroupName }}",
+              "StringEquals": "default"
+            }
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "DeleteSecurityGroup",
+      "action": "aws:executeAwsApi",
+      "description": "## DeleteSecurityGroup\nDeletes the security group based on the input security group ID.\n## Outputs\n* SecurityGroupApiResponse: The standard HTTP response from the DeleteSecurityGroup API.\n",
+      "outputs": [
+        {
+          "Name": "SecurityGroupApiResponse",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ],
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteSecurityGroup",
+        "GroupId": "{{ GroupId }}"
+      }
+    },
+    {
+      "name": "VerifySecurityGroupDeleted",
+      "action": "aws:executeScript",
+      "description": "## VerifySecurityGroupDeleted\nVerifies that the security group has been deleted.\n## Outputs\n* Output: Success message or failure exception.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "handler",
+        "InputPayload": {
+          "GroupId": "{{GroupId}}"
+        },
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\ndef handler(event, context):\n    ec2_client = boto3.client(\"ec2\")\n    group_id = event[\"GroupId\"]\n\n    try:\n      desc_group = ec2_client.describe_security_groups(GroupIds=[group_id])\n      info = \"ERROR IN VERIFICATION, SECURITY GROUP {} NOT DELETED \".format(group_id)\n      raise Exception(info)\n    except ClientError as ex:\n      if ex.response['Error']['Code'] == 'InvalidGroup.NotFound':\n         return {\n           \"output\": \"Security group deleted successfully.\"\n         }\n      raise Exception(ex)"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

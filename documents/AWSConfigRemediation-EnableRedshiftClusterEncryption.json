@@ -1,0 +1,160 @@
+{
+  "description": "### Document name - AWSConfigRemediation-EnableRedshiftClusterEncryption\n\n## What does this document do?\nThis automation document enables encryption on an Amazon Redshift cluster using the ModifyCluster API. Please note, to encrypt an already encrypted Amazon Redshift cluster using a different KMS key, the cluster's encryption must first be disabled. Also, this document must only be used as a baseline to ensure that your Amazon Redshift clusters are encrypted with the minimum security best practice of using an AWS KMS customer managed CMK. Based on your data policy, clusters should be encrypted with different customer managed CMKs as documented [here](https://docs.aws.amazon.com/kms/latest/developerguide/best-practices.html).                                                                                        \n## Input parameters\n* KMSKeyARN: (Required) The ARN of the AWS Key Management Service (KMS) encryption key that you want to use to encrypt data in the cluster.\n* ClusterIdentifier: (Required) The unique identifier of the cluster to be modified.\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output parameters\n* ModifyRedshiftCluster.Response - Standard HTTP response metadata of the ModifyCluster API.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "ModifyRedshiftCluster.Response"
+  ],
+  "parameters": {
+    "ClusterIdentifier": {
+      "type": "String",
+      "description": "The unique identifier of the cluster to be modified.",
+      "allowedPattern": "^(?!-)(?!.*--)([a-z][a-z0-9-]{0,62})(?<!-)$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "KMSKeyARN": {
+      "type": "String",
+      "description": "The ARN of the AWS Key Management Service (KMS) encryption key that you want to use to encrypt data in the cluster.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:kms:.*:\\d{12}:key/[\\w+=,.@-]+"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "DescribeRedshiftClusters",
+      "action": "aws:executeAwsApi",
+      "description": "## DescribeRedshiftCluster\nObtains the Amazon Redshift cluster details using the [DescribeClusters](https://docs.aws.amazon.com/redshift/latest/APIReference/API_DescribeClusters.html) API.\n## Outputs\n* ClusterEncrypted: Encrypted boolean property from DescribeClusters API response.\n* ClusterKmsKeyId: KmsKeyId from DescribeClusters API response. \n",
+      "inputs": {
+        "Service": "redshift",
+        "Api": "DescribeClusters",
+        "ClusterIdentifier": "{{ ClusterIdentifier }}"
+      },
+      "outputs": [
+        {
+          "Name": "ClusterEncrypted",
+          "Selector": "$.Clusters[0].Encrypted",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ClusterKmsKeyId",
+          "Selector": "$.Clusters[0].KmsKeyId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckClusterEncryption",
+      "description": "## CheckClusterEncryption\nChecks whether the cluster is encrypted with the given KMS key ID using the previous step's output.\n",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ModifyRedshiftCluster",
+            "Variable": "{{DescribeRedshiftClusters.ClusterEncrypted}}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "DisableRedshiftClusterEncryption",
+            "Not": {
+              "Variable": "{{KMSKeyARN}}",
+              "StringEquals": "{{DescribeRedshiftClusters.ClusterKmsKeyId}}"
+            }
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "DisableRedshiftClusterEncryption",
+      "action": "aws:executeAwsApi",
+      "description": "## DisableRedshiftClusterEncryption \nMakes ModifyCluster API call with property \"Encrypted\" as \"false\" to disable encryption.\n",
+      "inputs": {
+        "Service": "redshift",
+        "Api": "ModifyCluster",
+        "Encrypted": false,
+        "ClusterIdentifier": "{{ ClusterIdentifier }}"
+      }
+    },
+    {
+      "name": "WaitUntilEncryptionDisabled",
+      "description": "## WaitUntilEncryptionDisabled\nWaits until \"Encrypted\" property changes to \"False\" or times out.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "Service": "redshift",
+        "Api": "DescribeClusters",
+        "ClusterIdentifier": "{{ ClusterIdentifier }}",
+        "PropertySelector": "$.Clusters[0].Encrypted",
+        "DesiredValues": [
+          "False"
+        ]
+      }
+    },
+    {
+      "name": "ModifyRedshiftCluster",
+      "action": "aws:executeAwsApi",
+      "description": "## ModifyRedshiftCluster \nMakes ModifyCluster API call using the KMS key provided as input and \"Encrypted\" property as \"true\" to enable encryption.\n## Outputs\n* Response: Standard HTTP response metadata of the ModifyCluster API. \n",
+      "inputs": {
+        "Service": "redshift",
+        "Api": "ModifyCluster",
+        "Encrypted": true,
+        "KmsKeyId": "{{KMSKeyARN}}",
+        "ClusterIdentifier": "{{ ClusterIdentifier }}"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.ResponseMetadata",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "WaitUntilEncryptionEnabled",
+      "description": "## WaitUntilEncryptionEnabled\nWaits until \"Encrypted\" property changes to \"True\" or times out.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "Service": "redshift",
+        "Api": "DescribeClusters",
+        "ClusterIdentifier": "{{ ClusterIdentifier }}",
+        "PropertySelector": "$.Clusters[0].Encrypted",
+        "DesiredValues": [
+          "True"
+        ]
+      }
+    },
+    {
+      "name": "AssertClusterEncryption",
+      "description": "## AssertClusterEncryption\nChecks whether \"Encrypted\" property is set to \"True\" or not for the given cluster identifier.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "redshift",
+        "Api": "DescribeClusters",
+        "ClusterIdentifier": "{{ ClusterIdentifier }}",
+        "PropertySelector": "$.Clusters[0].Encrypted",
+        "DesiredValues": [
+          "True"
+        ]
+      }
+    },
+    {
+      "name": "AssertClusterKmsKeyId",
+      "description": "## AssertClusterKmsKeyId\nChecks whether encryption is enabled on the Amazon Redshift cluster using the given AWS KMS key.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "redshift",
+        "Api": "DescribeClusters",
+        "ClusterIdentifier": "{{ ClusterIdentifier }}",
+        "PropertySelector": "$.Clusters[0].KmsKeyId",
+        "DesiredValues": [
+          "{{KMSKeyARN}}"
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}

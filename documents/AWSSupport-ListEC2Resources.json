@@ -1,0 +1,412 @@
+{
+  "description": "*This document will focus on EC2 related resources (Instances, EIP's, EBS Volumes, ASG's) and help you to list the resources from your AWS Account.*  \n\n---\nThis document has four parameters\n- (Optional) AutomationAssumeRole for the IAM role required for executing AWS APIs\n- (Optional) BucketName, if you would like to save a CSV.\n- (Optional) RegionsToQuery for regions from where you would like to list the resources, by default it would query all active regions for listing resources.\n- (Optional) DisplayResourceDeletionDocumentation for surfacing relevant documentation links to delete the resources, by default it would be 'Yes'.\n\n**This document provides sensitive data, please make sure appropriate bucket policy is in place for the bucket specified in the parameter 'BucketName'. If the bucket is public CSV would not be uploaded.**",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "listEC2Instances.EC2_Instances",
+    "listImages.AMIs",
+    "listVolumes.EBS_Volumes",
+    "listSnapshots.Volume_Snapshots",
+    "listEIPs.EIPs",
+    "listENIs.NetworkInterfaces",
+    "listAutoScalingGroups.AutoScalingGroups",
+    "listElasticLoadBalancers.ELBs"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^$|^arn:aws:iam::[0-9]*:role/[/\\w+=,.@-]+$",
+      "default": ""
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Optional) If you would like to save a CSV, please provide a bucket name",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z0-9][a-zA-Z0-9.\\-_]{1,255}$"
+    },
+    "RegionsToQuery": {
+      "type": "String",
+      "default": "All",
+      "description": "(Optional) List resources in regions specified by this parameter. By default the document queries all regions however to override the behaviour it is possible to pass a comma delimited region list such as 'us-east-1,us-west-1'"
+    },
+    "DisplayResourceDeletionDocumentation": {
+      "type": "String",
+      "default": "True",
+      "description": "(Optional) If set to True the automation creates links in the output to documentation related to deleting your resources.",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getActiveRegions",
+      "action": "aws:executeAwsApi",
+      "outputs": [
+        {
+          "Name": "ActiveRegions",
+          "Selector": "$.Regions",
+          "Type": "MapList"
+        }
+      ],
+      "inputs": {
+        "Api": "DescribeRegions",
+        "Service": "ec2"
+      },
+      "description": "#### Get Active Regions for the AWS Account",
+      "nextStep": "validateRegionsToQuery",
+      "onFailure": "Abort",
+      "isCritical": true
+    },
+    {
+      "name": "validateRegionsToQuery",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_A='RegionName'\nfrom botocore.exceptions import ClientError\nimport boto3\nclass RegionValidation:\n\tdef __init__(A,active_regions,regions_to_query):A.all_regions=A.get_all_regions();A.active_regions=active_regions;A.regions_to_query=regions_to_query;A.known_issue=['me-south-1','af-south-1','eu-south-1','ap-east-1']\n\tdef get_all_regions(C):\n\t\ttry:return[A[_A]for A in boto3.client('ec2',region_name='us-east-1').describe_regions(AllRegions=True)['Regions']]\n\t\texcept ClientError as A:print('Something Went Wrong with the API Call!');print(str(A))\n\t\texcept Exception as B:print('get_all_regions: Oops! Something went wrong!');print(B)\ndef script_handler(events,context):\n\tP='not_running_in';O='inactive_regions';N='invalid_regions';M='valid_regions';K='RegionsToQuery';H=events;G='Empty';C=','\n\ttry:\n\t\tA=[];I=[];D=[];E=[A[_A]for A in H['ActiveRegions']]\n\t\tif H[K]==''or H[K].lower()=='all':B=RegionValidation(E,E);A=E;A=list(set(A)-set(B.known_issue));D=list(set(B.all_regions)-set(E));return{M:C.join(A)if len(A)>0 else G,N:G,O:C.join(D)if len(D)>0 else G,P:C.join(B.known_issue)}\n\t\telse:\n\t\t\tJ=H[K].split(C);B=RegionValidation(E,J)\n\t\t\tfor F in J:\n\t\t\t\tif F in B.all_regions:\n\t\t\t\t\tif F in E:A.append(F)\n\t\t\t\t\telse:D.append(F)\n\t\t\t\telse:I.append(F)\n\t\t\tA=list(set(A)-set(B.known_issue));return{M:C.join(A)if len(A)>0 else G,N:C.join(I)if len(I)>0 else G,O:C.join(D)if len(D)>0 else G,P:C.join(B.known_issue)}\n\texcept Exception as L:print('script_handler: Oops! Something went wrong!');print(L)\n",
+        "InputPayload": {
+          "RegionsToQuery": "{{RegionsToQuery}}",
+          "ActiveRegions": "{{getActiveRegions.ActiveRegions}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ValidRegions",
+          "Selector": "$.Payload.valid_regions",
+          "Type": "String"
+        },
+        {
+          "Name": "InvalidRegions",
+          "Selector": "$.Payload.invalid_regions",
+          "Type": "String"
+        },
+        {
+          "Name": "InactiveRegions",
+          "Selector": "$.Payload.inactive_regions",
+          "Type": "String"
+        },
+        {
+          "Name": "Known_Issue_Not_Running_In",
+          "Selector": "$.Payload.not_running_in",
+          "Type": "String"
+        }
+      ],
+      "description": "#### Verify if the regions provided in the RegionToQuery Parameter are valid AWS Regions"
+    },
+    {
+      "name": "assertIfValidRegions",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "uploadCSVToS3",
+            "Variable": "{{validateRegionsToQuery.ValidRegions}}",
+            "StringEquals": "Empty"
+          }
+        ]
+      },
+      "description": "#### If no valid regions, end the document"
+    },
+    {
+      "name": "listEC2Instances",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_G='ec2'\n_F='Message'\n_E='region'\n_D='resource_list'\n_C='Code'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=40,placeholder='...')if len(str(B[D]))>40 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\treturn A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb',_G,'glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _D in C:A.resource_list.extend(C[_D])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_resource(client,region,conn):\n\tN='AvailabilityZone';M='Key';L='-';G='Name';D=region;B=conn;H=['running','pending','stopped','stopping'];E=[]\n\ttry:\n\t\tfor A in client.instances.filter(Filters=[{G:'instance-state-name','Values':H}]):\n\t\t\tF=L\n\t\t\tif A.tags:\n\t\t\t\tfor C in A.tags:F=C['Value']if M in C and C[M].lower()=='name'else L\n\t\t\tI={'InstanceId':A.id,G:F,'State':A.state[G],'Region':A.placement[N][:-1],'Console':'https://console.aws.amazon.com/ec2/v2/home?region={}#Instances:search={}'.format(A.placement[N][:-1],A.id)};E.append(I)\n\t\tB.send({_D:E})\n\texcept ClientError as J:B.send({_B:{_A:J.response['Error'],_E:D}})\n\texcept Exception as K:B.send({_B:{_A:{_C:'InternalFailure',_F:K},_E:D}})\n\tB.close()\ndef script_handler(events,context):\n\tL='True';K='Documentation';J='{:<15}';I='{:<24}';B=events;D='Terminate your instance - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/terminating-instances.html';C=Parallelize(get_resource,_G);C.parallelize(B['Regions'].split(','));G=Prettify([I,I,J,J,'{:<15}\\n']);H=G.json_to_table_via_print(C.resource_list);E='';F=C.failed\n\tif len(F)>0:\n\t\tfor A in F:\n\t\t\tif A[_A][_C]=='UnauthorizedOperation'or A[_A][_C]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_C],A[_A][_F]))\n\t\t\telse:E+='{} - {}:{}\\n'.format(A[_E],A[_A][_C],A[_A][_F])\n\treturn{_D:'{}\\n{}'.format(H,D if B[K]==L else''),_B:E,'how_to':D if B[K]==L else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "EC2_Instances",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List EC2 Instances",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "listImages",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_G='ec2'\n_F='Message'\n_E='region'\n_D='resource_list'\n_C='Code'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=40,placeholder='...')if len(str(B[D]))>40 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\tprint(A.formattedVersion);return A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb',_G,'glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _D in C:A.resource_list.extend(C[_D])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_resource(client,region,conn):\n\t'Describes all of the images available to you.';C=conn;B=region;D=[]\n\ttry:\n\t\tfor A in client.images.filter(Owners=['self']):E={'Name':A.name,'ImageId':A.id,'ImageLocation':A.image_location,'State':A.state,'Public':A.public,'Region':B,'Console':'https://console.aws.amazon.com/ec2/home?region={}#Images:search={}'.format(B,A.id)};D.append(E)\n\t\tC.send({_D:D})\n\texcept ClientError as F:C.send({_B:{_A:F.response['Error'],_E:B}})\n\texcept Exception as G:C.send({_B:{_A:{_C:'InternalFailure',_F:G},_E:B}})\n\tC.close()\ndef script_handler(events,context):\n\tI='True';H='Documentation';G='{:<15}';B=events;D='Deregistering your Linux AMI - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/deregister-ami.html';C=Parallelize(get_resource,_G);C.parallelize(B['Regions'].split(','));E='-';F=C.failed\n\tif len(F)>0:\n\t\tfor A in F:\n\t\t\tif A[_A][_C]=='UnauthorizedOperation'or A[_A][_C]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_C],A[_A][_F]))\n\t\t\telse:E+='{} - {}:{}\\n'.format(A[_E],A[_A][_C],A[_A][_F])\n\treturn{_D:'{}\\n{}'.format(Prettify(['{:<45}','{:<24}','{:<30}',G,G,G,'{:<15}\\n']).json_to_table_via_print(C.resource_list),D if B[H]==I else''),_B:E,'how_to':D if B[H]==I else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "AMIs",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List AMIs",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "listVolumes",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_G='ec2'\n_F='Message'\n_E='region'\n_D='resource_list'\n_C='Code'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=40,placeholder='...')if len(str(B[D]))>40 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\treturn A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb',_G,'glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _D in C:A.resource_list.extend(C[_D])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_resource(client,region,conn):\n\t'Describes all Volumes';C=region;B=conn;D=[];E=['available','in-use','creating',_A]\n\ttry:\n\t\tfor A in client.volumes.filter(Filters=[{'Name':'status','Values':E}]):F={'VolumeId':A.id,'State':A.state,'Encrypted':A.encrypted,'AvailabilityZone':A.availability_zone,'Region':A.availability_zone[:-1],'Console':'https://console.aws.amazon.com/ec2/home?region={}#Volumes:search={}'.format(A.availability_zone[:-1],A.id)};D.append(F)\n\t\tB.send({_D:D})\n\texcept ClientError as G:B.send({_B:{_A:G.response['Error'],_E:C}})\n\texcept Exception as H:B.send({_B:{_A:{_C:'InternalFailure',_F:H},_E:C}})\n\tB.close()\ndef script_handler(events,context):\n\tJ='True';I='Documentation';H='{:<24}';G='{:<15}';B=events;D='Deleting an Amazon EBS volume - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-deleting-volume.html';C=Parallelize(get_resource,_G);C.parallelize(B['Regions'].split(','));E='-';F=C.failed\n\tif len(F)>0:\n\t\tfor A in F:\n\t\t\tif A[_A][_C]=='UnauthorizedOperation'or A[_A][_C]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_C],A[_A][_F]))\n\t\t\telse:E+='{} - {}:{}\\n'.format(A[_E],A[_A][_C],A[_A][_F])\n\treturn{_D:'{}\\n{}'.format(Prettify([H,G,G,H,G,'{:<15}\\n']).json_to_table_via_print(C.resource_list),D if B[I]==J else''),_B:E,'how_to':D if B[I]==J else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "EBS_Volumes",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List EBS Volumes",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "listSnapshots",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_G='ec2'\n_F='Message'\n_E='region'\n_D='resource_list'\n_C='Code'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=40,placeholder='...')if len(str(B[D]))>40 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\treturn A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb',_G,'glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _D in C:A.resource_list.extend(C[_D])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_resource(client,region,conn):\n\t'Describes all of the EBS snapshots available to you.';B=conn;A=region;D=[]\n\ttry:\n\t\tfor C in client.snapshots.filter(OwnerIds=['self']):E={'SnapshotId':C.id,'VolumeId':C.volume_id,'Encrypted':C.encrypted,'Region':A,'Console':'https://console.aws.amazon.com/ec2/home?region={}#Snapshots:search={}'.format(A,C.id)};D.append(E)\n\t\tB.send({_D:D})\n\texcept ClientError as F:B.send({_B:{_A:F.response['Error'],_E:A}})\n\texcept Exception as G:B.send({_B:{_A:{_C:'InternalFailure',_F:G},_E:A}})\n\tB.close()\ndef script_handler(events,context):\n\tJ='True';I='Documentation';H='{:<15}';G='{:<24}';B=events;D='Deleting an Amazon EBS snapshot - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-deleting-snapshot.html';C=Parallelize(get_resource,_G);C.parallelize(B['Regions'].split(','));E='-';F=C.failed\n\tif len(F)>0:\n\t\tfor A in F:\n\t\t\tif A[_A][_C]=='UnauthorizedOperation'or A[_A][_C]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_C],A[_A][_F]))\n\t\t\telse:E+='{} - {}:{}\\n'.format(A[_E],A[_A][_C],A[_A][_F])\n\treturn{_D:'{}\\n{}'.format(Prettify([G,G,H,H,'{:<15}\\n']).json_to_table_via_print(C.resource_list),D if B[I]==J else''),_B:E,'how_to':D if B[I]==J else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Volume_Snapshots",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List Volume Snapshots",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "listEIPs",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_H='ec2'\n_G='Message'\n_F='region'\n_E='-'\n_D='resource_list'\n_C='Code'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=40,placeholder='...')if len(str(B[D]))>40 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\treturn A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb',_H,'glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _D in C:A.resource_list.extend(C[_D])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_resource(client,region,conn):\n\t'Describes all of the EIPs.';C=conn;B=region;D=[]\n\ttry:\n\t\tfor A in client.vpc_addresses.all():E={'PublicIp':A.public_ip,'PrivateIpAddress':A.private_ip_address if A.private_ip_address else _E,'NetworkInterfaceId':A.network_interface_id if A.network_interface_id else _E,'NetworkInterfaceOwnerId':A.network_interface_owner_id if A.network_interface_owner_id else _E,'Region':B,'Console':'https://console.aws.amazon.com/ec2/home?region={}#Addresses:search={}'.format(B,A.public_ip)};D.append(E)\n\t\tC.send({_D:D})\n\texcept ClientError as F:C.send({_B:{_A:F.response['Error'],_F:B}})\n\texcept Exception as G:C.send({_B:{_A:{_C:'InternalFailure',_G:G},_F:B}})\n\tC.close()\ndef script_handler(events,context):\n\tI='True';H='Documentation';D='{:<24}';B=events;E='Releasing an Elastic IP address - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html#using-instance-addressing-eips-releasing';C=Parallelize(get_resource,_H);C.parallelize(B['Regions'].split(','));F=_E;G=C.failed\n\tif len(G)>0:\n\t\tfor A in G:\n\t\t\tif A[_A][_C]=='UnauthorizedOperation'or A[_A][_C]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_C],A[_A][_G]))\n\t\t\telse:F+='{} - {}:{}\\n'.format(A[_F],A[_A][_C],A[_A][_G])\n\treturn{_D:'{}\\n{}'.format(Prettify([D,D,D,D,'{:<15}','{:<15}\\n']).json_to_table_via_print(C.resource_list),E if B[H]==I else''),_B:F,'how_to':E if B[H]==I else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "EIPs",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List Elastic IPs",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "listENIs",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_G='ec2'\n_F='Message'\n_E='region'\n_D='resource_list'\n_C='Code'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=50,placeholder='...')if len(str(B[D]))>50 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\treturn A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb',_G,'glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _D in C:A.resource_list.extend(C[_D])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_resource(client,region,conn):\n\t'Describes all ENIs';C=region;B=conn;D=[]\n\ttry:\n\t\tfor A in client.network_interfaces.all():E={'NetworkInterfaceId':A.id,'Description':A.description if A.description else'-','OwnerId':A.owner_id,'Status':A.status,'Region':A.availability_zone[:-1],'Console':'https://console.aws.amazon.com/ec2/home?region={}#NIC:search={}'.format(A.availability_zone[:-1],A.id)};D.append(E)\n\t\tB.send({_D:D})\n\texcept ClientError as F:B.send({_B:{_A:F.response['Error'],_E:C}})\n\texcept Exception as G:B.send({_B:{_A:{_C:'InternalFailure',_F:G},_E:C}})\n\tB.close()\ndef script_handler(events,context):\n\tI='True';H='Documentation';G='{:<15}';B=events;D='Knowledge Center - https://aws.amazon.com/premiumsupport/knowledge-center/vpc-detach-or-delete-eni/ \\nDeleting a network interface - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html#delete_eni';C=Parallelize(get_resource,_G);C.parallelize(B['Regions'].split(','));E='-';F=C.failed\n\tif len(F)>0:\n\t\tfor A in F:\n\t\t\tif A[_A][_C]=='UnauthorizedOperation'or A[_A][_C]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_C],A[_A][_F]))\n\t\t\telse:E+='{} - {}:{}\\n'.format(A[_E],A[_A][_C],A[_A][_F])\n\treturn{_D:'{}\\n{}'.format(Prettify(['{:<24}','{:<50}',G,'{:<10}',G,'{:<15}\\n']).json_to_table_via_print(C.resource_list),D if B[H]==I else''),_B:E,'how_to':D if B[H]==I else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "NetworkInterfaces",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List Network Interfaces",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "listAutoScalingGroups",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_F='Message'\n_E='region'\n_D='resource_list'\n_C='Code'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=40,placeholder='...')if len(str(B[D]))>40 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\treturn A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb','ec2','glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _D in C:A.resource_list.extend(C[_D])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_resource(client,region,conn):\n\t'Describes all Auto Scaling Groups';P='LaunchConfigurationName';O='AutoScalingGroupName';N='NextToken';M='AutoScalingGroups';I='LaunchTemplate';F=client;D=conn;C=region;G='';E=[];H=[]\n\ttry:\n\t\tB=F.describe_auto_scaling_groups(MaxRecords=100)\n\t\twhile True:\n\t\t\tif len(B[M])>0:E.extend(B[M])\n\t\t\tif N in B:G=B[N]\n\t\t\telse:break\n\t\t\tB=F.describe_auto_scaling_groups(MaxRecords=100,NextToken=G)\n\t\tif E:\n\t\t\tfor A in E:J={'Name':A[O],'LaunchConfiguration':A[P]if P in A else'-',I:A[I]['LaunchTemplateName']if I in A else'-','Associated Instances':len([B['InstanceId']for B in A['Instances']]),'Region':C,'Console':'https://console.aws.amazon.com/ec2autoscaling/home?region={}#/details/{}?view=details'.format(C,A[O])};H.append(J)\n\t\tD.send({_D:H})\n\texcept ClientError as K:D.send({_B:{_A:K.response['Error'],_E:C}})\n\texcept Exception as L:D.send({_B:{_A:{_C:'InternalFailure',_F:L},_E:C}})\n\tD.close()\ndef script_handler(events,context):\n\tI='True';H='Documentation';G='{:<48}';B=events;D='Deleting Your Auto Scaling Infrastructure - https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-process-shutdown.html';C=Parallelize(get_resource,'autoscaling');C.parallelize(B['Regions'].split(','));E='-';F=C.failed\n\tif len(F)>0:\n\t\tfor A in F:\n\t\t\tif A[_A][_C]=='UnauthorizedOperation'or A[_A][_C]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_C],A[_A][_F]))\n\t\t\telse:E+='{} - {}:{}\\n'.format(A[_E],A[_A][_C],A[_A][_F])\n\treturn{_D:'{}\\n{}'.format(Prettify([G,G,G,'{:<24}','{:<15}','{:<15}\\n']).json_to_table_via_print(C.resource_list),D if B[H]==I else''),_B:E,'how_to':D if B[H]==I else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "AutoScalingGroups",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List Auto Scaling Groups",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "listElasticLoadBalancers",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_M='InternalFailure'\n_L='Error'\n_K='https://console.aws.amazon.com/ec2/v2/home?region={}#LoadBalancers:search={}'\n_J='Console'\n_I='Region'\n_H='Message'\n_G='NextToken'\n_F='region'\n_E='resource_list'\n_D='Code'\n_C='LoadBalancerName'\n_B='failed'\n_A='error'\nfrom botocore.exceptions import ClientError\nfrom multiprocessing import Process,Pipe\nfrom botocore.config import Config\nimport textwrap,boto3\nclass Prettify:\n\t' Prettify the json data for SSM Console '\n\tdef __init__(A,tableFormat):A.tableFormat=tableFormat;A.formattedVersion=''\n\tdef json_to_table_via_print(A,listOfResources):\n\t\tC=listOfResources\n\t\ttry:\n\t\t\tif len(C)>0:\n\t\t\t\tE=list(C[0].keys());A.formattedVersion=A.formattedVersion.join([A.tableFormat[B].format(E[B])for B in range(len(E))])\n\t\t\t\tfor F in range(len(C)):\n\t\t\t\t\tG='';B=list(C[F].values())\n\t\t\t\t\tfor D in range(len(B)-1):B[D]=textwrap.shorten(B[D],width=40,placeholder='...')if len(str(B[D]))>40 else B[D]\n\t\t\t\t\tA.formattedVersion+=G.join([A.tableFormat[C].format(B[C])for C in range(len(B))])\n\t\t\telse:A.formattedVersion='No Resources Found'\n\t\t\treturn A.formattedVersion\n\t\texcept Exception as H:print(H)\nclass Parallelize:\n\t' Parallize the API calling mechanism '\n\tdef __init__(A,describeFunction,service):A.describeFunction=describeFunction;A.service=service;A.resource_list=[];A.processes=[];A.parent_connections=[];A.failed=[]\n\tdef set_config(B,region):A=Config(retries={'max_attempts':10,'mode':'standard'},region_name=region);return A\n\tdef create_client(B,service,region):\n\t\tC=region;A=service;D=['cloudformation','cloudwatch','dynamodb','ec2','glacier','iam','opsworks','s3sns','sqs']\n\t\tif A in D:return boto3.resource(A,config=B.set_config(C))\n\t\telse:return boto3.client(A,config=B.set_config(C))\n\tdef parallelize(A,regions):\n\t\tfor E in regions:D,F=Pipe();A.parent_connections.append(D);G=A.create_client(A.service,E);B=Process(target=A.describeFunction,args=(G,E,F));A.processes.append(B)\n\t\tfor B in A.processes:B.start()\n\t\tfor B in A.processes:B.join()\n\t\tfor D in A.parent_connections:\n\t\t\tC=D.recv()\n\t\t\tif _E in C:A.resource_list.extend(C[_E])\n\t\t\tif _B in C:A.failed.append(C[_B])\ndef get_load_balancers_elb(client,region,conn):\n\t'Describes all Load Balancers';L='LoadBalancerDescriptions';E=client;C=conn;B=region;F='';D=[];G=[]\n\ttry:\n\t\tA=E.describe_load_balancers(PageSize=100)\n\t\twhile True:\n\t\t\tif len(A[L])>0:D.extend(A[L])\n\t\t\tif _G in A:F=A[_G]\n\t\t\telse:break\n\t\t\tA=E.describe_load_balancers(PageSize=100,Marker=F)\n\t\tif D:\n\t\t\tfor H in D:I={_C:H[_C],_I:B,_J:_K.format(B,H[_C])};G.append(I)\n\t\tC.send({_E:G})\n\texcept ClientError as J:C.send({_B:{_A:J.response[_L],_F:B}})\n\texcept Exception as K:C.send({_B:{_A:{_D:_M,_H:K},_F:B}})\n\tC.close()\ndef get_load_balancers_elbv2(client,region,conn):\n\t'Describes all Load Balancers';L='LoadBalancers';E=client;C=conn;B=region;F='';D=[];G=[]\n\ttry:\n\t\tA=E.describe_load_balancers(PageSize=100)\n\t\twhile True:\n\t\t\tif len(A[L])>0:D.extend(A[L])\n\t\t\tif _G in A:F=A[_G]\n\t\t\telse:break\n\t\t\tA=E.describe_load_balancers(PageSize=100,Marker=F)\n\t\tif D:\n\t\t\tfor H in D:I={_C:H[_C],_I:B,_J:_K.format(B,H[_C])};G.append(I)\n\t\tC.send({_E:G})\n\texcept ClientError as J:C.send({_B:{_A:J.response[_L],_F:B}})\n\texcept Exception as K:C.send({_B:{_A:{_D:_M,_H:K},_F:B}})\n\tC.close()\ndef script_handler(events,context):\n\tL='True';K='Documentation';J=',';I='Regions';B=events;F='Delete a Classic Load Balancer - https://docs.aws.amazon.com/elasticloadbalancing/latest/classic/elb-getting-started.html#delete-load-balancer                 \\nDelete an Application Load Balancer - https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-delete.html                 \\nDelete a Network Load Balancer - https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-delete.html';C=Parallelize(get_load_balancers_elb,'elb');D=Parallelize(get_load_balancers_elbv2,'elbv2');C.parallelize(B[I].split(J));D.parallelize(B[I].split(J));G=C.resource_list;G.extend(D.resource_list);E=C.failed;E.extend(D.failed);H='-'\n\tif len(E)>0:\n\t\tfor A in E:\n\t\t\tif A[_A][_D]=='UnauthorizedOperation'or A[_A][_D]=='AccessDenied':raise Exception('{} - {}'.format(A[_A][_D],A[_A][_H]))\n\t\t\telse:H+='{} - {}:{}\\n'.format(A[_F],A[_A][_D],A[_A][_H])\n\treturn{_E:'{}\\n{}'.format(Prettify(['{:<48}','{:<15}','{:<15}\\n']).json_to_table_via_print(G),F if B[K]==L else''),_B:H,'how_to':F if B[K]==L else\"Parameter 'DisplayResourceDeletionDocumentation' was set as 'False'\"}\n",
+        "InputPayload": {
+          "Regions": "{{validateRegionsToQuery.ValidRegions}}",
+          "Documentation": "{{DisplayResourceDeletionDocumentation}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ELBs",
+          "Selector": "$.Payload.resource_list",
+          "Type": "String"
+        },
+        {
+          "Name": "Failures",
+          "Selector": "$.Payload.failed",
+          "Type": "String"
+        },
+        {
+          "Name": "How to terminate resource",
+          "Selector": "$.Payload.how_to",
+          "Type": "String"
+        }
+      ],
+      "description": "#### List Elastic Load Balancers",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "uploadCSVToS3",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "_G='Code'\n_F='Error'\n_E='No Resources'\n_D=False\n_C='s3'\n_B=True\n_A='Bucket'\nimport boto3,csv,time\nfrom botocore.exceptions import ClientError\ndef create_csv_and_upload_to_s3(resources,bucket,automation_id):\n\tK='/tmp/{}';E=automation_id;B=resources\n\ttry:\n\t\tC='list_ec2_resources_{}_{}.csv'.format(E,time.strftime('%Y%m%d-%H%M%S'));F=open(K.format(C),'w');A=csv.writer(F);A.writerow(['Automation:{}'.format(E)])\n\t\tfor D in B:\n\t\t\tA.writerow([D])\n\t\t\tif B[D]==_E:A.writerow(['No Resources Found'])\n\t\t\telse:\n\t\t\t\tfor G in range(len(B[D])):A.writerow(B[D][G])\n\t\t\tA.writerow('')\n\t\tF.close();H=boto3.resource(_C);H.meta.client.upload_file(K.format(C),bucket,C);return C\n\texcept ClientError as I:print('Something Went Wrong with the API Call!');print(str(I))\n\texcept Exception as J:print('create_csv_and_upload_to_s3: Oops! Something went wrong!');print(J)\ndef create_presigned_url(bucket_name,object_name,expiration=3600):\n\t'Generate a presigned URL to share an S3 object'\n\ttry:A=boto3.client(_C);B=A.generate_presigned_url('get_object',Params={_A:bucket_name,'Key':object_name},ExpiresIn=expiration)\n\texcept ClientError as C:print(C)\n\texcept Exception as D:print(D)\n\treturn B\ndef is_bucket_exists(bucket_name):\n\ttry:C=boto3.resource(_C);C.meta.client.head_bucket(Bucket=bucket_name);return _B\n\texcept ClientError as A:\n\t\tB=int(A.response[_F][_G])\n\t\tif B==403:return _B\n\t\telif B==404:return _D\n\texcept Exception as A:print('is_bucket_exists: Something went wrong!');print(str(A))\n\treturn _D\ndef get_bucket_policy_status(bucket_name):\n\ttry:B=boto3.client(_C);return B.get_bucket_policy_status(Bucket=bucket_name)['PolicyStatus']['IsPublic']\n\texcept ClientError as A:\n\t\tprint(str(A))\n\t\tif A.response[_F][_G]=='NoSuchBucketPolicy':return _D\n\t\telse:return _B\n\texcept Exception as C:print(str(C));return _B\ndef is_bucket_public(bucket_name):\n\tL='URI';K='Grantee'\n\ttry:\n\t\tB='http://acs.amazonaws.com/groups/global/AllUsers';C=['READ','WRITE'];D=boto3.client(_C);E=D.get_bucket_acl(Bucket=bucket_name)\n\t\tfor A in E['Grants']:\n\t\t\tfor (F,G) in A.items():\n\t\t\t\tif F=='Permission'and any((A in G for A in C)):\n\t\t\t\t\tfor (H,M) in A[K].items():\n\t\t\t\t\t\tif L in H and A[K][L]==B:return _B\n\t\treturn _D\n\texcept ClientError as I:print(str(I));return _B\n\texcept Exception as J:print('is_bucket_public: Something went wrong!');print(str(J));return _B\ndef script_handler(events,context):\n\tH='message';A=events\n\tif A[_A]=='':return{H:'CSV Not Requested'}\n\telse:\n\t\tif not is_bucket_exists(A[_A]):raise Exception('Bucket {} does not exist'.format(A[_A]))\n\t\tif is_bucket_public(A[_A])or get_bucket_policy_status(A[_A]):raise Exception('Upload failed for {}. Please use a Private Bucket with appropriate Role & Bucket Policy which allows GetBucketAcl & PutObject.'.format(A[_A]))\n\t\telse:\n\t\t\tE=A[_A];D=['Instances','AMIs','EBS Volumes','Snapshots','Elastic IPs','Elastic Network Interfaces','Auto Scaling Groups','Elastic Load balancers'];C={}\n\t\t\tfor B in range(len(D)):C[D[B]]=A[D[B]].split('\\n')if A[D[B]]!=''else _E\n\t\t\tfor B in C:\n\t\t\t\tif C[B]!=_E and len(C[B])>0:\n\t\t\t\t\tfor F in range(len(C[B])):C[B][F]=C[B][F].split()\n\t\t\tG=create_csv_and_upload_to_s3(C,E,A['Automation ID']);return{'download_from_here':create_presigned_url(E,G),H:'{} successfully uploaded to {} bucket'.format(G,E)}\n",
+        "InputPayload": {
+          "Bucket": "{{BucketName}}",
+          "Automation ID": "{{automation:EXECUTION_ID}}",
+          "Instances": "{{listEC2Instances.EC2_Instances}}",
+          "AMIs": "{{listImages.AMIs}}",
+          "EBS Volumes": "{{listVolumes.EBS_Volumes}}",
+          "Snapshots": "{{listSnapshots.Volume_Snapshots}}",
+          "Elastic IPs": "{{listEIPs.EIPs}}",
+          "Elastic Network Interfaces": "{{listENIs.NetworkInterfaces}}",
+          "Auto Scaling Groups": "{{listAutoScalingGroups.AutoScalingGroups}}",
+          "Elastic Load balancers": "{{listElasticLoadBalancers.ELBs}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Download From Here",
+          "Selector": "$.Payload.download_from_here",
+          "Type": "String"
+        },
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "description": "#### Upload a CSV with resource details to S3"
+    }
+  ]
+}

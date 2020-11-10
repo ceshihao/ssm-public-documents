@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-DeleteDefaultVPCRoutes\n\n## What does this document do?\nThis Document deletes the default (\"0.0.0.0/0\", \"::/0\") routes in an Amazon EC2 VPC Route table using the [DeleteRoute](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeleteRoute.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* RouteTableID: (Required) Route Table ID for which default routes need to be deleted.\n\n## Output Parameters\n* DeleteRouteAndVerify.Output: Success message or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "RouteTableID": {
+      "type": "String",
+      "description": "(Required) The ID of the route table.",
+      "allowedPattern": "^rtb-[a-z0-9]{17}$"
+    }
+  },
+  "outputs": [
+    "DeleteRouteAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "DeleteRouteAndVerify",
+      "action": "aws:executeScript",
+      "description": "## DeleteRouteAndVerify\nDeletes the default IPv4 and IPv6 routes and verifies that the routes are deleted.\n## Outputs\n* Output: Success message or failure exception.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "handler",
+        "InputPayload": {
+          "RouteTableID": "{{ RouteTableID }}"
+        },
+        "Script": "import boto3\n\nINTERNET_CIDR_BLOCK = [\"0.0.0.0/0\", \"::/0\"]\n\n\ndef get_routes(ec2_client, route_table_id):\n    desc_route_table = ec2_client.describe_route_tables(RouteTableIds=[route_table_id])\n    route_tables = desc_route_table[\"RouteTables\"]\n    for route_table in route_tables:\n        return route_table[\"Routes\"]\n\n\ndef verify_default_route_exist(ec2_client, route_table_id):\n    routes = get_routes(ec2_client, route_table_id)\n    return any(route in INTERNET_CIDR_BLOCK for route in routes)\n\n\ndef delete_default_routes(ec2_client, route_table_id):\n    routes = get_routes(ec2_client, route_table_id)\n    response = {\n        \"IPv6Response\": [],\n        \"IPv4Response\": []\n    }\n    for route in routes:\n        dest_cidr_block = (\n            route.get(\"DestinationCidrBlock\")\n            or route.get(\"DestinationIpv6CidrBlock\")\n            or route.get(\"DestinationIpv4CidrBlock\")\n        )\n        if dest_cidr_block in INTERNET_CIDR_BLOCK:\n            if dest_cidr_block == \"::/0\":\n                ipv6_delete_response = ec2_client.delete_route(\n                    DestinationIpv6CidrBlock=dest_cidr_block,\n                    RouteTableId=route_table_id,\n                )\n                response[\"IPv6Response\"].append(ipv6_delete_response)\n            else:\n                ipv4_delete_response = ec2_client.delete_route(\n                    DestinationCidrBlock=dest_cidr_block, RouteTableId=route_table_id\n                )\n                response[\"IPv4Response\"].append(ipv4_delete_response)\n    return response\n\n\ndef handler(event, context):\n    ec2_client = boto3.client(\"ec2\")\n    route_table_id = event[\"RouteTableID\"]\n    response = delete_default_routes(ec2_client, route_table_id)\n\n    default_route_exist = verify_default_route_exist(\n        ec2_client, route_table_id\n    )\n    if not response[\"IPv6Response\"] or not response[\"IPv4Response\"]:\n        return {\n            \"output\": {\n                \"message\": \"No Default routes to delete.\"\n            }\n        }\n    if not default_route_exist:\n        return {\n            \"output\": {\n                \"message\": \"Default route successfully deleted.\",\n                \"HTTPResponse\": response\n            }\n        }\n    raise Exception(\"VERIFICATION FAILED. DEFAULT ROUTE NOT DELETED.\")"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
