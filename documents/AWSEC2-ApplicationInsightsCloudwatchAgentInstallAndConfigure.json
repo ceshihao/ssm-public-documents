@@ -6,6 +6,45 @@
       "description": "(Required) The value is the ssm parameter store name for ssm config source.",
       "type": "String",
       "allowedPattern": "[^\"]*"
+    },
+    "prometheusEnabled": {
+      "description": "(Optional) Select True to exclude the boot volume from the snapshot process.",
+      "type": "String",
+      "allowedValues": [
+        "True",
+        "False"
+      ],
+      "default": "False"
+    },
+    "application": {
+      "description": "(Optional) Application Insights application resource group name; required if prometheusEnabled is True",
+      "type": "String",
+      "default": ""
+    },
+    "componentName": {
+      "description": "(Optional) Application Insights application component ARN or name; required if prometheusEnabled is True",
+      "type": "String",
+      "default": ""
+    },
+    "prometheusGlobalConfig": {
+      "description": "(Optional) Prometheus global config in YAML; required if prometheusEnabled is True",
+      "type": "String",
+      "default": ""
+    },
+    "prometheusScrapeConfig": {
+      "description": "(Optional) Prometheus scrape config in YAML; required if prometheusEnabled is True",
+      "type": "String",
+      "default": ""
+    },
+    "prometheusSDConfig": {
+      "description": "(Optional) Prometheus SD config in YAML; required if prometheusEnabled is True",
+      "type": "String",
+      "default": ""
+    },
+    "prometheusJobPortMap": {
+      "description": "(Optional) Prometheus job name: port number map; required if prometheusEnabled is True. e.g. \"jmx-exporter:9404;sap-exporter:8001\"",
+      "type": "String",
+      "default": ""
     }
   },
   "mainSteps": [
@@ -14,7 +53,84 @@
       "name": "configurePackage",
       "inputs": {
         "name": "AmazonCloudWatchAgent",
-        "action": "Install"
+        "action": "Install",
+        "version": "latest"
+      }
+    },
+    {
+      "name": "setPrometheusConfigWindows",
+      "action": "aws:runPowerShellScript",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "[boolean]$prometheusEnabled = [System.Convert]::ToBoolean(\"{{prometheusEnabled}}\")",
+          "if (!$prometheusEnabled) {",
+          "  Write-Host \"Skip Prometheus configuration setup step.\"",
+          "  Exit 0",
+          "}",
+          "$jobports = '{{prometheusJobPortMap}}'.Split(';')",
+          "$pconfig = '{{prometheusGlobalConfig}}'",
+          "$instanceid = (New-Object System.Net.WebClient).DownloadString(\"http://169.254.169.254/latest/meta-data/instance-id\")",
+          "foreach ($jobport in $jobports) {",
+          "  $job, $port = $jobport.split(':')[0,1]",
+          "  $sdconfig = '{{prometheusSDConfig}}'",
+          "  $sdconfig = $sdconfig.replace('[port]', $port)",
+          "  $sdconfig = $sdconfig.replace('[application]', '{{application}}')",
+          "  $sdconfig = $sdconfig.replace('[componentname]', '{{componentName}}')",
+          "  $sdconfig = $sdconfig.replace('[instanceid]', $instanceid)",
+          "  echo $sdconfig > C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\applicationinsights_prometheus_sd_$job.yaml",
+          "  $scrapeconfig = '{{prometheusScrapeConfig}}'",
+          "  $scrapeconfig = $scrapeconfig.replace('[job]', $job)",
+          "  $scrapeconfigpath = '\"C:\\\\ProgramData\\\\Amazon\\\\AmazonCloudWatchAgent\\\\applicationinsights_prometheus_sd_' + $job + '.yaml\"'",
+          "  $scrapeconfig = $scrapeconfig.replace('[prometheussdconfigpath]', $scrapeconfigpath)",
+          "  $pconfig = $pconfig, $scrapeconfig -join \"\n\"",
+          "}",
+          "echo $pconfig > C:\\ProgramData\\Amazon\\AmazonCloudWatchAgent\\applicationinsights_prometheus.yaml"
+        ]
+      }
+    },
+    {
+      "name": "setPrometheusConfigLinux",
+      "action": "aws:runShellScript",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash",
+          "if [ \"{{prometheusEnabled}}\" != \"True\" ]",
+          "then",
+          "  echo \"Skip Prometheus configuration setup step.\"",
+          "  exit 0",
+          "fi",
+          "pconfig=\"{{prometheusGlobalConfig}}\"",
+          "instanceid=\"`wget -q -O - http://169.254.169.254/latest/meta-data/instance-id`\"",
+          "IFS=';' read -r -a jobports <<< '{{prometheusJobPortMap}}'",
+          "for jobport in \"${jobports[@]}\"",
+          "do",
+          "  IFS=':' read job port <<< $jobport",
+          "  sdconfig=\"{{prometheusSDConfig}}\"",
+          "  sdconfig=${sdconfig//'[port]'/$port}",
+          "  sdconfig=${sdconfig//'[application]'/'{{application}}'}",
+          "  sdconfig=${sdconfig//'[componentname]'/'{{componentName}}'}",
+          "  sdconfig=${sdconfig//'[instanceid]'/$instanceid}",
+          "  echo \"$sdconfig\" > /opt/aws/amazon-cloudwatch-agent/applicationinsights_prometheus_sd_$job.yaml",
+          "  scrapeconfig=\"{{prometheusScrapeConfig}}\"",
+          "  scrapeconfig=${scrapeconfig//'[job]'/$job}",
+          "  scrapeconfigpath='\"/opt/aws/amazon-cloudwatch-agent/applicationinsights_prometheus_sd_'$job'.yaml\"'",
+          "  scrapeconfig=${scrapeconfig//'[prometheussdconfigpath]'/$scrapeconfigpath}",
+          "  pconfig=$pconfig'\n'$scrapeconfig",
+          "done",
+          "echo \"$pconfig\" > /opt/aws/amazon-cloudwatch-agent/applicationinsights_prometheus.yaml"
+        ]
       }
     },
     {
