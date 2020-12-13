@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "1.0",
+  "description": "Document to retrieve a file's content",
+  "sessionType": "InteractiveCommands",
+  "parameters": {
+    "Path": {
+      "type": "String",
+      "description": "The file path to process",
+      "allowedPattern": "^\\w:$|^\\w:\\\\[^\"'|\\r\\n]*$|^\\/[^\"'|\\r\\n]*$|^([A-Za-z0-9-_\\/+]{4})*([A-Za-z0-9-_\\/+]{4}|[A-Za-z0-9-_\\/+]{3}=|[A-Za-z0-9-_\\/+]{2}==)$"
+    },
+    "TailFile": {
+      "type": "String",
+      "description": "(Optional) If set to 'Yes', the file's content will be continuously monitored.",
+      "default": "No",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ]
+    },
+    "NumberOfLinesToReturn": {
+      "type": "String",
+      "description": "(Optional) The number of lines to return when retrieving a files content. If set to '0' then all lines are returned. This parameter ignored when 'TailFile' is set to 'Yes'.",
+      "default": "0",
+      "allowedPattern": "^\\d*$"
+    },
+    "PrintInteractiveStatements": {
+      "type": "String",
+      "description": "(Optional) If set to 'No', the execution will not print text that indicates a keystoke is required to end execution.",
+      "default": "Yes",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ]
+    }
+  },
+  "properties": {
+    "windows": {
+      "commands": "$ErrorActionPreference = 'Stop'\n\nFunction ParseInputParameter {\n    param (\n        [string]$Name,\n        [string]$Value,\n        [string]$Regex\n    )\n\n    $ValidParameterRegex = '^--%[ +{|{].*}( +)?$'\n    if ($Value -notmatch $ValidParameterRegex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    }\n    $parameterValue = $Value.Substring(3)\n\n    $trimmedParameterValue = $parameterValue.TrimStart().TrimEnd()\n    $trimmedParameterValue = $trimmedParameterValue.Substring(1)\n    $trimmedParameterValue = $trimmedParameterValue.Substring(0, $trimmedParameterValue.Length - 1)\n\n    if ($Regex -and $trimmedParameterValue -notmatch $Regex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    } else {\n        $trimmedParameterValue\n    }\n}\n\nfunction ExitWithFailureMessage {\n    param (\n        [string]$Message,\n        [string]$ExceptionMessage,\n        [Switch]$PrintJson\n    )\n    if ([string]::IsNullOrWhitespace($ExceptionMessage)) {\n        $errorMessage = $Message\n    } else {\n        $errorMessage = '{0} {1}' -f $Message, $ExceptionMessage\n    }\n    if ($PrintJson) {ConvertTo-Json -InputObject @{error = $errorMessage} -Compress}\n    WriteStandardError -Message $errorMessage\n    [System.Environment]::Exit(1)\n}\n\nfunction ExitWithSuccessMessage {\n    param (\n        [string]$Message\n    )\n    Write-Host $Message\n    [System.Environment]::Exit(0)\n}\n\nfunction WriteStandardError {\n    param (\n        [string]$Message\n    )\n    $Host.UI.WriteErrorLine($Message)\n}\n\n$Path = Write-Output --%{{{ Path }}}\n$Path = ParseInputParameter -Name 'Path' -Value $Path\n\n$TailFile = Write-Output --%{{{ TailFile }}}\n$TailFile = ParseInputParameter -Name 'TailFile' -Value $TailFile\n\n$NumberOfLinesToReturn = Write-Output --%{{{ NumberOfLinesToReturn }}}\n$NumberOfLinesToReturn = ParseInputParameter -Name 'NumberOfLinesToReturn' -Value $NumberOfLinesToReturn\n\n$PrintInteractiveStatements = Write-Output --%{{{ PrintInteractiveStatements }}}\n$PrintInteractiveStatements = ParseInputParameter -Name 'PrintInteractiveStatements' -Value $PrintInteractiveStatements\n\nfunction ConvertBase64ToString {\n    param (\n        [string]$Base64\n    )\n    $bytes = [System.Convert]::FromBase64String($Base64)\n    [System.Text.Encoding]::UTF8.GetString($bytes)\n}\n\n$base64Regex = '^([A-Za-z0-9-_\\/+]{4})*([A-Za-z0-9-_\\/+]{4}|[A-Za-z0-9-_\\/+]{3}=|[A-Za-z0-9-_\\/+]{2}==)$'\nif ($Path -match $base64Regex) {\n    $Path = ConvertBase64ToString -Base64 $Path\n}\n\nif (Test-Path -Path $Path -PathType 'Leaf') {\n    Write-Host \"Getting the file content for $Path\"\n    if ($TailFile -eq 'Yes') {\n        Get-Content -Path $Path -Tail 10 -Wait\n    } else {\n        if ($NumberOfLinesToReturn -eq 0) {\n            Get-Content -Path $Path -Raw\n        } else {\n            Get-Content -Path $Path | Select-Object -First $NumberOfLinesToReturn\n        }\n    }\n} else {\n    ExitWithFailureMessage -Message 'The specified path is invalid.' -PrintJson\n}\nif ($TailFile -ne 'Yes') {\n    # Pause execution to ensure all file content is returned through the session\n    if ($PrintInteractiveStatements -eq 'Yes') {\n        Write-Host \"\"\n        Pause\n    } else {\n        Read-Host\n    }\n}\n",
+      "runAsElevated": true
+    },
+    "linux": {
+      "commands": "#!/bin/bash\nset -e\n\nExitWithFailureMessage() {\n    MESSAGE=\"$1\"\n    JSON=\"$2\"\n    if [[ \"$JSON\" == \"PRINT_JSON\" ]]; then\n        echo \"{\\\"error\\\":\\\"$MESSAGE\\\"}\"\n    fi\n    WriteStandardError \"$MESSAGE\"\n    exit 1\n}\n\nExitWithSuccessMessage() {\n    echo \"$1\"\n    exit 0\n}\n\nWriteStandardError() {\n    MESSAGE=\"$1\"\n    (>&2 echo \"$MESSAGE\")\n}\n\nFILEPATH='{{ Path }}'\nTAILFILE='{{ TailFile }}'\nNUMBEROFLINESTORETURN='{{ NumberOfLinesToReturn }}'\nPRINTINTERACTIVESTATEMENTS='{{ PrintInteractiveStatements }}'\n\nConvertBase64ToString() {\n    echo \"$1\" | base64 --decode\n}\n\nbase64Regex='^(?!\\/)([A-Za-z0-9-_\\/+]{4})*([A-Za-z0-9-_\\/+]{4}|[A-Za-z0-9-_\\/+]{3}=|[A-Za-z0-9-_\\/+]{2}==)$'\nif [ $(echo \"$FILEPATH\" | grep -P \"$base64Regex\") ]; then\n    FILEPATH=$(ConvertBase64ToString \"$FILEPATH\")\nfi\n\nif [ -f \"$FILEPATH\" ]; then\n    echo \"Getting the file content for $FILEPATH\"\n    if [[ \"$TAILFILE\" == \"Yes\" ]]; then\n        tail -f \"$FILEPATH\"\n    else\n        if [ \"$NUMBEROFLINESTORETURN\" == \"0\" ]; then\n            cat \"$FILEPATH\"\n        else\n            head -n \"$NUMBEROFLINESTORETURN\" \"$FILEPATH\"\n        fi\n    fi\nelse\n    ExitWithFailureMessage 'The specified path is invalid.'\nfi\nif [[ \"$TAILFILE\" != \"Yes\" ]]; then\n    if [[ \"$PRINTINTERACTIVESTATEMENTS\" == \"Yes\" ]]; then\n        echo \"\"\n        echo \"Press Enter to continue...:\"\n    fi\n    # Pause execution to ensure all file content is returned through the session\n    read\nfi\n",
+      "runAsElevated": true
+    },
+    "macos": {
+      "commands": "#!/bin/bash\nset -e\n\nExitWithFailureMessage() {\n    MESSAGE=\"$1\"\n    JSON=\"$2\"\n    if [[ \"$JSON\" == \"PRINT_JSON\" ]]; then\n        echo \"{\\\"error\\\":\\\"$MESSAGE\\\"}\"\n    fi\n    WriteStandardError \"$MESSAGE\"\n    exit 1\n}\n\nExitWithSuccessMessage() {\n    echo \"$1\"\n    exit 0\n}\n\nWriteStandardError() {\n    MESSAGE=\"$1\"\n    (>&2 echo \"$MESSAGE\")\n}\n\nFILEPATH='{{ Path }}'\nTAILFILE='{{ TailFile }}'\nNUMBEROFLINESTORETURN='{{ NumberOfLinesToReturn }}'\nPRINTINTERACTIVESTATEMENTS='{{ PrintInteractiveStatements }}'\n\nConvertBase64ToString() {\n    echo \"$1\" | /usr/bin/base64 --decode\n}\n\nbase64Regex='^(?!\\/)([A-Za-z0-9-_\\/+]{4})*([A-Za-z0-9-_\\/+]{4}|[A-Za-z0-9-_\\/+]{3}=|[A-Za-z0-9-_\\/+]{2}==)$'\nif [ $(echo \"$FILEPATH\" | /usr/bin/perl -ne \"print if /$base64Regex/\") ]; then\n    FILEPATH=$(ConvertBase64ToString \"$FILEPATH\")\nfi\n\nif [ -f \"$FILEPATH\" ]; then\n    echo \"Getting the file content for $FILEPATH\"\n    if [[ \"$TAILFILE\" == \"Yes\" ]]; then\n        /usr/bin/tail -f \"$FILEPATH\"\n    else\n        if [ \"$NUMBEROFLINESTORETURN\" == \"0\" ]; then\n            /bin/cat \"$FILEPATH\"\n        else\n            /usr/bin/head -n \"$NUMBEROFLINESTORETURN\" \"$FILEPATH\"\n        fi\n    fi\nelse\n    ExitWithFailureMessage 'The specified path is invalid.'\nfi\nif [[ \"$TAILFILE\" != \"Yes\" ]]; then\n    if [[ \"$PRINTINTERACTIVESTATEMENTS\" == \"Yes\" ]]; then\n        echo \"\"\n        echo \"Press Enter to continue...:\"\n    fi\n    # Pause execution to ensure all file content is returned through the session\n    read\nfi\n",
+      "runAsElevated": true
+    }
+  }
+}

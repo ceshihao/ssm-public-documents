@@ -1,0 +1,144 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-ModifyRDSInstancePortNumber\n\n## What does this document do?\nThis document updates port number on a given Amazon Relational Database Service (Amazon RDS) DB instance using the \n[ModifyDBInstance](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_ModifyDBInstance.html) API.\nAmazon RDS DB will restart when DBPortNumber value changes regardless of the ApplyImmediately parameter value.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* PortNumber: (Required) The port number on which the database accepts connections. The value of the DBPortNumber parameter must not match any of the port values specified for options in the option group for the Amazon RDS DB instance. Your database will restart when you change the DBPortNumber value regardless of the value of the ApplyImmediately parameter.\n* RDSDBInstanceResourceId: (Required) The Amazon RDS DB instance resource id.\n\n## Output Parameters\n* UpdateRDSPortNumber.Response: The standard HTTP response from ModifyDBInstance API call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "PortNumber": {
+      "type": "Integer",
+      "description": "(Required) The port number on which the database accepts connections. The value of the DBPortNumber parameter must not match any of the port values specified for options in the option group for the Amazon RDS DB instance. Your database will restart when you change the DBPortNumber value regardless of the value of the ApplyImmediately parameter.",
+      "allowedPattern": "^([0]?[2-9][0-9][0-9][0-9]|[0]?1[2-9][0-9][0-9]|[0]?11[5-9][0-9]|[1-5][0-9][0-9][0-9][0-9]|6[0-4][0-9][0-9][0-9]|65[0-4][0-9][0-9]|655[0-2][0-9]|6553[0-5])$"
+    },
+    "RDSDBInstanceResourceId": {
+      "type": "String",
+      "description": "(Required) Amazon RDS DB instance resource id.",
+      "allowedPattern": "db-[A-Z0-9]{26}"
+    }
+  },
+  "outputs": [
+    "UpdateRDSPortNumber.Response"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetRDSInstanceIdentifier",
+      "action": "aws:executeAwsApi",
+      "description": "## GetRDSInstanceIdentifier\nMakes DescribeDBInstances API call using Amazon RDS DB instance resource id to get Amazon RDS DB instance identifier.\n## Outputs\n* DbInstanceIdentifier: The Amazon RDS DB instance identifier.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "dbi-resource-id",
+            "Values": [
+              "{{ RDSDBInstanceResourceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DbInstanceIdentifier",
+          "Selector": "$.DBInstances[0].DBInstanceIdentifier",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyDBInstanceStatus",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "description": "## VerifyDBInstanceStatus\nVerifies the given Amazon RDS DB instance status is 'available' before modifying the port number.\n",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "UpdateRDSPortNumber",
+      "action": "aws:executeAwsApi",
+      "description": "## UpdateRDSPortNumber\nMakes ModifyDBInstance API call using Amazon RDS DB instance identifier and updates port number.\n## Outputs\n* Response: The standard HTTP response from the ModifyDBInstance API call.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "rds",
+        "Api": "ModifyDBInstance",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "DBPortNumber": "{{ PortNumber }}"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyDBInstanceStatusModify",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "description": "## VerifyDBInstanceStatus\nWaits for the given Amzon RDS DB instance status set to be \"modifying\".\n",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "modifying"
+        ]
+      }
+    },
+    {
+      "name": "VerifyDBInstanceStatusAvailable",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "description": "## VerifyDBInstanceStatus\nWaits for the given Amzon RDS DB instance status set to be \"available\".\n",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "VerifyRDSPortNumber",
+      "action": "aws:executeScript",
+      "description": "## VerifyRDSPortNumber\nVerifies the given Amazon RDS DB instance port number has been updated.\n## Outputs\n* Output: The standard HTTP response from the DescribeDBInstances API.\n",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "PortNumber": "{{ PortNumber }}",
+          "DBIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}"
+        },
+        "Script": "import boto3\n\ndef handler(event, context):\n    rds_client = boto3.client(\"rds\")\n    db_instance_id = event[\"DBIdentifier\"]\n    port_number = event[\"PortNumber\"]\n\n    rds_waiter = rds_client.get_waiter(\"db_instance_available\")\n    rds_waiter.wait(DBInstanceIdentifier=db_instance_id)\n\n    db_instances = rds_client.describe_db_instances(\n        DBInstanceIdentifier=db_instance_id)\n\n    db_port_number = db_instances['DBInstances'][0]['Endpoint']['Port']\n    if db_port_number == port_number:\n        return {\n              \"output\" : {\n                \"Message\": \"Verification of update port number on given Amazon RDS DB instance is successful\",\n                \"HTTPResponse\": db_instances[\"ResponseMetadata\"]\n              }\n          }\n    raise Exception(\"VERIFICATION FAILED. UPDATE PORT NUMBER ON GIVEN AMAZON RDS DB INSTANCE IS FAILED.\")"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

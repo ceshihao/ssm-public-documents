@@ -1,0 +1,212 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-EnablePerformanceInsightsOnRDSInstance\n\n## What does this document do?\nThis document enables Performance Insights on an Amazon Relational Database Service (Amazon RDS) instance using the [ModifyDBInstance](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_ModifyDBInstance.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* DbiResourceId: (Required) Amazon RDS instance resourceId for which Performance Insights needs to be enabled.\n* PerformanceInsightsKMSKeyId: (Optional) The AWS KMS key ID is the Amazon Resource Name (ARN), AWS KMS key identifier, or the AWS KMS key alias for the AWS KMS encryption key. When using an alias name, prefix it with \"alias/\". If you do not specify a value for PerformanceInsightsKMSKeyId, then Amazon RDS uses your default encryption key.\n* PerformanceInsightsRetentionPeriod: (Optional) The amount of time, in days, to retain Performance Insights data. Valid values are 7 days (the default) or 731 (2 years).\n\n## Output Parameters\n* EnablePerformanceInsights.Output: The standard HTTP response from the ModifyDBInstance API.\n* EnablePerformanceInsightsWithKMSKey.Output: The standard HTTP response from the ModifyDBInstance API.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "DbiResourceId": {
+      "type": "String",
+      "description": "(Required) Amazon RDS instance resourceId for which Performance Insights needs to be enabled.",
+      "allowedPattern": "^db-[A-Z0-9]{26}$"
+    },
+    "PerformanceInsightsKMSKeyId": {
+      "type": "String",
+      "description": "(Optional) The AWS KMS key ID is the Amazon Resource Name (ARN), AWS KMS key identifier, or the AWS KMS key alias for the KMS encryption key. When using an alias name, prefix it with \"alias/\". If you do not specify a value for PerformanceInsightsKMSKeyId, then Amazon RDS uses your default encryption key.",
+      "allowedPattern": "(^arn:(aws[a-zA-Z-]*)?:kms:[a-z0-9-]*:\\d{12}:key\\/)?(alias/)?[\\w-\\/]{1,256}",
+      "default": "alias/aws/rds"
+    },
+    "PerformanceInsightsRetentionPeriod": {
+      "type": "Integer",
+      "description": "(Optional) The amount of time, in days, to retain Performance Insights data. Valid values are 7 days (the default) or 731 (2 years).",
+      "default": 7,
+      "allowedValues": [
+        7,
+        731
+      ]
+    }
+  },
+  "outputs": [
+    "EnablePerformanceInsights.Output",
+    "EnablePerformanceInsightsWithKMSKey.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetRDSInstanceIdentifier",
+      "action": "aws:executeAwsApi",
+      "description": "## GetRDSInstanceIdentifier\nMakes DescribeDBInstances API call using Amazon RDS instance DbiResourceId to get DBInstanceId.\n## Outputs\n* DbInstanceIdentifier: DBInstance Identifier of the Amazon RDS instance.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "dbi-resource-id",
+            "Values": [
+              "{{ DbiResourceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DbInstanceIdentifier",
+          "Selector": "$.DBInstances[0].DBInstanceIdentifier",
+          "Type": "String"
+        },
+        {
+          "Name": "PerformanceInsightsEnabled",
+          "Selector": "$.DBInstances[0].PerformanceInsightsEnabled",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "PerformanceInsightsKMSKeyId",
+          "Selector": "$.DBInstances[0].PerformanceInsightsKMSKeyId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyDBInstanceStatus",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "description": "## VerifyDBInstanceStatus\nVerifies if the Amazon RDS DB instance status is available before enabling Performance Insights.\n",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "GetKMSKeyArn",
+      "action": "aws:executeAwsApi",
+      "description": "## GetKMSKeyArn\nGets AWS KMS Key ARN using the given input parameter PerformanceInsightsKMSKeyId.\n## Outputs\nKMSKeyArn: The AWS KMS key ARN of the given PerformanceInsightsKMSKeyId parameter.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "kms",
+        "Api": "DescribeKey",
+        "KeyId": "{{ PerformanceInsightsKMSKeyId }}"
+      },
+      "outputs": [
+        {
+          "Name": "KMSKeyArn",
+          "Selector": "$.KeyMetadata.Arn",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DbInstanceConfigCheck",
+      "description": "## DbInstanceConfigCheck\nChecks if the `PerformanceInsightsKMSKeyId` parameter is set before enabling Performance Insights.\n",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EnablePerformanceInsights",
+            "And": [
+              {
+                "Variable": "{{ GetRDSInstanceIdentifier.PerformanceInsightsKMSKeyId }}",
+                "StartsWith": "arn:"
+              },
+              {
+                "Variable": "{{ GetRDSInstanceIdentifier.PerformanceInsightsEnabled }}",
+                "BooleanEquals": false
+              }
+            ]
+          },
+          {
+            "NextStep": "EnablePerformanceInsightsWithKMSKey",
+            "Variable": "{{ GetRDSInstanceIdentifier.PerformanceInsightsEnabled }}",
+            "BooleanEquals": false
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "EnablePerformanceInsights",
+      "action": "aws:executeAwsApi",
+      "description": "## EnablePerformanceInsights\nEnables Performance Insights on the given Amazon RDS DB instance using the default AWS KMS encryption key.\n## Outputs\n* Output: The standard HTTP response from the ModifyDBInstance API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "nextStep": "VerifyEnablePerformanceInsightsKMSKey",
+      "inputs": {
+        "Service": "rds",
+        "Api": "ModifyDBInstance",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "EnablePerformanceInsights": true
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "EnablePerformanceInsightsWithKMSKey",
+      "action": "aws:executeAwsApi",
+      "description": "## EnablePerformanceInsightsWithKMSKey\nEnables Performance Insights on the given Amazon RDS DB instance using the provided AWS KMS encryption key.\n## Outputs\n* Output: The standard HTTP response from the ModifyDBInstance API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "rds",
+        "Api": "ModifyDBInstance",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "EnablePerformanceInsights": true,
+        "PerformanceInsightsKMSKeyId": "{{ PerformanceInsightsKMSKeyId }}",
+        "PerformanceInsightsRetentionPeriod": "{{ PerformanceInsightsRetentionPeriod }}"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyEnablePerformanceInsightsKMSKey",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "description": "## VerifyEnablePerformanceInsightsEnabled\nVerifies that PerformanceInsightsKMSKeyId has been correctly configured with the given AWS KMS encryption key on the Amazon RDS DB instance.\n",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].PerformanceInsightsKMSKeyId",
+        "DesiredValues": [
+          "{{ GetKMSKeyArn.KMSKeyArn }}"
+        ]
+      }
+    },
+    {
+      "name": "VerifyEnablePerformanceInsightsEnabled",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## VerifyEnablePerformanceInsightsEnabled\nVerifies that Performance Insights has been correctly enabled on the Amazon RDS DB instance.\n",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DbInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].PerformanceInsightsEnabled",
+        "DesiredValues": [
+          "True"
+        ]
+      }
+    }
+  ]
+}

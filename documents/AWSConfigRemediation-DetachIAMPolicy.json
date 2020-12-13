@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document Name - AWSConfigRemediation-DetachIAMPolicy\n\n## What does this document do?\nThis document detaches an AWS IAM Policy using the [DetachGroupPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DetachGroupPolicy.html), [DetachRolePolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DetachRolePolicy.html) and [DetachUserPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DetachUserPolicy.html) APIs.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* IAMResourceId: (Required) IAM resource unique identifier for the IAM Policy.\n\n## Output Parameters\n* DetachIAMPolicy.Output - Success message and HTTP response metadata or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$"
+    },
+    "IAMResourceId": {
+      "type": "String",
+      "description": "(Required) IAM resource unique identifier for the IAM Policy.",
+      "allowedPattern": "^[\\w+=,.@_-]{1,128}$"
+    }
+  },
+  "outputs": [
+    "DetachIAMPolicyAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "DetachIAMPolicyAndVerify",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## DetachIAMPolicyAndVerify\nDetaches the specified managed policy from every IAM entity it is currently attached and verifies it was properly detached.\n## Outputs\n* Output: Success message and HTTP response metadata or failure exception.\n",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "detach_policy_handler",
+        "InputPayload": {
+          "IAMResourceId": "{{ IAMResourceId }}"
+        },
+        "Script": "import boto3\n\n\niam_client = boto3.client(\"iam\")\nconfig_client = boto3.client(\"config\")\n\nresponses = {}\nresponses[\"DetachGroupPolicyResponses\"] = []\nresponses[\"DetachUserPolicyResponses\"] = []\nresponses[\"DetachRolePolicyResponses\"] = []\n\ndef get_policy_arn(resource_id):\n  response = config_client.get_resource_config_history(\n    resourceType='AWS::IAM::Policy',\n    resourceId=resource_id\n  )\n  policy_arn = response.get(\"configurationItems\")[0].get(\"arn\")\n  return policy_arn\n\ndef detach_policy_handler(event, context):\n  iam_resource_id = event.get(\"IAMResourceId\")\n  policy_arn = get_policy_arn(iam_resource_id)\n\n  policy_usage = iam_client.list_entities_for_policy(\n    PolicyArn=policy_arn\n  )\n  for group in policy_usage.get(\"PolicyGroups\"):\n    responses[\"DetachGroupPolicyResponses\"].append({\"GroupName\": group.get(\"GroupName\"), \"Response\": iam_client.detach_group_policy(GroupName=group.get(\"GroupName\"), PolicyArn=policy_arn)})\n  for user in policy_usage.get(\"PolicyUsers\"):\n    responses[\"DetachUserPolicyResponses\"].append({\"UserName\": user.get(\"UserName\"), \"Response\": iam_client.detach_user_policy(UserName=user.get(\"UserName\"), PolicyArn=policy_arn)})\n  for role in policy_usage.get(\"PolicyRoles\"):\n    responses[\"DetachRolePolicyResponses\"].append({\"RoleName\": role.get(\"RoleName\"), \"Response\": iam_client.detach_role_policy(RoleName=role.get(\"RoleName\"), PolicyArn=policy_arn)})\n\n  current_policy_usage = iam_client.list_entities_for_policy(\n    PolicyArn=policy_arn\n  )\n\n  if current_policy_usage.get(\"PolicyGroups\") or current_policy_usage.get(\"PolicyUsers\") or current_policy_usage.get(\"PolicyRoles\"):\n    error_message = \"IAM POLICY {} STILL IN USE.\".format(policy_arn)\n    raise Exception(error_message)\n\n  return {\n    \"output\": \"IAM Policy detached successfully.\",\n    \"http_response\": responses\n  }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

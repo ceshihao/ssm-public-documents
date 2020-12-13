@@ -1,0 +1,161 @@
+{
+  "description": "### Document name - AWSConfigRemediation-DeleteUnusedEBSVolume\n\n## What does this document do?\nThis document deletes an unused Amazon EBS volume. If the target EBS volume is in-use, this document does not perform any changes to the AWS account.\n\n## Input Parameters\n* VolumeId: (Required) The unique ID of the EBS volume.\n* CreateSnapshot: (Optional) Boolean value to determine snapshot creation.\n* AutomationAsssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* ValidateAndCreateEbsSnapshot.Snapshot: Amazon EBS snapshot ID\n* DeleteEbsVolume.Output: The standard HTTP response from the DeleteVolume API.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "VolumeId": {
+      "type": "String",
+      "description": "(Required) The unique ID of the EBS volume.",
+      "allowedPattern": "^vol-[0-9a-f]{17}$"
+    },
+    "CreateSnapshot": {
+      "type": "Boolean",
+      "description": "(Optional) Boolean value to determine snapshot creation.",
+      "default": true
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateAndCreateEbsSnapshot",
+      "description": "## ValidateAndCreateEbsSnapshot\nVerifies that the EBS volume is not in use and proceeds to create a snapshot based on the CreateSnapshot parameter.\n## Outputs\n* output: The EBS volume ID and snapshot ID.\n",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "nextStep": "BranchOnCreateSnapshot",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "inputs": {
+        "InputPayload": {
+          "VolumeId": "{{ VolumeId }}",
+          "CreateSnapshot": "{{ CreateSnapshot }}"
+        },
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\nec2_client = boto3.client(\"ec2\")\n\ndef script_handler(event, context):\n    volume_id = event.get(\"VolumeId\")\n    volume_details = ec2_client.describe_volumes(VolumeIds=[volume_id])[\"Volumes\"][0]\n    if volume_details[\"State\"] != \"available\":\n      raise Exception(f\"SPECIFIED VOLUME {volume_id} IS NOT IN AVAILABLE STATE\")\n\n    snapshot_id, response_metadata = \"\", \"\"\n    if event.get(\"CreateSnapshot\"):\n        try:\n            description = f\"Copy of {volume_id}\"\n            response = ec2_client.create_snapshot(\n                VolumeId=volume_id, Description=description\n            )\n            snapshot_id = response[\"SnapshotId\"]\n            response_metadata = response[\"ResponseMetadata\"]\n        except ClientError as err:\n            raise Exception(f\"FAILED TO CREATE EBS SNAPSHOT FOR SPECIFIED VOLUME: {err}\")\n\n    output = {\"Volume\": volume_id, \"Snapshot\": snapshot_id, \"ResponseMetadata\": response_metadata}\n    return output\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.7"
+      },
+      "outputs": [
+        {
+          "Name": "Snapshot",
+          "Selector": "$.Payload.Snapshot",
+          "Type": "String"
+        },
+        {
+          "Name": "Volume",
+          "Selector": "$.Payload.Volume",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnCreateSnapshot",
+      "description": "## BranchOnCreateSnapshot\nBranches based on the CreateSnapshot parameter value.\n",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 2,
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CreateSnapshot }}",
+            "BooleanEquals": false,
+            "NextStep": "DeleteEbsVolume"
+          }
+        ],
+        "Default": "CheckSnapshotIsCreated"
+      }
+    },
+    {
+      "name": "CheckSnapshotIsCreated",
+      "description": "## CheckSnapshotIsCreated\nWaits for snapshot to successfully move into completed state.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:CleanEbsSnapshotOnFailure",
+      "nextStep": "DeleteEbsVolume",
+      "isCritical": true,
+      "timeoutSeconds": 1800,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSnapshots",
+        "SnapshotIds": [
+          "{{ ValidateAndCreateEbsSnapshot.Snapshot }}"
+        ],
+        "PropertySelector": "$.Snapshots..State",
+        "DesiredValues": [
+          "completed"
+        ]
+      }
+    },
+    {
+      "name": "CleanEbsSnapshotOnFailure",
+      "description": "## CleanEbsSnapshotOnFailure\nDeletes created snapshot if step CheckSnapshotIsCreated fails.\n",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteSnapshot",
+        "SnapshotId": [
+          "{{ ValidateAndCreateEbsSnapshot.Snapshot }}"
+        ]
+      }
+    },
+    {
+      "name": "DeleteEbsVolume",
+      "description": "## DeleteEbsVolume\nDeletes the specified EBS Volume.\n## Outputs\n* Output: The standard HTTP response from the DeleteVolume API.\n",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteVolume",
+        "VolumeId": "{{ ValidateAndCreateEbsSnapshot.Volume }}"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyEbsVolumeDeletion",
+      "description": "## VerifyEbsVolumeDeletion\nVerifies that the Amazon EBS volume is deleted in the previous step.\n## Outputs\n* Output: A success message or failure exception.\n",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "VolumeID": "{{ ValidateAndCreateEbsSnapshot.Volume }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.7",
+        "Script": "import boto3\nimport botocore\n\ndef script_handler(event, context):\n    ec2_client = boto3.client('ec2')\n    volume_id = event['VolumeID']\n    try:\n       waiter = ec2_client.get_waiter('volume_deleted')\n       waiter.wait(VolumeIds=[volume_id],WaiterConfig={'Delay': 30, 'MaxAttempts': 10})\n       response = ec2_client.describe_volumes(VolumeIds=[volume_id])\n    except botocore.exceptions.WaiterError:\n       error_message = f\"VERIFICATION FAILED. EBS VOLUME {volume_id} DELETION UNSUCCESSFUL.\"\n       raise Exception(error_message)\n    except botocore.exceptions.ClientError as e:\n       if e.response[\"Error\"][\"Code\"] == \"InvalidVolume.NotFound\":\n          return {\"output\": \"Verification of 'DeleteEBSVolume' is successful.\"}\n       raise e\n"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "ValidateAndCreateEbsSnapshot.Snapshot",
+    "DeleteEbsVolume.Output"
+  ]
+}

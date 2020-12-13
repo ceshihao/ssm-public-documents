@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-DeleteAccessKeysFromCodeBuildProject\n\n## What does this document do?\nThis document deletes AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables from the given \nAWS CodeBuild project using [UpdateProject](https://docs.aws.amazon.com/codebuild/latest/APIReference/API_UpdateProject.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* ResourceId: (Required) The AWS CodeBuild project resource id from AWS Config.\n\n## Output Parameters\n* DeleteAndVerifyCodeBuildEnvironmentVariables.Output: The standard HTTP response from the UpdateProject API call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "ResourceId": {
+      "type": "String",
+      "description": "(Required) The AWS CodeBuild project resource id from AWS Config.",
+      "allowedPattern": "[a-z0-9-]{2,255}"
+    }
+  },
+  "outputs": [
+    "DeleteAndVerifyCodeBuildEnvironmentVariables.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "DeleteAndVerifyCodeBuildEnvironmentVariables",
+      "action": "aws:executeScript",
+      "description": "## DeleteAndVerifyCodeBuildEnvironmentVariables\nDeletes and verifies the deletion of environment variables (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) from the given AWS CodeBuild project.\n## Outputs\n* Output: The standard HTTP response from the UpdateProject API call.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "ResourceId": "{{ ResourceId }}"
+        },
+        "Script": "import boto3\nimport botocore\n\ndef get_project_name(config_client, resource_id):\n    list_discovered_resources_response = config_client.list_discovered_resources(\n        resourceType=\"AWS::CodeBuild::Project\",\n        resourceIds=[resource_id]\n    )\n    resource_name = list_discovered_resources_response[\"resourceIdentifiers\"][0][\"resourceName\"]\n    return resource_name\n\ndef delete_and_update_environment_variables(codebuild_client, project_name):\n    batch_get_projects_response = codebuild_client.batch_get_projects(names=[project_name])\n    environment = batch_get_projects_response[\"projects\"][0][\"environment\"]\n    environment_variables = batch_get_projects_response[\"projects\"][0][\"environment\"][\"environmentVariables\"]\n    environment_variables_length = len(batch_get_projects_response[\"projects\"][0][\"environment\"][\"environmentVariables\"])\n\n    if(environment_variables_length > 0):\n      index = environment_variables_length - 1\n      while index >= 0:\n        if environment_variables[index][\"name\"] in [\"AWS_ACCESS_KEY_ID\",\"AWS_SECRET_ACCESS_KEY\"]:\n          del environment_variables[index]\n          index = index - 1\n\n      codebuild_client.update_project(\n          name = project_name,\n          environment = environment\n      )\n\ndef verify_project_environment_variables(codebuild_client, project_name):\n    batch_get_projects_response = codebuild_client.batch_get_projects(names=[project_name])\n    environment_variables = batch_get_projects_response[\"projects\"][0][\"environment\"][\"environmentVariables\"]\n    for environment_variable in environment_variables:\n      if environment_variable[\"name\"] in [\"AWS_ACCESS_KEY_ID\", \"AWS_SECRET_ACCESS_KEY\"]:\n          return False\n    return True\n\ndef handler(event, context):\n    config_client = boto3.client(\"config\")\n    codebuild_client = boto3.client(\"codebuild\")\n    resource_id = event[\"ResourceId\"]\n\n    # Get the project name using resource id\n    project_name = get_project_name(config_client, resource_id)\n\n    # Delete and update the environment variables\n    delete_and_update_environment_variables(codebuild_client, project_name)\n\n    # Verify the deletion of environment variables\n    if verify_project_environment_variables(codebuild_client, project_name):\n        return {\n              \"output\": {\n                  \"Message\": \"Verification of delete AWS CodeBuild project {} environment variables (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) successful.\".format(project_name)\n          }\n        }\n    raise Exception(\n          \"VERIFICATION FAILED. DELETE AWS CODEBUILD PROJECT {} ENVIRONMENT VARIABLES (AWS_ACCESS_KEY_ID AND AWS_SECRET_ACCESS_KEY) FAILED.\".format(project_name)\n    )"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

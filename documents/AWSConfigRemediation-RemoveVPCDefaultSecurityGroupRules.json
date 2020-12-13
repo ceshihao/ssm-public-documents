@@ -1,0 +1,68 @@
+{
+  "description": "### Document name - AWSConfigRemediation-RemoveVPCDefaultSecurityGroupRules\n\n## What does this document do?\nThis document removes all inbound and outbound rules from the default security group in an Amazon VPC. A default security group is defined as any security group whose name is `default`. If the security group ID passed to this automation document belongs to a non-default security group, this document does not perform any changes to the AWS account.\n\n## Input Parameters\n* GroupId: (Required) The unique ID of the security group.\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* RemoveRulesAndVerify.Output - Success message or failure exception.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "GroupId": {
+      "type": "String",
+      "description": "(Required) The unique ID of the security group.",
+      "allowedPattern": "sg-[a-z0-9]+$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$"
+    }
+  },
+  "outputs": [
+    "RemoveRulesAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "CheckDefaultSecurityGroup",
+      "action": "aws:assertAwsResourceProperty",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 20,
+      "description": "## CheckDefaultSecurityGroup\nVerifies that the security group name does match `default`. If the group name does match `default`, go to the next step: DescribeSecurityGroups.\n",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSecurityGroups",
+        "GroupIds": [
+          "{{ GroupId }}"
+        ],
+        "PropertySelector": "$.SecurityGroups[0].GroupName",
+        "DesiredValues": [
+          "default"
+        ]
+      },
+      "nextStep": "RemoveRulesAndVerify"
+    },
+    {
+      "name": "RemoveRulesAndVerify",
+      "action": "aws:executeScript",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "isEnd": true,
+      "description": "## RemoveRulesAndVerify\nRemoves all rules from the default security group.\n## Outputs\n* Output: Success message or failure exception.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "GroupId": "{{ GroupId }}"
+        },
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\nfrom time import sleep\n\n\nec2_client = boto3.client(\"ec2\")\n\n\ndef get_permissions(group_id):\n    default_group = ec2_client.describe_security_groups(GroupIds=[group_id]).get(\"SecurityGroups\")[0]\n    return default_group.get(\"IpPermissions\"), default_group.get(\"IpPermissionsEgress\")\n\n\ndef handler(event, context):\n    group_id = event.get(\"GroupId\")\n    ingress_permissions, egress_permissions = get_permissions(group_id)\n\n    if ingress_permissions:\n        ec2_client.revoke_security_group_ingress(GroupId=group_id, IpPermissions=ingress_permissions)\n    if egress_permissions:\n        ec2_client.revoke_security_group_egress(GroupId=group_id, IpPermissions=egress_permissions)\n\n    ingress_permissions, egress_permissions = get_permissions(group_id)\n    if ingress_permissions or egress_permissions:\n        raise Exception(f\"VERIFICATION FAILED. SECURITY GROUP {group_id} NOT CLOSED.\")\n\n    return {\n        \"output\": \"Security group closed successfully.\"\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

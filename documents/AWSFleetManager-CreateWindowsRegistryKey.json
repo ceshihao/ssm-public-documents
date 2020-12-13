@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Creates a Windows Registry key.",
+  "parameters": {
+    "Path": {
+      "type": "String",
+      "description": "The registry path where the new key should be created. The format for this parameter is \"HIVE:\\Path\", for example \"HKLM:\\SOFTWARE\".",
+      "allowedPattern": "^((HKEY_LOCAL_MACHINE|HKLM|HKEY_CURRENT_CONFIG|HKCC|HKEY_CURRENT_USER|HKCU|HKEY_USERS|HKU|HKEY_CLASSES_ROOT|HKCR)+:\\\\)(()|([a-zA-Z0-9\\s_@\\-\\^!#.\\:\\/\\$%&+={}\\[\\]\\\\*]))+$"
+    },
+    "Name": {
+      "type": "String",
+      "description": "The name of the registry key to create.",
+      "allowedPattern": "^[^\\\\|\\n\\r]*$",
+      "maxChars": 255
+    },
+    "PerformAction": {
+      "type": "String",
+      "description": "(Optional) Set this to 'Yes' to perform the action.",
+      "default": "No",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "action": "aws:runPowerShellScript",
+      "name": "InvokeWindowsScript",
+      "inputs": {
+        "runCommand": [
+          "$ErrorActionPreference = 'Stop'\n\nFunction ParseInputParameter {\n    param (\n        [string]$Name,\n        [string]$Value,\n        [string]$Regex\n    )\n\n    $ValidParameterRegex = '^--%[ +{|{].*}( +)?$'\n    if ($Value -notmatch $ValidParameterRegex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    }\n    $parameterValue = $Value.Substring(3)\n\n    $trimmedParameterValue = $parameterValue.TrimStart().TrimEnd()\n    $trimmedParameterValue = $trimmedParameterValue.Substring(1)\n    $trimmedParameterValue = $trimmedParameterValue.Substring(0, $trimmedParameterValue.Length - 1)\n\n    if ($Regex -and $trimmedParameterValue -notmatch $Regex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    } else {\n        $trimmedParameterValue\n    }\n}\n\nfunction ExitWithFailureMessage {\n    param (\n        [string]$Message,\n        [string]$ExceptionMessage,\n        [Switch]$PrintJson\n    )\n    if ([string]::IsNullOrWhitespace($ExceptionMessage)) {\n        $errorMessage = $Message\n    } else {\n        $errorMessage = '{0} {1}' -f $Message, $ExceptionMessage\n    }\n    if ($PrintJson) {ConvertTo-Json -InputObject @{error = $errorMessage} -Compress}\n    WriteStandardError -Message $errorMessage\n    [System.Environment]::Exit(1)\n}\n\nfunction ExitWithSuccessMessage {\n    param (\n        [string]$Message\n    )\n    Write-Host $Message\n    [System.Environment]::Exit(0)\n}\n\nfunction WriteStandardError {\n    param (\n        [string]$Message\n    )\n    $Host.UI.WriteErrorLine($Message)\n}\n\nfunction TestPerformAction {\n    param ( [string]$PerformAction )\n    if ($PerformAction -ne 'Yes') {\n        ExitWithFailureMessage -Message \"No action was taken because the PerformAction parameter is set to $PerformAction. To make the desired change, set this parameter to Yes.\"\n    }\n}\n\n$Path = Write-Output --%{{{ Path }}}\n$Path = ParseInputParameter -Name 'Path' -Value $Path\n\n$Name = Write-Output --%{{{ Name }}}\n$Name = ParseInputParameter -Name 'Name' -Value $Name\n\n$PerformAction = Write-Output --%{{{ PerformAction }}}\n$PerformAction = ParseInputParameter -Name 'PerformAction' -Value $PerformAction -Regex '(Yes|No)'\nTestPerformAction -PerformAction $PerformAction\n\nfunction TestRegistryKeyExists {\n    param (\n        $Query,\n        $SubKey,\n        $Name\n    )\n\n    if ($Path -eq '\\') {\n        # Root/browsing the hive case\n        $keys = $Query.GetSubKeyNames()\n    } else {\n        # Browse a path within the hive\n        $registryKey = $Query.OpenSubKey($SubKey, $false)\n        if ($null -eq $registryKey) {return $false}\n        $keys = $registryKey.GetSubKeyNames()\n    }\n\n    if ($Name -in $keys) {\n        return $true\n    } else {\n        return $false\n    }\n}\n\nfunction CreateKey {\n    param (\n        $Query,\n        $Key,\n        $Name\n    )\n    if (TestRegistryKeyExists -Query $Query -SubKey $Key -Name $Name) {return}\n\n    $regKey = $query.OpenSubKey($Key, $true)\n    if ($null -eq $regKey) {\n        ExitWithFailureMessage -Message 'The specified registry key is invalid.' -PrintJson\n    }\n\n    try {\n        $null = $regKey.CreateSubKey($Name)\n    } catch {\n        ExitWithFailureMessage -Message 'Failed to create the specified registry key.' -PrintJson\n    }\n}\n\nfunction CreateRecursiveKey {\n    param (\n        $Query,\n        [string[]]$KeysToCreate\n    )\n    for ($i = 0; $i -lt $KeysToCreate.Count - 1; $i++) {\n        if ($i -eq 0) {\n            $parentKey = $KeysToCreate[$i]\n        } else {\n            $parentKey = '{0}\\{1}' -f $parentKey, $KeysToCreate[$i]\n        }\n        CreateKey -Query $Query -Key $parentKey -Name $KeysToCreate[$i + 1]\n    }\n}\n\n$hive = ($Path.Split('\\')).GetValue(0)\n$registrySubKey = $Path.Replace($hive, [string]::Empty).TrimStart('\\')\n\nif ([string]::IsNullOrWhiteSpace($registrySubKey)) {\n    $exitWithFailureMessage = @{\n        Message = 'The creation of a registry key at the registry hive level is not supported.'\n        PrintJson = $true\n    }\n    ExitWithFailureMessage @exitWithFailureMessage\n}\n\n[hashtable]$hivePrefixToName = @{\n    'HKLM:'                = [Microsoft.Win32.RegistryHive]::LocalMachine;\n    'HKEY_LOCAL_MACHINE:'  = [Microsoft.Win32.RegistryHive]::LocalMachine;\n    'HKCU:'                = [Microsoft.Win32.RegistryHive]::CurrentUser;\n    'HKEY_CURRENT_USER:'   = [Microsoft.Win32.RegistryHive]::CurrentUser;\n    'HKCC:'                = [Microsoft.Win32.RegistryHive]::CurrentConfig;\n    'HKEY_CURRENT_CONFIG:' = [Microsoft.Win32.RegistryHive]::CurrentConfig;\n    'HKEY_USERS:'          = [Microsoft.Win32.RegistryHive]::Users;\n    'HU:'                  = [Microsoft.Win32.RegistryHive]::Users;\n    'HKEY_CLASSES_ROOT:'   = [Microsoft.Win32.RegistryHive]::ClassesRoot;\n    'HKCR:'                = [Microsoft.Win32.RegistryHive]::ClassesRoot\n}\n$query = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hivePrefixToName[$hive], [Microsoft.Win32.RegistryView]'Default')\n\nif (TestRegistryKeyExists -Query $query -SubKey $registrySubKey -Name $Name) {\n    ExitWithFailureMessage -Message 'The specified registry key already exists.' -PrintJson\n}\n\nCreateRecursiveKey -Query $query -KeysToCreate $registrySubKey.Split('\\')\nCreateKey -Query $query -Key $registrySubKey -Name $Name\nExitWithSuccessMessage 'The specified registry key has been created.'\n"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Creates a local group.",
+  "parameters": {
+    "Group": {
+      "type": "String",
+      "description": "The group to create.",
+      "allowedPattern": "^[^\"'\\/\\\\\\[\\]:;|#=,+*?<>\\r\\n]+$",
+      "maxChars": 256
+    },
+    "Description": {
+      "type": "String",
+      "description": "(Optional) The group's description. Only supported on Windows.",
+      "allowedPattern": "^[^\"'|\\r\\n]*$",
+      "default": " ",
+      "maxChars": 48
+    },
+    "PerformAction": {
+      "type": "String",
+      "description": "(Optional) Set this to 'Yes' to perform the action.",
+      "default": "No",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "action": "aws:runPowerShellScript",
+      "name": "InvokeWindowsScript",
+      "inputs": {
+        "runCommand": [
+          "$ErrorActionPreference = 'Stop'\n\nFunction ParseInputParameter {\n    param (\n        [string]$Name,\n        [string]$Value,\n        [string]$Regex\n    )\n\n    $ValidParameterRegex = '^--%[ +{|{].*}( +)?$'\n    if ($Value -notmatch $ValidParameterRegex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    }\n    $parameterValue = $Value.Substring(3)\n\n    $trimmedParameterValue = $parameterValue.TrimStart().TrimEnd()\n    $trimmedParameterValue = $trimmedParameterValue.Substring(1)\n    $trimmedParameterValue = $trimmedParameterValue.Substring(0, $trimmedParameterValue.Length - 1)\n\n    if ($Regex -and $trimmedParameterValue -notmatch $Regex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    } else {\n        $trimmedParameterValue\n    }\n}\n\nfunction ExitWithFailureMessage {\n    param (\n        [string]$Message,\n        [string]$ExceptionMessage,\n        [Switch]$PrintJson\n    )\n    if ([string]::IsNullOrWhitespace($ExceptionMessage)) {\n        $errorMessage = $Message\n    } else {\n        $errorMessage = '{0} {1}' -f $Message, $ExceptionMessage\n    }\n    if ($PrintJson) {ConvertTo-Json -InputObject @{error = $errorMessage} -Compress}\n    WriteStandardError -Message $errorMessage\n    [System.Environment]::Exit(1)\n}\n\nfunction ExitWithSuccessMessage {\n    param (\n        [string]$Message\n    )\n    Write-Host $Message\n    [System.Environment]::Exit(0)\n}\n\nfunction WriteStandardError {\n    param (\n        [string]$Message\n    )\n    $Host.UI.WriteErrorLine($Message)\n}\n\nfunction TestPerformAction {\n    param ( [string]$PerformAction )\n    if ($PerformAction -ne 'Yes') {\n        ExitWithFailureMessage -Message \"No action was taken because the PerformAction parameter is set to $PerformAction. To make the desired change, set this parameter to Yes.\"\n    }\n}\n\n$Group = Write-Output --%{{{ Group }}}\n$Group = ParseInputParameter -Name 'Group' -Value $Group\n\n$Description = Write-Output --%{{{ Description }}}\n$Description = ParseInputParameter -Name 'Description' -Value $Description\n\n$PerformAction = Write-Output --%{{{ PerformAction }}}\n$PerformAction = ParseInputParameter -Name 'PerformAction' -Value $PerformAction -Regex '(Yes|No)'\nTestPerformAction -PerformAction $PerformAction\n\nfunction TestLocalGroupExists {\n    param (\n        [string]$Name,\n        [string]$Domain\n    )\n\n    $getCimInstance = @{\n        Class = 'Win32_Group'\n    }\n    if (Get-CimInstance @getCimInstance | Where-Object { $_.Name -eq $Name -and $_.Domain -eq $Domain }) {\n        $true\n    } else {\n        $false\n    }\n}\n\nif (TestLocalGroupExists -Name $Group -Domain $env:COMPUTERNAME) {\n    $group = ([adsi]\"WinNT://$env:COMPUTERNAME/$Group,group\")\n    ExitWithFailureMessage -Message 'The specified group already exists.' -PrintJson\n}\n\ntry {\n    $group = ([adsi]\"WinNT://$env:COMPUTERNAME\").Create('Group', $Group)\n    $group.setinfo()\n    $message = 'The specified group has been created.'\n} catch {\n    ExitWithFailureMessage -Message 'Failed to create the specified group.' -PrintJson\n}\n\ntry {\n    if (-not([string]::IsNullOrWhiteSpace($Description))) {\n        $group.description = $Description\n        $group.setinfo()\n    }\n} catch {\n    ExitWithFailureMessage -Message 'Failed to set the description of the group.' -PrintJson\n}\n\nExitWithSuccessMessage $message\n"
+        ]
+      }
+    },
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "action": "aws:runShellScript",
+      "name": "InvokeLinuxScript",
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash\nset -e\n\nExitWithFailureMessage() {\n    MESSAGE=\"$1\"\n    JSON=\"$2\"\n    if [[ \"$JSON\" == \"PRINT_JSON\" ]]; then\n        echo \"{\\\"error\\\":\\\"$MESSAGE\\\"}\"\n    fi\n    WriteStandardError \"$MESSAGE\"\n    exit 1\n}\n\nExitWithSuccessMessage() {\n    echo \"$1\"\n    exit 0\n}\n\nWriteStandardError() {\n    MESSAGE=\"$1\"\n    (>&2 echo \"$MESSAGE\")\n}\n\nTestPerformAction() {\n    if [[ \"$1\" != \"Yes\" ]]; then\n        ExitWithFailureMessage \"No action was taken because the PerformAction parameter is set to $1. To make the desired change, set this parameter to Yes.\"\n    fi\n}\n\nGroup='{{ Group }}'\n\nPERFORMACTION='{{ PerformAction }}'\nTestPerformAction \"$PERFORMACTION\"\n\nif grep -q \"^$Group:\" /etc/group; then\n    ExitWithFailureMessage 'The specified group already exists.'\nfi\n\nif type -P groupadd &>/dev/null; then\n    groupadd \"$Group\" || ExitWithFailureMessage 'Failed to create the specified group.'\n    ExitWithSuccessMessage 'The specified group has been created.'\nelse\n    ExitWithFailureMessage 'The required command groupadd does not exist.' 'PRINT_JSON'\nfi\n"
+        ]
+      }
+    }
+  ]
+}
