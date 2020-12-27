@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-ConfigureCodeBuildProjectWithKMSCMK\n\n## What does this document do?\nThis document configures a AWS Key Management Service (KMS) Customer Master Key (CMK) to encrypt a given AWS CodeBuild project's build artifacts using the [UpdateProject](https://docs.aws.amazon.com/codebuild/latest/APIReference/API_UpdateProject.html) API.\n\nThis document must only be used as a baseline to ensure that your AWS CodeBuild project's build artifacts are encrypted with the minimum security best practice of using an AWS KMS customer managed CMK.\nBased on your data policy, AWS CodeBuild project's build artifacts should be encrypted with different customer managed CMKs as documented [here](https://docs.aws.amazon.com/kms/latest/developerguide/best-practices.html).\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* ProjectId: (Required) The resource ID of the AWS CodeBuild project stored by AWS Config.\n* KMSCMKArn: (Required) The AWS KMS CMK ARN used for encryption.\n\n## Output Parameters\n* ModifyProject.Output: The standard HTTP response from the UpdateProject API.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "ProjectId": {
+      "type": "String",
+      "description": "(Required) The resource ID of the AWS CodeBuild project stored by AWS Config.",
+      "allowedPattern": "^[a-z0-9-]{1,768}"
+    },
+    "KMSCMKArn": {
+      "type": "String",
+      "description": "(Required) The AWS KMS CMK ARN used for encryption.",
+      "allowedPattern": "(^arn:(aws[a-z-]*)?:kms:)([a-z0-9-]*):\\d{12}:(key|alias)/([0-9a-z-_/]{1,256})"
+    }
+  },
+  "outputs": [
+    "ModifyProject.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetBuildName",
+      "action": "aws:executeAwsApi",
+      "description": "## GetBuildName\nMakes the GetResourceConfigHistory API call to obtain the AWS CodeBuild project name.\n## Outputs\n* BuildName: The name of the AWS CodeBuild project.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "config",
+        "Api": "GetResourceConfigHistory",
+        "resourceId": "{{ ProjectId }}",
+        "resourceType": "AWS::CodeBuild::Project"
+      },
+      "outputs": [
+        {
+          "Name": "BuildName",
+          "Selector": "$.configurationItems[0].resourceName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ModifyProject",
+      "action": "aws:executeAwsApi",
+      "description": "## ModifyProject\nUpdates the AWS CodeBuild project configuration to encrypt build output artifacts using the specified AWS KMS customer managed key.\n## Outputs\n* Output: The standard HTTP response from the UpdateProject API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "codebuild",
+        "Api": "UpdateProject",
+        "name": "{{ GetBuildName.BuildName }}",
+        "encryptionKey": "{{ KMSCMKArn }}"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyProject",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## VerifyProject\nVerifies that the AWS CodeBuild project has been configured to encrypt build artifacts using the given AWS KMS CMK.\n",
+      "inputs": {
+        "Service": "codebuild",
+        "Api": "BatchGetProjects",
+        "names": [
+          "{{ GetBuildName.BuildName }}"
+        ],
+        "PropertySelector": "$.projects[0].encryptionKey",
+        "DesiredValues": [
+          "{{ KMSCMKArn }}"
+        ]
+      }
+    }
+  ]
+}

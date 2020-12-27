@@ -1,0 +1,116 @@
+{
+  "description": "### Document name - AWSConfigRemediation-DeleteIamRole\n\n## What does this document do?\nThis document deletes an AWS Identity and Access Management role (IAM role) using the [DeleteRole](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DeleteRole.html) API.\nNote: This document does not delete the instance profile associated with the role.\n      This document does not delete service linked roles.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* IAMRoleID: (Required) The id of the AWS IAM role to delete.\n\n## Output Parameters\n* DeleteIAMRoleAndVerify.Output: The standard HTTP response from the DeleteRole API.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "DeleteIAMRoleAndVerify.Output"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "IAMRoleID": {
+      "type": "String",
+      "description": "The id of the AWS AWS IAM role to delete.",
+      "allowedPattern": "^AROA[A-Z0-9]+$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetIAMRoleName",
+      "action": "aws:executeScript",
+      "description": "## GetIAMRoleName\nAccepts the AWS IAM role id as an input and gets the name of the AWS IAM role.\n## outputs\nRoleName: The name of the AWS IAM role.",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "RoleId": "{{ IAMRoleID }}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom time import sleep\n\nTHROTTLE_PERIOD = 0.05\ndef get_role_name(iam_client, iam_role_id):\n    PAGE_SIZE = 1000\n    paginator = iam_client.get_paginator(\"list_roles\")\n    page_iterator = paginator.paginate(PaginationConfig={\"PageSize\": PAGE_SIZE})\n    for page in page_iterator:\n        for role in page[\"Roles\"]:\n            if role[\"RoleId\"] == iam_role_id:\n                return role[\"RoleName\"]\n        sleep(THROTTLE_PERIOD)\n\ndef handler(event,context):\n    iam_client = boto3.client(\"iam\")\n    iam_role_id = event[\"RoleId\"]\n    iam_role_name = get_role_name(iam_client, iam_role_id)\n    if iam_role_name is not None:\n        return {\"RoleName\": iam_role_name}\n    error_message = f\"IAM ROLE {iam_role_name} DOES NOT EXIST.\"\n    raise Exception(error_message)"
+      },
+      "outputs": [
+        {
+          "Name": "RoleName",
+          "Selector": "$.Payload.RoleName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetInstanceProfilesAndPolicies",
+      "action": "aws:executeScript",
+      "description": "## GetInstanceProfilesAndPolicies\nGets the instance profiles and policies for the given AWS IAM role.\n## outputs\nInstanceProfileAttachments: The instance profiles associated with the AWS IAM role.\nRoleManagedPolicies: The managed policies attached to the AWS IAM role.\nRoleInlinePolicies: The inline policies attached to the AWS IAM role.",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "RoleName": "{{ GetIAMRoleName.RoleName}}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom time import sleep\nTHROTTLE_PERIOD = 0.05\n\ndef get_inline_role_policies(iam_client, iam_role_name):\n    PAGE_SIZE = 1000\n    paginator = iam_client.get_paginator(\"list_role_policies\")\n    page_iterator = paginator.paginate(RoleName=iam_role_name, PaginationConfig={\"PageSize\": PAGE_SIZE})\n    policies = []\n    for page in page_iterator:\n        policy_names = page[\"PolicyNames\"]\n        policies.extend(policy_names)\n        sleep(THROTTLE_PERIOD)\n    return policies\n\ndef get_managed_role_policies(iam_client, iam_role_name):\n    PAGE_SIZE = 1000\n    paginator = iam_client.get_paginator(\"list_attached_role_policies\")\n    page_iterator = paginator.paginate(RoleName=iam_role_name, PaginationConfig={\"PageSize\": PAGE_SIZE})\n    policies = []\n    for page in page_iterator:\n        for policy in page[\"AttachedPolicies\"]:\n            policy_arn = policy[\"PolicyArn\"]\n            policies.append(policy_arn)\n        sleep(THROTTLE_PERIOD)\n    return policies\n\ndef get_instance_profile(iam_client, iam_role_name):\n    PAGE_SIZE = 1000\n    paginator = iam_client.get_paginator(\"list_instance_profiles_for_role\")\n    page_iterator = paginator.paginate(RoleName=iam_role_name, PaginationConfig={\"PageSize\": PAGE_SIZE})\n    instance_profiles = []\n    for page in page_iterator:\n        for instance_profile in page[\"InstanceProfiles\"]:\n            instant_profile_name = instance_profile[\"InstanceProfileName\"]\n            instance_profiles.append(instant_profile_name)\n        sleep(THROTTLE_PERIOD)\n    return instance_profiles\n\ndef handler(event,context):\n    iam_client = boto3.client(\"iam\")\n    iam_role_name = event[\"RoleName\"]\n    role_inline_policies = get_inline_role_policies(iam_client, iam_role_name)\n    role_managed_policies = get_managed_role_policies(iam_client, iam_role_name)\n    instance_profile_attachments = get_instance_profile(iam_client,iam_role_name)\n    return {\n        \"role_inline_policies\":role_inline_policies,\n        \"role_managed_policies\":role_managed_policies,\n        \"instance_profile_attachments\":instance_profile_attachments\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "RoleInlinePolicies",
+          "Selector": "$.Payload.role_inline_policies",
+          "Type": "StringList"
+        },
+        {
+          "Name": "RoleManagedPolicies",
+          "Selector": "$.Payload.role_managed_policies",
+          "Type": "StringList"
+        },
+        {
+          "Name": "InstanceProfileAttachments",
+          "Selector": "$.Payload.instance_profile_attachments",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "DeleteInstanceProfilesAndPolicies",
+      "action": "aws:executeScript",
+      "description": "## DeleteInstanceProfilesAndPolicies\nDeletes the instance profiles and policies for the given AWS IAM role.",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "RoleName": "{{ GetIAMRoleName.RoleName }}",
+          "InstanceProfileAttachments": "{{ GetInstanceProfilesAndPolicies.InstanceProfileAttachments }}",
+          "RoleManagedPolicies": "{{ GetInstanceProfilesAndPolicies.RoleManagedPolicies }}",
+          "RoleInlinePolicies": "{{ GetInstanceProfilesAndPolicies.RoleInlinePolicies }}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom time import sleep\nTHROTTLE_PERIOD = 0.05\n\ndef delete_inline_role_policies(iam_client, iam_role_name, role_inline_policies):\n    responses = []\n    for policy in role_inline_policies:\n        response = iam_client.delete_role_policy(RoleName=iam_role_name, PolicyName=policy)\n        responses.append(response)\n    return responses\n\ndef detach_managed_role_policies(iam_client, iam_role_name, role_managed_policies):\n    responses = []\n    for policy in role_managed_policies:\n        response = iam_client.detach_role_policy(RoleName=iam_role_name, PolicyArn=policy)\n        responses.append(response)\n    return responses\n\ndef detach_instance_profile (iam_client,iam_role_name, instance_profile_attachments):\n    responses = []\n    for instantProfileName in instance_profile_attachments:\n        response = iam_client.remove_role_from_instance_profile(RoleName=iam_role_name, InstanceProfileName=instantProfileName)\n        responses.append(response)\n    return responses\n\ndef handler(event,context):\n    iam_client = boto3.client(\"iam\")\n    iam_role_name = event[\"RoleName\"]\n    role_inline_policies = event[\"RoleInlinePolicies\"]\n    role_managed_policies = event[\"RoleManagedPolicies\"]\n    instance_profile_attachments = event[\"InstanceProfileAttachments\"]\n    delete_inline_role_policies(iam_client, iam_role_name, role_inline_policies)\n    detach_managed_role_policies(iam_client,iam_role_name,role_managed_policies)\n    detach_instance_profile(iam_client,iam_role_name, instance_profile_attachments)"
+      }
+    },
+    {
+      "name": "DeleteIAMRoleAndVerify",
+      "action": "aws:executeScript",
+      "description": "## DeleteIAMRoleAndVerify\nDeletes the given AWS IAM role using DeleteRole API and verifies its deletion.      \n## outputs\nOutput: The standard HTTP response from the DeleteRole API.",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "RoleName": "{{ GetIAMRoleName.RoleName }}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom time import sleep\n\nTHROTTLE_PERIOD = 0.05\n\ndef delete_iam_role(iam_client,iam_role_name):\n    response = iam_client.delete_role(RoleName=iam_role_name)\n    return response\n    \ndef verify_iam_role_deletion(iam_client,iam_role_name):\n    try:\n        iam_client.get_role(RoleName=iam_role_name)\n        error_message = f\"VERIFICATION FAILED. IAM ROLE NAME {iam_role_name} NOT DELETED.\"\n        raise Exception(error_message)\n    except iam_client.exceptions.NoSuchEntityException:\n        return \"Verification of 'DeleteIamRole' is successful.\"\n\ndef handler(event,context):\n    iam_client = boto3.client(\"iam\")\n    iam_role_name = event[\"RoleName\"]\n    response = delete_iam_role(iam_client, iam_role_name)\n    output = verify_iam_role_deletion(iam_client, iam_role_name)\n    return {\n        \"output\":{\n            \"Message\":output,\n            \"HTTPResponse\": response\n        }\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

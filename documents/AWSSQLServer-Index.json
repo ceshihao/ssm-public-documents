@@ -1,0 +1,177 @@
+{
+  "description": "#### Performs SQL Server index maintenance operations on a specified database.\n---\n#### Prerequisites for using this document:\n* Instance(s) must be running SQL Server.\n* An AWS Secrets Manager database credential must be configured with the following two fields: **username** and **password**. For instructions, see [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access.html).\n* On Windows, the **username** and **password** must be the domain account and password used to authenticate SQL Server.\n* On Linux, the **username** and **password** must be the SQL Server login  name and password.\nThe **username** must own the database or must be assigned, at minimum, the following database role: **db_owner**. \n* Instances may need to be granted additional permissions and roles that allow access to AWS Secrets Manager credentials and Amazon S3. For more information, see the [documentation](http://docs.aws.amazon.com/launchwizard/latest/userguide/launch-wizard-sql-provided-runbooks.html).\n---\nThis document uses fragmentation defaults of less than 5% for low, 5% to 30% for medium, and greater than 30% for high.\n\n*Note: This document installs and uses third-party software from [https://ola.hallengren.com](https://ola.hallengren.com), which is provided under the following license: [https://ola.hallengren.com/license.html](https://ola.hallengren.com/license.html)*.",
+  "schemaVersion": "0.3",
+  "parameters": {
+    "Database": {
+      "type": "String",
+      "allowedPattern": "^([^&,\\*\\s]+){1,127}$",
+      "description": "Database on which to perform index maintenance operations"
+    },
+    "InstanceId": {
+      "type": "StringList",
+      "description": "Target SQL Server instance on which to perform the backup operation"
+    },
+    "LowFragmentIndexAction": {
+      "type": "String",
+      "default": "Do nothing",
+      "allowedValues": [
+        "Do nothing",
+        "Build index online",
+        "Build index offline",
+        "Reorganize index",
+        "Build index online, with offline fallback",
+        "Build index online, with reorganize fallback",
+        "Reorganize index, with online fallback, then offline fallback"
+      ],
+      "description": "Action to be taken on indexes with low fragmentation"
+    },
+    "MediumFragmentIndexAction": {
+      "type": "String",
+      "default": "Reorganize index, with online fallback, then offline fallback",
+      "allowedValues": [
+        "Do nothing",
+        "Build index online",
+        "Build index offline",
+        "Reorganize index",
+        "Build index online, with offline fallback",
+        "Build index online, with reorganize fallback",
+        "Reorganize index, with online fallback, then offline fallback"
+      ],
+      "description": "Action to be taken on indexes with medium fragmentation"
+    },
+    "HighFragmentIndexAction": {
+      "type": "String",
+      "default": "Build index online, with offline fallback",
+      "allowedValues": [
+        "Do nothing",
+        "Build index online",
+        "Build index offline",
+        "Reorganize index",
+        "Build index online, with offline fallback",
+        "Build index online, with reorganize fallback",
+        "Reorganize index, with online fallback, then offline fallback"
+      ],
+      "description": "Action to be taken on indexes with high fragmentation"
+    },
+    "UseTempDbForReindexing": {
+      "type": "String",
+      "default": "No",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ],
+      "description": "Specifies whether to use a temporary database for re-indexing"
+    },
+    "SecretsMangerCredential": {
+      "type": "String",
+      "allowedPattern": "^[\\/_+=\\.@\\-a-zA-Z0-9]{1,512}$",
+      "description": "AWS Secrets Manager credentials for SQL Server"
+    },
+    "ThirdPartySoftwareConsent": {
+      "type": "String",
+      "allowedValues": [
+        "Yes"
+      ],
+      "description": "Consent to the use the third-party software mentioned in the description"
+    },
+    "IncludeMSShippedObjects": {
+      "type": "String",
+      "default": "No",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ],
+      "description": "Specifies whether to perform index maintenance on Microsoft shipped components"
+    },
+    "MaxDOP": {
+      "type": "String",
+      "default": "0",
+      "description": "Controls CPU utilization. Specifying 0 designates CPU utilization based on workload, and specifying a value greater than 0 designates the number of CPUs to use",
+      "allowedValues": [
+        "0",
+        "1",
+        "2",
+        "4",
+        "8",
+        "16",
+        "32",
+        "64"
+      ]
+    },
+    "ReindexTableList": {
+      "type": "String",
+      "allowedPattern": "^([^&,\\*\\s]+){1,127}$|^([^&,\\*\\s]+){1,127},([^&,\\*\\s]+){1,127}$|^([^&,\\*\\s]+){1,127},([^&,\\*\\s]+){1,127},([^&,\\*\\s]+){1,127}$|^$",
+      "description": "A comma-delimited list that specifies the tables to re-index. There is a maximum limit of three tables. If no tables are specified, the default is to re-index all tables in the database).",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetInstanceOSInfo",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "platform",
+          "Selector": "$.InstanceInformationList[0].PlatformType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnWindowsOrLinux",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ExecuteReindexing",
+            "Variable": "{{GetInstanceOSInfo.platform}}",
+            "StringEquals": "Windows"
+          },
+          {
+            "NextStep": "InstallPowerShellOnLinux",
+            "Variable": "{{GetInstanceOSInfo.platform}}",
+            "StringEquals": "Linux"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InstallPowerShellOnLinux",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": "{{ InstanceId }}",
+        "Parameters": {
+          "commands": "if [ \"$(which pwsh > /dev/null 2>&1; echo $?)\" -ne \"0\" ]\nthen\n   sudo apt-get install -y powershell\nfi"
+        }
+      }
+    },
+    {
+      "name": "ExecuteReindexing",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": "{{ InstanceId }}",
+        "Parameters": {
+          "commands": [
+            "function VerifySignature { param( [Parameter(Mandatory=$true)] $FilePath, [Parameter(Mandatory=$true)] $SignatureFilePath ) $code = \" using System; using System.IO; using System.Security.Cryptography; namespace Crypto { public class CryptoHelper { public static bool VerifySignature(string FilePath, string SignatureFilePath) { try { var modulus = Convert.FromBase64String(\"\"68hw9z3PIC7u5VkEoWeOI+f63hf3+FTDidjgEYkbsGVJ/8Yip0tIyk7rw84AEA9mlZ8c9k5U0dZo18fLGYhRkfgytLVwaXXU8083DwTGj5n8TvTrKss8ugschfGQJIanyWR7eRFLxuYZS5fo2lxur8K+6rc7yDgM+zQTzoOz2GDcTMm3MY3aST9/SShmJLoc6yoekXifyCebSFt8PZ0lmARFiHupepDrZlqXKY/490MlEiZz2fh7RjOORTDZo85Ai/prxxRuHnXrlIBDCbWfCqPCphJD9IMYcbFUxMfL1M7WXCheAtPpzJjMpdLQ+QIzOY1gdvTxx9ml4BtcdXyyE1BE0gFmR8QHBzJIE6KWE7OSEQpPnqwJ+zkA79Mr9/Ud4gdKeI2rGWN7quspSn7nCXcfbG+j9Rc0JMpKgaVLhfXxC0/xWS6JO4HCgrfh5rXWjAN+HVeHDI2iuPOALrHSUPK9hFudqDWSCEhBO3WcVTeg7dzU2M8rx92ypfbThEhczwXQ3yXGbojUzEPv8M24tOsjDZtPlyErE9xwtVY4UBUuJPsjbxLYx/Bq8Fg79liIVITRDH+UQFGws3YZe8EqSOpyk8hY6rOXXXU0uVLpjMny1tmxngdFRaTnQtNUoqV4NBT1wTTSNKEx/O04fEfU7Jha6oaeZ1NaL4F4wApmAh0=\"\"); var exponent = Convert.FromBase64String(\"\"AQAB\"\"); var rsa = RSA.Create(new RSAParameters {Exponent = exponent, Modulus = modulus}); using (var stream = File.OpenRead(FilePath)) { var signatureBytes = File.ReadAllBytes(SignatureFilePath); var bytesToVerify = SHA256.Create().ComputeHash(stream); return rsa.VerifyData(bytesToVerify, signatureBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1); } } catch (Exception e) { Console.WriteLine(e.ToString()); return false; } } } } \"; Add-Type -TypeDefinition $code -Language CSharp -ErrorAction Stop; return [Crypto.CryptoHelper]::VerifySignature($FilePath, $SignatureFilePath); }\nfunction ExecuteScript { param( [Parameter(Mandatory=$true)] $ScriptFileName, [Parameter(Mandatory=$true)] $ScriptExpression)\n$ExitCode = 1; $Result = \"\"; $TempFolder = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ([System.Guid]::NewGuid()); $null = New-Item -ItemType Directory -Path $TempFolder -ErrorAction Stop; try { $MaintenanceZip = \"aws-maintenance.zip\"; $MaintenanceZipSig = \"aws-maintenance.zip.sig\"; $Prefix = \"3fae63dc-d9c3-40b1-a8c5-e03461b2ee9a\"; $Stage  = \"prod\"; $Region = \"{{global:REGION}}\"; $S3Domain = \"s3.amazonaws.com\"; if ($Region.Contains(\"gov\")) { $S3Domain = \"s3-$Region.amazonaws.com\"; } $URI=\"https://launchwizardscript-$Stage-$Region.$S3Domain/$Prefix/Maintenance/\"; $ZipFile = Join-Path -Path $TempFolder -ChildPath $MaintenanceZip; $ZipFileSig = Join-Path -Path $TempFolder -ChildPath $MaintenanceZipSig; $ScriptPath = Join-Path -Path $TempFolder -ChildPath \"Maintenance\"; $ScriptPath = Join-Path -Path $ScriptPath -ChildPath $ScriptFileName; $ProgressPreference = \"SilentlyContinue\"; $global:ProgressPreference = \"SilentlyContinue\"; $null = Invoke-WebRequest -Uri ($URI+$MaintenanceZip) -OutFile $ZipFile -ErrorAction Stop; $null = Invoke-WebRequest -Uri ($URI+$MaintenanceZipSig) -OutFile $ZipFileSig -ErrorAction Stop; if ((VerifySignature $ZipFile $ZipFileSig) -ne $true) { throw \"Signature validation failed\" } $null = Expand-Archive -Path $ZipFile -DestinationPath $TempFolder -ErrorAction Stop; $ScriptBlock = [scriptblock]::Create(\". $ScriptPath; $ScriptExpression\"); $Result = Invoke-Command -ScriptBlock $ScriptBlock -ErrorAction Stop; } catch { Write-Output $_.Exception; } finally { $Null = Remove-Item $TempFolder -Recurse -Force -ErrorAction SilentlyContinue; if (($null -eq $Result) -or ($Result.GetType().FullName -eq \"System.String\")) { Write-Output \"Unknown execution failure $Result\"; exit(1) } else { $Len = $Result.Length-1; $ExitCode = $Result[$Len]; $Len2 = $Len-1; Write-Output $Result[0..$Len2]; exit($ExitCode) } } } try { Set-StrictMode -Version latest; $Map = @{\"Do nothing\" = \"DoNothing\"; \"Build index online\" = \"BuildOnline\"; \"Rebuild index offline\" = \"RebuildOffline\"; \"Reorganize index\" = \"Reorganize\"; \"Build index online, with offline fallback\" = \"BuildOnlineThenRebuildOffline\"; \"Build index online, with reorganize fallback\" = \"BuildOnlineThenReorganize\"; \"Reorganize index, with online fallback, then offline fallback\"=\"ReorganizeThenBuildOnlineThenRebuildOffline\"}; $Low=$Map[\"{{LowFragmentIndexAction}}\"]; $Medium=$Map[\"{{MediumFragmentIndexAction}}\"]; $High=$Map[\"{{HighFragmentIndexAction}}\"]; $ReindexType=\"ReindexAllTables\"; $ReindexTableExpression=\"\";\nif (\"{{ReindexTableList}}\" -ne \"\") { $ReindexTableExpression = \"-ReindexTableList {{ReindexTableList}}\"; $ReindexType=\"ReindexSpecificTables\" };\n$ScriptExpression = \"ReindexDatabase -Databases {{Database}} -SecretsManagerId {{SecretsMangerCredential}} \" + \"-ReindexOptions LowFragmentIndexAction=$Low,MediumFragmentIndexAction=$Medium,\" + \"HighFragmentIndexAction=$High,UseTempDbForReindexing={{UseTempDbForReindexing}},\" + \"IncludeMSShippedObjects={{IncludeMSShippedObjects}},MaxDOP={{MaxDOP}},ReindexType=$ReindexType \" + \"$ReindexTableExpression\"; ExecuteScript -ScriptFileName \"aws-sqlreindexing.ps1\" -ScriptExpression $ScriptExpression } catch { Write-Output $_.Exception; exit(1) }"
+          ],
+          "executionTimeout": "172800"
+        }
+      },
+      "timeoutSeconds": 172800
+    }
+  ]
+}

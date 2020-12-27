@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-EnableApiGatewayTracing\n\n## What does this document do?\nThis document enables tracing on an Amazon API Gateway Stage using the [UpdateStage](https://docs.aws.amazon.com/apigateway/api-reference/link-relation/stage-update/) API.\nPlease note, AWS Config is required to be enabled in this region for this document to work as it requires the resource ID recorded by the AWS Config service.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* StageArn: (Required) The Amazon API Gateway Stage ARN.\n\n## Output Parameters\n* EnableTracingAndVerify.Output: Success message or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "StageArn": {
+      "type": "String",
+      "description": "(Required) The Amazon API Gateway Stage ARN.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:apigateway:[a-z0-9-]+::/restapis/[a-z0-9]+/stages/[\\w]+"
+    }
+  },
+  "outputs": [
+    "EnableTracingAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "EnableTracingAndVerify",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## EnableTracingAndVerify\nEnables tracing on the given Amazon API Gateway stage and verifies.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "StageArn": "{{ StageArn }}"
+        },
+        "Script": "import boto3\nimport botocore\nimport re\n\ndef handler(event, context):\n    config_client = boto3.client(\"config\")\n    apigateway_client = boto3.client(\"apigateway\")\n    stage_id = event[\"StageArn\"]\n    rest_api_id = \"\"\n\n    stage_response = config_client.get_resource_config_history(resourceType=\"AWS::ApiGateway::Stage\",\n                                                                resourceId=stage_id, limit=1)\n    stage_name = stage_response[\"configurationItems\"][0][\"resourceName\"]\n    rest_api_arn = stage_response[\"configurationItems\"][0][\"relationships\"][0][\"resourceId\"]\n    rest_api_arn_pattern = \"^arn:.*:/restapis/(.*)\"\n    rest_api_match = re.match(rest_api_arn_pattern, rest_api_arn)\n    if not rest_api_match:\n        raise Exception(\"GIVEN AMAZON API GATEWAY STAGE ID IS NOT ASSOCIATED WITH ANY REST API ID.\")\n    rest_api_id = rest_api_match.groups()[0]\n\n    # Enables tracing to the given Amazon API Gateway stage.\n    update_stage_response = apigateway_client.update_stage(stageName=stage_name, restApiId=rest_api_id, patchOperations=[\n        {\n            \"op\": \"replace\",\n            \"path\": \"/tracingEnabled\",\n            \"value\": \"true\"\n        },\n    ])\n\n    # Verifies that the stage tracing has enabled.\n    get_stage_response = apigateway_client.get_stage(restApiId=rest_api_id, stageName=stage_name)\n    if get_stage_response['tracingEnabled']:\n        return {\n            \"output\": {\n                \"message\": \"Verification of 'Enable Tracing' is successful.\",\n                \"HTTPResponse\": update_stage_response[\"ResponseMetadata\"]\n            }\n        }\n    error_message = f\"VERIFICATION FAILED. API GATEWAY STAGE {stage_name} TRACING NOT ENABLED.\"\n    raise Exception(error_message)"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

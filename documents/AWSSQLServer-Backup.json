@@ -1,0 +1,138 @@
+{
+  "description": "#### Backs up SQL Server databases to a local volume and optionally uploads the backup files to Amazon S3. \n---\n#### Prerequisites for using this document:\n* Instance(s) must be running SQL Server.\n* An AWS Secrets Manager database credential must be configured with the following two fields: **username** and **password**. For instructions, see [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access.html).\n* On Windows, the **username** and **password** must be the domain account and password used to authenticate SQL Server.\n* On Linux, the **username** and **password** must be the SQL Server login  name and password.\n* The **username** must be assigned, at minimum, the following database role: **db_backupoperator**. \n* Instances may need to be granted additional permissions and roles that allow access to AWS Secrets Manager credentials and Amazon S3. For more information, see the [documentation](https://docs.aws.amazon.com/launchwizard/latest/userguide/launch-wizard-sql-provided-runbooks.html).\n---\n\n*Note: This document installs and uses third-party software from [https://ola.hallengren.com](https://ola.hallengren.com), which is provided under the following license: [https://ola.hallengren.com/license.html](https://ola.hallengren.com/license.html)*.",
+  "schemaVersion": "0.3",
+  "parameters": {
+    "Database": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z_][\\w@$#_]{0,127}$",
+      "description": "Database to back up"
+    },
+    "BackupType": {
+      "type": "String",
+      "allowedValues": [
+        "FULL",
+        "DIFF",
+        "LOG"
+      ],
+      "description": "Select FULL for complete backup, DIFF for differential backup, LOG for transaction log backup"
+    },
+    "Directory": {
+      "type": "String",
+      "description": "Directory path for the local backup. For example, C:\\backup (Windows) or /home/user/backup (Linux)",
+      "allowedPattern": "^[a-zA-Z]\\:\\\\[\\w_\\-\\.\\\\!@#$%^+-=~{};,]{1,180}$|^\\/[\\w_\\-\\.\\/!@#$%^+-=~{};,]{1,180}$"
+    },
+    "BackupRetentionPolicy": {
+      "type": "String",
+      "description": "Retention policy for local backup files",
+      "allowedValues": [
+        "Never delete older backups",
+        "Delete older backups after successful backup (specify retention time in DeleteBackupsOlderThan)",
+        "Delete older backups before backup (specify retention time in DeleteBackupsOlderThan)"
+      ],
+      "default": "Never delete older backups"
+    },
+    "DeleteBackupsOlderThan": {
+      "type": "String",
+      "default": "0",
+      "description": "Retention time, in hours, for local backup files (used by \"Delete older backups...\");  0 means never delete",
+      "allowedPattern": "^[0-9]{1,6}$"
+    },
+    "SecretsMangerCredential": {
+      "type": "String",
+      "description": "Name of the AWS Secrets Manager database secret",
+      "allowedPattern": "^[\\/_+=\\.@\\-a-zA-Z0-9]{1,512}$"
+    },
+    "S3Bucket": {
+      "type": "String",
+      "allowedPattern": "^[0-9a-z][a-z0-9\\-\\.]{3,63}$|^$",
+      "description": "Optionally specified Amazon S3 bucket name to which to upload backup. For example, my-backup-bucket",
+      "default": ""
+    },
+    "S3BucketFolder": {
+      "type": "String",
+      "allowedPattern": "^[\\S].+$|^$",
+      "default": "",
+      "description": "Optionally specified non-public Amazon S3 folder to store backups, which must be specified for S3Bucket"
+    },
+    "InstanceId": {
+      "type": "StringList",
+      "description": "Target SQL Server instance on which to perform the backup operation"
+    },
+    "ThirdPartySoftwareConsent": {
+      "type": "String",
+      "allowedValues": [
+        "Yes"
+      ],
+      "description": "Consent to the use third-party software mentioned in description"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetInstanceOSInfo",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "platform",
+          "Selector": "$.InstanceInformationList[0].PlatformType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnWindowsOrLinux",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ExecuteBackup",
+            "Variable": "{{GetInstanceOSInfo.platform}}",
+            "StringEquals": "Windows"
+          },
+          {
+            "NextStep": "InstallPowerShellOnLinux",
+            "Variable": "{{GetInstanceOSInfo.platform}}",
+            "StringEquals": "Linux"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InstallPowerShellOnLinux",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": "{{ InstanceId }}",
+        "Parameters": {
+          "commands": "if [ \"$(which pwsh > /dev/null 2>&1; echo $?)\" -ne \"0\" ]\nthen\n   sudo apt-get install -y powershell\nfi"
+        }
+      }
+    },
+    {
+      "name": "ExecuteBackup",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": "{{ InstanceId }}",
+        "Parameters": {
+          "commands": [
+            "function VerifySignature { param( [Parameter(Mandatory=$true)] $FilePath, [Parameter(Mandatory=$true)] $SignatureFilePath ) $code = \" using System; using System.IO; using System.Security.Cryptography; namespace Crypto { public class CryptoHelper { public static bool VerifySignature(string FilePath, string SignatureFilePath) { try { var modulus = Convert.FromBase64String(\"\"68hw9z3PIC7u5VkEoWeOI+f63hf3+FTDidjgEYkbsGVJ/8Yip0tIyk7rw84AEA9mlZ8c9k5U0dZo18fLGYhRkfgytLVwaXXU8083DwTGj5n8TvTrKss8ugschfGQJIanyWR7eRFLxuYZS5fo2lxur8K+6rc7yDgM+zQTzoOz2GDcTMm3MY3aST9/SShmJLoc6yoekXifyCebSFt8PZ0lmARFiHupepDrZlqXKY/490MlEiZz2fh7RjOORTDZo85Ai/prxxRuHnXrlIBDCbWfCqPCphJD9IMYcbFUxMfL1M7WXCheAtPpzJjMpdLQ+QIzOY1gdvTxx9ml4BtcdXyyE1BE0gFmR8QHBzJIE6KWE7OSEQpPnqwJ+zkA79Mr9/Ud4gdKeI2rGWN7quspSn7nCXcfbG+j9Rc0JMpKgaVLhfXxC0/xWS6JO4HCgrfh5rXWjAN+HVeHDI2iuPOALrHSUPK9hFudqDWSCEhBO3WcVTeg7dzU2M8rx92ypfbThEhczwXQ3yXGbojUzEPv8M24tOsjDZtPlyErE9xwtVY4UBUuJPsjbxLYx/Bq8Fg79liIVITRDH+UQFGws3YZe8EqSOpyk8hY6rOXXXU0uVLpjMny1tmxngdFRaTnQtNUoqV4NBT1wTTSNKEx/O04fEfU7Jha6oaeZ1NaL4F4wApmAh0=\"\"); var exponent = Convert.FromBase64String(\"\"AQAB\"\"); var rsa = RSA.Create(new RSAParameters {Exponent = exponent, Modulus = modulus}); using (var stream = File.OpenRead(FilePath)) { var signatureBytes = File.ReadAllBytes(SignatureFilePath); var bytesToVerify = SHA256.Create().ComputeHash(stream); return rsa.VerifyData(bytesToVerify, signatureBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1); } } catch (Exception e) { Console.WriteLine(e.ToString()); return false; } } } } \"; Add-Type -TypeDefinition $code -Language CSharp -ErrorAction Stop; return [Crypto.CryptoHelper]::VerifySignature($FilePath, $SignatureFilePath); }\nfunction ExecuteScript { param( [Parameter(Mandatory=$true)] $ScriptFileName, [Parameter(Mandatory=$true)] $ScriptExpression)\n$ExitCode = 1; $Result = \"\"; $TempFolder = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ([System.Guid]::NewGuid()); $null = New-Item -ItemType Directory -Path $TempFolder -ErrorAction Stop; try { $MaintenanceZip = \"aws-maintenance.zip\"; $MaintenanceZipSig = \"aws-maintenance.zip.sig\"; $Prefix = \"3fae63dc-d9c3-40b1-a8c5-e03461b2ee9a\"; $Stage  = \"prod\"; $Region = \"{{global:REGION}}\"; $S3Domain = \"s3.amazonaws.com\"; if ($Region.Contains(\"gov\")) { $S3Domain = \"s3-$Region.amazonaws.com\"; } $URI=\"https://launchwizardscript-$Stage-$Region.$S3Domain/$Prefix/Maintenance/\"; $ZipFile = Join-Path -Path $TempFolder -ChildPath $MaintenanceZip; $ZipFileSig = Join-Path -Path $TempFolder -ChildPath $MaintenanceZipSig; $ScriptPath = Join-Path -Path $TempFolder -ChildPath \"Maintenance\"; $ScriptPath = Join-Path -Path $ScriptPath -ChildPath $ScriptFileName; $ProgressPreference = \"SilentlyContinue\"; $global:ProgressPreference = \"SilentlyContinue\"; $null = Invoke-WebRequest -Uri ($URI+$MaintenanceZip) -OutFile $ZipFile -ErrorAction Stop; $null = Invoke-WebRequest -Uri ($URI+$MaintenanceZipSig) -OutFile $ZipFileSig -ErrorAction Stop; if ((VerifySignature $ZipFile $ZipFileSig) -ne $true) { throw \"Signature validation failed\" } $null = Expand-Archive -Path $ZipFile -DestinationPath $TempFolder -ErrorAction Stop; $ScriptBlock = [scriptblock]::Create(\". $ScriptPath; $ScriptExpression\"); $Result = Invoke-Command -ScriptBlock $ScriptBlock -ErrorAction Stop; } catch { Write-Output $_.Exception; } finally { $Null = Remove-Item $TempFolder -Recurse -Force -ErrorAction SilentlyContinue; if (($null -eq $Result) -or ($Result.GetType().FullName -eq \"System.String\")) { Write-Output \"Unknown execution failure $Result\"; exit(1) } else { $Len = $Result.Length-1; $ExitCode = $Result[$Len]; $Len2 = $Len-1; Write-Output $Result[0..$Len2]; exit($ExitCode) } } } try { Set-StrictMode -Version latest; $Map = @{\"Never delete older backups\" = \"NeverDelete\"; \"Delete older backups after successful backup (specify retention time in DeleteBackupsOlderThan)\" = \"DeleteAfterBackup\"; \"Delete older backups before backup (specify retention time in DeleteBackupsOlderThan)\" = \"DeleteBeforeBackup\";}; $S3Bucket=\"{{S3Bucket}}\"; $S3BucketFolder=\"{{S3BucketFolder}}\"; $S3Expression=\"\"; if (($S3Bucket -ne \"\") -or ($S3BucketFolder -ne \"\")) { if (!(($S3Bucket -ne \"\") -and ($S3BucketFolder -ne \"\"))) { Write-Output \"The S3Bucket and S3Bucket folder must be specified together\" exit(1) } $S3Expression = \"-S3Bucket {{S3Bucket}} -S3BucketFolder {{S3BucketFolder}}\" };\n$BackupRetentionPolicy = $Map[\"{{BackupRetentionPolicy}}\"]; $DeleteBackupsOlderThan = \"{{DeleteBackupsOlderThan}}\";\nif ([string]::IsNullOrEmpty($BackupRetentionPolicy) -or [string]::IsNullOrEmpty($DeleteBackupsOlderThan)) { Write-Output \"Mismatch in document content\"; exit(1); }\n$ScriptExpression = \"BackupDatabase -SecretsManagerId {{SecretsMangerCredential}} -Databases {{Database}} -BackupType \" + \"{{BackupType}} -Directory {{Directory}} $S3Expression \" + \"-BackupRetentionPolicy $BackupRetentionPolicy -DeleteBackupsOlderThan $DeleteBackupsOlderThan\"; ExecuteScript -ScriptFileName \"aws-sqlbackup.ps1\" -ScriptExpression $ScriptExpression; } catch { Write-Output $_.Exception; exit(1) }"
+          ],
+          "executionTimeout": "172800"
+        }
+      },
+      "timeoutSeconds": 172800
+    }
+  ]
+}

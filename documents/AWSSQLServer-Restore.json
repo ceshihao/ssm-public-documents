@@ -1,0 +1,132 @@
+{
+  "description": "#### Downloads SQL Server backups from Amazon S3 to local storage, and optionally restores the database from a backup.\n---\n#### Prerequisites for using this document:\n* Instance(s) must be running SQL Server.\n* An AWS Secrets Manager database credential must be configured with with the following two fields: **username** and **password**. For instructions, see the [documentation](http://docs.aws.amazon.com/launchwizard/latest/userguide/launch-wizard-sql-provided-runbooks.html).\n* On Windows, the **username** and **password** must be the domain account and password used to authenticate SQL Server.\n* On Linux, the **username** and **password** must be the SQL Server login  name and password.\n* The Amazon S3 database backup must have been performed by the following AWS backup document: [PlaceHolderForLink].\n* The Amazon S3 database backups must include at least one FULL database backup.\n* The **username** must be assigned, at minimum, the following database role: **db_owner**.\n* Instances may need to be granted additional permissions and roles that allow access to AWS Secrets Manager credentials and Amazon S3. For more information, see [PlaceHolderForLink].\n---\nThis document can optionally restore a database from a backup using the latest FULL backup for the specified time range. It then applies the latest DIFF and LOG backups performed after the latest complete backup.",
+  "schemaVersion": "0.3",
+  "parameters": {
+    "InstanceId": {
+      "type": "StringList",
+      "description": "Target SQL Server instance on which to perform backup operation"
+    },
+    "Database": {
+      "type": "String",
+      "allowedPattern": "^([^&,\\*\\s]+){1,127}$",
+      "description": "Database to restore"
+    },
+    "S3Bucket": {
+      "type": "String",
+      "allowedPattern": "^[0-9a-z][a-z0-9\\-\\.]{3,63}$",
+      "description": "Amazon S3 bucket that contains the backup files (for example, my-backup-bucket)"
+    },
+    "S3BucketFolder": {
+      "type": "String",
+      "allowedPattern": "^[\\S].+$",
+      "description": "Amazon S3 folder that contains the backup files (for example, SqlBackups)"
+    },
+    "RestoreAction": {
+      "type": "String",
+      "allowedValues": [
+        "Copy FULL, DIFF, and LOG files to local storage",
+        "Copy FULL, DIFF, and LOG files to local storage, and restore database from backup"
+      ],
+      "description": "Specifies whether restore action should only download files, or download and restore database",
+      "default": ""
+    },
+    "DownloadDirectory": {
+      "type": "String",
+      "description": "Local directory path for download from Amazon S3. For example, C:\\Download (Windows), /home/user/download (Linux)",
+      "allowedPattern": "^[a-zA-Z]\\:\\\\[\\w_\\-\\.\\\\!@#$%^+-=~{};,]{1,180}$|^\\/[\\w_\\-\\.\\/!@#$%^+-=~{};,]{1,180}$"
+    },
+    "DataFilesDirectory": {
+      "type": "String",
+      "description": "Optional local directory path for remapping logical database files, such as .ldf and .mdf files",
+      "allowedPattern": "^[a-zA-Z]\\:\\\\[\\w_\\-\\.\\\\!@#$%^+-=~{};,]{1,180}$|^\\/[\\w_\\-\\.\\/!@#$%^+-=~{};,]{1,180}$|^$",
+      "default": ""
+    },
+    "DateRangeNotBefore": {
+      "type": "String",
+      "description": "Optionally specified file date after which files will not be considered for restore. Must use YYYY/MM/DD format.",
+      "allowedPattern": "(^([12]\\d{3}\\/(0[1-9]|1[0-2])\\/(0[1-9]|[12]\\d|3[01]))$)|^$",
+      "default": ""
+    },
+    "DateRangeNotAfter": {
+      "type": "String",
+      "description": "Optionally specified file date before which files will not be considered for restore. Must use the YYYY/MM/DD format.",
+      "allowedPattern": "(^([12]\\d{3}\\/(0[1-9]|1[0-2])\\/(0[1-9]|[12]\\d|3[01]))$)|^$",
+      "default": ""
+    },
+    "SecretsMangerCredential": {
+      "type": "String",
+      "description": "Optionally specified name of the AWS Secrets Manager database secret, which is required for database restore",
+      "allowedPattern": "^[\\/_+=\\.@\\-a-zA-Z0-9]{1,512}$|^$",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetInstanceOSInfo",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "platform",
+          "Selector": "$.InstanceInformationList[0].PlatformType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnWindowsOrLinux",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ExecuteRestore",
+            "Variable": "{{GetInstanceOSInfo.platform}}",
+            "StringEquals": "Windows"
+          },
+          {
+            "NextStep": "InstallPowerShellOnLinux",
+            "Variable": "{{GetInstanceOSInfo.platform}}",
+            "StringEquals": "Linux"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InstallPowerShellOnLinux",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": "{{ InstanceId }}",
+        "Parameters": {
+          "commands": "if [ \"$(which pwsh > /dev/null 2>&1; echo $?)\" -ne \"0\" ]\nthen\n   sudo apt-get install -y powershell\nfi"
+        }
+      }
+    },
+    {
+      "name": "ExecuteRestore",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": "{{ InstanceId }}",
+        "Parameters": {
+          "commands": [
+            "function VerifySignature { param( [Parameter(Mandatory=$true)] $FilePath, [Parameter(Mandatory=$true)] $SignatureFilePath ) $code = \" using System; using System.IO; using System.Security.Cryptography; namespace Crypto { public class CryptoHelper { public static bool VerifySignature(string FilePath, string SignatureFilePath) { try { var modulus = Convert.FromBase64String(\"\"68hw9z3PIC7u5VkEoWeOI+f63hf3+FTDidjgEYkbsGVJ/8Yip0tIyk7rw84AEA9mlZ8c9k5U0dZo18fLGYhRkfgytLVwaXXU8083DwTGj5n8TvTrKss8ugschfGQJIanyWR7eRFLxuYZS5fo2lxur8K+6rc7yDgM+zQTzoOz2GDcTMm3MY3aST9/SShmJLoc6yoekXifyCebSFt8PZ0lmARFiHupepDrZlqXKY/490MlEiZz2fh7RjOORTDZo85Ai/prxxRuHnXrlIBDCbWfCqPCphJD9IMYcbFUxMfL1M7WXCheAtPpzJjMpdLQ+QIzOY1gdvTxx9ml4BtcdXyyE1BE0gFmR8QHBzJIE6KWE7OSEQpPnqwJ+zkA79Mr9/Ud4gdKeI2rGWN7quspSn7nCXcfbG+j9Rc0JMpKgaVLhfXxC0/xWS6JO4HCgrfh5rXWjAN+HVeHDI2iuPOALrHSUPK9hFudqDWSCEhBO3WcVTeg7dzU2M8rx92ypfbThEhczwXQ3yXGbojUzEPv8M24tOsjDZtPlyErE9xwtVY4UBUuJPsjbxLYx/Bq8Fg79liIVITRDH+UQFGws3YZe8EqSOpyk8hY6rOXXXU0uVLpjMny1tmxngdFRaTnQtNUoqV4NBT1wTTSNKEx/O04fEfU7Jha6oaeZ1NaL4F4wApmAh0=\"\"); var exponent = Convert.FromBase64String(\"\"AQAB\"\"); var rsa = RSA.Create(new RSAParameters {Exponent = exponent, Modulus = modulus}); using (var stream = File.OpenRead(FilePath)) { var signatureBytes = File.ReadAllBytes(SignatureFilePath); var bytesToVerify = SHA256.Create().ComputeHash(stream); return rsa.VerifyData(bytesToVerify, signatureBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1); } } catch (Exception e) { Console.WriteLine(e.ToString()); return false; } } } } \"; Add-Type -TypeDefinition $code -Language CSharp -ErrorAction Stop; return [Crypto.CryptoHelper]::VerifySignature($FilePath, $SignatureFilePath); }\nfunction ExecuteScript { param( [Parameter(Mandatory=$true)] $ScriptFileName, [Parameter(Mandatory=$true)] $ScriptExpression)\n$ExitCode = 1; $Result = \"\"; $TempFolder = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ([System.Guid]::NewGuid()); $null = New-Item -ItemType Directory -Path $TempFolder -ErrorAction Stop; try { $MaintenanceZip = \"aws-maintenance.zip\"; $MaintenanceZipSig = \"aws-maintenance.zip.sig\"; $Prefix = \"3fae63dc-d9c3-40b1-a8c5-e03461b2ee9a\"; $Stage  = \"prod\"; $Region = \"{{global:REGION}}\"; $S3Domain = \"s3.amazonaws.com\"; if ($Region.Contains(\"gov\")) { $S3Domain = \"s3-$Region.amazonaws.com\"; } $URI=\"https://launchwizardscript-$Stage-$Region.$S3Domain/$Prefix/Maintenance/\"; $ZipFile = Join-Path -Path $TempFolder -ChildPath $MaintenanceZip; $ZipFileSig = Join-Path -Path $TempFolder -ChildPath $MaintenanceZipSig; $ScriptPath = Join-Path -Path $TempFolder -ChildPath \"Maintenance\"; $ScriptPath = Join-Path -Path $ScriptPath -ChildPath $ScriptFileName; $ProgressPreference = \"SilentlyContinue\"; $global:ProgressPreference = \"SilentlyContinue\"; $null = Invoke-WebRequest -Uri ($URI+$MaintenanceZip) -OutFile $ZipFile -ErrorAction Stop; $null = Invoke-WebRequest -Uri ($URI+$MaintenanceZipSig) -OutFile $ZipFileSig -ErrorAction Stop; if ((VerifySignature $ZipFile $ZipFileSig) -ne $true) { throw \"Signature validation failed\" } $null = Expand-Archive -Path $ZipFile -DestinationPath $TempFolder -ErrorAction Stop; $ScriptBlock = [scriptblock]::Create(\". $ScriptPath; $ScriptExpression\"); $Result = Invoke-Command -ScriptBlock $ScriptBlock -ErrorAction Stop; } catch { Write-Output $_.Exception; } finally { $Null = Remove-Item $TempFolder -Recurse -Force -ErrorAction SilentlyContinue; if (($null -eq $Result) -or ($Result.GetType().FullName -eq \"System.String\")) { Write-Output \"Unknown execution failure $Result\"; exit(1) } else { $Len = $Result.Length-1; $ExitCode = $Result[$Len]; $Len2 = $Len-1; Write-Output $Result[0..$Len2]; exit($ExitCode) } } } try { Set-StrictMode -Version latest; $Map = @{\"Copy FULL, DIFF, and LOG files to local storage\" = \"Download\"; \"Copy FULL, DIFF, and LOG files to local storage, and restore database from backup\" = \"DownloadAndRestore\"}; $RestoreAction = $Map[\"{{RestoreAction}}\"];\n$SecretsMangerCredential = \"{{SecretsMangerCredential}}\"; $RestoreExpression = \"\"; if ($RestoreAction -eq \"DownloadAndRestore\") { if (($SecretsMangerCredential -eq \"\") -or (\"{{DataFilesDirectory}}\" -eq \"\")) { Write-Output \"The AWS Secrets Manager credential and the data files directory must be specified when restoring the database\"; exit(1) } $RestoreExpression = \"-SecretsManagerId $SecretsMangerCredential  -DataFilesDirectory {{DataFilesDirectory}}\" };\n$DateExpression = \"\"; if (\"{{DateRangeNotBefore}}\" -ne \"\") { $DateExpression = \" -DateRangeNotBefore {{DateRangeNotBefore}}000000\"; $DateExpression = $DateExpression.Replace(\"/\", \"\"); }\nif (\"{{DateRangeNotAfter}}\" -ne \"\") { $DateExpression += \" -DateRangeNotAfter {{DateRangeNotAfter}}235959\"; $DateExpression = $DateExpression.Replace(\"/\", \"\"); }\n$ScriptExpression = \"RestoreDatabase -S3BucketAndFolder {{S3Bucket}}/{{S3BucketFolder}} -DownloadDirectory {{DownloadDirectory}} \" + \"-Database {{Database}}  -RestoreAction $RestoreAction $RestoreExpression $DateExpression\"; ExecuteScript -ScriptFileName \"aws-sqlrestore.ps1\" -ScriptExpression $ScriptExpression; } catch { Write-Output $_.Exception; exit(1) }"
+          ],
+          "executionTimeout": "172800"
+        }
+      },
+      "timeoutSeconds": 172800
+    }
+  ]
+}

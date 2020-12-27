@@ -1,0 +1,172 @@
+{
+  "description": "### Document name - AWS-DeleteEKSCluster\n\n## What does this document do?\n* This document deletes the resources associated with an Amazon EKS cluster as in [this link](https://docs.aws.amazon.com/eks/latest/userguide/delete-cluster.html#delete-cluster-cli).\n* Deletes all node groups and Fargate profiles\n* (Optional) Deletes all self-managed node AWS CloudFormation stacks.\n* (Optional) Delete the VPC AWS CloudFormation stack\n\n  ### NOTE\n  If you have active services in your cluster that are associated with a load balancer, you must delete those services before deleting the cluster so that the load balancers are deleted properly. Otherwise, you can have orphaned resources in your VPC that prevent you from being able to delete the VPC.\n\n  ## [ To delete an Amazon EKS cluster with AWS-DeleteEKSCluster Automation document]\n  1. List all services running in your cluster.\n\n      ```kubectl get svc --all-namespaces```\n\n  2. Delete any services that have an associated EXTERNAL-IP value. These services are fronted by an Elastic Load Balancing load balancer, and you must delete them in Kubernetes to allow the load balancer and associated resources to be properly released.\n\n      ```kubectl delete svc <service-name>```\n\n  3. Execute the AWS-DeleteEKSCluster Automation document.\n\n  ## Input Parameters\n  * EKSClusterName: (Required) The name of the Amazon EKS Cluster to be deleted.\n  * VPCCloudFormationStack: (Optional) AWS Cloudformation stack name for VPC for the EKS cluster being deleted. This will delete the AWS Cloudformation stack for VPC.\n  * VPCCloudFormationStackRole: (Optional) The ARN of an IAM role that AWS CloudFormation assumes to delete the VPC CloudFormation stack. AWS CloudFormation uses the role's credentials to make calls on your behalf.\n  * SelfManagedNodeStacks: (Optional) Comma-separated  list of AWS Cloudformation stack names for self-managed nodes, This will delete the AWS Cloudformation stacks for self-managed nodes.\n  * SelfManagedNodeStacksRole: (Optional) The ARN of an IAM role that AWS CloudFormation assumes to delete the Self-managed Node Stacks. AWS CloudFormation uses the role's credentials to make calls on your behalf\n  * AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n  ## Output parameters\n  * DeleteNodeGroups.output\n      * DeletedNodeGroups - Deleted EKS node groups.\n      * RemainingNodeGroups\n\n  * DeleteFargateProfiles.output\n      * DeletedFargateProfiles - Deleted EKS fargate profiles.\n      * RemainingFargateProfiles\n\n  * DeleteSelfManagedNodes.output\n      * Stacks: Deleted self-managed node stacks in the cluster\n          * Name: stack name\n          * StackStatus: 'DELETE_COMPLETE'\n\n  * DeleteEKSCluster.output\n      * EKSClusterStatus\n          * EKSClusterName: Deleted EKS Cluster name.\n          * DeleteStatus: 'DELETING'\n\n  * DeleteVPCCloudFormationStack.output - The Status of the deleted VPC AWS CloudFormation stack\n      * Name: stack name\n      * StackStatus: 'DELETE_COMPLETE'\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "EKSClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon EKS Cluster to be deleted.",
+      "allowedPattern": "^[A-Za-z0-9_-]*$"
+    },
+    "VPCCloudFormationStack": {
+      "type": "String",
+      "description": "(Optional) AWS Cloudformation stack name for VPC for the EKS cluster being deleted. This will delete the AWS Cloudformation stack for VPC.",
+      "default": "",
+      "allowedPattern": "^[a-zA-Z0-9-]*$"
+    },
+    "VPCCloudFormationStackRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of an IAM role that AWS CloudFormation assumes to delete the VPC CloudFormation stack. AWS CloudFormation uses the role's credentials to make calls on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role/[\\w+=,.@-]+|^$"
+    },
+    "SelfManagedNodeStacks": {
+      "type": "StringList",
+      "description": "(Optional) Comma separated list of AWS Cloudformation stack names for self-managed nodes, This will delete the AWS Cloudformation stacks for self-managed stacks.",
+      "minItems": 0,
+      "displayType": "textarea",
+      "default": [
+        ""
+      ],
+      "allowedPattern": "^[a-zA-Z0-9-,]*$"
+    },
+    "SelfManagedNodeStacksRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of an IAM role that AWS CloudFormation assumes to delete the Self-managed Node Stacks. AWS CloudFormation uses the role's credentials to make calls on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role/[\\w+=,.@-]+|^$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role/[\\w+=,.@-]+|^$"
+    }
+  },
+  "outputs": [
+    "DeleteEKSCluster.output",
+    "DeleteNodeGroups.output",
+    "DeleteFargateProfiles.output",
+    "DeleteSelfManagedNodes.output",
+    "DeleteVPCCloudFormationStack.output"
+  ],
+  "mainSteps": [
+    {
+      "name": "DeleteNodeGroups",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "description": "## DeleteNodeGroups\nFind and delete all node groups in the EKS cluster.\n## Outputs\n* DeletedNodeGroups\n* RemainingNodeGroups\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "delete_node_groups_handler",
+        "InputPayload": {
+          "EKSClusterName": "{{EKSClusterName}}"
+        },
+        "Script": "import json\nimport boto3\nimport time\n\neks = boto3.client('eks')\nDEFAULT_SLEEP_TIME=10\n\ndef delete_nodegroups(eks_cluster_name):\n    nodegroups = []\n    remaining_nodegroups = []\n    temp_remaining_nodegroups = []\n    nodegroups_response = eks.list_nodegroups(\n        clusterName=eks_cluster_name,\n        maxResults=100\n    )\n    nodegroups = nodegroups_response['nodegroups']\n    if \"nextToken\" in nodegroups_response:\n        while \"nextToken\" in nodegroups_response:\n            nodegroups_response = eks.list_nodegroups(\n            clusterName=eks_cluster_name,\n            maxResults=100,\n            nextToken=nodegroups_response['nextToken']\n            )\n            nodegroups += nodegroups_response['nodegroups']\n\n    for count,node in enumerate(nodegroups):\n        delete_nodegroup_response = eks.delete_nodegroup(\n        clusterName=eks_cluster_name,\n        nodegroupName=node\n        )\n        if delete_nodegroup_response['nodegroup']['status'] != \"DELETING\":\n            remaining_nodegroups.append(node)\n\n    for x in range(2):\n        if not remaining_nodegroups:\n            break\n        time.sleep(DEFAULT_SLEEP_TIME)\n        for count,node in enumerate(remaining_nodegroups):\n            delete_nodegroup_response = eks.delete_nodegroup(\n            clusterName=eks_cluster_name,\n            nodegroupName=node\n            )\n            if delete_nodegroup_response['nodegroup']['status'] == \"DELETING\":\n                temp_remaining_nodegroups.append(node)\n        remaining_nodegroups = temp_remaining_nodegroups\n        temp_remaining_nodegroups  =[]\n    return nodegroups,remaining_nodegroups\n\ndef delete_node_groups_handler(event, context):\n        eks_cluster_name = event['EKSClusterName']\n        successful = True\n        deleted_nodegroups = []\n        remaining_nodegroups =[]\n        msg= ''\n        try:\n            deleted_nodegroups,remaining_nodegroups = delete_nodegroups(eks_cluster_name)\n        except Exception as e:\n            successful= False\n            msg= str(e)\n\n        out ={\n            \"DeletedNodeGroups\": deleted_nodegroups,\n            \"RemainingNodeGroups\": remaining_nodegroups\n            }\n\n        if not successful:\n            raise Exception(msg,out)\n\n        return {\n        'output': json.dumps(out)\n        }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DeleteFargateProfiles",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "description": "## DeleteFargateProfiles\nFind and delete all Fargate profiles in the EKS cluster.\n## Outputs\n* DeletedFargeteProfiles\n* RemainingFargateProfiles\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "delete_fargate_profiles_handler",
+        "InputPayload": {
+          "EKSClusterName": "{{EKSClusterName}}"
+        },
+        "Script": "import json\nimport boto3\nimport time\neks = boto3.client('eks')\n\ndelete_fargate_profile_retrials = 0\nremaining_fargate_profiles= []\ndeleted_fargate_profiles= []\n\nMAX_RETRIALS_NUM= 10\nDEFAULT_SLEEP_TIME=20\n\n\ndef delete_fargate_profile(eks_cluster_name, profile):\n    global delete_fargate_profile_retrials\n    global remaining_fargate_profiles\n    global deleted_fargate_profiles\n    try:\n        response = eks.delete_fargate_profile(\n        clusterName = eks_cluster_name,\n        fargateProfileName=profile\n        )\n\n        if response['fargateProfile']['status'] != \"DELETING\":\n            if profile not in remaining_fargate_profiles:\n                remaining_fargate_profiles.append(profile)\n        else:\n            deleted_fargate_profiles.append(profile)\n\n    except Exception as e:\n        time.sleep(DEFAULT_SLEEP_TIME)\n        if delete_fargate_profile_retrials < MAX_RETRIALS_NUM:\n            delete_fargate_profile_retrials+=1\n            delete_fargate_profile(eks_cluster_name,profile)\n        else:\n            raise e\n    delete_fargate_profile_retrials = 0\n\ndef delete_fargate_profiles(eks_cluster_name):\n    fargate_profiles = []\n    fargate_profiles_response = eks.list_fargate_profiles(\n        maxResults=100,\n        clusterName = eks_cluster_name\n    )\n    fargate_profiles = fargate_profiles_response['fargateProfileNames']\n    if fargate_profiles:\n        while \"nextToken\" in fargate_profiles_response:\n            fargate_profiles_response = eks.list_fargate_profiles(\n                maxResults=100,\n                clusterName=eks_cluster_name,\n                nextToken=fargate_profiles_response[\"nextToken\"]\n            )\n            fargate_profiles += fargate_profiles_response['fargateProfileNames']\n\n        for count,profile in enumerate(fargate_profiles):\n            delete_fargate_profile(eks_cluster_name,profile)\n\n        # retry to delete the remaining fargate profiles\n        for x in range(2):\n            if not remaining_fargate_profiles:\n                break\n            time.sleep(DEFAULT_SLEEP_TIME)\n\n            for count,profile in enumerate(remaining_fargate_profiles):\n                delete_fargate_profile(eks_cluster_name,profile)\n\n            # remove successfully deleted fargate profile after retries\n            for count,profile in enumerate(remaining_fargate_profiles):\n                if profile in deleted_fargate_profiles:\n                    remaining_fargate_profiles.remove(profile)\n\ndef delete_fargate_profiles_handler(event, context):\n        eks_cluster_name = event['EKSClusterName']\n        successful = True\n        global deleted_fargate_profiles\n        msg=''\n\n        try:\n            delete_fargate_profiles(eks_cluster_name)\n        except Exception as e:\n            successful= False\n            msg= str(e)\n\n        out ={\n            \"DeletedFargeteProfiles\": deleted_fargate_profiles,\n            \"RemainingFargateProfiles\": remaining_fargate_profiles\n            }\n\n        if not successful:\n            raise Exception(msg,out)\n        elif remaining_fargate_profiles:\n            raise Exception(\"Not able to delete all fargate profiles\",out)\n\n        return {\n        'output': json.dumps(out)\n        }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DeleteSelfManagedNodes",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "description": "## DeleteSelfManagedNodes\nDelete all self-managed node AWS CloudFormation stacks\n## Outputs\n* SelfManagedNodeStacksStatus: Deleted self-managed node stacks in the cluster.\n    * Stacks: Deleted self-managed node stacks in the cluster\n        * Name: stack name,\n        * StackStatus: 'DELETE_IN_PROGRESS'\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "delete_self_managed_nodes_handler",
+        "InputPayload": {
+          "SelfManagedNodeStacks": "{{SelfManagedNodeStacks}}",
+          "SelfManagedNodeStacksRole": "{{SelfManagedNodeStacksRole}}"
+        },
+        "Script": "import json\nimport boto3\nimport time\nimport random\nsts_client = boto3.client('sts')\ncfn_resource = boto3.resource('cloudformation')\ncfn_client = boto3.client('cloudformation')\n\nDEFAULT_SLEEP_TIME=10\ncurrent_stack_status = \"undefined\"\nretrials=0\nMAX_RETRIALS=10\n\ndef is_stack_present(stack_name):\n    try:\n        resp = describe_stacks_with_retries(stack_name)\n        stacks = resp.get(\"Stacks\", [])\n            # double check for deleted stacks in case a stack id was used\n        return any([s[\"StackStatus\"] != \"DELETE_COMPLETE\" for s in stacks])\n    except Exception as ex:\n        if (isinstance(ex, boto3.exceptions.botocore.exceptions.ClientError)) and ('Error' in ex.response) and ('Message' in ex.response['Error']) and (ex.response['Error']['Message'].endswith(\"does not exist\")) :\n            return False\n        raise ex\n\ndef describe_stacks_with_retries(stack_name):\n    allowed_retries = 10\n    finished_retry_count = 0\n    for finished_retry_count in range(0, allowed_retries):\n        try:\n            response = cfn_client.describe_stacks(StackName=stack_name)\n            return response\n        except Exception as ex:\n            if (isinstance(ex, boto3.exceptions.botocore.exceptions.ClientError)) and \\\n                    ('Error' in ex.response) and \\\n                    ('Message' in ex.response['Error']) and \\\n                    ('Throttling' in ex.response['Error']['Message']):\n                # if multiple tests gets throttled at the same time, then adding constant value here would cause the\n                # next requests to be throttled again. So randomly choosing values between 1 to 3 to sleep.\n                time_to_sleep = random.randint(1, 3)\n                time.sleep(time_to_sleep)\n            else:\n                raise ex\n    if finished_retry_count == allowed_retries:\n        raise Exception(\"Automation is throttled by DescribeStacks API and is not successful even after retries!\")\n\n\ndef delete_cfn_stack(stack_name,role_arn):\n    global retrials\n    global current_stack_status\n\n    stack_name = stack_name.strip()\n    if not stack_name:\n        current_stack_status = \"empty_stack_name\"\n        return\n\n    if not is_stack_present(stack_name):\n        current_stack_status = \"stack_not_found\"\n        return\n\n    stack = cfn_resource.Stack(stack_name)\n\n    if role_arn:\n        stack.delete(RoleARN=role_arn)\n    else:\n        stack.delete()\n        stack.load()\n\n    if stack.stack_status in [\"DELETE_COMPLETE\",\"DELETE_IN_PROGRESS\"]:\n        # waiting for stack to be DELETE_COMPLETE\n        while is_stack_present(stack_name) is True:\n            time.sleep(30)\n\n        current_stack_status = \"DELETE_COMPLETE\"\n    elif stack.stack_status == \"DELETE_FAILED\":\n        raise Exception (\"DELETE_FAILED stack:{} \".format(stack_name))\n    else:\n        # retry\n        time.sleep(DEFAULT_SLEEP_TIME)\n        if retrials < MAX_RETRIALS:\n            retrials += 1\n            delete_cfn_stack(stack_name,role_arn)\n\n        else:\n            raise Exception (\"not able to delete stack:{}\".format(stack_name))\n    # reset retrials after successful delete\n    retrials = 0\n\ndef verify_role_created(role_arn):\n    # For what ever reason assuming a role that got created too fast fails, so we just wait until we can.\n    retry_count = 12\n    while True:\n        try:\n            sts_client.assume_role(RoleArn=role_arn, RoleSessionName=\"checking_assume\")\n            break\n        except Exception as e:\n            retry_count -= 1\n            if retry_count == 0:\n                raise e\n            time.sleep(5)\n\ndef delete_self_managed_nodes_handler(event, context):\n        self_managed_node_stacks =  event['SelfManagedNodeStacks']\n        self_managed_node_stacks_role = event['SelfManagedNodeStacksRole']\n        global current_stack_status\n\n        self_managed_node_stacks_status = []\n        successful = True\n        err_msg=''\n\n        if self_managed_node_stacks_role:\n            verify_role_created(self_managed_node_stacks_role)\n\n\n        for count,stack in enumerate(self_managed_node_stacks):\n            if stack:\n                try:\n                    delete_cfn_stack(stack,self_managed_node_stacks_role)\n                    stack={\"Name\":stack, \"StackStatus\":current_stack_status}\n                except Exception as e:\n                    err_msg =str(e)\n                    stack={\"Name\":stack, \"StackStatus\":\"DELETE_FAILED\",\"Exception\":err_msg}\n                    successful = False\n                finally:\n                    self_managed_node_stacks_status.append(stack)\n                    current_stack_status = \"undefined\"\n\n        out ={\n        \"SelfManagedNodeStacksStatus\": self_managed_node_stacks_status\n        }\n\n        if not successful:\n            raise Exception(\"Not able to delete all self-managed nodes stacks\",out)\n\n        return {\n        'output': json.dumps(out)\n        }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DeleteEKSCluster",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "description": "##DeleteEKSCluster\nDelete EKS Cluster\n## Outputs\n* EKSClusterStatus\n    * EKSClusterName: Deleted EKS Cluster name.\n    * DeleteStatus: 'DELETING'\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "delete_eks_cluster_handler",
+        "InputPayload": {
+          "EKSClusterName": "{{EKSClusterName}}"
+        },
+        "Script": "import json\nimport boto3\nimport time\neks = boto3.client('eks')\n\ndelete_eks_cluster_retrials = 0\neks_delete_status = \"Failed\"\nMAX_RETRIALS_NUM= 10\nDEFAULT_SLEEP_TIME=30\n\ndef delete_eks_cluster(eks_cluster_name):\n    global delete_eks_cluster_retrials\n    global eks_delete_status\n    try:\n        response = eks.delete_cluster(\n            name=eks_cluster_name\n        )\n        eks_delete_status = response['cluster']['status']\n    except Exception as e:\n        time.sleep(DEFAULT_SLEEP_TIME)\n        if delete_eks_cluster_retrials < MAX_RETRIALS_NUM:\n            delete_eks_cluster_retrials += 1\n            delete_eks_cluster(eks_cluster_name)\n        else:\n            raise e\n\ndef delete_eks_cluster_handler(event, context):\n        eks_cluster_name = event['EKSClusterName']\n        error_msg=''\n\n        eks_cluster_status ={\n            \"Name\":eks_cluster_name,\n            \"DeleteStatus\" : \"Undefined\"\n        }\n        successful = True\n\n        try:\n            delete_eks_cluster(eks_cluster_name)\n            eks_cluster_status[\"DeleteStatus\"] = eks_delete_status\n        except Exception as e:\n            successful= False\n            eks_cluster_status[\"DeleteStatus\"] = \"Failed\"\n            error_msg= str(e)\n\n\n        out ={\n            \"EKSClusterStatus\": eks_cluster_status\n            }\n\n        if not successful:\n            raise Exception(error_msg,out)\n\n        return {\n        'output': json.dumps(out)\n        }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DeleteVPCCloudFormationStack",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "description": "##  DeleteVPCCloudFormationStack\nDelete the VPC AWS CloudFormation stack\n## Outputs\n* VPCCloudFormationStackStatus: Deleted VPC AWS CloudFormation stack.\n    * Name: stack name\n    * StackStatus: 'DELETE_IN_PROGRESS'\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "delete_vpc_cloudformation_stack_handler",
+        "InputPayload": {
+          "VPCCloudFormationStack": "{{VPCCloudFormationStack}}",
+          "VPCCloudFormationStackRole": "{{VPCCloudFormationStackRole}}"
+        },
+        "Script": "import json\nimport boto3\nimport time\nimport random\n\nsts_client = boto3.client('sts')\ncfn_resource = boto3.resource('cloudformation')\ncfn_client = boto3.client('cloudformation')\n\nDEFAULT_SLEEP_TIME=10\ncurrent_stack_status = \"undefined\"\nretrials=0\nMAX_RETRIALS=10\n\ndef is_stack_present(stack_name):\n    try:\n        resp = describe_stacks_with_retries(stack_name)\n        stacks = resp.get(\"Stacks\", [])\n            # double check for deleted stacks in case a stack id was used\n        return any([s[\"StackStatus\"] != \"DELETE_COMPLETE\" for s in stacks])\n    except Exception as ex:\n        if (isinstance(ex, boto3.exceptions.botocore.exceptions.ClientError)) and ('Error' in ex.response) and ('Message' in ex.response['Error']) and (ex.response['Error']['Message'].endswith(\"does not exist\")) :\n            return False\n        raise ex\n\ndef describe_stacks_with_retries(stack_name):\n    allowed_retries = 10\n    finished_retry_count = 0\n    for finished_retry_count in range(0, allowed_retries):\n        try:\n            response = cfn_client.describe_stacks(StackName=stack_name)\n            return response\n        except Exception as ex:\n            if (isinstance(ex, boto3.exceptions.botocore.exceptions.ClientError)) and \\\n                    ('Error' in ex.response) and \\\n                    ('Message' in ex.response['Error']) and \\\n                    ('Throttling' in ex.response['Error']['Message']):\n                # if multiple tests gets throttled at the same time, then adding constant value here would cause the\n                # next requests to be throttled again. So randomly choosing values between 1 to 3 to sleep.\n                time_to_sleep = random.randint(1, 3)\n                time.sleep(time_to_sleep)\n            else:\n                raise ex\n    if finished_retry_count == allowed_retries:\n        raise Exception(\"Automation is throttled by DescribeStacks API and is not successful even after retries!\")\n\n\ndef delete_cfn_stack(stack_name,role_arn):\n    global retrials\n    global current_stack_status\n\n    stack_name = stack_name.strip()\n    if not stack_name:\n        current_stack_status = \"empty_stack_name\"\n        return\n\n    if not is_stack_present(stack_name):\n        current_stack_status = \"stack_not_found\"\n        return\n\n    stack = cfn_resource.Stack(stack_name)\n\n    if role_arn:\n        stack.delete(RoleARN=role_arn)\n    else:\n        stack.delete()\n        stack.load()\n\n    if stack.stack_status in [\"DELETE_COMPLETE\",\"DELETE_IN_PROGRESS\"]:\n        # waiting for stack to be DELETE_COMPLETE\n        while is_stack_present(stack_name) is True:\n            time.sleep(30)\n\n        current_stack_status = \"DELETE_COMPLETE\"\n    elif stack.stack_status == \"DELETE_FAILED\":\n        raise Exception (\"DELETE_FAILED stack:{} \".format(stack_name))\n    else:\n        # retry\n        time.sleep(DEFAULT_SLEEP_TIME)\n        if retrials < MAX_RETRIALS:\n            retrials += 1\n            delete_cfn_stack(stack_name,role_arn)\n        else:\n            raise Exception (\"not able to delete stack:{}\".format(stack_name))\n    # reset retrials after successful delete\n    retrials = 0\n\ndef verify_role_created(role_arn):\n    # For what ever reason assuming a role that got created too fast fails, so we just wait until we can.\n    retry_count = 12\n    while True:\n        try:\n            sts_client.assume_role(RoleArn=role_arn, RoleSessionName=\"checking_assume\")\n            break\n        except Exception as e:\n            retry_count -= 1\n            if retry_count == 0:\n                raise e\n            time.sleep(5)\n\ndef delete_vpc_cloudformation_stack_handler(event, context):\n        vpc_cfn_stack_name = event['VPCCloudFormationStack']\n        vpc_cfn_role = event['VPCCloudFormationStackRole']\n        successful = True\n        errMsg = ''\n        VPCCloudFormationStackStatus = {\n                \"Name\": vpc_cfn_stack_name,\n                \"StackStatus\": current_stack_status\n                }\n        vpc_cfn_stack_name.strip()\n        if vpc_cfn_stack_name:\n            try:\n                if vpc_cfn_role:\n                    verify_role_created(vpc_cfn_role)\n\n                delete_cfn_stack(vpc_cfn_stack_name,vpc_cfn_role)\n                VPCCloudFormationStackStatus[\"StackStatus\"]  = current_stack_status\n\n            except Exception as e:\n                successful= False\n                VPCCloudFormationStackStatus[\"StackStatus\"] = \"DELETE_FAILED\"\n                errMsg= str(e)\n\n        out ={\n            \"VPCCloudFormationStackStatus\": VPCCloudFormationStackStatus\n            }\n\n        if not successful:\n            raise Exception(errMsg,out)\n\n        return {\n        'output': json.dumps(out)\n        }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

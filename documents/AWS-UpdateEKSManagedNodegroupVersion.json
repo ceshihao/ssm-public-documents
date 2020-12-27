@@ -1,0 +1,69 @@
+{
+  "description": "### Document name - AWS-UpdateEKSManagedNodegroupVersion\n\n## What does this document do?\nThis document updates AMI version of EKS cluster - Managed nodegroups. The AMI version updated will be the latest version released for the AMI for the Kubernetes version of the cluster. The steps provided by EKS team are detailed  [here](https://docs.aws.amazon.com/eks/latest/userguide/update-managed-node-group.html).\n\n### Automation Steps\n1. If using Cluster Autoscaler, scale the deployment down to zero replicas to avoid conflicting\nscaling actions. This can be done by running:\n\n```kubectl scale deployments/cluster-autoscaler --replicas=0 -n kube-system```\n\n2. Run The Automation Document.\n\n3. If using Cluster Autoscaler, scale the deployment back to desired number of replicas, by\nrunning:\n\n```kubectl scale deployments/cluster-autoscaler --replicas=<numReplicas> -n kube-sys```\n\n\n## Input Parameters\n  * ClusterName: (Required) EKS cluster name.\n  * NodeGroupName: (Required) Managed nodegroup name.\n  * LaunchTemplateVersion: (Optional) EC2 LanuchTemplate version. Valid only if a nodegroup was\n  created with a launch template.\n  * ForceUpgrade: (Optional) Upgrade strategy. Update will not fail due to Pod Disruption\n  Budget violation.\n\n## Output parameters\n  * NodeGroupName: The name associated with an Amazon EKS managed node group.\n  * Status: The current status of the managed node group.\n  * Id: A UUID that is used to track the update\n  * Message: Output message to the user.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "ClusterName": {
+      "type": "String",
+      "description": "(Required) EKS cluster name.",
+      "allowedPattern": "^[A-Za-z0-9_-]*$"
+    },
+    "NodeGroupName": {
+      "type": "String",
+      "description": "(Required) Managed nodegroup name.",
+      "allowedPattern": "^[A-Za-z0-9_-]*$"
+    },
+    "LaunchTemplateVersion": {
+      "type": "String",
+      "description": "(Optional) EC2 LanuchTemplate version. Valid only if a nodegroup was created with a launch template.",
+      "default": "",
+      "allowedPattern": "^[0-9]*$"
+    },
+    "ForceUpgrade": {
+      "type": "Boolean",
+      "description": "(Optional) Upgrade strategy. Update will not fail due to Pod Disruption Budget violation.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role/[\\w+=,.@-]+|^$"
+    }
+  },
+  "outputs": [
+    "UpdateEKSManagedNodegroupVersion.output"
+  ],
+  "mainSteps": [
+    {
+      "name": "UpdateEKSManagedNodegroupVersion",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "description": "## UpdateEKSManagedNodegroupVersion\nThis step updates AMI version of EKS cluster - Managed nodegroups.\n## Outputs\n* output:\n    * NodeGroupName: The name associated with an Amazon EKS managed node group.\n    * Status: The current status of the managed node group.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "update_eks_managed_nodegroup_version_handler",
+        "InputPayload": {
+          "ClusterName": "{{ClusterName}}",
+          "NodeGroupName": "{{NodeGroupName}}",
+          "LaunchTemplateVersion": "{{LaunchTemplateVersion}}",
+          "ForceUpgrade": "{{ForceUpgrade}}"
+        },
+        "Script": "import json\nimport boto3\neks_client = boto3.client('eks')\n\ndef update_eks_managed_nodegroup_version_handler(event, context):\n    cluster_name = event['ClusterName']\n    ng_name = event['NodeGroupName']\n    launch_template_version = str(event['LaunchTemplateVersion'])\n    force_upgrade =  event['ForceUpgrade']\n    ng_status = \"undefined\"\n\n    try:\n        ng_description = eks_client.describe_nodegroup(\n            clusterName=cluster_name,\n            nodegroupName=ng_name)\n    except Exception as ex:\n        raise Exception(\"Could not find managed nodegroup with name {} for the cluster {}\".format(ng_name,cluster_name))\n\n    ng_status = ng_description[\"nodegroup\"][\"status\"]\n\n    if ng_status != \"ACTIVE\":\n        raise Exception(\"Nodegroup {} status '{}' is not valid for updating\".format(ng_name,ng_status))\n\n    try:\n        if launch_template_version:\n            if \"launchTemplate\" not in ng_description[\"nodegroup\"]:\n                raise Exception(\"Managed nodegroup {} does not use custom launch template.\".format(ng_name))\n\n            launch_template = ng_description[\"nodegroup\"][\"launchTemplate\"]\n            current_version = str(launch_template[\"version\"])\n\n            # no action required\n            if launch_template_version == current_version:\n                msg= \"launch_template_version {} is the same as the current version.\".format(launch_template_version)\n                out ={\n                \"NodeGroupName\": ng_name,\n                \"Status\": ng_status,\n                \"Message\": msg\n                }\n\n                return {\n                    'output': json.dumps(out)\n                }\n            else:\n                update_ng_response = eks_client.update_nodegroup_version(\n                clusterName=cluster_name,\n                nodegroupName=ng_name,\n                launchTemplate={\n                    'version': launch_template_version,\n                    'id': launch_template[\"id\"]\n                },\n                force=force_upgrade)\n        else:\n            update_ng_response = eks_client.update_nodegroup_version(\n            clusterName=cluster_name,\n            nodegroupName=ng_name,\n            force=force_upgrade)\n\n    except Exception as ex:\n        raise Exception(\"Unable to update managed nodegroup '{}'' Error:{}\".format(ng_name,str(ex)))\n\n\n    ng_description = eks_client.describe_nodegroup(\n            clusterName=cluster_name,\n            nodegroupName=ng_name)\n\n    ng_status = ng_description[\"nodegroup\"][\"status\"]\n\n    if ng_status != \"UPDATING\":\n        raise Exception(\"Unable to update managed nodegroup {}\".format(ng_name))\n\n    update_id = update_ng_response[\"update\"][\"id\"]\n\n    msg = \"The update has started. You can track the update status by using the id '{}'.\".format(update_id)\n\n    out ={\n            \"NodeGroupName\": ng_name,\n            \"Status\": ng_status,\n            \"Id\": update_id,\n            \"Message\": msg\n        }\n\n    return {\n                'output': json.dumps(out)\n            }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}
