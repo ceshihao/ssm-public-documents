@@ -1,0 +1,61 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-DeleteRDSCluster\n\n## What does this document do?\nThis document deletes a given Amazon RDS cluster using the [DeleteDBCluster](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DeleteDBCluster.html) API.\nPlease note, AWS Config is required to be enabled in this region for this document to work as it requires the resource ID recorded by the AWS Config service.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* DBClusterId: (Required) Amazon RDS cluster resourceId to be deleted.\n* SkipFinalSnapshot: (Optional) A value that indicates whether to skip the creation of a final DB cluster snapshot before the DB cluster is deleted.\n* FinalDBSnapshotIdentifier: (Optional) The DB cluster snapshot identifier of the new DB cluster snapshot created when SkipFinalSnapshot is disabled.\n\n## Output Parameters\n* DeleteRDSClusterAndVerify.Output: Success message or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "DBClusterId": {
+      "type": "String",
+      "description": "(Required) Amazon RDS cluster resourceId to be deleted.",
+      "allowedPattern": "^cluster-[A-Z0-9]{26}$"
+    },
+    "SkipFinalSnapshot": {
+      "type": "Boolean",
+      "description": "(Optional) A value that indicates whether to skip the creation of a final DB cluster snapshot before the DB cluster is deleted.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "FinalDBSnapshotIdentifier": {
+      "type": "String",
+      "description": "(Optional) The DB cluster snapshot identifier of the new DB cluster snapshot created when SkipFinalSnapshot is disabled.",
+      "allowedPattern": "^((?!-)(?!.*--)[a-zA-Z]{1}[A-Za-z0-9-]{1,254}(?<!-))?$",
+      "default": ""
+    }
+  },
+  "outputs": [
+    "DeleteRDSClusterAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "DeleteRDSClusterAndVerify",
+      "action": "aws:executeScript",
+      "description": "## DeleteRDSClusterAndVerify\nDeletes the DB cluster and verifies that the cluster deleted.\n## Outputs\n* Output: Success message or failure exception.\n",
+      "isEnd": true,
+      "timeoutSeconds": 900,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBClusterId": "{{ DBClusterId }}",
+          "SkipFinalSnapshot": "{{ SkipFinalSnapshot }}",
+          "FinalDBSnapshotIdentifier": "{{ FinalDBSnapshotIdentifier }}"
+        },
+        "Script": "import boto3\n\nrds_client = boto3.client(\"rds\")\nconfig_client = boto3.client(\"config\")\n\ndef get_db_cluster_id(db_cluster_id):\n    response = config_client.get_resource_config_history(\n        resourceType=\"AWS::RDS::DBCluster\", resourceId=db_cluster_id, limit=1\n    )\n    return response[\"configurationItems\"][0][\"resourceName\"]\n\ndef describe_rds_cluster(db_cluster_id):\n    return rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n\ndef delete_rds_cluster(db_cluster_id, desc_rds_cluster, snapshot_identifier):\n    db_cluster_members = desc_rds_cluster[\"DBClusters\"][0][\"DBClusterMembers\"]\n    for db_cluster_member in db_cluster_members:\n        delete_db_cluster_member = rds_client.delete_db_instance(\n            DBInstanceIdentifier=db_cluster_member[\"DBInstanceIdentifier\"]\n        )\n    if snapshot_identifier:\n        delete_db_cluster = rds_client.delete_db_cluster(\n            DBClusterIdentifier=db_cluster_id,\n            FinalDBSnapshotIdentifier=snapshot_identifier,\n        )\n    else:\n        delete_db_cluster = rds_client.delete_db_cluster(\n            DBClusterIdentifier=db_cluster_id,\n            SkipFinalSnapshot=True,\n        )\n    return {\"HTTPResponse\": delete_db_cluster[\"ResponseMetadata\"]}\n\ndef verify_db_cluster_deleted(db_cluster_id, cluster_snapshot_identifier):\n    if cluster_snapshot_identifier:\n        rds_cluster_snapshot_waiter = rds_client.get_waiter(\n            \"db_cluster_snapshot_available\"\n        )\n        rds_cluster_snapshot_waiter.wait(\n            DBClusterSnapshotIdentifier=cluster_snapshot_identifier\n        )\n    else:\n        rds_instance_deleted_waiter = rds_client.get_waiter(\n            \"db_instance_deleted\"\n        )\n        rds_instance_deleted_waiter.wait(\n            Filters=[{\"Name\":\"db-cluster-id\", \"Values\":[db_cluster_id]}]\n        )\n    response = describe_rds_cluster(db_cluster_id)\n    if (\n        response[\"DBClusters\"][0][\"Status\"] == \"deleting\"\n        or response[\"DBClusters\"][0][\"Status\"] == \"backing-up\"\n    ):\n        return True\n    return False\n\ndef handler(event, context):\n    db_resource_id = event[\"DBClusterId\"]\n    db_cluster_id = get_db_cluster_id(db_resource_id)\n    desc_rds_cluster = describe_rds_cluster(db_cluster_id)\n    if event[\"SkipFinalSnapshot\"]:\n        snapshot_identifier = \"\"\n    else:\n        snapshot_identifier = event.get(\"FinalDBSnapshotIdentifier\") or db_resource_id\n    delete_rds_cluster_response = delete_rds_cluster(\n        db_cluster_id, desc_rds_cluster, snapshot_identifier\n    )\n    db_cluster_status = verify_db_cluster_deleted(\n        db_cluster_id, snapshot_identifier\n    )\n    if db_cluster_status:\n        output_data = {\n            \"output\": {\n                \"Message\": \"Verification of DeleteRDSCluster is successful.\",\n                \"HTTPResponse\": delete_rds_cluster_response[\"HTTPResponse\"],\n            }\n        }\n        if snapshot_identifier:\n            output_data[\"output\"][\"FinalDBSnapshotIdentifier\"] = snapshot_identifier\n        return output_data\n    raise Exception(\"VERIFICATION FAILED. AMAZON RDS CLUSTER NOT DELETED.\")"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
