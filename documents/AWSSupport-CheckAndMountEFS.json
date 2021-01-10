@@ -1,0 +1,413 @@
+{
+  "description": "This Document can check if the Instances meet the prerequistes for mounting EFS and can also mount EFS to multiple Instances. This document will run on SSM Managed Linux Instances.",
+  "schemaVersion": "0.3",
+  "outputs": [
+    "OnlyCheck.Output",
+    "CheckEFSandMountEFS.Output"
+  ],
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) Provide the Instance Id for the instance where you will mount the EFS filesystem. (e.g. i-05fa91429c6cdcb49 )",
+      "allowedPattern": "^[m]{0,1}i-[a-z0-9]{8,17}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified,this document will use the permissions of the user that executes this document.",
+      "allowedPattern": "^$|^arn:aws:iam::[0-9]*:role/[/\\w+=,.@-]+$",
+      "default": ""
+    },
+    "EfsId": {
+      "type": "String",
+      "description": "(Required) EFS file system id. (e.g.,fs-e3ae8800 )",
+      "allowedPattern": "(^fs-[0-9a-f]{8,8})$|()$"
+    },
+    "MountTargetIP": {
+      "type": "String",
+      "description": "(Optional) Enter the Mount Target IP of the Subnet to mount EFS with IP address when using CheckandMount Action. Use this, in case, you are using custom DNS server and your custom DNS server cannot resolve the internal names of the EFS DNS Names. In case you are not using it, leave it blank .",
+      "default": ""
+    },
+    "MountOptions": {
+      "type": "String",
+      "description": "(Optional) Mount options that can be used with efs mount helper.If using TLS, make sure your stunnel package is updated. For more info, refer https://docs.aws.amazon.com/efs/latest/ug/using-amazon-efs-utils.html-upgrading-stunnel",
+      "default": "_netdev",
+      "allowedValues": [
+        "_netdev",
+        "tls,_netdev",
+        "iam,tls,_netdev"
+      ]
+    },
+    "Region": {
+      "type": "String",
+      "description": "(Required) Region of EFS filesystem and the Instance, E.g., us-east-1"
+    },
+    "MountPoint": {
+      "type": "String",
+      "description": "(Optional) Enter directory where you want to mount your EFS e.g., /mnt/efs. Use this option,when using CheckandMount Action. In case, you are using Check Action, leave it blank. Note: You will not able to mount the EFS on the common filesystem directories like /, /etc, /var etc. ",
+      "default": ""
+    },
+    "Action": {
+      "type": "String",
+      "description": "(Required) Allowed Values are Check and CheckandMount. Check action will see if the prerequisites are met on the Instance. CheckandMount action will mount the EFS. ",
+      "default": "Check",
+      "allowedValues": [
+        "Check",
+        "CheckandMount"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "EC2Script",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "GetInstance": "{{InstanceId}}",
+          "GetRegion": "{{Region}}"
+        },
+        "Script": "def script_handler(events, context):\n import boto3\n\n Instance = events['GetInstance']\n EFS_Region = events['GetRegion']\n\n Groupsdetails = []\n ec2 = boto3.client('ec2',region_name = EFS_Region)\n response = ec2.describe_instances(InstanceIds=[Instance])\n\n for allinstances in response['Reservations']:\n  for Instancedetails in allinstances['Instances']:\n   subnetdetails = Instancedetails['SubnetId']\n   AZdetails = Instancedetails['Placement']['AvailabilityZone']\n   allsg = Instancedetails['SecurityGroups']\n   for instancesg in allsg:\n    SecurityGroupsdetails = instancesg['GroupId']\n    Groupsdetails.append(SecurityGroupsdetails)\n    sginstrings = ','.join(Groupsdetails)\n    printoutput = 'Instance subnet is ' + subnetdetails + ' | ' + 'Security Groups are ' + sginstrings + ' | ' + 'AZ is ' + AZdetails\n\n    return {'message': printoutput}\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "EFSScript",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "EFSFilesystemID": "{{EfsId}}",
+          "GetRegion": "{{Region}}"
+        },
+        "Script": "def script_handler(events, context):\n import boto3\n from botocore.exceptions import ClientError\n import sys\n\n #assigning variables\n EFSFileID = events['EFSFilesystemID']\n EFS_Region = events['GetRegion']\n mounttargetids = []\n printoutput = \"\"\n i = 1\n\n #Get Mount Target IDs List\n try:\n  efs = boto3.client('efs',region_name = EFS_Region)\n  response = efs.describe_mount_targets(FileSystemId=EFSFileID)\n  for item in response[\"MountTargets\"]:\n   ID = str(item[\"MountTargetId\"])\n   mounttargetids.append(ID)\n \n except ClientError as e:\n   if e.response['Error']['Code'] == 'FileSystemNotFound':\n    Policyoutput = 'EFS ID provided cannot be found.'\n    printoutput = printoutput + Policyoutput + \"\\n\"\n    sys.exit(printoutput)\n   else:\n    sys.exit(\"Unexpected error: %s\" % e)\n\n # Running loop and getting security group details\n for MountId in mounttargetids:\n  response = efs.describe_mount_targets(MountTargetId=MountId)\n  output = efs.describe_mount_target_security_groups(MountTargetId=MountId)\n  for mounttargetdetails in response[\"MountTargets\"]:\n   subnet = mounttargetdetails[\"SubnetId\"]\n   MountIP = mounttargetdetails[\"IpAddress\"]\n   AZ = mounttargetdetails[\"AvailabilityZoneName\"]\n   output = ' ' + str(i)+'. '+ subnet +'  |  '+ AZ +'  |  '+ MountId +'  |  '+ MountIP +'  |  '+ ','.join(output[\"SecurityGroups\"]) \n   printoutput = printoutput + output + \"\\n\"\n   i=i+1\n printoutput = printoutput + \"\\n\"\n \n# Checking Filesystem Policy\n try:\n  efs = boto3.client('efs',region_name = EFS_Region)\n  results = efs.describe_file_system_policy(FileSystemId=EFSFileID)\n  is_non_empty = bool(results)\n  Policyoutput = 'd. Does File System Policy Exist for this EFS? ' + str(is_non_empty) + '. Ensure the filesystem policy allows mounting of the EFS. Refer : https://docs.aws.amazon.com/efs/latest/ug/access-control-overview.html'\n  printoutput = printoutput + Policyoutput + \"\\n\"\n  \n except ClientError as e:\n  if e.response['Error']['Code'] == 'PolicyNotFound':\n   Policyoutput = 'd. Does File System Policy Exist for this EFS? False'\n   printoutput = printoutput + Policyoutput + \"\\n\"\n  else:\n   print(\"Unexpected error: %s\" % e)\n \n return {'message': printoutput }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "EvaluateEFSSecurityRules",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "EFSFilesystemID": "{{EfsId}}",
+          "GetInstance": "{{InstanceId}}",
+          "GetRegion": "{{Region}}"
+        },
+        "Script": "def script_handler(events, context):\n import boto3\n import ipaddress\n \n #Handling events\n Instance = events['GetInstance']\n EFSFileID = events['EFSFilesystemID']\n EFS_Region = events['GetRegion']\n Groupsdetails = []\n\n\n #Getting Instance IP and Security Groups\n  \n ec2 = boto3.client('ec2',region_name = EFS_Region)\n ec2response = ec2.describe_instances(InstanceIds=[Instance])\n for getinstances in ec2response['Reservations']:\n  for Instancedetails in getinstances['Instances']:\n   Instance_IP =  Instancedetails['PrivateIpAddress']\n   AZdetails = Instancedetails['Placement']['AvailabilityZone']\n   Instance_Subnet = Instancedetails['SubnetId']\n   allsg = Instancedetails['SecurityGroups']\n   for instancesg in allsg:\n    SecurityGroupsdetails = instancesg['GroupId']\n    Groupsdetails.append(SecurityGroupsdetails )\n \n #print(Instance_IP)\n print('Instance subnet is ' + Instance_Subnet)\n print('Instance is launched in ' + AZdetails)\n  \n #Getting EFS Mount Target ID for the same AZ of Instance and store in MountID variable.\n \n MountID = \"\"\n efs = boto3.client('efs',region_name = EFS_Region)\n efsresponse = efs.describe_mount_targets(FileSystemId=EFSFileID)\n for item in efsresponse['MountTargets']:\n  if item['AvailabilityZoneName'] == AZdetails:\n   MountID = item['MountTargetId']\n   break\n  else:\n   continue\n lengthofMountID = len(MountID)\n\n if lengthofMountID == 0:\n    return {'message': 'No Mount Target found in the same AZ as of Instance'}\n \n print('Mount target ID found in the same AZ as of Instance is ' + MountID )\n \n output =  efs.describe_mount_target_security_groups(MountTargetId=MountID)\n MountTarget_SG = ','.join(output['SecurityGroups'])\n \n print('Mount Target ' + MountID + ' has security group ' + MountTarget_SG) \n \n # Getting security group rules of the Mount target ID and constructing a dictionary for it.\n # First Creating an empty dictionary. SG rules will be added on it as per the evaluation below.\n\n sg_rules_dict = {} \n\n for efssg in  output['SecurityGroups']:\n  response = ec2.describe_security_groups(GroupIds=[efssg])\n  for describe in response['SecurityGroups']:\n   for rules in describe['IpPermissions']:\n    if rules['IpProtocol'] == '-1': #For ALL TRAFFIC\n     if len(rules['UserIdGroupPairs']) == 0 and len(rules['IpRanges']) != 0:   # Source can be Security group or IPRanges .\n      Key = 'ALL'\n      list_source = []\n      for entries in rules['IpRanges']:\n       cidr = (entries['CidrIp']) \n       list_source.append(cidr)\n      sg_rules_dict.update({Key : list_source})\n     elif len(rules['IpRanges']) == 0 and len(rules['UserIdGroupPairs']) != 0:\n      Key = 'ALL'\n      list_source = []\n      for entries in rules['UserIdGroupPairs']:\n       SGID = (entries['GroupId'])\n       list_source.append(SGID)\n      sg_rules_dict.update({Key : list_source})\n     elif len(rules['IpRanges']) != 0 and len(rules['UserIdGroupPairs']) != 0 :\n      Key = 'ALL'\n      list_source = []\n      for entries in rules['UserIdGroupPairs']:\n       SGID = (entries['GroupId'])\n       list_source.append(SGID)\n      for m in rules['IpRanges']:\n       cidr = (m['CidrIp'])\n       list_source.append(cidr)\n      sg_rules_dict.update({Key : list_source})\n    elif rules['FromPort'] == 0 and rules['ToPort'] == 65535 and rules['IpProtocol'] == 'tcp' : #For ALL TCP Traffic\n     if len(rules['UserIdGroupPairs']) == 0 and len(rules['IpRanges']) != 0:  # Source can be Security group or IPRanges .\n      Key = 'ALLTCP'\n      list_source = []\n      for entries in rules['IpRanges']:\n       cidr = (entries['CidrIp'])\n       list_source.append(cidr)\n      sg_rules_dict.update({Key : list_source})\n     elif len(rules['IpRanges']) == 0 and len(rules['UserIdGroupPairs']) != 0:\n      Key = 'ALLTCP'\n      list_source = []\n      for entries in rules['UserIdGroupPairs']:\n       SGID = (entries['GroupId'])\n       list_source.append(SGID)\n      sg_rules_dict.update({Key : list_source})\n     elif len(rules['IpRanges']) != 0 and len(rules['UserIdGroupPairs']) != 0 :\n      Key = 'ALLTCP'\n      list_source = []\n      for entries in rules['UserIdGroupPairs']:\n       SGID = (entries['GroupId'])\n       list_source.append(SGID)\n      for m in rules['IpRanges']:\n       cidr = (m['CidrIp'])\n       list_source.append(cidr)\n      sg_rules_dict.update({Key : list_source})\n    else:\n     if len(rules['UserIdGroupPairs']) == 0: \n      Key = (str(rules['FromPort']))\n      list_source = []\n      for entries in rules['IpRanges']:\n       cidr = (entries['CidrIp'])\n       list_source.append(cidr)\n      sg_rules_dict.update({Key : list_source})\n     elif len(rules['IpRanges']) == 0 and len(rules['UserIdGroupPairs']) != 0:\n      Key = (str(rules['FromPort']))\n      list_source = []\n      for entries in rules['UserIdGroupPairs']:\n       SGID = (entries['GroupId'])\n       list_source.append(SGID)\n      sg_rules_dict.update({Key : list_source})\n     elif len(rules['IpRanges']) != 0 and len(rules['UserIdGroupPairs']) != 0 :\n      Key = (str(rules['FromPort']))\n      list_source = []\n      for entries in rules['UserIdGroupPairs']:\n       SGID = (entries['GroupId'])\n       list_source.append(SGID)\n      for m in rules['IpRanges']:\n       cidr = (m['CidrIp'])\n       list_source.append(cidr)\n      sg_rules_dict.update({Key : list_source})\n \n print('')\n print(sg_rules_dict)\n \n # Creating a source list which is allowed for NFS PORT .\n \n NFS_Source_ALL = []\n for key in sg_rules_dict:\n  if key == '2049' or key == 'ALLTCP' or key == 'ALL':\n   IPvalue = sg_rules_dict[key]\n   NFS_Source_ALL.extend(IPvalue)\n \n if len(NFS_Source_ALL) == 0:\n  Access = 'Port 2049 not opened in any of the security groups associated with  Mount target ' + MountID \n  return {'message': Access }\n\n\n # Breaking the Source list into IPs and Security group lists\n Access = '' # Declaring empty string. If NFS_SOURCE_IPS is found empty, Access will be found undeclared to match the response in following steps.\n NFS_SOURCE_SG = []\n NFS_SOURCE_IPS = []\n for items in NFS_Source_ALL:\n  if 'sg' in items:\n   NFS_SOURCE_SG.append(items)\n  else:\n   NFS_SOURCE_IPS.append(items)\n \n #Checking if Instance IP belongs to the Source list. If yes, exit from the script, Dont need to evaluate further. If not, continue to match with the security group of the instance.\n \n for iplist in NFS_SOURCE_IPS:\n  response = ipaddress.ip_address(Instance_IP) in ipaddress.ip_network(iplist)\n  if response == True or iplist == '0.0.0.0/0':\n   Access = 'True'\n   break\n  else:\n   Access = 'False'\n\n if Access == 'True':\n  return {'message': 'Security Groups associated with the EFS Mount target are configured to ALLOW Traffic from Instance.' }\n\n SGCheck = any(sg in NFS_SOURCE_SG for sg in Groupsdetails)\n if SGCheck is True:\n  Access =  'Security Groups associated with the EFS Mount target are configured to ALLOW Traffic from Instance.'\n  return {'message': Access }\n else:\n  Access = 'Security Groups associated with the EFS Mount target are NOT configured to allow Traffic from Instance. '\n  return {'message': Access }\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifySSMConnectivity",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "nextStep": "DefineAction",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      }
+    },
+    {
+      "name": "DefineAction",
+      "action": "aws:branch",
+      "isEnd": "true",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "OnlyCheck",
+            "Variable": "{{ Action }}",
+            "StringEquals": "Check"
+          },
+          {
+            "NextStep": "CheckEFSandMountEFS",
+            "Variable": "{{ Action }}",
+            "StringEquals": "CheckandMount"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OnlyCheck",
+      "action": "aws:runCommand",
+      "isEnd": "true",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "",
+            "NFSPORT=2049",
+            "REGION=\"{{ Region }}\"",
+            "efs_filesystem_id=\"{{ EfsId }}\"",
+            "file_system_id_dns=$efs_filesystem_id.efs.$REGION.amazonaws.com",
+            "mountip=\"{{MountTargetIP}}\"",
+            "echo  \" \" ",
+            "echo \"---------------------------------\" ",
+            "echo \"|  Instance and EFS details | \" ",
+            "echo \"---------------------------------\" ",
+            "echo \"a. Instance ID is  : {{InstanceId}} \" ",
+            "echo \"b. {{EC2Script.output}}\" ",
+            "echo  \" \" ",
+            "echo \"a. EFS DNS is $file_system_id_dns\"",
+            "echo \"b. {{EvaluateEFSSecurityRules.output}}\" ",
+            "echo \"c. EFS Mount Target details are as follows:\" ",
+            "echo  \" \" ",
+            "echo \"{{EFSScript.output}}\" ",
+            "echo \"--------------------------------------------\" ",
+            "echo \"|  Checking if EFS is already mounted | \" ",
+            "echo \"--------------------------------------------\" ",
+            "cat /etc/mtab | grep $efs_filesystem_id > /dev/null 2>/dev/null",
+            "if [ $? -eq 0 ]; ",
+            "then",
+            "  cat /etc/mtab | grep $efs_filesystem_id | head -n 1",
+            "  echo \"$efs_filesystem_id is already mounted on the Instance. Continuing with the other checks.\"",
+            "else",
+            " echo \"$efs_filesystem_id is NOT mounted on the Instance. \"",
+            "fi",
+            "echo  \" \" ",
+            "echo \"-------------------------------\" ",
+            "echo \"|  Testing DNS resolution  | \" ",
+            "echo \"-------------------------------\" ",
+            "if [ -f /usr/bin/dig ]; ",
+            "then ",
+            " ip=`dig +short $file_system_id_dns` ",
+            "    if [ -n \"$ip\" ];",
+            "    then",
+            "        echo \"Resolvable to IP: $ip\"",
+            "    else",
+            "        echo \"Could NOT resolve hostname. Check the DNS server configured on the Instane is working or not. Note: Custom DNS servers cannot resolve the internal names of the EFS by default\"",
+            "    fi",
+            "else",
+            "  host $file_system_id_dns",
+            "  if [ $? -ne 0 ];",
+            "  then",
+            "   echo \"Could NOT resolve hostname. Check the DNS server configured on the Instane is working or not. Note: Custom DNS servers cannot resolve the internal names of the EFS by default\"",
+            "  fi",
+            "fi",
+            "echo  \" \" ",
+            "echo \"-----------------------------------------------------\" ",
+            "echo \"|  Testing NFS connectivity to EFS DNS Name  |\" ",
+            "echo \"-----------------------------------------------------\" ",
+            "timeout 3 bash -c \"file_system_id_dns={{ EfsId }}.efs.{{ Region }}.amazonaws.com && cat < /dev/null > /dev/tcp/$file_system_id_dns/2049\" ",
+            "exitcode=$?",
+            "if [ $exitcode -eq 0 ]; ",
+            "then ",
+            "  echo \"Connection to ${file_system_id_dns}:${NFSPORT} is SUCCESSFUL.\"",
+            "elif [ $exitcode -eq 124 ]; ",
+            "then ",
+            "  echo \"Failed to Connect to ${file_system_id_dns}:${NFSPORT} .Check the  security group attach to the instance and EFS. Also, check the OS level firewall configuration if any.\"",
+            "  echo \"Port 2049 is NOT Reachable.\" ",
+            "else ",
+            "  echo \"Invalid argument provided. Wrong EFS ID or DNS resolution NOT working. \" ",
+            "fi",
+            "echo  \" \" ",
+            "if [ \"$mountip\" != \"\" ]",
+            "then",
+            " echo \"------------------------------------------------------\" ",
+            " echo \"|  Testing NFS connectivity to Mount Target IP  |\" ",
+            " echo \"------------------------------------------------------\" ",
+            " timeout 3 bash -c \"mountip={{MountTargetIP}} && cat < /dev/null > /dev/tcp/$mountip/2049\" ",
+            " exitcode=$?",
+            " if [ $exitcode -eq 0 ]; ",
+            " then ",
+            "   echo \"Connection to ${mountip}:${NFSPORT} is SUCCESSFUL.\"",
+            " else ",
+            "   echo \"Failed to Connect to ${mountip}:${NFSPORT} . Check the  security group attach to the instance and EFS. Also, check the OS level firewall configuration if any.\"",
+            " fi ",
+            "fi",
+            "echo  \" \" ",
+            "echo \"--------------------------------------------------\" ",
+            "echo \"|  Checking if EFS/NFS-Utils are installed  |\" ",
+            "echo \"--------------------------------------------------\" ",
+            "if [ -f /usr/bin/yum ]; ",
+            "then ",
+            " rpm -qa | grep amazon-efs-utils ",
+            " if [ $? -eq 0 ]; ",
+            " then ",
+            "  echo \"amazon-efs-utils is installed on the instance. \" ",
+            " else ",
+            "  echo \"amazon-efs-utils is NOT installed on the instance.\" ",
+            " fi   ",
+            " rpm -qa | grep NFS-Utils",
+            " if [ $? -eq 0 ]; ",
+            " then ",
+            "  echo \"nfs-utils is installed on the instance. \" ",
+            " else ",
+            "  echo \"nfs-utils is NOT installed on the instance.\" ",
+            " fi   ",
+            "elif [ -f /usr/bin/zypper ];",
+            "then ",
+            " rpm -qa | grep amazon-efs-utils ",
+            " if [ $? -eq 0 ]; ",
+            " then ",
+            "  echo \"aws-efs-utils is installed on the instance. \" ",
+            " else ",
+            "  echo \"aws-efs-utils is NOT installed on the instance.\" ",
+            " fi   ",
+            " rpm -qa | grep nfs-client",
+            " if [ $? -eq 0 ]; ",
+            " then ",
+            "  echo \"nfs-utils is installed on the instance.\" ",
+            " else ",
+            "  echo \"nfs-utils is NOT installed on the instance.\" ",
+            " fi ",
+            "else ",
+            " if [ $(dpkg-query -W -f='${Status}' amazon-efs-utils 2>/dev/null | grep -c \"ok installed\") -eq 1 ]; ",
+            " then ",
+            "  echo \"amazon-efs-utils is installed on the instance. \" ",
+            " else ",
+            "  echo \"amazon-efs-utils is NOT installed on the instance.\" ",
+            " fi   ",
+            " if [ $(dpkg-query -W -f='${Status}' nfs-common 2>/dev/null | grep -c \"ok installed\") -eq 1 ]; ",
+            " then ",
+            "  echo \"nfs-common is installed on the instance.\" ",
+            " else ",
+            "  echo \"nfs-common is NOT installed on the instance.\" ",
+            " fi",
+            "fi",
+            "echo  \" \"",
+            "echo \"------------------------------------------------------------\" ",
+            "echo \"|  Checking if this Linux Distribution supports NFSv4   |\" ",
+            "echo \"------------------------------------------------------------\" ",
+            "grep -x -e \"CONFIG_NFS_V4=m\" -e \"CONFIG_NFS_V4=y\" -e \"CONFIG_NFS_V4_1=m\" -e \"CONFIG_NFS_V4_1=y\" /boot/config-$(uname -r)",
+            "exitcode=$?",
+            "if [ $exitcode -eq 0 ]; ",
+            "then ",
+            "  echo \"This Instance support Network File System versions 4.0 or 4.1 (NFSv4).\"",
+            "else ",
+            "  echo \"This Instance doesn't support Network File System versions 4.0 or 4.1 (NFSv4)\"",
+            "fi "
+          ]
+        }
+      }
+    },
+    {
+      "name": "CheckEFSandMountEFS",
+      "action": "aws:runCommand",
+      "isEnd": "true",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "commands": [
+            "",
+            "#!/bin/bash",
+            "",
+            "NFSPORT=2049",
+            "REGION=\"{{ Region }}\"",
+            "efs_filesystem_id=\"{{ EfsId }}\"",
+            "efs_mount_point=\"{{ MountPoint }}\"",
+            "file_system_id_dns=$efs_filesystem_id.efs.$REGION.amazonaws.com",
+            "mountip=\"{{MountTargetIP}}\"",
+            "restricted_dir=\"/ /var /etc /home /sys /dev /bin /sbin /usr /run /boot\"",
+            "",
+            "echo  \" \" ",
+            "echo \"---------------------------------\" ",
+            "echo \"|  Instance and EFS details | \" ",
+            "echo \"---------------------------------\" ",
+            "echo \"a. Instance ID is  : {{InstanceId}} \" ",
+            "echo \"b. {{EC2Script.output}}\" ",
+            "echo  \" \" ",
+            "echo \"a. EFS DNS is $file_system_id_dns\" ",
+            "echo \"b. {{EvaluateEFSSecurityRules.output}}\" ",
+            "echo \"c. EFS Mount Target details are as follows:\" ",
+            "echo  \" \" ",
+            "echo \"{{EFSScript.output}}\" ",
+            "echo  \" \"",
+            "echo \"---------------------\" ",
+            "echo \"|  Mounting EFS  |\" ",
+            "echo \"---------------------\"",
+            "",
+            "# Validating the Mount directory provided",
+            "",
+            "if [ \"$efs_mount_point\" = \"\" ]",
+            " then",
+            "  echo \"No Mount Directory Provided. Exiting.. \"",
+            "  exit 1",
+            "fi",
+            "",
+            "for item in $restricted_dir; do",
+            " if [ \"$efs_mount_point\" = \"$item\" ]",
+            "  then",
+            "   echo \"Cannot mount in this directory. It is restricted.\"",
+            "   exit 1",
+            " fi",
+            "done",
+            "",
+            "# Mounting",
+            "",
+            "mkdir -p \"${efs_mount_point}\"",
+            "if [ \"$mountip\" = \"\" ]",
+            " then",
+            "   test -f \"/sbin/mount.efs\" && mount -t efs -o {{MountOptions}} ${efs_filesystem_id}:/ ${efs_mount_point} || mount -t nfs4 -o {{MountOptions}} ${efs_filesystem_id}.efs.$REGION.amazonaws.com:/ ${efs_mount_point}",
+            "else",
+            "   mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev ${mountip}:/ ${efs_mount_point}",
+            "fi",
+            "if [ $? -eq 0 ]; ",
+            "then ",
+            " echo \"Mount was succesfull.\" ",
+            " echo  \" \"",
+            " echo \"Verifying from /etc/mtab : \" ",
+            " cat /etc/mtab | grep $efs_filesystem_id",
+            " echo  \" \" ",
+            " echo  \" --------------------- \"",
+            " echo  \" --- Auto Mounting --- \" ",
+            " echo  \" --------------------- \" ",
+            " echo  \" \" ",
+            " echo \"If you need EFS to mount automatically on next boot, you can add the below lines in /etc/fstab.\" ",
+            " echo  \" \" ",
+            " echo \"${efs_filesystem_id}:/ ${efs_mount_point} efs {{MountOptions}}  0 0\"",
+            " echo \" OR \" ",
+            " echo \"${efs_filesystem_id}.efs.$REGION.amazonaws.com:/ ${efs_mount_point} nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev 0 0\"",
+            " echo  \" \" ",
+            " echo \"You can Replace Filesystem ID with Mount target IP in the above lines when using Custom DNS. \"",
+            "else",
+            " echo \"Mount was unsuccesfull. Run the Check Action to see if the Instance meets the prerequistes to mount EFS.\"",
+            "exit 1",
+            "fi"
+          ]
+        }
+      }
+    }
+  ]
+}
