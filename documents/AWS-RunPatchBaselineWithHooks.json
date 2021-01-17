@@ -1,0 +1,246 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Wrapper document that uses AWS-RunPatchBaseline to compose more complex patch install scenarios, allowing for custom scripts to be run as pre-installation, post-installation, and post-reboot hooks. Requires SSM Agent 3.0.502 or higher",
+  "parameters": {
+    "Operation": {
+      "type": "String",
+      "description": "(Required) The update or configuration to perform on the instance. The system checks if patches specified in the patch baseline are installed on the instance. The install operation installs patches missing from the baseline.",
+      "allowedValues": [
+        "Scan",
+        "Install"
+      ]
+    },
+    "SnapshotId": {
+      "type": "String",
+      "description": "(Optional) The snapshot ID to use to retrieve a patch baseline snapshot.",
+      "allowedPattern": "(^$)|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "default": ""
+    },
+    "RebootOption": {
+      "type": "String",
+      "description": "(Optional) Reboot behavior after a patch Install operation. If you choose NoReboot and patches are installed, the instance is marked as non-compliant until a subsequent reboot and scan.",
+      "allowedValues": [
+        "RebootIfNeeded",
+        "NoReboot"
+      ],
+      "default": "RebootIfNeeded"
+    },
+    "PreInstallHookDocName": {
+      "type": "String",
+      "description": "SSM Document Name for Pre Install Hook",
+      "default": "AWS-Noop"
+    },
+    "PostInstallHookDocName": {
+      "type": "String",
+      "description": "SSM Document Name for Post Install Hook",
+      "default": "AWS-Noop"
+    },
+    "PostRebootHookDocName": {
+      "type": "String",
+      "description": "SSM Document Name for Post Reboot Hook",
+      "default": "AWS-Noop"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runDocument",
+      "name": "PreInstallScan",
+      "inputs": {
+        "documentType": "SSMDocument",
+        "documentPath": "AWS-RunPatchBaseline",
+        "documentParameters": "{\"Operation\":\"Scan\",\"RebootOption\":\"NoReboot\", \"SnapshotId\": {{SnapshotId}}}",
+        "onFailure": "exit"
+      }
+    },
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "action": "aws:runShellScript",
+      "name": "VerifyLocalPatchStatesLinux",
+      "inputs": {
+        "runCommand": [
+          "#operation was scan, exit and skip the rest of doc execution:",
+          "if [ {{Operation}} = \"Scan\" ]; then",
+          "        echo \"Selected operation was Scan. Exiting document execution\"",
+          "        exit 168",
+          "fi",
+          "localFile=/var/log/amazon/ssm/patch-configuration/patch-inventory-from-last-operation.json",
+          "[[ ! -f \"$localFile\" ]] && exit 169",
+          "missingCountCount=$(cat $localFile | grep 'MissingCount' | sed 's/[^0-9]*//g')",
+          "installedPendingRebootCount=$(cat $localFile | grep 'InstalledPendingRebootCount' | sed 's/[^0-9]*//g')",
+          "if [ \"$missingCountCount\" -eq 0 ]; then",
+          "     if [ \"$installedPendingRebootCount\" -eq 0 ]; then",
+          "         echo \"No missing patches were detected. Exiting document execution\"",
+          "         exit 168",
+          "     elif [ {{RebootOption}} = \"NoReboot\" ]; then",
+          "         echo \"Pending Reboot patches were detected with NoReboot setting. Exiting document execution\"",
+          "         exit 168",
+          "     fi",
+          "fi",
+          "echo \"Pre-patch hook setup completed successfully. Proceeding with installation next.\""
+        ]
+      }
+    },
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "action": "aws:runPowerShellScript",
+      "name": "VerifyLocalPatchStatesWindows",
+      "inputs": {
+        "runCommand": [
+          "#operation was scan, exit and skip the rest of doc execution:",
+          "$operation = \"{{ Operation }}\"",
+          "$rebootOption = \"{{ RebootOption }}\"",
+          "if ($operation -eq 'Scan') {",
+          "     Write-Output 'Selected operation was Scan. Exiting document execution'",
+          "     exit 168",
+          "}",
+          "$appName = 'PatchBaselineOperations'",
+          "$fileName = 'PatchInventoryFromLastOperation.json'",
+          "$localFileLocation = [IO.Path]::Combine($env:ProgramData, 'Amazon', $appName, 'State')",
+          "$localFile = [IO.Path]::Combine($localFileLocation, $fileName)",
+          "if (-Not (Test-Path $localFile -PathType Leaf)) {",
+          "     exit 169",
+          "}",
+          "$missingCountLine = Get-Content $localFile | Select-String 'MissingCount'",
+          "$missingCountCount = $missingCountLine -replace '\\D+(\\d+)','$1'",
+          "$installedPendingRebootCountLine = Get-Content $localFile | Select-String 'InstalledPendingRebootCount'",
+          "$installedPendingRebootCount = $installedPendingRebootCountLine -replace '\\D+(\\d+)','$1'",
+          "if ($missingCountCount -eq 0) {",
+          "       if ($installedPendingRebootCount -eq 0) {",
+          "           Write-Output 'No missing patches were detected. Exiting document execution'",
+          "           exit 168",
+          "       }",
+          "       elseif ($rebootOption -eq 'NoReboot') {",
+          "           Write-Output 'Pending Reboot patches were detected with NoReboot setting. Exiting document execution'",
+          "           exit 168",
+          "       }",
+          "}",
+          "Write-Output 'Pre-patch hook setup completed successfully. Proceeding with installation next.'"
+        ]
+      }
+    },
+    {
+      "action": "aws:runDocument",
+      "name": "CustomerProvidedPrePatchHook",
+      "inputs": {
+        "documentType": "SSMDocument",
+        "documentPath": "{{PreInstallHookDocName}}",
+        "onFailure": "exit"
+      }
+    },
+    {
+      "action": "aws:runDocument",
+      "name": "InstallNoReboot",
+      "inputs": {
+        "documentType": "SSMDocument",
+        "documentPath": "AWS-RunPatchBaseline",
+        "documentParameters": "{\"Operation\":\"Install\",\"RebootOption\":\"NoReboot\", \"SnapshotId\": {{SnapshotId}}}",
+        "onFailure": "exit"
+      }
+    },
+    {
+      "action": "aws:runDocument",
+      "name": "CustomerProvidedPostInstallHook",
+      "inputs": {
+        "documentType": "SSMDocument",
+        "documentPath": "{{PostInstallHookDocName}}",
+        "onFailure": "exit"
+      }
+    },
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "action": "aws:runShellScript",
+      "name": "VerifyIfShouldRebootLinux",
+      "inputs": {
+        "runCommand": [
+          "#RebootOption was NoReboot, exit and skip the rest of doc execution:",
+          "if [ {{RebootOption}} = \"NoReboot\" ]; then",
+          "        echo \"Selected reboot option was NoReboot. Exiting document execution\"",
+          "        exit 168",
+          "fi",
+          "localFile=/var/log/amazon/ssm/patch-configuration/patch-inventory-from-last-operation.json",
+          "[[ ! -f \"$localFile\" ]] && exit 169",
+          "installedPendingRebootCount=$(cat $localFile | grep 'InstalledPendingRebootCount' | sed 's/[^0-9]*//g')",
+          "if [ \"$installedPendingRebootCount\" -eq 0 ]; then",
+          "    echo \"No installed Pending Reboot patches were detacted. Exiting document execution\"",
+          "    exit 168",
+          "fi",
+          "echo \"Reboot option verification completed successfully. Proceeding with installation next.\""
+        ]
+      }
+    },
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "action": "aws:runPowerShellScript",
+      "name": "VerifyIfShouldRebootWindows",
+      "inputs": {
+        "runCommand": [
+          "#RebootOption was NoReboot, exit and skip the rest of doc execution:",
+          "$rebootOption = \"{{ RebootOption }}\"",
+          "if ($rebootOption -eq 'NoReboot') {",
+          "        Write-Output 'Selected reboot option was NoReboot. Exiting document execution'",
+          "        exit 168",
+          "}",
+          "$appName = 'PatchBaselineOperations'",
+          "$fileName = 'PatchInventoryFromLastOperation.json'",
+          "$localFileLocation = [IO.Path]::Combine($env:ProgramData, 'Amazon', $appName, 'State')",
+          "$localFile = [IO.Path]::Combine($localFileLocation, $fileName)",
+          "if (-Not (Test-Path $localFile -PathType Leaf)) {",
+          "     exit 169",
+          "}",
+          "$installedPendingRebootCountLine = Get-Content $localFile | Select-String 'InstalledPendingRebootCount'",
+          "$installedPendingRebootCount = $installedPendingRebootCountLine -replace '\\D+(\\d+)','$1'",
+          "if ($installedPendingRebootCount -eq 0) {",
+          "        Write-Output 'No installed Pending Reboot patches were detected. Exiting document execution'",
+          "        exit 168",
+          "}",
+          "Write-Output 'Reboot option verification completed successfully. Proceeding with installation next.'"
+        ]
+      }
+    },
+    {
+      "action": "aws:runDocument",
+      "name": "RebootHandlingAndReporting",
+      "inputs": {
+        "documentType": "SSMDocument",
+        "documentPath": "AWS-RunPatchBaseline",
+        "documentParameters": "{\"Operation\":\"Install\",\"RebootOption\":\"RebootIfNeeded\", \"SnapshotId\": {{SnapshotId}}}",
+        "onFailure": "exit"
+      }
+    },
+    {
+      "action": "aws:runDocument",
+      "name": "CustomerProvidedPostRebootHook",
+      "precondition": {
+        "StringEquals": [
+          "{{ Operation }}",
+          "Install"
+        ]
+      },
+      "inputs": {
+        "documentType": "SSMDocument",
+        "documentPath": "{{PostRebootHookDocName}}",
+        "finallyStep": true
+      }
+    }
+  ]
+}
