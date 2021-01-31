@@ -1,0 +1,599 @@
+{
+  "description": "The *AWSSupport-RecoverWorkSpaceWithApproval* runbook performs recovery steps on the Amazon WorkSpaces instance you specify if its operational state is Unhealthy. Depending on the values you specify for the input parameters and the snapshots available, the runbook will reboot, restore, and rebuild the WorkSpace until its status becomes Available. This runboook uses the automation action aws:approve, which temporarily pauses the automation until the designated principals either approve or deny to proceed with the recovery actions selected. Please see [Running an automation with approvers](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-working-executing-approval.html) for more information.\n\n**Important:** Restoring or rebuilding a WorkSpace is a potentially destructive action that can result in the loss of data. This is because the WorkSpace is restored from the last available snapshot and data recovered from snapshots can be as old as 12 hours. Please see [Rebuild a WorkSpace](https://docs.aws.amazon.com/workspaces/latest/adminguide/rebuild-workspace.html) and [Restore a WorkSpace](https://docs.aws.amazon.com/workspaces/latest/adminguide/restore-workspace.html) for more details.\n\nBefore using this runbook we recommend reviewing the [Troubleshooting Amazon WorkSpaces Issues](https://docs.aws.amazon.com/workspaces/latest/adminguide/amazon-workspaces-troubleshooting.html) topic in the Amazon WorkSpaces Administration Guide. ",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to execute this document.",
+      "default": ""
+    },
+    "WorkspaceId": {
+      "type": "String",
+      "description": "(Required) WorkSpace ID for troubleshooting",
+      "allowedPattern": "^ws-[0-9a-z]{8,63}$",
+      "maxChars": 63
+    },
+    "Reboot": {
+      "type": "String",
+      "description": "(Required) Set it to \"Yes\" if you allow the WorkSpace to be rebooted.",
+      "default": "Yes",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ]
+    },
+    "Restore": {
+      "type": "String",
+      "description": "(Required) Set it to \"Yes\" if you allow the WorkSpace to be restored. The system is restored to the most recent snapshot of the root volume. Any applications that were installed, or system settings that were changed after the most recent snapshot was created, are lost. The user volume (for Microsoft Windows, the D drive; for Linux, /home) is recreated from the most recent snapshot. The current contents of the user volume are overwritten.",
+      "default": "No",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ]
+    },
+    "Rebuild": {
+      "type": "String",
+      "description": "(Required) Set it to \"Yes\" if you allow the WorkSpace to be rebuild. The system is refreshed with the most recent image of the bundle that the WorkSpace was created from. Any applications that were installed, or system settings that were changed after the WorkSpace was created, are lost. The user volume (for Microsoft Windows, the D drive; for Linux, /home) is recreated from the most recent snapshot. The current contents of the user volume are overwritten.",
+      "default": "No",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ]
+    },
+    "Acknowledge": {
+      "type": "String",
+      "description": "(Required) Please write \"Yes\" if you acknowledge that both the restore and rebuild actions will try to recover the WorkSpace from the most recent snapshot. Data restored from snapshots can be as old as 12 hours as they are based on the last automatic snapshot of your WorkSpace.",
+      "allowedPattern": "^[Yy][Ee][Ss]$",
+      "maxChars": 3
+    },
+    "Approvers": {
+      "type": "StringList",
+      "description": "(Required) List of IAM user names or ARNs of the approvers for the automation action. You can specify principals by using any of the following formats: IAM user name, IAM user ARN, IAM role ARN, or IAM assume role user ARN.",
+      "maxItems": 10,
+      "minItems": 1,
+      "allowedPattern": "^[a-zA-Z0-9_+=,.@\\-/]{1,128}$|^arn:aws(-[a-z]+)?(-[a-z]+)?:iam:.*:[0-9]{12}:[a-zA-Z0-9_+=,.@\\-/]{1,256}$",
+      "maxChars": 256
+    },
+    "MinRequiredApprovals": {
+      "type": "Integer",
+      "description": "(Required) The minimum number of approvals required to resume the Automation execution. The value for this parameter can't exceed the number of approvers defined by the Approvers parameter.",
+      "default": 1,
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) The SNS topic ARN used to send pending approval notification for rebooting, restoring, and rebuilding the WorkSpace. The SNS topic name must be prefixed with \"Automation\"",
+      "allowedPattern": "^arn:aws(-[a-z]+)?(-[a-z]+)?:sns:.*:[0-9]{12}:[Aa][Uu][Tt][Oo][Mm][Aa][Tt][Ii][Oo][Nn][a-zA-Z0-9_-]{1,246}$",
+      "maxChars": 256
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getWorkSpaceInitialState",
+      "description": "Describe the WorkSpace initial status.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Workspaces[0].State",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "assertWorkSpaceInitialState"
+    },
+    {
+      "name": "assertWorkSpaceInitialState",
+      "description": "Confirm the WorkSpace status is 'Unhealthy', 'Error', 'Impaired', 'Stopped', or 'Available'; otherwise the automation ends. ",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "AVAILABLE",
+          "ERROR",
+          "STOPPED",
+          "UNHEALTHY",
+          "IMPAIRED"
+        ]
+      },
+      "nextStep": "branchOnWorkSpaceInitialState"
+    },
+    {
+      "name": "branchOnWorkSpaceInitialState",
+      "description": "Branch the document depending on the WorkSpace status.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "startWorkSpace",
+            "Variable": "{{getWorkSpaceInitialState.Result}}",
+            "StringEquals": "STOPPED"
+          },
+          {
+            "Or": [
+              {
+                "Variable": "{{getWorkSpaceInitialState.Result}}",
+                "StringEquals": "UNHEALTHY"
+              },
+              {
+                "Variable": "{{getWorkSpaceInitialState.Result}}",
+                "StringEquals": "ERROR"
+              },
+              {
+                "Variable": "{{getWorkSpaceInitialState.Result}}",
+                "StringEquals": "IMPAIRED"
+              }
+            ],
+            "NextStep": "getWorkSpaceSnapshots"
+          }
+        ],
+        "Default": "assertWorkSpaceFinalState"
+      }
+    },
+    {
+      "name": "startWorkSpace",
+      "description": "Start the WorkSpace.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "StartWorkspaces",
+        "StartWorkspaceRequests": [
+          {
+            "WorkspaceId": "{{WorkspaceId}}"
+          }
+        ]
+      },
+      "nextStep": "waitForStartWorkSpace"
+    },
+    {
+      "name": "waitForStartWorkSpace",
+      "description": "Wait until the WorkSpace status is 'Starting'.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "STARTING"
+        ]
+      },
+      "nextStep": "waitForStartWorkSpaceResult"
+    },
+    {
+      "name": "waitForStartWorkSpaceResult",
+      "description": "Wait until the WorkSpace status is 'Unhealthy', 'Error', 'Impaired', or 'Available' after Start.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "UNHEALTHY",
+          "AVAILABLE",
+          "ERROR",
+          "IMPAIRED"
+        ]
+      },
+      "nextStep": "getWorkSpaceStateAfterStart"
+    },
+    {
+      "name": "getWorkSpaceStateAfterStart",
+      "description": "Describe the WorkSpace status after Start.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Workspaces[0].State",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnWorkSpaceStateAfterStart"
+    },
+    {
+      "name": "branchOnWorkSpaceStateAfterStart",
+      "description": "Branch the document depending on the WorkSpace status after Start.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{getWorkSpaceStateAfterStart.Result}}",
+            "StringEquals": "AVAILABLE",
+            "NextStep": "assertWorkSpaceFinalState"
+          }
+        ],
+        "Default": "getWorkSpaceSnapshots"
+      }
+    },
+    {
+      "name": "getWorkSpaceSnapshots",
+      "description": "Describe the WorkSpace 'Rebuild' and 'Restore' snapshots.",
+      "action": "aws:executeAwsApi",
+      "isCritical": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaceSnapshots",
+        "WorkspaceId": "{{WorkspaceId}}"
+      },
+      "outputs": [
+        {
+          "Name": "rebuildSnapshots",
+          "Selector": "$.RebuildSnapshots",
+          "Type": "MapList"
+        },
+        {
+          "Name": "restoreSnapshots",
+          "Selector": "$.RestoreSnapshots",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "approval"
+    },
+    {
+      "name": "approval",
+      "description": "Approve the document 'Reboot', 'Restore', and 'Rebuild' actions.",
+      "action": "aws:approve",
+      "timeoutSeconds": 86400,
+      "onFailure": "Abort",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Pending approval request for WorkSpace Reboot={{Reboot}}, Restore={{Restore}}, and Rebuild={{Rebuild}} actions. Important: Both the restore and rebuild actions will recover the WorkSpace from the most recent snapshot. Data restored from snapshots can be as old as 12 hours as they are based on the last backup of your WorkSpace. Refer to the WorkSpaces Rebuild and Restore documentation for more information. Please visit the link below and approve/reject the workflow.",
+        "MinRequiredApprovals": "{{MinRequiredApprovals}}",
+        "Approvers": "{{Approvers}}"
+      },
+      "nextStep": "branchOnRebootAllowed"
+    },
+    {
+      "name": "branchOnRebootAllowed",
+      "description": "Branch the document depending on the 'Reboot' allowed document parameter.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{Reboot}}",
+            "StringEquals": "Yes",
+            "NextStep": "rebootWorkSpace"
+          }
+        ],
+        "Default": "branchOnRestoreAllowed"
+      }
+    },
+    {
+      "name": "rebootWorkSpace",
+      "description": "Reboot the WorkSpace.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "RebootWorkspaces",
+        "RebootWorkspaceRequests": [
+          {
+            "WorkspaceId": "{{WorkspaceId}}"
+          }
+        ]
+      },
+      "nextStep": "waitForRebootWorkSpace"
+    },
+    {
+      "name": "waitForRebootWorkSpace",
+      "description": "Wait until the WorkSpace is in 'Rebooting' status.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "REBOOTING"
+        ]
+      },
+      "nextStep": "waitForRebootWorkSpaceResult"
+    },
+    {
+      "name": "waitForRebootWorkSpaceResult",
+      "description": "Wait until the WorkSpace status is 'Unhealthy', 'Error', or 'Available' after Reboot.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "UNHEALTHY",
+          "AVAILABLE",
+          "ERROR"
+        ]
+      },
+      "nextStep": "getWorkSpaceStateAfterReboot"
+    },
+    {
+      "name": "getWorkSpaceStateAfterReboot",
+      "description": "Describe the WorkSpace status after Reboot.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Workspaces[0].State",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnWorkSpaceStateAfterReboot"
+    },
+    {
+      "name": "branchOnWorkSpaceStateAfterReboot",
+      "description": "Branch the document depending on the WorkSpace status after Reboot.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{getWorkSpaceStateAfterReboot.Result}}",
+            "StringEquals": "AVAILABLE",
+            "NextStep": "assertWorkSpaceFinalState"
+          }
+        ],
+        "Default": "branchOnRestoreAllowed"
+      }
+    },
+    {
+      "name": "branchOnRestoreAllowed",
+      "description": "Branch the document depending on the 'Restore' allowed document parameter.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{Restore}}",
+            "StringEquals": "Yes",
+            "NextStep": "restoreWorkSpace"
+          }
+        ],
+        "Default": "branchOnRebuildAllowed"
+      }
+    },
+    {
+      "name": "restoreWorkSpace",
+      "description": "Restore the WorkSpace. If the Restore fails, the document then will try to Rebuild the WorkSpace.",
+      "isCritical": false,
+      "onFailure": "step:branchOnRebuildAllowed",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "RestoreWorkspace",
+        "WorkspaceId": "{{WorkspaceId}}"
+      },
+      "nextStep": "waitForRestoreWorkSpace"
+    },
+    {
+      "name": "waitForRestoreWorkSpace",
+      "description": "Wait until the WorkSpace is in 'Restoring' status.",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": "600",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "RESTORING"
+        ]
+      },
+      "nextStep": "waitForRestoreWorkSpaceResult"
+    },
+    {
+      "name": "waitForRestoreWorkSpaceResult",
+      "description": "Wait until the WorkSpace status is 'Unhealthy', 'Error', or 'Available' after Restore.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "UNHEALTHY",
+          "AVAILABLE",
+          "ERROR"
+        ]
+      },
+      "nextStep": "getWorkSpaceStateAfterRestore"
+    },
+    {
+      "name": "getWorkSpaceStateAfterRestore",
+      "description": "Describe the WorkSpace status after Restore.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Workspaces[0].State",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnWorkSpaceStateAfterRestore"
+    },
+    {
+      "name": "branchOnWorkSpaceStateAfterRestore",
+      "description": "Branch the document depending on the WorkSpace status after Restore.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{getWorkSpaceStateAfterRestore.Result}}",
+            "StringEquals": "AVAILABLE",
+            "NextStep": "assertWorkSpaceFinalState"
+          }
+        ],
+        "Default": "branchOnRebuildAllowed"
+      }
+    },
+    {
+      "name": "branchOnRebuildAllowed",
+      "description": "Branch the document depending on the 'Rebuild' allowed document parameter.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{Rebuild}}",
+            "StringEquals": "Yes",
+            "NextStep": "rebuildWorkSpace"
+          }
+        ],
+        "Default": "assertWorkSpaceFinalState"
+      }
+    },
+    {
+      "name": "rebuildWorkSpace",
+      "description": "Rebuild the WorkSpace.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:assertWorkSpaceFinalState",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "RebuildWorkspaces",
+        "RebuildWorkspaceRequests": [
+          {
+            "WorkspaceId": "{{WorkspaceId}}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.FailedRequests[0].ErrorCode",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "waitForRebuildWorkSpace"
+    },
+    {
+      "name": "waitForRebuildWorkSpace",
+      "description": "Wait until the WorkSpace is in 'Rebuilding' status.",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:assertWorkSpaceFinalState",
+      "timeoutSeconds": "600",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "REBUILDING"
+        ]
+      },
+      "nextStep": "waitForRebuildWorkSpaceResult"
+    },
+    {
+      "name": "waitForRebuildWorkSpaceResult",
+      "description": "Wait until the WorkSpace status is 'Unhealthy', 'Error', or 'Available' after Rebuild.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "UNHEALTHY",
+          "AVAILABLE",
+          "ERROR"
+        ]
+      },
+      "nextStep": "getWorkSpaceStateAfterRebuild"
+    },
+    {
+      "name": "getWorkSpaceStateAfterRebuild",
+      "description": "Describe the WorkSpace status after Rebuild.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Workspaces[0].State",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "assertWorkSpaceFinalState"
+    },
+    {
+      "name": "assertWorkSpaceFinalState",
+      "description": "Confirms if the WorkSpace status is 'Available'.",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "WorkspaceIds": [
+          "{{WorkspaceId}}"
+        ],
+        "PropertySelector": "$.Workspaces[0].State",
+        "DesiredValues": [
+          "AVAILABLE"
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}

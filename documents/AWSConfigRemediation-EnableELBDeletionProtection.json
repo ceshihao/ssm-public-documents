@@ -1,0 +1,46 @@
+{
+  "description": "### Document name - AWSConfigRemediation-EnableELBDeletionProtection\n\n## What does this document do?\nThis document enables deletion protection for the specified AWS Elastic Load Balancer using the [ModifyLoadBalancerAttributes](https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_ModifyLoadBalancerAttributes.html) API.\n\n## Input Parameters\n* LoadBalancerArn: (Required) The Amazon Resource Name (ARN) of the load balancer.\n* AutomationAsssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* EnableAndVerifyDeletionProtection.Output - The standard HTTP response from ModifyLoadBalancerAttributes API.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "LoadBalancerArn": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the load balancer.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:elasticloadbalancing:[a-z]{2}-[a-z]+-[0-9]{1}:[0-9]{12}:loadbalancer\\/(net|app|gwy)\\/((?!internal-)(?!-)[0-9a-zA-Z-]{0,32}(?<!-))\\/[0-9aA-zZ]{16}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$"
+    }
+  },
+  "outputs": [
+    "EnableAndVerifyDeletionProtection.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "EnableAndVerifyDeletionProtection",
+      "description": "## EnableAndVerifyDeletionProtection\nVerifies load balancer state and enables deletion protection\n",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "inputs": {
+        "InputPayload": {
+          "LoadBalancerArn": "{{ LoadBalancerArn }}"
+        },
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\nelb_client = boto3.client(\"elbv2\")\n\ndef is_deletion_protection_enabled(elb_arn):\n  elb_attributes = elb_client.describe_load_balancer_attributes(LoadBalancerArn=elb_arn)[\"Attributes\"]\n  attribute_value = list(filter(lambda x:x[\"Key\"]==\"deletion_protection.enabled\",elb_attributes))[0][\"Value\"]\n  if attribute_value:\n    return True\n  return False\n\ndef script_handler(event, context):\n  elb_arn = event.get(\"LoadBalancerArn\")\n  elb_details = elb_client.describe_load_balancers(LoadBalancerArns=[elb_arn])[\"LoadBalancers\"][0]\n  elb_name = elb_details[\"LoadBalancerName\"]\n  if elb_details[\"State\"][\"Code\"] != \"active\":\n     raise Exception(f\"SPECIFIED LOAD BALANCER {elb_name} IS NOT IN ACTIVE STATE\") \n\n  response = elb_client.modify_load_balancer_attributes(LoadBalancerArn=elb_arn,Attributes=[{\"Key\": \"deletion_protection.enabled\",\"Value\": \"true\"}])\n  retry_count = 0\n  while retry_count < 5:\n    retry_count = retry_count + 1\n    if is_deletion_protection_enabled(elb_arn):\n      return {\n          \"Message\": \"Deletion protection enabled successfully.\",\n          \"HTTPResponse\": response\n        }\n  raise Exception(f\"VERIFICATION FAILED. DELETION PROTECTION IS NOT ENABLED ON ELB {elb_name}.\")\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.7"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
