@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-UpdateElasticsearchDomainSecurityGroups\n\n## What does this document do?\nThis document updates the AWS security group configuration on a given Amazon Elasticsearch Service (Amazon ES) domain using the [UpdateElasticsearchDomainConfig](https://docs.aws.amazon.com/elasticsearch-service/latest/developerguide/es-configuration-api.html#es-configuration-api-actions-updateelasticsearchdomainconfig) API.\nPlease note, AWS security groups can only be applied to Amazon ES domains configured for Amazon Virtual Private Cloud (VPC) Access, not those configured for Public Access.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* DomainName: (Required) The name of the Amazon ES domain.\n* SecurityGroupList: (Required) The list of AWS security group IDs.\n\n## Output Parameters\n* UpdateSecurityGroupsAndVerify.Output - Success message or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "DomainName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon ES domain.",
+      "allowedPattern": "(\\d{12}/)?[a-z]{1}[a-z0-9-]{2,28}"
+    },
+    "SecurityGroupList": {
+      "type": "StringList",
+      "description": "(Required) The list of AWS security group IDs.",
+      "allowedPattern": "^sg-[0-9a-f]{1,17}$"
+    }
+  },
+  "outputs": [
+    "UpdateSecurityGroupsAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "UpdateSecurityGroupsAndVerify",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## UpdateSecurityGroupsAndVerify\nMakes UpdateElasticsearchDomainConfig API call using Amazon ES domain name and security groups ID's and updates AWS security group configuration on Amazon ES domain and verifies its state.\n## Outputs\n* Output: Success message or failure exception.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "DomainName": "{{ DomainName }}",
+          "SecurityGroupIds": "{{ SecurityGroupList }}"
+        },
+        "Script": "import boto3\nimport re\n\ndef update_es_security_group_ids(es_client, domain_name, security_grp_list):\n    return es_client.update_elasticsearch_domain_config(\n        DomainName=domain_name, VPCOptions={\"SecurityGroupIds\": security_grp_list}\n    )\n\ndef verify_security_groups_ids_updated(es_client, domain_name, security_grp_ids):\n    security_grp_list = es_client.describe_elasticsearch_domain(\n        DomainName=domain_name\n    )[\"DomainStatus\"][\"VPCOptions\"][\"SecurityGroupIds\"]\n    if sorted(security_grp_list) == sorted(security_grp_ids):\n        return True\n    return False\n\ndef handler(event, context):\n    es_client = boto3.client(\"es\")\n    domain_name = event[\"DomainName\"]\n    security_grp_ids = event[\"SecurityGroupIds\"]\n    domain_pattern = r\"(\\d{12}/)?[a-z0-9-]{3,28}\"\n    if re.match(domain_pattern, domain_name):\n        domain_name = domain_name.split(\"/\")[-1]\n    update_elasticsearch_domain_response = update_es_security_group_ids(es_client, domain_name, security_grp_ids)['ResponseMetadata']\n    update_status = verify_security_groups_ids_updated(es_client, domain_name, security_grp_ids)\n    if update_status:\n        return {\n            \"output\": {\n                \"Message\": \"Verification of AWS security groups on Amazon ES domain is successful.\",\n                \"HTTPResponse\": update_elasticsearch_domain_response,\n            }\n        }\n    raise Exception(\n        \"VERIFICATION OF AWS SECURITY GROUPS ON AMAZON ES DOMAIN FAILED.\"\n    )"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

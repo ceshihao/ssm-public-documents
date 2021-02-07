@@ -1,0 +1,80 @@
+{
+  "description": "### Document name - AWSConfigRemediation-ModifyRedshiftClusterNodeType\n\n## What does this document do?\nThis document modifies the node type and number of nodes for a given Amazon Redshift cluster using the [ResizeCluster](https://docs.aws.amazon.com/redshift/latest/APIReference/API_ResizeCluster.html) API.\nNote: Choose classic resize when you are resizing to a configuration that isn't available through elastic resize.\n      You can't use elastic resize on single-node clusters.\n      Choose RA3 node types to take advantage of improved performance and to get more storage capacity.\n\n## Input Parameters\n* ClusterIdentifier: (Required) The unique identifier of the Amazon Redshift cluster.\n* NodeType: (Required) The new node type of the Amazon Redshift cluster. \n* NumberOfNodes: (Optional) The new number of nodes of the Amazon Redshift cluster. The value must be at least 1 and no more than 100.\n* ClusterType: (Required) The new cluster type for the specified cluster.\n* Classic: (Optional) A boolean value indicating whether the resize operation is using the classic resize process.\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* ModifyAndVerifyRedshiftClusterNodeTypeAndNumber.Output - The standard HTTP response from the ResizeCluster API.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "ModifyAndVerifyRedshiftClusterNodeTypeAndNumber.Output"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "ClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) The unique identifier of the Amazon Redshift cluster to be modified.",
+      "allowedPattern": "^[a-z](?!.*--)[a-z0-9-]{0,62}(?<!-)$"
+    },
+    "Classic": {
+      "type": "Boolean",
+      "description": "(Optional) A boolean value indicating whether the resize operation is using the classic resize process.",
+      "default": false
+    },
+    "ClusterType": {
+      "type": "String",
+      "description": "(Required) The new cluster type for the specified cluster.",
+      "allowedValues": [
+        "multi-node",
+        "single-node"
+      ]
+    },
+    "NodeType": {
+      "type": "String",
+      "description": "(Required) The new node type of the Amazon Redshift cluster.",
+      "allowedValues": [
+        "ds2.xlarge",
+        "ds2.8xlarge",
+        "dc2.large",
+        "dc2.8xlarge",
+        "ra3.xlplus",
+        "ra3.4xlarge",
+        "ra3.16xlarge"
+      ]
+    },
+    "NumberOfNodes": {
+      "type": "Integer",
+      "description": "(Optional) The new number of nodes of the Amazon Redshift cluster. For multi-node cluster type, the value must be at least 2 and no more than 100. For single-node cluster type, leave the field empty.",
+      "allowedPattern": "^[1-9][0-9]?$|^100$|[\\w]{0}",
+      "default": 1
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ModifyAndVerifyRedshiftClusterNodeTypeAndNumber",
+      "action": "aws:executeScript",
+      "description": "## ModifyAndVerifyRedshiftClusterNodeTypeAndNumber\nModifies and verifies cluster is resizing as configured for the given Amazon Redshift cluster.\n## outputs\n* Output: The verification response that cluster is resizing as configured for the given Amazon Redshift cluster.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "cluster_identifier": "{{ ClusterIdentifier }}",
+          "node_type": "{{ NodeType }}",
+          "number_of_nodes": "{{ NumberOfNodes }}",
+          "cluster_type": "{{ ClusterType}}",
+          "classic": "{{ Classic }}"
+        },
+        "Script": "import boto3\nimport json\nimport datetime\ndef default(obj):\n    if isinstance(obj, (datetime.date, datetime.datetime)):\n        return obj.isoformat()\ndef verify_cluster_node_type_number(redshift_client,cluster_identifier,cluster_type,node_type,number_of_nodes):\n    response = redshift_client.describe_clusters(ClusterIdentifier=cluster_identifier)\n    if ((response[\"Clusters\"][0][\"ClusterStatus\"] == \"resizing\") or (\"prep-for-resize\" in  response[\"Clusters\"][0][\"ClusterStatus\"])):\n        return \"Verification of 'ModifyRedshiftClusterNodeType' is successful.\"\n    error = f\"VERIFICATION FAILED. GIVEN AMAZON REDSHIFT CLUSTER {cluster_identifier} IS NOT RESIZING.\"\n    raise Exception(error)\n\ndef handler(event, context):\n    redshift_client = boto3.client(\"redshift\")\n    if (event[\"cluster_type\"] == \"single-node\"):\n        response = redshift_client.resize_cluster(\n            ClusterIdentifier=event[\"cluster_identifier\"],\n            ClusterType=event[\"cluster_type\"],\n            NodeType=event[\"node_type\"],\n            Classic=event[\"classic\"]\n        )\n    else:\n        response = redshift_client.resize_cluster(\n            ClusterIdentifier=event[\"cluster_identifier\"],\n            ClusterType=event[\"cluster_type\"],\n            NodeType=event[\"node_type\"],\n            Classic=event[\"classic\"],\n            NumberOfNodes=event [\"number_of_nodes\"]\n        )\n    output = verify_cluster_node_type_number(redshift_client,event[\"cluster_identifier\"],event[\"cluster_type\"],event[\"node_type\"],event[\"number_of_nodes\"])\n    return {\n        \"output\":{\n             \"Message\": output, \n             \"HTTPResponse\":  json.dumps(response, default=default)\n         }\n     }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Type": "StringMap",
+          "Selector": "$.Payload.output"
+        }
+      ]
+    }
+  ]
+}
