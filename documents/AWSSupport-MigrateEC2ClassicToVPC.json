@@ -1,0 +1,918 @@
+{
+  "description": "# EC2ClassicToVPCMigration\n---\nThis document migrates EC2 Classic instances to EC2 VPC (Xen Platform) by creating an AMI and launching a new EC2 instance, from the AMI, in VPC. The document only supports EC2 Classic instances with **Virtualization Type** as **HVM** and **Root Volume** of type **EBS**, providing two types of Migration:\n- Test -- Creates an AMI (without Reboot) from the EC2 Classic Instance and launches new instance from AMI in VPC.\n- CutOver -- Uses aws:approve automation action to ask user approval for stopping the original instance, if provided creates an AMI from the instance and launches Target instance from the AMI in VPC.\n---\n\n## Parameters\n1. **InstanceId:**\n\nType: String\n\nDescription: **(Required)** _Instance you want to migrate from EC2 Classic to VPC(e.g. i-123456789abcdefgh)_\n\n2. **AutomationAssumeRole:**\n\nType: String \n\nDescription: **(Optional)** _IAM role which SSM Systems Manager will assume to execute this automation. For more information, visit [link](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-setup.html)_\n\n3.  **DestinationSubnetId:**\n\nType: String\n\nDescription: **(Optional)** _Destination SubnetId. If DestinationSubnetId is not provided, automation will choose any random subnet in the default VPC of the region_\n\n4.  **MigrationType:**\n\nType: String\n\nDescription: **(Required)** _Type of migration operation that is needed to be performed. If you choose ```CutOver```, the original instance will be stopped & started during the execution. Default is ``Test`` which won't affect the original instance._\n\n5.  **TargetInstanceType:**\n\nType: String \n\nDescription: **(Required)** _Target EC2 Instance type for the migration. Only T2 instance types are supported. Default is t2.xlarge_\n\n6.   **SNSNotificationARNforApproval:**\n\nType: String \n\nDescription: **(Optional)** _ARN of SNS Topic for sending Approval notification. Only applicable when the MigrationType is CutOver. For more information visit [link](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-action-approve.html)_\n\n7.   **ApproverIAM**:\n\nType: StringList \n\nDescription: **(Optional)** _ARN of the Approvers who are able to either approve or reject the action. Only applicable when the MigrationType is CutOver. For more information visit [link](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-action-approve.html)_\n\n8. **DestinationSecurityGroupId:**\n\nType: StringList \n\nDescription: **(Optional)** _Destination SecurityGroup ID. If DestinationSecurityGroup ID is not provided, Security Groups attached to the source instance will be copied to VPC and used. If automation fails to copy security groups attached to source instance, then target instance will be launched with default security group of selected VPC._",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "default": "",
+      "type": "String",
+      "description": "(Optional) IAM role which SSM Systems Manager will assume to execute this automation. For more information, visit - https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-setup.html",
+      "allowedPattern": "^$|^arn:aws:iam::[0-9]*:role/[/\\w+=,.@-]+$"
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) Instance you want to migrate from EC2 Classic to VPC (e.g. i-123456789abcdefgh).",
+      "allowedPattern": "^[m]{0,1}i-[a-z0-9]{8,17}$"
+    },
+    "TargetInstanceType": {
+      "default": "t2.xlarge",
+      "type": "String",
+      "description": "(Required) Target EC2 Instance type for the migration. Only T2 instance types are supported.",
+      "allowedValues": [
+        "t2.nano",
+        "t2.micro",
+        "t2.small",
+        "t2.medium",
+        "t2.large",
+        "t2.xlarge",
+        "t2.2xlarge"
+      ]
+    },
+    "MigrationType": {
+      "default": "Test",
+      "type": "String",
+      "description": "(Required) ype of migration operation that is needed to be performed. If you choose CutOver, the original instance will be stopped & started during the execution. Default is Test which won't effect the original instance.",
+      "allowedValues": [
+        "Test",
+        "CutOver"
+      ]
+    },
+    "SNSNotificationARNforApproval": {
+      "default": "",
+      "type": "String",
+      "description": "(Optional) Provide the ARN of the SNS Topic for sending Approval notification. Only applicable when the MigrationType is CutOver. For more information visit - https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-action-approve.html",
+      "allowedPattern": "^$|arn:aws:sns:(us(-gov)?|ap|ca|cn|eu|sa)-(central|(north|south)?(east|west)?)-\\d:\\d{12}:.*"
+    },
+    "ApproverIAM": {
+      "default": [],
+      "type": "StringList",
+      "description": "(Optional) Provide the ARN of the Approver who are able to either approve or reject the action. Only applicable when the MigrationType is CutOver. For more information visit - https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-action-approve.html",
+      "allowedPattern": "^$|arn:aws:iam::\\d{12}:.*"
+    },
+    "DestinationSubnetId": {
+      "default": "",
+      "type": "String",
+      "description": "(Optional) Destination SubnetId. If  DestinationSubnetId is not provided, automation which choose any random subnet in the default VPC.",
+      "allowedPattern": "^$|^subnet-[a-z0-9]{8,17}$"
+    },
+    "DestinationSecurityGroupId": {
+      "default": [],
+      "type": "StringList",
+      "description": "(Optional) Provide the destination VPC SecurityGroup ID. If no SecurityGroup ID is provided, Security Groups attached to the source instance will be copied to VPC and used.",
+      "allowedPattern": "^$|^sg-[0-9a-f]{8,17}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "checkInstanceIsInClassic",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "virtualizationType",
+          "Selector": "$.Reservations[0].Instances[0].VirtualizationType",
+          "Type": "String"
+        },
+        {
+          "Name": "rootDeviceType",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceType",
+          "Type": "String"
+        },
+        {
+          "Name": "Keypair",
+          "Selector": "$.Reservations[0].Instances[0].KeyName",
+          "Type": "String"
+        },
+        {
+          "Name": "PublicIpAddress",
+          "Selector": "$.Reservations[0].Instances[0].PublicIpAddress",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Reservations[0].Instances[0].VpcId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "checkInstanceIsInClassic",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfVirtualizationTypeIsHVM",
+            "Not": {
+              "Variable": "{{getInstanceProperties.VpcId}}",
+              "StartsWith": "vpc-"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfVirtualizationTypeIsHVM",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "nextStep": "checkIfRootVolumeIsEBS",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].VirtualizationType",
+        "DesiredValues": [
+          "hvm"
+        ]
+      }
+    },
+    {
+      "name": "checkIfRootVolumeIsEBS",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "nextStep": "verifySecurityGroup",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].RootDeviceType",
+        "DesiredValues": [
+          "ebs"
+        ]
+      }
+    },
+    {
+      "name": "verifySecurityGroup",
+      "action": "aws:executeScript",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "nextStep": "verifySubnetId",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "verifysecurityGroup",
+        "InputPayload": {
+          "security_group": "{{DestinationSecurityGroupId}}",
+          "subnet_id": "{{DestinationSubnetId}}",
+          "instance_id": "{{InstanceId}}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom botocore.exceptions import ClientError\nimport sys\n\n#ErrorCodes:\n#140 - NoDefaultVPCFound\n#141 - SubnetNotFound(InvalidSubnetID.NotFound)\n#142 - SecurityGroupExists\n#143 - SecurityGroupsFromDifferentVpcs\n\ndef initiazlize_client(service):\n    try:\n        global client\n        client = boto3.client(service)\n    except ClientError as e:\n        raise Exception (\"[ERROR] Failed to initiazlie EC2 client\",e)\n\ndef get_default_vpc():\n    print (\"[INFO] Looking for the default VPC\")\n    try:\n        default_vpc=client.describe_vpcs(\n            Filters = [\n                {\n                    \"Name\": \"isDefault\",\n                    \"Values\": [\n                        \"true\"\n                    ]\n                }\n            ]\n        )\n        if not default_vpc['Vpcs']:\n            print ('[ERROR] No default VPC found')\n            return 140\n        else:\n            return (default_vpc['Vpcs'][0]['VpcId'])\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n\ndef find_vpc_from_subnet(subnet_id):\n    print(\"[INFO] Finding VPC Id from the provided subnet:\", subnet_id)\n    try:\n        subnet_details=client.describe_subnets(\n            SubnetIds = [\n                subnet_id\n            ]\n        )\n        if \"InvalidSubnetID.NotFound\" in subnet_details:\n            return 141\n        else:\n            return subnet_details['Subnets'][0]['VpcId']\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n\ndef find_vpc_from_security_group(sg_id):\n    index=0\n    vpcids=[]\n    print('[INFO] Finding VPC of Provided Security groups:', sg_id)\n\n    try:\n        for i in sg_id:\n            security_group = client.describe_security_groups(\n                Filters = [\n                    {\n                        \"Name\": \"group-id\",\n                        \"Values\": [\n                            sg_id[index]\n                        ]\n                    }\n                ]\n            )\n            if (len(security_group['SecurityGroups']) == 0):\n                raise Exception ('[ERROR] No Security Group found', sg_id[index])\n            else:\n                vpcid = security_group['SecurityGroups'][0]['VpcId']\n                vpcids.append(vpcid)\n            index+=1\n        if(len(set(vpcids)) != 1):\n            return 143\n        else:\n            return vpcids[0]      \n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n\ndef check_if_security_group_exists(security_group_name, vpcid):\n    print(\"[INFO] Checking if Security group by name \", security_group_name,\"exists\")\n    try:    \n        security_group = client.describe_security_groups(\n                Filters = [\n                    {\n                        \"Name\": \"group-name\",\n                        \"Values\": [\n                            security_group_name\n                        ]\n                    },\n                    {\n                        \"Name\": \"vpc-id\",\n                        \"Values\": [\n                            vpcid\n                        ]\n                    }\n                ]\n            )\n        if (len(security_group['SecurityGroups']) != 0):\n            security_group_id = security_group['SecurityGroups'][0]['GroupId']\n            return security_group_id\n        else:\n            return 142\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)    \n    \ndef create_security_group(vpcid, instance_id):    \n    index=0\n    new_security_group_ids=[]\n    print(\"[INFO] Finding security groups attached to source instance:\", instance_id)\n    try:            \n        instance_details=client.describe_instances(InstanceIds = [instance_id])\n        for i in instance_details['Reservations'][0]['Groups']:\n            security_group_Id = instance_details['Reservations'][0]['Groups'][index].get('GroupId', '')\n            security_group_name = instance_details['Reservations'][0]['Groups'][index].get('GroupName', '')+'-CopiedFromClassic'\n            \n            security_group_exists = check_if_security_group_exists(security_group_name, vpcid)\n            if  security_group_exists != 142:\n                print(\"[INFO] Security group by name \", security_group_name,\" exists\")\n                new_security_group_ids.append(security_group_exists)\n                \n            else:\n                try:\n                    security_group = client.describe_security_groups(GroupIds = [security_group_Id])\n                    \n                    security_group_description = security_group['SecurityGroups'][0].get('Description', '')\n                    print ('[INFO] Creating new Security Group in VPC:', vpcid)\n                    \n                    new_security_group = client.create_security_group(GroupName=security_group_name, VpcId=vpcid, Description=security_group_description)\n                    new_security_group_id = new_security_group['GroupId']\n                    \n                    print ('[INFO] Created Security Group:', new_security_group_id )\n                    \n                    add_ingress_rules = client.authorize_security_group_ingress(\n                        GroupId=new_security_group_id,\n                        IpPermissions=security_group['SecurityGroups'][0].get('IpPermissions', '')\n                        )                                    \n                    new_security_group_ids.append(new_security_group_id)\n                except ClientError as e:\n                    error = e.response['Error']['Code'] \n                    if error == 'InvalidParameterCombination':\n                        print('[ERROR] Unable to copy security group due to:', e)\n                        print('[ERROR] Ensure the source security does not have a rule with source as security group')\n                    else:\n                        print('[ERROR] Unable to copy security group due to:', e)\n                    print('[INFO] Deleting the security group:', new_security_group_id)\n                    delete = client.delete_security_group(GroupId = new_security_group_id)\n            index+=1\n        return new_security_group_ids\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n\ndef create_security_group_in_default_vpc(instance_id):\n    vpcid = get_default_vpc()\n    try:\n        if (vpcid == 140):\n            raise Exception ('[ERROR] No Default VPC Found')\n        else:\n            return create_security_group(vpcid, instance_id)\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n        \ndef create_security_group_in_provided_vpc(vpcid, instance_id):\n    return create_security_group(vpcid, instance_id)\n        \ndef verifysecurityGroup(events,context):\n    initiazlize_client('ec2')\n    if (events['security_group'] == []):\n        if (events['subnet_id'] == \"\"):\n            final_security_groupid = create_security_group_in_default_vpc(events['instance_id'])\n        else:\n            final_security_groupid = create_security_group_in_provided_vpc(find_vpc_from_subnet(events['subnet_id']),events['instance_id'])\n    else:\n        if (events['subnet_id'] == \"\"):\n            vpcid1 = get_default_vpc()\n            vpcid2 = find_vpc_from_security_group(events['security_group'])\n            if vpcid2 != 143:\n                if vpcid1 == vpcid2:\n                    final_security_groupid=events['security_group']\n                else:\n                    raise Exception('[ERROR] Security Group and Subnet are not in same VPC')\n            else:\n                raise Exception ('[ERROR] Provided Security groups are not from same VPC')                \n        else:\n            vpcid1 = find_vpc_from_subnet(events['subnet_id'])\n            vpcid2 = find_vpc_from_security_group(events['security_group'])\n            if vpcid2 != 143:            \n                if vpcid1 == vpcid2:\n                    final_security_groupid=events['security_group']\n                else:\n                    raise Exception('[ERROR] Security Group and Subnet are not in same VPC')\n            else:\n                raise Exception ('[ERROR] Provided Security groups are not from same VPC')\n    if len(final_security_groupid) == 0:\n        print('[WARN] No security group found, target instance will be launched with default security group')\n    print (final_security_groupid)       \n    return {\n        \"SecuritygroupId\": final_security_groupid\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "VerifiedSecurityGroupID",
+          "Type": "StringList",
+          "Selector": "$.Payload.SecuritygroupId"
+        }
+      ]
+    },
+    {
+      "name": "verifySubnetId",
+      "action": "aws:branch",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "createAMIWithoutReboot",
+            "Not": {
+              "Variable": "{{DestinationSubnetId}}",
+              "StringEquals": ""
+            }
+          }
+        ],
+        "Default": "getDefaultVPC"
+      }
+    },
+    {
+      "name": "getDefaultVPC",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "nextStep": "getSubnetIdDefaultVPC",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVpcs",
+        "Filters": [
+          {
+            "Name": "isDefault",
+            "Values": [
+              "true"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VpcId",
+          "Selector": "$.Vpcs[0].VpcId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "getSubnetIdDefaultVPC",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "nextStep": "createAMIWithoutReboot",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSubnets",
+        "Filters": [
+          {
+            "Name": "vpc-id",
+            "Values": [
+              "{{getDefaultVPC.VpcId}}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "subnetIdFromDefaultVpc",
+          "Selector": "$.Subnets[0].SubnetId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "createAMIWithoutReboot",
+      "action": "aws:createImage",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "branchOnMigrationType",
+      "inputs": {
+        "InstanceId": "{{InstanceId}}",
+        "ImageName": "Test_BackupAMI_fromAutomation_{{automation:EXECUTION_ID}}",
+        "NoReboot": true,
+        "ImageDescription": "InitialBackup_createdFrom_{{InstanceId}}_byAutomationId:{{automation:EXECUTION_ID}}_{{global:DATE_TIME}}"
+      }
+    },
+    {
+      "name": "branchOnMigrationType",
+      "action": "aws:branch",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkInstanceStopBehavior",
+            "Variable": "{{MigrationType}}",
+            "StringEquals": "CutOver"
+          }
+        ],
+        "Default": "chooseSubnetToUseTest"
+      }
+    },
+    {
+      "name": "chooseSubnetToUseTest",
+      "action": "aws:branch",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "launchTestInstanceDefaultVPC",
+            "Variable": "{{DestinationSubnetId}}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "launchTestInstanceProvidedSubnet"
+      }
+    },
+    {
+      "name": "launchTestInstanceDefaultVPC",
+      "action": "aws:runInstances",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "step:terminateTestInstanceDefaultVPC",
+      "nextStep": "branchOnPublicIp",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "ImageId": "{{createAMIWithoutReboot.ImageId}}",
+        "InstanceType": "{{TargetInstanceType}}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "SubnetId": "{{getSubnetIdDefaultVPC.subnetIdFromDefaultVpc}}",
+        "SecurityGroupIds": [
+          "{{verifySecurityGroup.VerifiedSecurityGroupID}}"
+        ],
+        "KeyName": "{{getInstanceProperties.Keypair}}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "CreatedBySSMAutomation_from_{{InstanceId}}"
+              },
+              {
+                "Key": "CreatedFromAMI",
+                "Value": "{{ createAMIWithoutReboot.ImageId }}"
+              },
+              {
+                "Key": "Category",
+                "Value": "TestEC2ClassicMigration"
+              },
+              {
+                "Key": "AutomationExecutionID",
+                "Value": "{{automation:EXECUTION_ID}}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "InstanceIds[0]",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "terminateTestInstanceDefaultVPC",
+      "action": "aws:changeInstanceState",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchTestInstanceDefaultVPC.InstanceIds}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "launchTestInstanceProvidedSubnet",
+      "action": "aws:runInstances",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "step:terminateTestInstanceProvidedSubnet",
+      "nextStep": "branchOnPublicIp",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "ImageId": "{{createAMIWithoutReboot.ImageId}}",
+        "InstanceType": "{{TargetInstanceType}}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "SubnetId": "{{DestinationSubnetId}}",
+        "SecurityGroupIds": [
+          "{{verifySecurityGroup.VerifiedSecurityGroupID}}"
+        ],
+        "KeyName": "{{getInstanceProperties.Keypair}}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "CreatedBySSMAutomation_from_{{InstanceId}}"
+              },
+              {
+                "Key": "CreatedFromAMI",
+                "Value": "{{ createAMIWithoutReboot.ImageId }}"
+              },
+              {
+                "Key": "Category",
+                "Value": "TestEC2ClassicMigration"
+              },
+              {
+                "Key": "AutomationExecutionID",
+                "Value": "{{automation:EXECUTION_ID}}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "InstanceIds[0]",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "terminateTestInstanceProvidedSubnet",
+      "action": "aws:changeInstanceState",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchTestInstanceProvidedSubnet.InstanceIds}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "checkInstanceStopBehavior",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "nextStep": "approvalToStopOriginalInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceAttribute",
+        "InstanceId": "{{InstanceId}}",
+        "Attribute": "instanceInitiatedShutdownBehavior",
+        "PropertySelector": "$.InstanceInitiatedShutdownBehavior.Value",
+        "DesiredValues": [
+          "stop"
+        ]
+      }
+    },
+    {
+      "name": "approvalToStopOriginalInstance",
+      "action": "aws:approve",
+      "timeoutSeconds": 1800,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "stopOriginalInstance",
+      "inputs": {
+        "NotificationArn": "{{SNSNotificationARNforApproval}}",
+        "Message": "Provide approval for stopping the original instance and migrate",
+        "MinRequiredApprovals": 1,
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "stopOriginalInstance",
+      "action": "aws:changeInstanceState",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "step:forceStopOriginalInstance",
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "createAMIAfterStoppingInstance"
+    },
+    {
+      "name": "forceStopOriginalInstance",
+      "action": "aws:changeInstanceState",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "nextStep": "createAMIAfterStoppingInstance",
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      }
+    },
+    {
+      "name": "createAMIAfterStoppingInstance",
+      "action": "aws:createImage",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "chooseSubnetToUseCutOver",
+      "inputs": {
+        "InstanceId": "{{InstanceId}}",
+        "ImageName": "CutOver_BackupAMI_fromAutomation_{{automation:EXECUTION_ID}}",
+        "NoReboot": true,
+        "ImageDescription": "Backup_createdFrom_{{InstanceId}}_byAutomationId:{{automation:EXECUTION_ID}}_{{global:DATE_TIME}}"
+      }
+    },
+    {
+      "name": "chooseSubnetToUseCutOver",
+      "action": "aws:branch",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "launchCutOverInstanceDefaultVPC",
+            "Variable": "{{DestinationSubnetId}}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "launchCutOverInstanceProvidedSubnet"
+      }
+    },
+    {
+      "name": "launchCutOverInstanceDefaultVPC",
+      "action": "aws:runInstances",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "step:awaitFailureApprovalDefaultVPC",
+      "nextStep": "branchOnPublicIp",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "ImageId": "{{createAMIAfterStoppingInstance.ImageId}}",
+        "InstanceType": "{{TargetInstanceType}}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "SubnetId": "{{getSubnetIdDefaultVPC.subnetIdFromDefaultVpc}}",
+        "SecurityGroupIds": [
+          "{{verifySecurityGroup.VerifiedSecurityGroupID}}"
+        ],
+        "KeyName": "{{getInstanceProperties.Keypair}}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "CreatedBySSMAutomation_from_{{InstanceId}}"
+              },
+              {
+                "Key": "CreatedFromAMI",
+                "Value": "{{ createAMIWithoutReboot.ImageId }}"
+              },
+              {
+                "Key": "Category",
+                "Value": "CutOverEC2ClassicMigration"
+              },
+              {
+                "Key": "AutomationExecutionID",
+                "Value": "{{automation:EXECUTION_ID}}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "InstanceIds[0]",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "awaitFailureApprovalDefaultVPC",
+      "action": "aws:approve",
+      "timeoutSeconds": 1800,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "terminateCutOverInstanceDefaultVPC",
+      "inputs": {
+        "NotificationArn": "{{SNSNotificationARNforApproval}}",
+        "Message": "Failed to launch the instance in the Default VPC. Provide approval for starting the Original instance and terminating the new CutOver instance. This step will timeout after 3600s",
+        "MinRequiredApprovals": 1,
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "terminateCutOverInstanceDefaultVPC",
+      "action": "aws:changeInstanceState",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "nextStep": "startOriginalInstance",
+      "onFailure": "step:startOriginalInstance",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchCutOverInstanceDefaultVPC.InstanceIds}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "launchCutOverInstanceProvidedSubnet",
+      "action": "aws:runInstances",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "step:awaitFailureApprovalProvidedSubnet",
+      "nextStep": "branchOnPublicIp",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "ImageId": "{{createAMIAfterStoppingInstance.ImageId}}",
+        "InstanceType": "{{TargetInstanceType}}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "SubnetId": "{{DestinationSubnetId}}",
+        "SecurityGroupIds": [
+          "{{verifySecurityGroup.VerifiedSecurityGroupID}}"
+        ],
+        "KeyName": "{{getInstanceProperties.Keypair}}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "CreatedBySSMAutomation_from_{{InstanceId}}"
+              },
+              {
+                "Key": "CreatedFromAMI",
+                "Value": "{{ createAMIWithoutReboot.ImageId }}"
+              },
+              {
+                "Key": "Category",
+                "Value": "CutOverEC2ClassicMigration"
+              },
+              {
+                "Key": "AutomationExecutionID",
+                "Value": "{{automation:EXECUTION_ID}}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "InstanceIds[0]",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "awaitFailureApprovalProvidedSubnet",
+      "action": "aws:approve",
+      "maxAttempts": 3,
+      "timeoutSeconds": 1800,
+      "onFailure": "Abort",
+      "nextStep": "terminateCutOverInstanceProvidedSubnet",
+      "inputs": {
+        "NotificationArn": "{{SNSNotificationARNforApproval}}",
+        "Message": "Failed to launch the instance in the Default VPC. Provide approval for starting the Original instance and terminating the new CutOver instance. This step will timeout after 3600s",
+        "MinRequiredApprovals": 1,
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "terminateCutOverInstanceProvidedSubnet",
+      "action": "aws:changeInstanceState",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "nextStep": "startOriginalInstance",
+      "onFailure": "step:startOriginalInstance",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchCutOverInstanceProvidedSubnet.InstanceIds}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "startOriginalInstance",
+      "action": "aws:changeInstanceState",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "isEnd": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      }
+    },
+    {
+      "name": "branchOnPublicIp",
+      "action": "aws:branch",
+      "isCritical": true,
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "verifyPublicIpIsEIP",
+            "Not": {
+              "Variable": "{{getInstanceProperties.PublicIpAddress}}",
+              "Contains": "PublicIpAddress"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifyPublicIpIsEIP",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "isCritical": false,
+      "nextStep": "branchOnInstanceLaunched",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeAddresses",
+        "PublicIps": [
+          "{{getInstanceProperties.PublicIpAddress}}"
+        ]
+      }
+    },
+    {
+      "name": "branchOnInstanceLaunched",
+      "action": "aws:branch",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "moveEIPToVPC",
+            "Variable": "{{launchCutOverInstanceDefaultVPC.InstanceId}}",
+            "StartsWith": "i-"
+          },
+          {
+            "NextStep": "moveEIPToVPC",
+            "Variable": "{{launchCutOverInstanceProvidedSubnet.InstanceId}}",
+            "StartsWith": "i-"
+          },
+          {
+            "NextStep": "verifySubnetIsPublicTestDefaultVPC",
+            "Variable": "{{launchTestInstanceDefaultVPC.InstanceId}}",
+            "StartsWith": "i-"
+          },
+          {
+            "NextStep": "verifySubnetIsPublicTestProvidedSubnet",
+            "Variable": "{{launchTestInstanceProvidedSubnet.InstanceId}}",
+            "StartsWith": "i-"
+          }
+        ]
+      }
+    },
+    {
+      "name": "moveEIPToVPC",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "nextStep": "getAllocationIDOfEIP",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "MoveAddressToVpc",
+        "PublicIp": "{{getInstanceProperties.PublicIpAddress}}"
+      }
+    },
+    {
+      "name": "getAllocationIDOfEIP",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "branchOnCutOverInstanceLaunched",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeAddresses",
+        "PublicIps": [
+          "{{getInstanceProperties.PublicIpAddress}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "AllocationId",
+          "Selector": "Addresses[0].AllocationId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "branchOnCutOverInstanceLaunched",
+      "action": "aws:branch",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "associateEIPCutOverDefaultVPC",
+            "Variable": "{{launchCutOverInstanceDefaultVPC.InstanceId}}",
+            "StartsWith": "i-"
+          },
+          {
+            "NextStep": "associateEIPCutOverProvidedSubnet",
+            "Variable": "{{launchCutOverInstanceProvidedSubnet.InstanceId}}",
+            "StartsWith": "i-"
+          }
+        ]
+      }
+    },
+    {
+      "name": "associateEIPCutOverDefaultVPC",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "AssociateAddress",
+        "AllocationId": "{{getAllocationIDOfEIP.AllocationId}}",
+        "InstanceId": "{{launchCutOverInstanceDefaultVPC.InstanceId}}"
+      }
+    },
+    {
+      "name": "associateEIPCutOverProvidedSubnet",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "AssociateAddress",
+        "AllocationId": "{{getAllocationIDOfEIP.AllocationId}}",
+        "InstanceId": "{{launchCutOverInstanceProvidedSubnet.InstanceId}}"
+      }
+    },
+    {
+      "name": "verifySubnetIsPublicTestDefaultVPC",
+      "action": "aws:executeScript",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "verifyIfSubnetIsPublic",
+        "InputPayload": {
+          "instance_id": "{{launchTestInstanceDefaultVPC.InstanceId}}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom botocore.exceptions import ClientError\n\ndef initiazlize_client(service):\n    try:\n        global client\n        client = boto3.client(service)\n    except ClientError as e:\n        raise Exception (\"[ERROR] Failed to initiazlie EC2 client\",e)\n    \ndef verifyIfSubnetIsPublic(event, context):\n    initiazlize_client('ec2')\n    try:\n        instance_id = event['instance_id']\n        subnet_id = client.describe_instances(InstanceIds = [instance_id])['Reservations'][0]['Instances'][0]['SubnetId']\n        route_table = client.describe_route_tables(\n            Filters = [\n                {\n                    'Name': 'association.subnet-id',\n                    'Values': [\n                        subnet_id\n                    ]\n                }\n            ]\n        )\n        \n        if (len(route_table['RouteTables']) == 0):\n            route_table = client.describe_route_tables(\n                Filters = [\n                    {\n                        'Name': 'association.main',\n                        'Values': [\n                            'true'\n                        ]\n                    }\n                ]\n            )\n        print (\"[INFO] Verifying if Route table\", route_table['RouteTables'][0]['RouteTableId'], \"of Instance has Internet Gateway \")\n        all_routes = route_table['RouteTables'][0]['Routes']\n        for route in all_routes:\n            gateway_id = route.get('GatewayId', '')\n            if gateway_id.startswith('igw-'):\n                igw_present = 'True'\n            else:\n                igw_present = 'False'\n\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n    \n    return {\n        \"PublicSubnet\": igw_present\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "IsSubnetPublic",
+          "Type": "String",
+          "Selector": "$.Payload.PublicSubnet"
+        }
+      ]
+    },
+    {
+      "name": "verifySubnetIsPublicTestProvidedSubnet",
+      "action": "aws:executeScript",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "verifyIfSubnetIsPublic",
+        "InputPayload": {
+          "instance_id": "{{launchTestInstanceProvidedSubnet.InstanceId}}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom botocore.exceptions import ClientError\n\ndef initiazlize_client(service):\n    try:\n        global client\n        client = boto3.client(service)\n    except ClientError as e:\n        raise Exception (\"[ERROR] Failed to initiazlie EC2 client\",e)\n    \ndef verifyIfSubnetIsPublic(event, context):\n    initiazlize_client('ec2')\n    try:\n        instance_id = event['instance_id']\n        subnet_id = client.describe_instances(InstanceIds = [instance_id])['Reservations'][0]['Instances'][0]['SubnetId']\n        route_table = client.describe_route_tables(\n            Filters = [\n                {\n                    'Name': 'association.subnet-id',\n                    'Values': [\n                        subnet_id\n                    ]\n                }\n            ]\n        )\n        \n        if (len(route_table['RouteTables']) == 0):\n            route_table = client.describe_route_tables(\n                Filters = [\n                    {\n                        'Name': 'association.main',\n                        'Values': [\n                            'true'\n                        ]\n                    }\n                ]\n            )\n        print (\"[INFO] Verifying if Route table\", route_table['RouteTables'][0]['RouteTableId'], \"of Instance has Internet Gateway \")\n        all_routes = route_table['RouteTables'][0]['Routes']\n        for route in all_routes:\n            gateway_id = route.get('GatewayId', '')\n            if gateway_id.startswith('igw-'):\n                igw_present = 'True'\n            else:\n                igw_present = 'False'\n\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n    \n    return {\n        \"PublicSubnet\": igw_present\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "IsSubnetPublic",
+          "Type": "String",
+          "Selector": "$.Payload.PublicSubnet"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "getInstanceProperties.virtualizationType",
+    "getInstanceProperties.rootDeviceType",
+    "createAMIWithoutReboot.ImageId",
+    "verifySecurityGroup.VerifiedSecurityGroupID",
+    "getDefaultVPC.VpcId",
+    "getSubnetIdDefaultVPC.subnetIdFromDefaultVpc",
+    "launchTestInstanceDefaultVPC.InstanceIds",
+    "launchTestInstanceDefaultVPC.InstanceStates",
+    "launchTestInstanceProvidedSubnet.InstanceIds",
+    "launchTestInstanceProvidedSubnet.InstanceStates",
+    "createAMIAfterStoppingInstance.ImageId",
+    "launchCutOverInstanceProvidedSubnet.InstanceIds",
+    "launchCutOverInstanceProvidedSubnet.InstanceStates",
+    "launchCutOverInstanceDefaultVPC.InstanceIds",
+    "launchCutOverInstanceDefaultVPC.InstanceStates",
+    "verifySubnetIsPublicTestDefaultVPC.IsSubnetPublic",
+    "verifySubnetIsPublicTestProvidedSubnet.IsSubnetPublic"
+  ]
+}
