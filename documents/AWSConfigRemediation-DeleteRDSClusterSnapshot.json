@@ -1,0 +1,78 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-DeleteRDSClusterSnapshot\n\n## What does this document do?\nThis runbook deletes the given Amazon Relational Database Service (Amazon RDS) cluster snapshot using the [DeleteDBClusterSnapshot](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DeleteDBClusterSnapshot.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* DBClusterSnapshotId: (Required) The Amazon RDS cluster snapshot identifier to be deleted.\n\n## Output Parameters\n* DeleteDBClusterSnapshot.Response: The standard HTTP response from the DeleteDBClusterSnapshot API.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "DBClusterSnapshotId": {
+      "type": "String",
+      "description": "(Required) The Amazon RDS cluster snapshot identifier to be deleted.",
+      "allowedPattern": "^((?!-)(?!.*--)[a-zA-Z]{1}[A-Za-z0-9-]{1,63}(?<!-))?$"
+    }
+  },
+  "outputs": [
+    "DeleteDBClusterSnapshot.Response"
+  ],
+  "mainSteps": [
+    {
+      "name": "CheckDBClusterSnapshotStatus",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "## CheckDBClusterSnapshotStatus\nChecks if the cluster snapshot is in the available state. If it is not available, the flow ends.",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBClusterSnapshots",
+        "DBClusterSnapshotIdentifier": "{{ DBClusterSnapshotId }}",
+        "PropertySelector": "$.DBClusterSnapshots[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "DeleteDBClusterSnapshot",
+      "action": "aws:executeAwsApi",
+      "description": "## DeleteDBClusterSnapshot\nDeletes the given Amazon RDS cluster snapshot using the database (DB) cluster snapshot identifier.\n## Outputs\n* Response: The standard HTTP response from the DeleteDBClusterSnapshot API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DeleteDBClusterSnapshot",
+        "DBClusterSnapshotIdentifier": "{{ DBClusterSnapshotId }}"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyDBClusterSnapshotState",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## VerifyDBClusterSnapshotState\nVerifies that the given Amazon RDS cluster snapshot was deleted.\n## Outputs\n* Output: The standard HTTP response from the DescribeDBClusterSnapshots API.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBClusterSnapshotIdentifier": "{{ DBClusterSnapshotId }}"
+        },
+        "Script": "import boto3\n\ndef handler(event, context):\n    rds_client = boto3.client(\"rds\")\n    snapshot_identifier = event[\"DBClusterSnapshotIdentifier\"]\n    try:\n        rds_client.describe_db_cluster_snapshots(\n            DBClusterSnapshotIdentifier=snapshot_identifier\n        )\n        error_message = (\n            \"VERIFICATION OF DELETION OF AMAZON RDS CLUSTER SNAPSHOT {} FAILED.\".format(\n                snapshot_identifier\n            )\n        )\n        raise Exception(error_message)\n    except rds_client.exceptions.DBClusterSnapshotNotFoundFault:\n        return {\n            \"output\": {\n                \"Message\": \"Verification of deletion of Amazon RDS Cluster snapshot is {} successful.\".format(\n                    snapshot_identifier\n                )\n            }\n        }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

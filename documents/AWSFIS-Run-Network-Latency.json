@@ -1,0 +1,67 @@
+{
+  "description": "### Document name - AWSFIS-Run-Network-Latency\n\n## What does this document do?\nIt adds latency on the network.\n\n## Input Parameters\n* Interface: The interface to add delay to (default: eth0).\n* DelayMilliseconds: The delay - in milliseconds - to add to the interface (default: 200).\n* DurationSeconds: (Required) The duration - in seconds - of the test.\n* InstallDependencies: If set to True, Systems Manager installs the required dependencies on the target instances. (default: True).\n\n## Output Parameters\nNone.\n",
+  "schemaVersion": "2.2",
+  "parameters": {
+    "Interface": {
+      "type": "String",
+      "description": "The interface to add delay to (default: eth0).",
+      "default": "eth0",
+      "allowedPattern": "^[0-9a-zA-Z\\-]{1,15}$"
+    },
+    "DelayMilliseconds": {
+      "type": "String",
+      "description": "The delay - in milliseconds - to add to the interface (default: 200).",
+      "default": "200",
+      "allowedPattern": "^[0-9]+$"
+    },
+    "DurationSeconds": {
+      "type": "String",
+      "description": "(Required) The duration - in seconds - of the test.",
+      "allowedPattern": "^[0-9]+$"
+    },
+    "InstallDependencies": {
+      "type": "String",
+      "description": "If set to True, Systems Manager installs the required dependencies on the target instances. (default: True).",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "InstallDependencies",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "description": "## Parameter: InstallDependencies\nIf set to True, this step installs the required dependecy via operating system's repository. It supports both\nDebian (apt) and CentOS (yum) based package managers.\n",
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash\nif  [[ \"{{ InstallDependencies }}\" == True ]] ; then\n  if [[ \"$( which tc 2>/dev/null )\" ]] ; then echo Dependency is already installed. ; exit ; fi\n  echo \"Installing required dependencies\"\n  if [ -f  \"/etc/system-release\" ] ; then\n    if cat /etc/system-release | grep -i 'Amazon Linux' ; then\n      sudo amazon-linux-extras install testing\n      sudo yum -y install tc\n    else\n      echo \"There was a problem installing dependencies.\"\n      exit 1\n    fi\n  elif cat /etc/issue | grep -i Ubuntu ; then\n    sudo apt-get update -y\n    sudo DEBIAN_FRONTEND=noninteractive sudo apt-get install -y iproute2\n  else\n    echo \"There was a problem installing dependencies.\"\n    exit 1\n  fi\nfi\n"
+        ]
+      }
+    },
+    {
+      "action": "aws:runShellScript",
+      "name": "FaultInjection",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "description": "## Parameters: Interface, DelayMilliseconds and DurationSeconds\nThis step adds a `DelayMilliseconds` delay to `Interface` for the given `DurationSeconds`, using the `tc` (Traffic Control) command.\nThe script will inject latency on the network, and wait for the given duration to remove that. It has two rollback mechanisms in place:\n* It will listen for exit signals (SIGINT and SIGTERM), and will stop the latency injection if any of them is received.\n* It will periodically enqueue rollback checks into a queue (using `at` command). This way, if the command is stopped and the rollback\nwas not executed, the enqueued commands will try to stop it. (for example, if the command is stopped using kill -9). This is just\nand extra safety check to avoid the latency to remain injected after the script is no longer running.\n",
+      "inputs": {
+        "maxAttempts": 1,
+        "runCommand": [
+          "#!/bin/bash\nMAX_FLAG_AGE_SECONDS=5\nATTEMPT_ROLLBACK_AT_SECONDS=10\nSTOP_TIME=$(( $(date +%s) + {{ DurationSeconds }} ))\n\nRANDOM_STRING=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)\nFLAG_PATH=\"/tmp/Run-Network-Latency-$RANDOM_STRING.flag\"\nROLLBACK_COMMAND=\"tc qdisc del dev {{ Interface }} root netem delay {{ DelayMilliseconds }}ms\"\nROLLBACK_CHECK='if test ! -f \"'$FLAG_PATH'\" || test \"$(( $(date +%s) - $(stat -c \"%Y\" '$FLAG_PATH') ))\" -gt '$MAX_FLAG_AGE_SECONDS' ; then rm '$FLAG_PATH'; '$ROLLBACK_COMMAND' ; fi 2>/dev/null'\n\n# this will enqueue a rollback check, after $ATTEMPT_ROLLBACK_AT_SECONDS seconds\nschedule_rollback_attempt() {\n  echo \"sleep $ATTEMPT_ROLLBACK_AT_SECONDS; $ROLLBACK_CHECK\" | at now\n}\n\n# this will delete the flag file, and rollback the latency injection\nrollback() {\n  rm $FLAG_PATH\n  $ROLLBACK_COMMAND ; STATUS=$?\n  echo Rollback done.\n  exit $STATUS\n}\n\n# this will inject some latency on the network\ninject_latency() {\n  echo \"Injecting latency...\"\n  tc qdisc add dev {{ Interface }} root netem delay {{ DelayMilliseconds }}ms\n}\n\n# binding the rollback function to these exit signals\ntrap rollback INT\ntrap rollback TERM\n\n# atd must be running in order to use \"at\" later\natd || { echo Failed to run atd daemon, exiting... 1>&2 ; exit 1; }\n\nschedule_rollback_attempt\ninject_latency\n\n# for the duration of the injection, the flag file is updated, and a rollback check is enqueued\nwhile [[ $(date +%s) -lt $STOP_TIME ]] ; do\n  touch $FLAG_PATH\n  schedule_rollback_attempt\n  sleep $MAX_FLAG_AGE_SECONDS\ndone\n\n# after the desired duration, the latency injection is removed\nrollback"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,198 @@
+{
+  "description": "### Document name - AWSConfigRemediation-DetachAndDeleteVirtualPrivateGateway\n\n## What does this document do?\nThis runbook detaches and deletes a given Amazon Elastic Compute Cloud (Amazon EC2) virtual private gateway attached to an Amazon Virtual Private Cloud (Amazon VPC) using the [DeleteVpnGateway](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeleteVpnGateway.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* VpnGatewayId: (Required) The ID of the virtual private gateway to be deleted.\n\n## Output Parameters\n* DeleteVPNGateway.Output: The standard HTTP response of the DeleteVpnGateway API call.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "DeleteVPNGateway.Output"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "VpnGatewayId": {
+      "type": "String",
+      "description": "(Required) The ID of the virtual private gateway to be deleted.",
+      "allowedPattern": "^vgw-[a-z0-9]+$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "WaitUntilVPNGatewayIsAvailable",
+      "description": "## WaitUntilVPNGatewayIsAvailable\nAccepts the ID of the virtual private gateway and waits until the virtual private gateway's state property changes to `available` or times out.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "isCritical": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVpnGateways",
+        "VpnGatewayIds": [
+          "{{ VpnGatewayId }}"
+        ],
+        "PropertySelector": "$.VpnGateways[0].State",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "GetVPNGatewayDetails",
+      "description": "## GetVPNGatewayDetails\nRetrieves a specified virtual private gateway configuration.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVpnGateways",
+        "VpnGatewayIds": [
+          "{{ VpnGatewayId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VgwState",
+          "Selector": "$.VpnGateways[0].State",
+          "Type": "String"
+        },
+        {
+          "Name": "VgwVpcAttachState",
+          "Selector": "$.VpnGateways[0].VpcAttachments[0].State",
+          "Type": "String"
+        },
+        {
+          "Name": "VgwVpcId",
+          "Selector": "$.VpnGateways[0].VpcAttachments[0].VpcId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnVpcAttachmentStatus",
+      "description": "## BranchOnVpcAttachmentStatus\nBranches based on the VpcAttachments.state parameter value.\n",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 2,
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ GetVPNGatewayDetails.VgwVpcAttachState }}",
+            "StringEquals": "attaching",
+            "NextStep": "WaitUntilAttachedState"
+          },
+          {
+            "Variable": "{{ GetVPNGatewayDetails.VgwVpcAttachState }}",
+            "StringEquals": "detaching",
+            "NextStep": "WaitUntilDetachedState"
+          },
+          {
+            "Variable": "{{ GetVPNGatewayDetails.VgwVpcAttachState }}",
+            "StringEquals": "attached",
+            "NextStep": "DetachVPNGateway"
+          },
+          {
+            "Variable": "{{ GetVPNGatewayDetails.VgwVpcAttachState }}",
+            "StringEquals": "detached",
+            "NextStep": "DeleteVPNGateway"
+          }
+        ],
+        "Default": "DeleteVPNGateway"
+      }
+    },
+    {
+      "name": "WaitUntilAttachedState",
+      "description": "## WaitUntilAttachedState\nAccepts the ID of the virtual private gateway and waits until the virtual private gateway's VpcAttachments.state's property changes to `attached` or times out.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "nextStep": "DetachVPNGateway",
+      "isCritical": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVpnGateways",
+        "VpnGatewayIds": [
+          "{{ VpnGatewayId }}"
+        ],
+        "PropertySelector": "$.VpnGateways[0].VpcAttachments[0].State",
+        "DesiredValues": [
+          "attached"
+        ]
+      }
+    },
+    {
+      "name": "DetachVPNGateway",
+      "description": "## DetachVPNGateway\nAccepts the ID of the virtual private gateway and the ID of the Amazon VPC as input, and detaches the virtual private gateway from the Amazon VPC.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DetachVpnGateway",
+        "VpcId": "{{ GetVPNGatewayDetails.VgwVpcId }}",
+        "VpnGatewayId": "{{ VpnGatewayId }}"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "WaitUntilDetachedState",
+      "description": "## WaitUntilDetachedState\nAccepts the ID of the virtual private gateway and waits until the virtual private gateway's VpcAttachments.state's property changes to `detached` or times out.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "nextStep": "DeleteVPNGateway",
+      "isCritical": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVpnGateways",
+        "VpnGatewayIds": [
+          "{{ VpnGatewayId }}"
+        ],
+        "PropertySelector": "$.VpnGateways[0].VpcAttachments[0].State",
+        "DesiredValues": [
+          "detached"
+        ]
+      }
+    },
+    {
+      "name": "DeleteVPNGateway",
+      "description": "## DeleteVPNGateway\nAccepts the ID of the virtual private gateway as input and deletes it.\n",
+      "action": "aws:executeAwsApi",
+      "isEnd": false,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteVpnGateway",
+        "VpnGatewayId": "{{ VpnGatewayId }}"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyVPNGatewayDeletion",
+      "description": "## VerifyVPNGatewayDeletion\nAccepts the ID of the virtual private gateway as input and verifies its deletion.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "isEnd": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVpnGateways",
+        "VpnGatewayIds": [
+          "{{ VpnGatewayId }}"
+        ],
+        "PropertySelector": "$.VpnGateways[0].State",
+        "DesiredValues": [
+          "deleted"
+        ]
+      }
+    }
+  ]
+}

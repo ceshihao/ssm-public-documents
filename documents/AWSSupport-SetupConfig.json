@@ -1,0 +1,144 @@
+{
+  "description": "*This document will assist you to setup AWS Config by creating the service linked role, recorder, s3 bucket , required bucket policy, delivery channel and optionally aggregator authorizations in source accounts/regions where you run the workflow. The new resources will be created only if there are no existing resources, if there are any existing resources they will be leveraged during the setup.*  \n\n---\nThis document has six parameters:\n- (Required) BucketName, if not provided the default 'aws-config-delivery-channel' will be considered.\n- (Required) IncludeGlobalResourcesRegion to avoid duplication, specify one Region for global resources.\n- (Required) AutomationAssumeRole for the IAM role required for executing AWS APIs in the document.\n- (Required) Partition default value is 'aws'.\n- (Optional) AggregatorAccountId is the aggregator account id for setting authorization in source accounts for this aggreagtor account.Default is none.\n- (Optional) AggregatorAccountRegion is the aggregator region for setting authoriztion in source accounts for this region\n\n**This document if used for multi-account setup, requires AutomationExecutionRole called 'AWS-SystemsManager-AutomationExecutionRole'. Please refer the below document for details on running ssm documents multiaccount, multi-region:\n - https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-automation-multiple-accounts-and-regions.html. Also please ensure to add the appropriate permissions mentioned in workflow public documentation for the AutomationAssumeRole to be able to execute Config and S3 APIs.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "S3BucketName": {
+      "type": "String",
+      "description": "(Required) S3 Bucket name for the AWS Config delivery channel. The name provided will be appended with '-[AWS Account ID]'.",
+      "allowedPattern": "^[a-zA-Z0-9.\\-_]{1,255}$",
+      "default": "aws-config-delivery-channel"
+    },
+    "IncludeGlobalResourcesRegion": {
+      "type": "String",
+      "description": "(Required) To avoid duplication, specify one Region for global resources.",
+      "default": "us-east-1"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The IAM role that allows Automation to perform the actions on your behalf. This IAM role needs a trust relationship to ssm.amazonaws.com (see README)",
+      "allowedPattern": "^$|^arn:aws:iam::[0-9]*:role/[/\\w+=,.@-]+$"
+    },
+    "Partition": {
+      "type": "String",
+      "description": "(Required) AWS Partition. For GovCloud, use 'aws-us-gov'",
+      "default": "aws"
+    },
+    "AggregatorAccountId": {
+      "type": "String",
+      "description": "(Optional) If you choose to setup Config Aggregation, the AWS Account ID to which Config data will be aggregated. This is used to authorize the source accounts.",
+      "default": "",
+      "allowedPattern": "^($|\\d{12})$"
+    },
+    "AggregatorAccountRegion": {
+      "type": "String",
+      "description": "(Optional) If you choose to setup Config Aggregation, the AWS Account Region to which Config data will be aggregated. This is used to authorize the source accounts.",
+      "default": "",
+      "allowedPattern": "^($|\\w{2}-.+-\\w{1})$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CreateServiceLinkedRole",
+      "action": "aws:executeScript",
+      "nextStep": "CreateRecorder",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "import json\nimport boto3\nfrom botocore.exceptions import ClientError\n\ndef script_handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    # if it does not already exist, create the service-linked role for config\n    try:\n        iam_client.create_service_linked_role(AWSServiceName=\"config.amazonaws.com\")\n    except ClientError as ex:\n        if ex.response[\"Error\"][\"Code\"] == \"InvalidInputException\":\n            print (\"Service role name AWSServiceRoleForConfig already exists. Using the existing Service linked role.\")\n        if ex.response[\"Error\"][\"Code\"] == \"AccessDenied\":\n            raise Exception (\"(Access Denied) The SSM Role does not have enough permission. Please check the role permission policy for CreateServiceLinkedRole API. Also check for any permission boundary or SCPs attached to the account\")\n    return\n"
+      }
+    },
+    {
+      "name": "CreateRecorder",
+      "action": "aws:executeScript",
+      "nextStep": "CreateBucket",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "Partition": "{{Partition}}",
+          "AccountId": "{{global:ACCOUNT_ID}}",
+          "Region": "{{global:REGION}}",
+          "IncludeGlobalResourcesRegion": "{{IncludeGlobalResourcesRegion}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.exceptions import ClientError\n\ndef script_handler(event, context):\n    # get input parameters\n    region = event[\"Region\"]\n    partition = event[\"Partition\"]\n    account_id = event[\"AccountId\"]\n    global_resource_region = event[\"IncludeGlobalResourcesRegion\"]\n    config_client = boto3.client(\"config\")\n    roleARN = f\"arn:{partition}:iam::{account_id}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig\"\n\n    # if it does not already exist, create the configuration recorder\n    configuration_recorder_name = \"default\"\n    try:\n        response = config_client.describe_configuration_recorders()\n        if response[\"ConfigurationRecorders\"]: \n            configuration_recorder_name = response[\"ConfigurationRecorders\"][0][\"name\"]\n            roleARN = response[\"ConfigurationRecorders\"][0][\"roleARN\"]\n        \n        if global_resource_region == region :\n            config_client.put_configuration_recorder(\n                    ConfigurationRecorder={\n                        \"name\": configuration_recorder_name,\n                        \"roleARN\": roleARN,\n                        \"recordingGroup\": {\n                            \"allSupported\": True,\n                            \"includeGlobalResourceTypes\": True\n                        }\n                    }\n                )         \n        config_client.put_configuration_recorder(\n                ConfigurationRecorder={\n                    \"name\": configuration_recorder_name,\n                    \"roleARN\": roleARN,\n                    \"recordingGroup\": {\n                        \"allSupported\": True,\n                        \"includeGlobalResourceTypes\": False\n                    }\n                }\n            )\n    except ClientError as ex:\n        if ex.response[\"Error\"][\"Code\"] == \"MaxNumberOfConfigurationRecordersExceededException\":\n        # Currently, you can specify only one configuration recorder per region in your account.\n            print (\"Configuration Recorder already exists with name \" + configuration_recorder_name + \". Hence proceeding with existing recorder.\")\n        if ex.response[\"Error\"][\"Code\"] == \"AccessDenied\":\n            raise Exception (\"(Access Denied) The SSM Role does not have enough permission. Please check the role permission policy for PutConfigurationRecorder API and DescribeConfigurationRecorders API. Also check for any permission boundary or SCPs attached to the account\")\n    return {'recordername': configuration_recorder_name}\n"
+      },
+      "outputs": [
+        {
+          "Selector": "$.Payload.recordername",
+          "Name": "recordername",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateBucket",
+      "action": "aws:executeScript",
+      "nextStep": "CreateDeliveryChannel",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "Partition": "{{Partition}}",
+          "AccountId": "{{global:ACCOUNT_ID}}",
+          "Region": "{{global:REGION}}",
+          "S3BucketName": "{{S3BucketName}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.exceptions import ClientError\n\ndef script_handler(event, context):\n    # get input parameters\n    partition = event[\"Partition\"]\n    account_id = event[\"AccountId\"]\n    region = event[\"Region\"]\n    s3_bucket_name = event[\"S3BucketName\"] + \"-\" + account_id\n    s3_client = boto3.client(\"s3\")\n    flagcreate = False\n\n    # if it does not already exist, create the bucket (with bucket policy) for the delivery channel\n    bucket_policy = {\n        \"Version\": \"2012-10-17\",\n        \"Statement\": [\n            {\n                \"Sid\": \"AWSConfigBucketPermissionsCheck\",\n                \"Effect\": \"Allow\",\n                \"Principal\": {\n                    \"Service\": [\n                        \"config.amazonaws.com\"\n                    ]\n                },\n                \"Action\": \"s3:GetBucketAcl\",\n                \"Resource\": f\"arn:{partition}:s3:::{s3_bucket_name}\"\n            },\n            {\n                \"Sid\": \"AWSConfigBucketExistenceCheck\",\n                \"Effect\": \"Allow\",\n                \"Principal\": {\n                    \"Service\": [\n                        \"config.amazonaws.com\"\n                    ]\n                },\n                \"Action\": \"s3:ListBucket\",\n                \"Resource\": f\"arn:{partition}:s3:::{s3_bucket_name}\"\n            },\n            {\n                \"Sid\": \" AWSConfigBucketDelivery\",\n                \"Effect\": \"Allow\",\n                \"Principal\": {\n                    \"Service\": [\n                        \"config.amazonaws.com\"\n                    ]\n                },\n                \"Action\": \"s3:PutObject\",\n                \"Resource\": f\"arn:{partition}:s3:::{s3_bucket_name}/*\",\n                \"Condition\": {\n                    \"StringEquals\": {\n                        \"s3:x-amz-acl\": \"bucket-owner-full-control\"\n                    }\n                }\n            }\n        ]\n    }\n    try:\n        # specify the region if not in us-east-1\n        # details: https://github.com/boto/boto3/issues/125\n        if region == \"us-east-1\":\n            s3_client.create_bucket(\n                Bucket = s3_bucket_name\n            )\n            flagcreate = True\n        else:\n            s3_client.create_bucket(\n                Bucket = s3_bucket_name,\n                CreateBucketConfiguration = {\n                    \"LocationConstraint\": region\n                }\n            )\n            flagcreate = True\n        s3_client.put_bucket_policy(\n            Bucket = s3_bucket_name,\n            Policy = json.dumps(bucket_policy)\n        )\n\n    except ClientError as ex:\n        if ex.response[\"Error\"][\"Code\"] == \"IllegalLocationConstraintException\" or ex.response[\"Error\"][\"Code\"] == \"BucketAlreadyExists\" or ex.response[\"Error\"][\"Code\"] == \"BucketAlreadyOwnedByYou\":\n            print (\"S3 Bucket already exists. Using the existing bucket for delivery Channel\")\n            flagcreate = False\n            \n        if ex.response[\"Error\"][\"Code\"] == \"AccessDenied\":\n            raise Exception (\"(Access Denied) The SSM Role does not have enough permission. Please check the role permission policy for CreateBucket and PutBucketPolicy API. Also check for any permission boundary or SCPs attached to the account\" )\n  \n    return {'flagcreate': flagcreate}\n"
+      },
+      "outputs": [
+        {
+          "Selector": "$.Payload.flagcreate",
+          "Name": "flagcreate",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "CreateDeliveryChannel",
+      "action": "aws:executeScript",
+      "nextStep": "StartRecorder",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "AccountId": "{{global:ACCOUNT_ID}}",
+          "S3BucketName": "{{S3BucketName}}",
+          "flagcreate": "{{CreateBucket.flagcreate}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.exceptions import ClientError\n\ndef script_handler(event, context):\n    # get input parameters\n    account_id = event[\"AccountId\"]\n    Flag = event[\"flagcreate\"]\n    s3_bucket_name = event[\"S3BucketName\"] + \"-\" + account_id\n    config_client = boto3.client(\"config\")\n\n    # if it does not already exist, create the delivery channel\n    try:\n        delivery_channel = config_client.describe_delivery_channels()['DeliveryChannels']\n        if not delivery_channel:\n            config_client.put_delivery_channel(\n                DeliveryChannel={\n                    \"name\": \"default\",\n                    \"s3BucketName\": s3_bucket_name,\n                    \"configSnapshotDeliveryProperties\": {\n                        \"deliveryFrequency\": \"One_Hour\"\n                    }\n                }\n            )\n    except ClientError as ex:\n        if Flag:\n            s3_client = boto3.client(\"s3\")\n            s3_client.delete_bucket(Bucket=s3_bucket_name)\n        # Currently, you can specify only one delivery channel per region in your account.\n        if ex.response[\"Error\"][\"Code\"] == \"InsufficientDeliveryPolicyException\":\n            raise Exception (ex.response[\"Error\"]['Message'])\n        if ex.response[\"Error\"][\"Code\"] == \"MaxNumberOfDeliveryChannelsExceededException\":\n            print (\"Delivery Channel already exists. Will be using the existing setup.\")\n        if ex.response[\"Error\"][\"Code\"] == \"AccessDenied\":\n            raise Exception (\"(Access Denied) The SSM Role does not have enough permission. Please check the role permission policy for PutDeliveryChannel API and DescribeDeliveryChannel API. Also check for any permission boundary or SCPs attached to the account\")\n    delivery_channel = config_client.describe_delivery_channels()\n    return {\"DeliveryChannel_S3Bucket\":delivery_channel['DeliveryChannels'][0]['s3BucketName']}\n"
+      }
+    },
+    {
+      "name": "StartRecorder",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "nextStep": "PutAggregationAuthorization",
+      "inputs": {
+        "Service": "config",
+        "Api": "StartConfigurationRecorder",
+        "ConfigurationRecorderName": "{{CreateRecorder.recordername}}"
+      }
+    },
+    {
+      "name": "PutAggregationAuthorization",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "AggregatorAccountId": "{{AggregatorAccountId}}",
+          "AggregatorAccountRegion": "{{AggregatorAccountRegion}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.exceptions import ClientError\n\ndef script_handler(event, context):\n    # get input parameters\n    aggregator_account_id = event[\"AggregatorAccountId\"]\n    aggregator_account_region = event[\"AggregatorAccountRegion\"]\n    config_client = boto3.client(\"config\")\n\n    # allow master account to aggregate config data\n    if aggregator_account_id and aggregator_account_region:\n        try:\n            config_client.put_aggregation_authorization(\n                AuthorizedAccountId=aggregator_account_id,\n                AuthorizedAwsRegion=aggregator_account_region\n            )\n        except ClientError as ex:\n            if ex.response[\"Error\"][\"Code\"] == \"AccessDenied\":\n                raise Exception (\"(Access Denied) The SSM Role does not have enough permission. Please check the role permission policy for PutAggregationAuthorization API. Also check for any permission boundary or SCPs attached to the account\" )\n        return {'aggregatorauthorization': 'Authorization creation is successful'}\n    return {'aggregatorauthorization': 'You did not opt in for creation of authorization'}\n"
+      },
+      "outputs": [
+        {
+          "Selector": "$.Payload.aggregatorauthorization",
+          "Name": "AggregatorAuthorization",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-EnableLoggingForALBAndCLB\n\n## What does this document do?\nThe runbook enables logging for the specified AWS Application Load Balancer using the \n[ModifyLoadBalancerAttributes](https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_ModifyLoadBalancerAttributes.html) API \nor a Classic Load Balancer (CLB) using the [ModifyLoadBalancerAttributes](https://docs.aws.amazon.com/elasticloadbalancing/2012-06-01/APIReference/API_ModifyLoadBalancerAttributes.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* LoadBalancerId: (Required) The Classic Load Balancer name or the Application Load Balancer ARN.\n* S3BucketName: (Required) The Amazon S3 bucket name.\n* S3BucketPrefix: (Optional) The logical hierarchy you created for your Amazon Simple Storage Service (Amazon S3) bucket, for example my-bucket-prefix/prod. If the prefix is not provided, the log is placed at the root level of the bucket.\n\n## Output Parameters\n* EnableAndVerifyLoggingForELB.Output: The standard HTTP response from the ModifyLoadBalancerAttributes API call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "LoadBalancerId": {
+      "type": "String",
+      "description": "(Required) The Classic Load Balancer name or the Application Load Balancer ARN.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:elasticloadbalancing:.*:\\d{12}:loadbalancer\\/[\\w+=,.@\\/-]+$|^[a-zA-Z0-9]([a-zA-Z0-9\\-]{0,30}[a-zA-Z0-9])?$"
+    },
+    "S3BucketName": {
+      "type": "String",
+      "description": "(Required) The Amazon S3 bucket name.",
+      "allowedPattern": "(?=^.{3,63}$)(?!.*[.-]{2})(?!.*[--]{2})(?!^(?:(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(?!$)|$)){4}$)(^(([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])\\.)*([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])$)"
+    },
+    "S3BucketPrefix": {
+      "type": "String",
+      "description": "(Optional) The logical hierarchy you created for your Amazon Simple Storage Service (Amazon S3) bucket, for example my-bucket-prefix/prod. If the prefix is not provided, the log is placed at the root level of the bucket.",
+      "allowedPattern": "^$|(.*){1,1024}",
+      "default": ""
+    }
+  },
+  "outputs": [
+    "EnableAndVerifyLoggingForELB.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "EnableAndVerifyLoggingForELB",
+      "action": "aws:executeScript",
+      "description": "## EnableAndVerifyLoggingForELB\nEnables and verifies the logging for the Classic Load Balancer or the Application Load Balancer. \n## Outputs\n* Output: The standard HTTP response from the ModifyLoadBalancerAttributes API call.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "ResourceId": "{{ LoadBalancerId }}",
+          "S3BucketName": "{{ S3BucketName }}",
+          "S3BucketPrefix": "{{ S3BucketPrefix }}"
+        },
+        "Script": "import boto3\nimport json\nimport re\n\ndef is_elb_logging_enabled(resource_type, elb_client, resource_id, s3_bucket_name, s3_bucket_prefix):\n  if resource_type == 'AWS::ElasticLoadBalancing::LoadBalancer':\n    return is_classic_elb_logging_enabled(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix)\n  elif resource_type == 'AWS::ElasticLoadBalancingV2::LoadBalancer':\n    return is_application_elb_logging_enabled(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix)\n\ndef is_classic_elb_logging_enabled(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix):\n  load_balancer_attributes = elb_client.describe_load_balancer_attributes(LoadBalancerName=resource_id)\n  if (load_balancer_attributes['LoadBalancerAttributes']['AccessLog']['Enabled'] and\n     s3_bucket_name == load_balancer_attributes['LoadBalancerAttributes']['AccessLog']['S3BucketName'] and\n     s3_bucket_prefix == load_balancer_attributes['LoadBalancerAttributes']['AccessLog']['S3BucketPrefix']):\n    return True\n  return False\n\ndef is_application_elb_logging_enabled(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix):\n  load_balancer_attributes = elb_client.describe_load_balancer_attributes(LoadBalancerArn=resource_id)\n  for attribute in load_balancer_attributes['Attributes']:\n    if (\n        (attribute['Key'] ==  'access_logs.s3.enabled' and attribute['Value'] != 'true') or \n        (attribute['Key'] == 'access_logs.s3.bucket' and attribute['Value'] != s3_bucket_name) or\n        (attribute['Key'] == 'access_logs.s3.prefix' and attribute['Value'] != s3_bucket_prefix)\n      ):\n      return False\n  return True\n\ndef update_application_elb_logging(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix):\n  response = elb_client.modify_load_balancer_attributes(\n      LoadBalancerArn=resource_id,\n      Attributes=[\n          {\"Key\": \"access_logs.s3.enabled\", \"Value\": \"true\"},\n          {\"Key\": \"access_logs.s3.bucket\", \"Value\": s3_bucket_name},\n          {\"Key\": \"access_logs.s3.prefix\", \"Value\": s3_bucket_prefix}\n      ]\n  )\n  return response\n\ndef update_classic_elb_logging(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix):\n  load_balancer_attributes = elb_client.describe_load_balancer_attributes(\n      LoadBalancerName=resource_id\n  )\n  #Update logging details\n  load_balancer_attributes['LoadBalancerAttributes']['AccessLog']['Enabled'] = True\n  load_balancer_attributes['LoadBalancerAttributes']['AccessLog']['S3BucketName'] = s3_bucket_name\n  load_balancer_attributes['LoadBalancerAttributes']['AccessLog']['S3BucketPrefix'] = s3_bucket_prefix\n  response = elb_client.modify_load_balancer_attributes(\n      LoadBalancerName=resource_id,\n      LoadBalancerAttributes = load_balancer_attributes['LoadBalancerAttributes']\n    )\n  return response\n\ndef handler(event, context):\n  resource_id = event[\"ResourceId\"]\n  elb_client = boto3.client(\"elb\")\n  s3_bucket_name = event[\"S3BucketName\"]\n  s3_bucket_prefix = event[\"S3BucketPrefix\"]\n  ALB_REGEX = \"^arn:(aws[a-zA-Z-]*)?:elasticloadbalancing:.*:\\d{12}:loadbalancer\\/[\\w+=,.@\\/-]+$\"\n\n  if re.match(ALB_REGEX, resource_id):\n    resource_type = \"AWS::ElasticLoadBalancingV2::LoadBalancer\"\n  else:\n    resource_type = \"AWS::ElasticLoadBalancing::LoadBalancer\"\n  \n  update_response = {}\n  if resource_type == 'AWS::ElasticLoadBalancingV2::LoadBalancer':\n    elb_client = boto3.client(\"elbv2\")\n    update_response = update_application_elb_logging(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix)\n  elif resource_type == 'AWS::ElasticLoadBalancing::LoadBalancer':\n    update_response = update_classic_elb_logging(elb_client, resource_id, s3_bucket_name, s3_bucket_prefix)\n  else:\n    raise Exception(\n      \"THE RESOURCE TYPE {} IS NOT SUPPORTED FOR THIS REMEDIATION DOCUMENT AWSConfigRemediation-EnableLoggingForELB.\".format(resource_type)\n    )\n\n  if is_elb_logging_enabled(resource_type, elb_client, resource_id, s3_bucket_name, s3_bucket_prefix):\n      return {\n          \"output\": {\n              \"Message\": \"Verification of enable logging on Elastic Load Balancer {} is successful.\".format(resource_id),\n              \"HTTPResponse\": update_response[\"ResponseMetadata\"]\n          }\n      }\n  raise Exception(\n      \"VERIFICATION FAILED. ENABLE LOGGING ON ELASTIC LOAD BALANCER {} IS UNSUCCESSFUL.\".format(resource_id)\n  )"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

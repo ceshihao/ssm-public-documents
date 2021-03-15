@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-EnableCWLoggingForSessionManager\n\n## What does this document do?\nThis runbook enables AWS Systems Manager Session Manager (Session Manager) sessions to store output logs to an Amazon CloudWatch (CloudWatch) log group\nusing [CreateDocument](https://docs.aws.amazon.com/systems-manager/latest/APIReference/API_CreateDocument.html) or [UpdateDocument](https://docs.aws.amazon.com/systems-manager/latest/APIReference/API_UpdateDocument.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* DestinationLogGroup: (Required) The name of the CloudWatch log group.\n\n## Output Parameters\n* EnableCWLoggingAndVerify.Output: The standard HTTP response from the GetDocument API.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "DestinationLogGroup": {
+      "type": "String",
+      "description": "(Required) The name of the CloudWatch log group.",
+      "allowedPattern": "[\\.\\-_/#A-Za-z0-9]+"
+    }
+  },
+  "outputs": [
+    "EnableCWLoggingAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "EnableCWLoggingAndVerify",
+      "action": "aws:executeScript",
+      "description": "## EnableCWLoggingAndVerify\nAccepts the CloudWatch log group to update the document which stores Session Manager session output logs preferences, or creates one if it doesn't exist.\n## Outputs\n* Output: The standard HTTP response from the GetDocument API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "cloudWatchLogGroupName": "{{ DestinationLogGroup }}"
+        },
+        "Script": "import boto3\nimport json\n\nstandard_document_content = '''\n{{\n  \"schemaVersion\": \"1.0\",\n  \"description\": \"Document to hold regional settings for Session Manager\",\n  \"sessionType\": \"Standard_Stream\",\n  \"inputs\": {{\n    \"s3BucketName\": \"\",\n    \"s3KeyPrefix\": \"\",\n    \"s3EncryptionEnabled\": true,\n    \"cloudWatchLogGroupName\": \"{0}\",\n    \"cloudWatchEncryptionEnabled\": true,\n    \"kmsKeyId\": \"\",\n    \"runAsEnabled\": false,\n    \"runAsDefaultUser\": \"\"\n  }}\n}}\n'''\n\ndef is_document_exists(ssm_client, document_name):\n    try:\n        document_response = ssm_client.get_document(Name=document_name)\n        return json.loads(document_response[\"Content\"])\n    except ssm_client.exceptions.InvalidDocument:\n        return False\n\ndef update_ssm_document_preference(ssm_client, updated_content, document_name):\n    ssm_client.update_document(Content=updated_content,\n                               Name=document_name,\n                               DocumentVersion=\"$LATEST\",\n                               DocumentFormat=\"JSON\")\n\n    # Setting the default version of the document to $LATEST\n    document_response = ssm_client.describe_document(Name=document_name)\n    document_status = document_response[\"Document\"][\"Status\"]\n    latest_version = document_response[\"Document\"][\"LatestVersion\"]\n    if document_status == \"Active\":\n        ssm_client.update_document_default_version(Name=document_name, DocumentVersion=latest_version)\n\ndef handler(event, context):\n    ssm_client = boto3.client(\"ssm\")\n\n    document_name = \"SSM-SessionManagerRunShell\"\n    log_group_name = event[\"cloudWatchLogGroupName\"]\n    new_document_content = standard_document_content.format(log_group_name)\n\n    document_content = is_document_exists(ssm_client, document_name)\n    if document_content:\n        document_content[\"inputs\"][\"cloudWatchLogGroupName\"] = log_group_name\n        updated_content = json.dumps(document_content)\n        update_ssm_document_preference(ssm_client, updated_content, document_name)\n    else:\n        ssm_client.create_document(Content=new_document_content,\n                                   Name=document_name,\n                                   DocumentType=\"Session\")\n\n    document_response = ssm_client.get_document(Name=document_name)\n    configured_log_group_name = json.loads(document_response[\"Content\"])[\"inputs\"][\"cloudWatchLogGroupName\"]\n    if document_response and configured_log_group_name == log_group_name:\n        return {\n            \"output\": {\n                \"Message\": \"Verification of EnableCWLoggingAndVerify is successful.\",\n                \"HTTPResponse\": document_response[\"ResponseMetadata\"]\n            }\n        }\n    else:\n        raise Exception(\"AWS Systems Manager 'SSM-SessionManagerRunShell' DOCUMENT CREATE OR UPDATE FAILED.\",\n                        document_response[\"ResponseMetadata\"])"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

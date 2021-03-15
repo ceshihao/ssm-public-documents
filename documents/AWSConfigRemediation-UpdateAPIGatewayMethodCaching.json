@@ -1,0 +1,63 @@
+{
+  "description": "### Document name - AWSConfigRemediation-UpdateAPIGatewayMethodCaching\n\n## What does this document do?\nThis runbook updates the cache method setting for Amazon API Gateway Stage using the [UpdateStage](https://docs.aws.amazon.com/apigateway/api-reference/link-relation/stage-update/) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* StageArn: (Required) The Amazon API Gateway Stage ARN for the `REST` API.\n* CachingAuthorizedMethods: (Required) The methods authorized to have caching enabled. The list must be some combination of `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, and `PUT`. Caching is enabled for selected methods and disabled for non-selected methods. Caching is enabled for all methods if `ANY` is selected and is disabled for all methods if `NONE` is selected.\n\n## Output Parameters\n* UpdateApiGatewayMethodCacheAndVerify.Output: The standard HTTP response from the UpdateStage API or script response.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "UpdateApiGatewayMethodCacheAndVerify.Output"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "CachingAuthorizedMethods": {
+      "type": "StringList",
+      "description": "(Required) The methods authorized to have caching enabled. The list must be some combination of `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, and `PUT`. Caching is enabled for selected methods and disabled for non-selected methods. Caching is enabled for all methods if `ANY` is selected and is disabled for all methods if `NONE` is selected.",
+      "allowedValues": [
+        "ANY",
+        "DELETE",
+        "GET",
+        "HEAD",
+        "OPTIONS",
+        "PATCH",
+        "POST",
+        "PUT",
+        "NONE"
+      ],
+      "default": [
+        "GET"
+      ]
+    },
+    "StageArn": {
+      "type": "String",
+      "description": "(Required) The Amazon API Gateway Stage ARN for the `REST` API.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:apigateway:[a-z0-9-]+::/restapis/[a-z0-9]+/stages/[a-zA-Z0-9_-]{1,128}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "UpdateApiGatewayMethodCacheAndVerify",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## UpdateApiGatewayMethodCacheAndVerify\nAccepts the stage resource ID as input, updates cache method setting for Amazon API Gateway Stage using the UpdateStage API, and verifies the update.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "StageArn": "{{ StageArn }}",
+          "AuthorizedMethods": "{{ CachingAuthorizedMethods }}"
+        },
+        "Script": "import boto3\nimport botocore\nimport re\n\n\ndef get_caching_authorized_list(method_list):\n    none_method = \"false\"\n    authorized_list = []\n    \n    # Method ANY will implicitly include all the methods.\n    any_method_list = [\"DELETE\", \"GET\", \"HEAD\", \"OPTIONS\", \"PATCH\", \"POST\", \"PUT\", \"*\"]\n    if \"ANY\" in method_list:\n        authorized_list = any_method_list\n    elif \"NONE\" in method_list:\n        authorized_list = []\n        none_method = \"true\"\n    else:\n        authorized_list += method_list\n\n    return authorized_list, none_method\n\ndef add_method_settings(method, patch_operations, value):\n    temp_dict=dict()\n    temp_dict[\"op\"] = \"replace\"\n    temp_dict[\"path\"] = \"/\" + method + \"/caching/enabled\"\n    temp_dict[\"value\"] = value\n    patch_operations.append(temp_dict)\n\ndef verify_method_settings_cache(rest_api_id, stage_name, method_list, apigateway_client):\n    update_fail_list = []\n    authorized_list, none_method = get_caching_authorized_list(method_list)\n\n    response = apigateway_client.get_stage(restApiId=rest_api_id, stageName=stage_name)\n\n    for method in response[\"methodSettings\"]:\n        if response[\"methodSettings\"][method][\"cachingEnabled\"] and method.split(\"/\")[1] not in authorized_list:\n            if (method != \"*\") or (method == \"*\" and none_method == \"true\"):\n                update_fail_list.append(method)\n        elif not response[\"methodSettings\"][method][\"cachingEnabled\"] and method.split(\"/\")[1] in authorized_list:\n            update_fail_list.append(method)\n    return update_fail_list\n\ndef get_method_settings_cache_details(rest_api_id, stage_name, method_list, apigateway_client):\n    patch_operations = []\n    authorized_list, none_method = get_caching_authorized_list(method_list)\n\n    response = apigateway_client.get_stage(restApiId=rest_api_id, stageName=stage_name)\n\n    for method in response[\"methodSettings\"]:\n        if response[\"methodSettings\"][method][\"cachingEnabled\"] and method.split(\"/\")[1] not in authorized_list:\n            if (method != \"*\") or (method == \"*\" and none_method == \"true\"):\n                add_method_settings(method, patch_operations, \"false\")\n        elif not response[\"methodSettings\"][method][\"cachingEnabled\"] and method.split(\"/\")[1] in authorized_list:\n            add_method_settings(method, patch_operations, \"true\")\n    return patch_operations\n\ndef handler(event, context):\n    apigateway_client = boto3.client(\"apigateway\")\n    stage_id = event[\"StageArn\"]\n    authorized_list = event[\"AuthorizedMethods\"]\n\n    rest_api_id = \"\"\n    patch_operations = []\n    update_stage_response = dict()\n    update_stage_response[\"ResponseMetadata\"] = \"\"\n\n    rest_api_arn = stage_id\n    rest_api_arn_pattern = \"^arn:.*:/restapis/(.*)/stages/(.*)\"\n    rest_api_match = re.match(rest_api_arn_pattern, rest_api_arn)\n    if not rest_api_match:\n        raise Exception(\"GIVEN AMAZON API GATEWAY STAGE ID IS NOT ASSOCIATED WITH ANY REST API ID.\")\n    rest_api_id = rest_api_match.groups()[0]\n    stage_name = rest_api_match.groups()[1]\n\n    # Enables cache method setting for the specified Amazon API Gateway stage.\n    patch_operations = get_method_settings_cache_details(rest_api_id, stage_name, authorized_list, apigateway_client)\n\n    if patch_operations:\n        update_stage_response = apigateway_client.update_stage(stageName=stage_name, restApiId=rest_api_id, patchOperations=patch_operations)\n    else:\n       return {\n           \"output\": {\n               \"Message\": f\"No caching update for API Gateway method(s).\"\n               }\n           }\n\n    # Verifies that the stage method caching enabled.\n    update_fail_list = verify_method_settings_cache(rest_api_id, stage_name, authorized_list, apigateway_client)\n    if update_fail_list:\n        error_message = f\"VERIFICATION FAILED. API GATEWAY STAGE {stage_name} CACHING NOT UPDATED FOR METHOD(S) {update_fail_list}.\"\n        raise Exception(error_message)\n    return {\n        \"output\": {\n            \"Message\": f\"Verification of API Gateway Stage caching updated for the {authorized_list} method(s) is successful.\",\n            \"HTTPResponse\": update_stage_response[\"ResponseMetadata\"]\n            }\n        }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
