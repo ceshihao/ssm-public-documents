@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-ReplaceIAMInlinePolicy\n\n## What does this document do?\nThe runbook replaces an inline AWS Identity and Access Management (IAM) policy with a replicated managed IAM policy. \nFor an inline policy attached to an IAM user, group, or role the inline policy permissions are cloned into a managed IAM policy. \nThe managed IAM policy will be added to the resource, and the inline policy is removed. AWS Config must be enabled in the AWS Region where you run this automation.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* ResourceId: (Required) The ID of the IAM user, group, or role whose inline policy you want to replace.\n* InlinePolicyNames: (Optional) The list of inline IAM policies you want to replace. If not specified all inline IAM policies attached to the resource will be replaced.\n\n## Output Parameters\n* ReplaceIamInlinePolicies.Output: The standard HTTP response from the ListRolePolicies or ListUserPolicies or ListGroupPolicies call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "ResourceId": {
+      "type": "String",
+      "description": "(Required) The ID of the IAM user, group, or role whose inline policy you want to replace.",
+      "allowedPattern": "^(AGPA|AIDA|AROA)[A-Z0-9+=,.@-_]{1,128}$"
+    },
+    "InlinePolicyNames": {
+      "type": "StringList",
+      "description": "(Optional) The list of inline IAM policies you want to replace. If not specified all inline IAM policies attached to the resource will be replaced.",
+      "allowedPattern": "^$|^[a-zA-Z0-9+=,.@-_]*",
+      "default": []
+    }
+  },
+  "outputs": [
+    "ReplaceIamInlinePolicies.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "ReplaceIamInlinePolicies",
+      "action": "aws:executeScript",
+      "description": "## ReplaceIamInlinePolicies\nReplace the inline IAM policy with an AWS managed policy on the resource you specify.\n## Outputs\n* Output: The standard HTTP response from the ListRolePolicies or ListUserPolicies or ListGroupPolicies call.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "ResourceId": "{{ ResourceId }}",
+          "InlinePolicyNames": "{{ InlinePolicyNames }}"
+        },
+        "Script": "import boto3\nimport json\n\ndef get_list_policies(iam_client, resourceType, resourceName):\n  policy_response = {}\n  if resourceType == \"AWS::IAM::Role\":\n    policy_response = iam_client.list_role_policies(RoleName=resourceName)\n  elif resourceType == \"AWS::IAM::Group\":\n    policy_response = iam_client.list_group_policies(GroupName=resourceName)\n  elif resourceType == \"AWS::IAM::User\":\n    policy_response = iam_client.list_user_policies(UserName=resourceName)\n  return policy_response\n\ndef is_inline_policy_exists(policy_response, inline_policy_names):\n  if policy_response[\"PolicyNames\"]:\n    if not inline_policy_names or set(inline_policy_names).intersection(policy_response[\"PolicyNames\"]):\n      return False \n  return True\n\ndef get_select_resource_config(config_client, resource_id):\n  select_query = \"SELECT * WHERE resourceType in ('AWS::IAM::Group','AWS::IAM::Role','AWS::IAM::User') and resourceId = '{}'\"\n  select_query = select_query.format(resource_id)\n  return config_client.select_resource_config(Expression=select_query)\n\ndef update_role_inline_policies(iam_client, resourceName, inline_policy_names):\n  #update Role changes\n  policy_list = iam_client.list_role_policies(RoleName=resourceName)\n  for policy_name in policy_list['PolicyNames']:\n    if not inline_policy_names or policy_name  in inline_policy_names:\n      policy_name_converted = policy_name + \"_converted\"\n      policy_details = iam_client.get_role_policy(RoleName=resourceName,PolicyName=policy_name)\n      create_policy_Response = iam_client.create_policy(PolicyName=policy_name_converted,PolicyDocument=json.dumps(policy_details['PolicyDocument']),Description=\"Converted inline policy to managed policy\")\n      iam_client.attach_role_policy(RoleName=resourceName, PolicyArn=create_policy_Response['Policy']['Arn'])\n      iam_client.delete_role_policy(RoleName=resourceName, PolicyName=policy_name)\n\ndef update_group_inline_policies(iam_client, resourceName, inline_policy_names):\n  #update Group changes\n  policy_list = iam_client.list_group_policies(GroupName=resourceName)\n  for policy_name in policy_list['PolicyNames']:\n    if not inline_policy_names or policy_name in inline_policy_names:\n      policy_name_converted = policy_name + \"_converted\"\n      policy_details = iam_client.get_group_policy(GroupName=resourceName,PolicyName=policy_name)\n      create_policy_Response = iam_client.create_policy(PolicyName=policy_name_converted,PolicyDocument=json.dumps(policy_details['PolicyDocument']),Description=\"Converted inline policy to managed policy\")\n      iam_client.attach_group_policy(GroupName=resourceName, PolicyArn=create_policy_Response['Policy']['Arn'])\n      iam_client.delete_group_policy(GroupName=resourceName, PolicyName=policy_name)\n\ndef update_user_inline_policies(iam_client, resourceName, inline_policy_names):\n  #update User changes\n  policy_list = iam_client.list_user_policies(UserName=resourceName)\n  for policy_name in policy_list['PolicyNames']:\n    if not inline_policy_names or policy_name in inline_policy_names:\n      policy_name_converted = policy_name + \"_converted\"\n      policy_details = iam_client.get_user_policy(UserName=resourceName,PolicyName=policy_name)\n      create_policy_Response = iam_client.create_policy(PolicyName=policy_name_converted,PolicyDocument=json.dumps(policy_details['PolicyDocument']),Description=\"Converted inline policy to managed policy\")\n      iam_client.attach_user_policy(UserName=resourceName, PolicyArn=create_policy_Response['Policy']['Arn'])\n      iam_client.delete_user_policy(UserName=resourceName, PolicyName=policy_name)\n\ndef handler(event, context):\n  config_client = boto3.client(\"config\")\n  iam_client = boto3.client(\"iam\")\n  resource_id = event[\"ResourceId\"]\n  inline_policy_names = event[\"InlinePolicyNames\"]\n  \n  select_response = get_select_resource_config(config_client, resource_id)\n\n  resource_type = json.loads(select_response['Results'][0])['resourceType']\n  resource_name = json.loads(select_response['Results'][0])['resourceName']\n  resource = \"\"\n  if resource_type == 'AWS::IAM::Role':\n    update_role_inline_policies(iam_client, resource_name, inline_policy_names)\n    resource = \"Role\"\n  elif resource_type == 'AWS::IAM::Group':\n    update_group_inline_policies(iam_client, resource_name, inline_policy_names)\n    resource = \"Group\"\n  elif resource_type == 'AWS::IAM::User':\n    update_user_inline_policies(iam_client, resource_name, inline_policy_names)\n    resource = \"User\"\n\n  list_policies_response = get_list_policies(iam_client, resource_type, resource_name)\n  if is_inline_policy_exists(list_policies_response, inline_policy_names):\n      return {\n          \"output\": {\n              \"Message\": \"Verification of replacing inline policies for AWS IAM {} {} is successful.\".format(resource.lower(), resource_name),\n              \"HTTPResponse\": list_policies_response[\"ResponseMetadata\"]\n          }\n      }\n  raise Exception(\n      \"VERIFICATION FAILED. REPLACING INLINE POLICIES FOR AWS IAM {} {} IS UNSUCCESSFUL.\".format(resource.upper(), resource_name)\n  )"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
