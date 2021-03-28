@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-EnableAutoScalingGroupELBHealthCheck\n\n## What does this document do?\nThis runbook enables health checks for the Amazon EC2 Auto Scaling (Auto Scaling) group you specify using the [UpdateAutoScalingGroup](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_UpdateAutoScalingGroup.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* AutoScalingGroupARN: (Required) The Amazon Resource Name (ARN) of the auto scaling group that you want to enable health checks on.\n* HealthCheckGracePeriod: (Optional) The amount of time, in seconds, that Auto Scaling waits before checking the health status of an Amazon Elastic Compute Cloud (Amazon EC2) instance that has come into service.\n\n## Output Parameters\n* EnableAutoScalingGroupELBHealthCheckAndVerify.Response: Response from the UpdateAutoScalingGroup API.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "AutoScalingGroupARN": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the auto scaling group that you want to enable health checks on.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:autoscaling:[a-z0-9-]+:\\d{12}:autoScalingGroup:[a-z0-9-]+:autoScalingGroupName/(?!.*[:])(.{1,255})$"
+    },
+    "HealthCheckGracePeriod": {
+      "type": "Integer",
+      "description": "(Optional) The amount of time, in seconds, that Auto Scaling waits before checking the health status of an Amazon Elastic Compute Cloud (Amazon EC2) instance that has come into service.",
+      "allowedPattern": "^[0-9]\\d*$",
+      "default": 300
+    }
+  },
+  "outputs": [
+    "EnableAutoScalingGroupELBHealthCheckAndVerify.Response"
+  ],
+  "mainSteps": [
+    {
+      "name": "EnableAutoScalingGroupELBHealthCheckAndVerify",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## EnableAutoScalingGroupELBHealthCheckAndVerify\nEnables health checks on the Auto Scaling group you specify in the AutoScalingGroupARN parameter.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "AutoScalingGroupARN": "{{ AutoScalingGroupARN }}",
+          "HealthCheckGracePeriod": "{{ HealthCheckGracePeriod }}"
+        },
+        "Script": "import boto3\nimport re\n\ndef get_group_name_from_arn(autoscaling_group_arn):\n    group_arn_regex = \"^arn:(aws[a-zA-Z-]*)?:autoscaling:[a-z0-9-]+:\\d{12}:autoScalingGroup:[a-z0-9-]+:autoScalingGroupName/(?!.*[:])(.{1,255})$\"\n    group_match = re.match(group_arn_regex, autoscaling_group_arn)\n    if group_match:\n      return group_match.groups()[1]\n    else:\n      raise Exception(\"AUTOSCALING GROUP ARN IS NOT IN VALID FORMAT.\")\n\ndef update_autoscaling_group_elb_health_check(client, autoscaling_group_name, health_check_period):\n    update_response = client.update_auto_scaling_group(AutoScalingGroupName=autoscaling_group_name,\n                                                      HealthCheckType=\"ELB\",\n                                                      HealthCheckGracePeriod=health_check_period)\n    return update_response\n\ndef handler(event, context):\n    group_arn = event[\"AutoScalingGroupARN\"]\n    group_name = get_group_name_from_arn(group_arn)\n    grace_period = event[\"HealthCheckGracePeriod\"]\n\n    client = boto3.client('autoscaling')\n\n    update_response = update_autoscaling_group_elb_health_check(client, group_name, grace_period)\n\n    autoscaling_response = client.describe_auto_scaling_groups(AutoScalingGroupNames=[group_name])\n    configured_health_check_type = autoscaling_response[\"AutoScalingGroups\"][0][\"HealthCheckType\"]\n    configured_grace_period = autoscaling_response[\"AutoScalingGroups\"][0][\"HealthCheckGracePeriod\"]\n    if configured_grace_period == grace_period and configured_health_check_type == \"ELB\":\n        return {\n            \"Message\": \"Verification of EnableAutoScalingGroupHealthCheck is successful.\",\n            \"HTTPResponse\": update_response[\"ResponseMetadata\"]\n          }\n    raise Exception(\"VERIFICATION FAILED. AMAZON EC2 AUTOSCALING GROUP IS NOT ENABLED WITH GIVEN HEALTH CHECK GRACE PERIOD.\")"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-RestrictBucketSSLRequestsOnly\n\n## What does this document do?\nThis runbook creates a Amazon Simple Storage Service (Amazon S3) bucket policy statement that explicitly denies HTTP requests to the Amazon S3 bucket you specify by using the [PutBucketPolicy](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketPolicy.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* BucketName: (Required) The name of the S3 bucket you want to want to deny HTTP requests.\n\n## Output Parameters\n* ModifyBucketPolicy.Output: Success message and HTTP response metadata or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Required) The name of the S3 bucket you want to want to deny HTTP requests.",
+      "allowedPattern": "(?=^.{3,63}$)(?!^(\\d+\\.)+\\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])\\.)*([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])$)"
+    }
+  },
+  "outputs": [
+    "ModifyBucketPolicy.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "ModifyBucketPolicy",
+      "action": "aws:executeScript",
+      "description": "## ModifyBucketPolicy\nCreates a bucket policy for the S3 bucket specified in the BucketName parameter that explicitly denies HTTP requests.\n## Outputs\n* Output: Success message and HTTP response metadata or failure exception.\n",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}"
+        },
+        "Script": "import json\nimport boto3\nimport botocore\nimport string\nimport random\nimport os\n\n\ndef get_bucket_policy(s3_client, bucket_name):\n    try:\n        bucket_policy = s3_client.get_bucket_policy(Bucket=bucket_name)\n        bucket_policy = json.loads(bucket_policy[\"Policy\"])\n        return bucket_policy\n    except botocore.exceptions.ClientError as error:\n        if error.response[\"Error\"][\"Code\"] == \"NoSuchBucket\":\n            error_message = f\"BUCKET POLICY MODIFICATION FAILED. S3 BUCKET {bucket_name} DOES NOT EXIST.\"\n            raise Exception(error_message)\n        elif error.response[\"Error\"][\"Code\"] == \"NoSuchBucketPolicy\":\n            return None\n        elif error.response[\"Error\"][\"Code\"] == \"AccessDenied\":\n            error_message = f\"BUCKET POLICY MODIFICATION FAILED. ACCESS DENIED TO S3 BUCKET {bucket_name}.\"\n            raise Exception(error_message)\n        else:\n            raise error\n\ndef generate_random_policy_statement_id():\n    char = string.ascii_uppercase + string.ascii_lowercase + string.digits\n    random_string = ''.join(random.choice(char) for _ in range(6))\n    random_sid = ''.join(\"AllowSSLRequestsOnly_\" + random_string.lower())\n    return random_sid\n\ndef update_bucket_policy(bucket_policy, bucket_name, partition, policy_sid):\n    statement = {\"Sid\": policy_sid, \"Action\": \"s3:*\", \"Effect\": \"Deny\", \"Resource\": [f\"arn:{partition}:s3:::{bucket_name}\", f\"arn:{partition}:s3:::{bucket_name}/*\"], \"Condition\": {\"Bool\": {\"aws:SecureTransport\": \"false\"}},\"Principal\": \"*\"}\n    if bucket_policy:\n        bucket_policy[\"Statement\"].append(statement)\n    else:\n        bucket_policy = {\"Version\":\"2012-10-17\",\"Statement\":[statement]}\n    return bucket_policy\n\ndef put_bucket_policy(s3_client, bucket_name, bucket_policy):\n    bucket_policy = json.dumps(bucket_policy)\n    response = s3_client.put_bucket_policy(Bucket=bucket_name, Policy=bucket_policy)\n    return response\n\ndef verify_bucket_policy_updated(updated_bucket_policy, policy_sid):\n    for statement in updated_bucket_policy[\"Statement\"]:\n        if statement.get(\"Sid\") == policy_sid:\n          if statement.get(\"Condition\").get(\"Bool\").get(\"aws:SecureTransport\") == \"false\":\n            return True\n    return False\n\ndef get_partition(region):\n    partitions = {\n        \"cn-\" : \"aws-cn\",\n        \"us-iso-\" : \"aws-iso\",\n        \"us-isob-\" : \"aws-iso-b\",\n        \"us-gov-\" : \"aws-us-gov\"\n    }\n    for key in partitions:\n        if key in region:\n            partition = partitions[key]\n            return partition\n    partition = \"aws\"\n    return partition\n\ndef handler(event, context):\n    s3_client = boto3.client(\"s3\")\n    bucket_name = event[\"BucketName\"]\n    region = os.environ['AWS_REGION']\n    \n    bucket_policy = get_bucket_policy(s3_client, bucket_name)\n    policy_sid = generate_random_policy_statement_id()\n    partition = get_partition(region)\n    restricted_bucket_policy = update_bucket_policy(bucket_policy, bucket_name, partition, policy_sid)\n    response = put_bucket_policy(s3_client, bucket_name, restricted_bucket_policy)\n    updated_bucket_policy = get_bucket_policy(s3_client, bucket_name)\n    if not verify_bucket_policy_updated(updated_bucket_policy, policy_sid):\n        error_message = f\"VERIFICATION FAILED. S3 {bucket_name} BUCKET POLICY NOT UPDATED.\"\n        raise Exception(error_message)\n    return {\n        \"output\": \"Verification of S3 Bucket Policy is successful.\",\n        \"http_response\": response\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document Name - AWSConfigRemediation-DeleteUnusedIAMPolicy\n\n## What does this document do?\nThis runbook deletes an AWS Identity and Access Management (IAM) policy that is not attached to any IAM users, groups, or roles using the [DeletePolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DeletePolicy.html) and [DeletePolicyVersion](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DeletePolicyVersion.html) APIs.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* IAMResourceId: (Required) The resource identifier of the IAM policy that you want to delete.\n\n## Output Parameters\n* DeleteUnusedIAMPolicy.Output - Success message and HTTP response metadata or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$"
+    },
+    "IAMResourceId": {
+      "type": "String",
+      "description": "(Required) IAM resource unique identifier for the IAM Policy.",
+      "allowedPattern": "^[\\w+=,.@_-]{1,128}$"
+    }
+  },
+  "outputs": [
+    "DeleteUnusedIAMPolicyAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "DeleteUnusedIAMPolicyAndVerify",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## DeleteUnusedIAMPolicyAndVerify\nDeletes the policy you specify in the IAMResourceId parameter, and verifies the policy was deleted.\n## Outputs\n* Output: Success message and HTTP response metadata or failure exception.\n",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "delete_policy_handler",
+        "InputPayload": {
+          "IAMResourceId": "{{ IAMResourceId }}"
+        },
+        "Script": "import boto3\n\n\niam_client = boto3.client(\"iam\")\nconfig_client = boto3.client(\"config\")\n\n\ndef is_policy_deleted(policy_arn):\n  try:\n    iam_client.get_policy(PolicyArn=policy_arn)\n    error_message = \"VERIFICATION FAILED. IAM POLICY {} NOT DELETED\".format(policy_arn)\n    raise Exception(error_message)\n  except iam_client.exceptions.NoSuchEntityException:\n    return True\n  return False\n\ndef get_policy_arn(resource_id):\n  response = config_client.get_resource_config_history(\n    resourceType='AWS::IAM::Policy',\n    resourceId=resource_id\n  )\n  resource_name = response.get(\"configurationItems\")[0].get(\"arn\")\n  return resource_name\n\ndef delete_policy_handler(event, context):\n  iam_resource_id = event.get(\"IAMResourceId\")\n  policy_arn = get_policy_arn(iam_resource_id)\n  \n  policy_usage = iam_client.list_entities_for_policy(\n    PolicyArn=policy_arn\n  )\n  if policy_usage.get(\"PolicyGroups\") or policy_usage.get(\"PolicyUsers\") or policy_usage.get(\"PolicyRoles\"):\n    error_message = \"IAM POLICY {} STILL IN USE. CANNOT DELETE A POLICY ATTACHED TO ENTITIES.\".format(policy_arn)\n    raise Exception(error_message)\n  policy_versions = iam_client.list_policy_versions(\n    PolicyArn=policy_arn\n  )\n  for policy_version in policy_versions.get(\"Versions\"):\n    if not policy_version.get(\"IsDefaultVersion\"):\n      iam_client.delete_policy_version(PolicyArn=policy_arn,VersionId=policy_version.get(\"VersionId\"))\n  response = iam_client.delete_policy(PolicyArn=policy_arn)\n  if not is_policy_deleted(policy_arn):\n    raise Exception(f\"VERIFICATION FAILED. IAM POLICY {policy_arn} NOT DELETED.\")\n  return {\n    \"output\": \"IAM Policy deleted successfully.\",\n    \"http_response\": response\n  }"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
