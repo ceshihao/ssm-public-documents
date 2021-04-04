@@ -1,0 +1,66 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-EnableCloudFrontAccessLogs\n\n## What does this document do?\nThis runbook enables access logging on an Amazon CloudFront (CloudFront) distribution you specify using the [UpdateDistribution](https://docs.aws.amazon.com/cloudfront/latest/APIReference/API_UpdateDistribution.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* CloudFrontId: (Required) The ID of the CloudFront distribution you want to enable access logging on.\n* BucketName: (Required) The name of the Amazon Simple Storage Service (Amazon S3) bucket you want to store access logs in. Buckets in the af-south-1, ap-east-1, eu-south-1, and me-south-1 AWS Region are not supported.\n* Prefix: (Optional) An optional string that you want CloudFront to prefix to the access log filenames for your distribution, for example, myprefix/.\n* IncludeCookies: (Required) Set this parameter to 'true', if you want cookies to be included in the access logs.\n\n## Output Parameters\n* UpdateDistributionAndVerify.Response: The standard HTTP response from the UpdateDistribution API.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$"
+    },
+    "CloudFrontId": {
+      "type": "String",
+      "description": "(Required) The ID of the CloudFront distribution you want to enable access logging on.",
+      "allowedPattern": "[A-Z0-9]+"
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon Simple Storage Service (Amazon S3) bucket you want to store access logs in. Buckets in the af-south-1, ap-east-1, eu-south-1, and me-south-1 AWS Region are not supported.\n",
+      "allowedPattern": "(?=^.{3,63}$)(?!.*[.-]{2})(?!.*[--]{2})(?!^(?:(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(?!$)|$)){4}$)(^(([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])\\.)*([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])$)"
+    },
+    "Prefix": {
+      "type": "String",
+      "description": "(Optional) An optional string that you want CloudFront to prefix to the access log filenames for your distribution, for example, myprefix/.",
+      "allowedPattern": "(.*){1,1024}",
+      "default": ""
+    },
+    "IncludeCookies": {
+      "type": "Boolean",
+      "description": "(Required) Set this parameter to 'true', if you want cookies to be included in the access logs.",
+      "allowedValues": [
+        true,
+        false
+      ]
+    }
+  },
+  "outputs": [
+    "UpdateDistributionAndVerify.Response"
+  ],
+  "mainSteps": [
+    {
+      "name": "UpdateDistributionAndVerify",
+      "action": "aws:executeScript",
+      "description": "## UpdateDistributionAndVerify\nEnables and verifies access logging for the CloudFront distribution you specify in the CloudFrontDistributionId parameter.\n## Outputs\n* Response: The standard HTTP response from the UpdateDistribution API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "handler",
+        "InputPayload": {
+          "DistributionId": "{{ CloudFrontId }}",
+          "BucketName": "{{ BucketName }}",
+          "Prefix": "{{ Prefix }}",
+          "IncludeCookies": "{{ IncludeCookies }}"
+        },
+        "Script": "import boto3\n\ndef get_distribution_configuration(cloudfront_client, distribution_id):\n    waiter = cloudfront_client.get_waiter('distribution_deployed')\n    waiter.wait(Id=distribution_id)\n    get_response = cloudfront_client.get_distribution_config(Id=distribution_id)\n    return get_response\n\ndef update_distribution_configuration(cloudfront_client, distribution_id, distribution_content, logging_content):\n    distribution_content['DistributionConfig']['Logging'] = logging_content\n    etag = distribution_content['ETag']\n    updated_configuration = distribution_content['DistributionConfig']\n    update_distribution_response = cloudfront_client.update_distribution(DistributionConfig=updated_configuration,\n                                                                         Id=distribution_id,\n                                                                         IfMatch=etag)\n    return update_distribution_response\n\ndef get_bucket_region(bucket_name):\n    s3_client = boto3.client(\"s3\")\n    bucket_response = s3_client.get_bucket_location(Bucket=bucket_name)\n    bucket_region = bucket_response[\"LocationConstraint\"]\n    if bucket_region is None:\n        bucket_region = \"us-east-1\"\n    return bucket_region\n\ndef handler(event, context):\n    cloudfront_client = boto3.client(\"cloudfront\")\n    distribution_id = event[\"DistributionId\"]\n    bucket_name = event[\"BucketName\"]\n    bucket_region = get_bucket_region(bucket_name)\n\n    if bucket_region in [\"af-south-1\", \"ap-east-1\", \"eu-south-1\", \"me-south-1\"]:\n       raise Exception(\"CloudFront doesn't deliver access logs to buckets which resides in these region: {}\".format(bucket_region))\n\n    logging_content = {\n        \"Enabled\": True,\n        \"Bucket\":  \".\".join([bucket_name, \"s3\", bucket_region, \"amazonaws\", \"com\"]),\n        \"Prefix\": event[\"Prefix\"],\n        \"IncludeCookies\": event[\"IncludeCookies\"]\n    }\n    get_distribution_response = get_distribution_configuration(cloudfront_client, distribution_id)\n    update_distribution = update_distribution_configuration(cloudfront_client, distribution_id, get_distribution_response, logging_content)\n\n    # Verification of logging enabled on given Amazon Cloudfront distribution\n    verify_response = get_distribution_configuration(cloudfront_client, distribution_id)\n    if verify_response['DistributionConfig']['Logging'] == logging_content:\n        return {\n            \"Message\": \"Verification of EnableCloudFrontAccessLogs is successful.\",\n            \"HTTPResponse\": update_distribution['ResponseMetadata']\n        }\n    raise Exception(\"VERIFICATION OF EnableCloudFrontAccessLogs FAILED.\")"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
