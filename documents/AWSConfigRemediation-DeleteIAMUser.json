@@ -1,0 +1,197 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-DeleteIAMUser\n\n## What does this document do?\nThis runbook deletes the AWS Identity and Access Management (IAM) user you specify using the [DeleteUser](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DeleteUser.html) API. This automation deletes or detaches the following resources associated with the IAM user.\n\n- Access keys\n- Attached managed policies\n- Git credentials\n- IAM group memberships\n- IAM user password\n- Inline policies\n- Multi-factor authentication (MFA) devices\n- Signing certificates\n- SSH public keys\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* IAMUserId: (Required) The ID of the IAM user you want to delete.\n\n## Output Parameters\n* DeleteIAMUserAndVerify.Output: Output of the step indicating successful deletion of the AWS IAM User.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "IAMUserId": {
+      "type": "String",
+      "description": "(Required) The ID of the IAM user you want to delete.",
+      "allowedPattern": "^AIDA[A-Z0-9]+$"
+    }
+  },
+  "outputs": [
+    "DeleteIAMUserAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetUsername",
+      "action": "aws:executeScript",
+      "description": "## GetUsername\nGathers the user name of the IAM user you specify in the `IAMUserId` parameter.\n## Outputs\n* UserName: The name of the user.\n",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "IAMUserId": "{{ IAMUserId }}"
+        },
+        "Script": "from time import sleep\n\nimport boto3\n\nTHROTTLE_PERIOD = 0.05\n\n\ndef get_username(iam_client, iam_user_id):\n    paginator = iam_client.get_paginator(\"list_users\")\n    page_iterator = paginator.paginate()\n    for page in page_iterator:\n        for user in page[\"Users\"]:\n            if user[\"UserId\"] == iam_user_id:\n                return user[\"UserName\"]\n        sleep(THROTTLE_PERIOD)\n\n\ndef handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    iam_user_id = event[\"IAMUserId\"]\n\n    iam_username = get_username(iam_client, iam_user_id)\n\n    if iam_username is not None:\n        return {\"UserName\": iam_username}\n    else:\n        error_message = f\"AWS IAM USER ID, {iam_user_id} DOES NOT EXIST.\"\n        raise Exception(error_message)"
+      },
+      "outputs": [
+        {
+          "Name": "UserName",
+          "Selector": "$.Payload.UserName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetKeysCertificatesMfaAndCredentials",
+      "action": "aws:executeScript",
+      "description": "## GetKeysCertificatesMfaAndCredentials\nGathers access keys, certificates, credentials, MFA devices, and SSH keys associated with the IAM user.\n## Outputs\n* Output: The access keys, ssh keys, certificates, mfa device and credentials for the AWS IAM user.\n",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "UserName": "{{ GetUsername.UserName }}"
+        },
+        "Script": "from time import sleep\n\nimport boto3\n\nTHROTTLE_PERIOD = 0.05\n\n\ndef get_access_keys(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_access_keys\")\n    page_iterator = paginator.paginate(UserName=iam_username)\n    access_keys = []\n    for page in page_iterator:\n        for access_key in page[\"AccessKeyMetadata\"]:\n            access_keys.append(access_key[\"AccessKeyId\"])\n        sleep(THROTTLE_PERIOD)\n    return access_keys\n\n\ndef get_ssh_public_keys(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_ssh_public_keys\")\n    page_iterator = paginator.paginate(UserName=iam_username)\n    ssh_keys = []\n    for page in page_iterator:\n        for ssh_key in page[\"SSHPublicKeys\"]:\n            ssh_keys.append(ssh_key[\"SSHPublicKeyId\"])\n        sleep(THROTTLE_PERIOD)\n    return ssh_keys\n\n\ndef get_signing_certificates(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_signing_certificates\")\n    page_iterator = paginator.paginate(UserName=iam_username)\n    signing_certificates = []\n    for page in page_iterator:\n        for access_key in page[\"Certificates\"]:\n            signing_certificates.append(access_key[\"CertificateId\"])\n            sleep(THROTTLE_PERIOD)\n    return signing_certificates\n\n\ndef get_mfa_devices(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_mfa_devices\")\n    page_iterator = paginator.paginate(UserName=iam_username)\n    mfa_devices = []\n    for page in page_iterator:\n        for mfa_device in page[\"MFADevices\"]:\n            mfa_devices.append(mfa_device[\"SerialNumber\"])\n        sleep(THROTTLE_PERIOD)\n    return mfa_devices\n\n\ndef get_service_specific_credentials(iam_client, iam_username):\n    response = iam_client.list_service_specific_credentials(UserName=iam_username)\n    service_specific_credential_ids = []\n    for service in response[\"ServiceSpecificCredentials\"]:\n        service_specific_credential_ids.append(service[\"ServiceSpecificCredentialId\"])\n    return service_specific_credential_ids\n\n\ndef handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    iam_username = event[\"UserName\"]\n\n    access_keys = get_access_keys(iam_client, iam_username)\n    ssh_public_keys = get_ssh_public_keys(iam_client, iam_username)\n    signing_certificates = get_signing_certificates(iam_client, iam_username)\n    mfa_devices = get_mfa_devices(iam_client, iam_username)\n    service_specific_credentials = get_service_specific_credentials(iam_client, iam_username)\n\n    return {\n        \"access_keys\": access_keys,\n        \"ssh_public_keys\": ssh_public_keys,\n        \"signing_certificates\": signing_certificates,\n        \"mfa_devices\": mfa_devices,\n        \"service_specific_credentials\": service_specific_credentials,\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "AccessKeys",
+          "Selector": "$.Payload.access_keys",
+          "Type": "StringList"
+        },
+        {
+          "Name": "SSHPublicKeys",
+          "Selector": "$.Payload.ssh_public_keys",
+          "Type": "StringList"
+        },
+        {
+          "Name": "SigningCertificates",
+          "Selector": "$.Payload.signing_certificates",
+          "Type": "StringList"
+        },
+        {
+          "Name": "MFADevices",
+          "Selector": "$.Payload.mfa_devices",
+          "Type": "StringList"
+        },
+        {
+          "Name": "ServiceSpecificCredentials",
+          "Selector": "$.Payload.service_specific_credentials",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "GetGroupsAndPolicies",
+      "action": "aws:executeScript",
+      "description": "## GetGroupsAndPolicies\nGathers group memberships and policies for the IAM user.\n## Outputs\n* Output: The group memberships and policies for the AWS IAM user.\n",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "UserName": "{{ GetUsername.UserName }}"
+        },
+        "Script": "from time import sleep\n\nimport boto3\n\nTHROTTLE_PERIOD = 0.05\n\n\ndef get_user_groups(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_groups_for_user\")\n    page_iterator = paginator.paginate(UserName=iam_username)\n    groups = []\n    for page in page_iterator:\n        for group in page[\"Groups\"]:\n            groups.append(group[\"GroupName\"])\n        sleep(THROTTLE_PERIOD)\n    return groups\n\n\ndef get_user_policies(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_user_policies\")\n    page_iterator = paginator.paginate(UserName=iam_username)\n    policies = []\n    for page in page_iterator:\n        policies.extend(page[\"PolicyNames\"])\n        sleep(THROTTLE_PERIOD)\n    return policies\n\n\ndef get_attached_user_policies(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_attached_user_policies\")\n    page_iterator = paginator.paginate(UserName=iam_username)\n    policies = []\n    for page in page_iterator:\n        for policy in page[\"AttachedPolicies\"]:\n            policies.append(policy[\"PolicyArn\"])\n        sleep(THROTTLE_PERIOD)\n    return policies\n\n\ndef handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    iam_username = event[\"UserName\"]\n\n    groups = get_user_groups(iam_client, iam_username)\n    user_policies = get_user_policies(iam_client, iam_username)\n    attached_user_policies = get_attached_user_policies(iam_client, iam_username)\n\n    return {\"groups\": groups, \"user_policies\": user_policies, \"attached_user_policies\": attached_user_policies}"
+      },
+      "outputs": [
+        {
+          "Name": "Groups",
+          "Selector": "$.Payload.groups",
+          "Type": "StringList"
+        },
+        {
+          "Name": "UserPolicies",
+          "Selector": "$.Payload.user_policies",
+          "Type": "StringList"
+        },
+        {
+          "Name": "AttachedUserPolicies",
+          "Selector": "$.Payload.attached_user_policies",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "DeleteKeysCertificatesMfaAndCredentials",
+      "action": "aws:executeScript",
+      "description": "## DeleteKeysCertificatesMfaAndCredentials\nDeletes access keys, certificates, credentials, MFA devices, and SSH keys associated with the IAM user.\n## Outputs\n* Output: The output of this step indicating successful deletion of the access keys, ssh keys, certificates, MFA device and credentials for the AWS IAM user.\n",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "UserName": "{{ GetUsername.UserName }}",
+          "AccessKeys": "{{ GetKeysCertificatesMfaAndCredentials.AccessKeys }}",
+          "SSHPublicKeys": "{{ GetKeysCertificatesMfaAndCredentials.SSHPublicKeys }}",
+          "SigningCertificates": "{{ GetKeysCertificatesMfaAndCredentials.SigningCertificates }}",
+          "MFADevices": "{{ GetKeysCertificatesMfaAndCredentials.MFADevices }}",
+          "ServiceSpecificCredentials": "{{ GetKeysCertificatesMfaAndCredentials.ServiceSpecificCredentials }}"
+        },
+        "Script": "import boto3\n\n\ndef delete_login_profile(iam_client, iam_username):\n    try:\n        response = iam_client.delete_login_profile(UserName=iam_username)\n        return response\n    except iam_client.exceptions.NoSuchEntityException:\n        return None\n\n\ndef delete_access_keys(iam_client, iam_username, access_keys):\n    responses = []\n    for access_key in access_keys:\n        response = iam_client.delete_access_key(UserName=iam_username, AccessKeyId=access_key)\n        responses.append(response)\n    return responses\n\n\ndef delete_ssh_public_keys(iam_client, iam_username, ssh_public_keys):\n    responses = []\n    for ssh_key in ssh_public_keys:\n        response = iam_client.delete_ssh_public_key(UserName=iam_username, SSHPublicKeyId=ssh_key)\n        responses.append(response)\n    return responses\n\n\ndef delete_signing_certificate(iam_client, iam_username, signing_certificates):\n    responses = []\n    for certificate in signing_certificates:\n        response = iam_client.delete_signing_certificate(UserName=iam_username, CertificateId=certificate)\n        responses.append(response)\n    return responses\n\n\ndef deactivate_mfa_devices(iam_client, iam_username, mfa_devices):\n    responses = []\n    for mfa_device in mfa_devices:\n        response = iam_client.deactivate_mfa_device(UserName=iam_username, SerialNumber=mfa_device)\n        responses.append(response)\n    return responses\n\n\ndef delete_mfa_devices(iam_client, mfa_devices):\n    responses = []\n    for mfa_device in mfa_devices:\n        response = iam_client.delete_virtual_mfa_device(SerialNumber=mfa_device)\n        responses.append(response)\n    return responses\n\n\ndef delete_service_specific_credential(iam_client, iam_username, service_specific_credentials):\n    responses = []\n    for service_credential in service_specific_credentials:\n        response = iam_client.delete_service_specific_credential(\n            UserName=iam_username, ServiceSpecificCredentialId=service_credential\n        )\n        responses.append(response)\n    return responses\n\n\ndef handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    iam_username = event[\"UserName\"]\n    access_keys = event[\"AccessKeys\"]\n    ssh_public_keys = event[\"SSHPublicKeys\"]\n    signing_certificates = event[\"SigningCertificates\"]\n    mfa_devices = event[\"MFADevices\"]\n    service_specific_credentials = event[\"ServiceSpecificCredentials\"]\n\n    delete_login_profile(iam_client, iam_username)\n    delete_access_keys(iam_client, iam_username, access_keys)\n    delete_ssh_public_keys(iam_client, iam_username, ssh_public_keys)\n    delete_signing_certificate(iam_client, iam_username, signing_certificates)\n    deactivate_mfa_devices(iam_client, iam_username, mfa_devices)\n    delete_mfa_devices(iam_client, mfa_devices)\n    delete_service_specific_credential(iam_client, iam_username, service_specific_credentials)\n\n    return \"Processed deleting login profile, deleting access keys, deleting ssh public keys, deleting signing certificates, deactivating & deleting MFA devices, and deleting service specific credentials.\""
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DeleteGroupsAndPolicies",
+      "action": "aws:executeScript",
+      "description": "## DeleteGroupsAndPolicies\nDeletes group memberships and policies for the IAM user.\n## Outputs\n* Output: The output of this step indicating successful deletion of the group memberships and policies for the AWS IAM User.\n",
+      "isEnd": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "UserName": "{{ GetUsername.UserName }}",
+          "Groups": "{{ GetGroupsAndPolicies.Groups }}",
+          "UserPolicies": "{{ GetGroupsAndPolicies.UserPolicies }}",
+          "AttachedUserPolicies": "{{ GetGroupsAndPolicies.AttachedUserPolicies }}"
+        },
+        "Script": "import boto3\n\n\ndef remove_user_from_group(iam_client, iam_username, groups):\n    responses = []\n    for group in groups:\n        response = iam_client.remove_user_from_group(UserName=iam_username, GroupName=group)\n        responses.append(response)\n    return responses\n\n\ndef delete_user_policies(iam_client, iam_username, user_policies):\n    responses = []\n    for policy in user_policies:\n        response = iam_client.delete_user_policy(UserName=iam_username, PolicyName=policy)\n        responses.append(response)\n    return responses\n\n\ndef detach_attached_user_policies(iam_client, iam_username, attached_user_policies):\n    responses = []\n    for policy in attached_user_policies:\n        response = iam_client.detach_user_policy(UserName=iam_username, PolicyArn=policy)\n        responses.append(response)\n    return responses\n\n\ndef handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    iam_username = event[\"UserName\"]\n    groups = event[\"Groups\"]\n    user_policies = event[\"UserPolicies\"]\n    attached_user_policies = event[\"AttachedUserPolicies\"]\n\n    remove_user_from_group(iam_client, iam_username, groups)\n    delete_user_policies(iam_client, iam_username, user_policies)\n    detach_attached_user_policies(iam_client, iam_username, attached_user_policies)\n\n    return \"Processed removal of user from groups, deleting user policies, and detaching user attached policies.\""
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DeleteIAMUserAndVerify",
+      "action": "aws:executeScript",
+      "description": "## DeleteIAMUserAndVerify\nDeletes the IAM user and verifies the user has been deleted.\n## Outputs\n* Output: A success message or failure exception.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "UserName": "{{ GetUsername.UserName }}"
+        },
+        "Script": "import boto3\n\n\ndef delete_iam_user(iam_client, iam_username):\n    response = iam_client.delete_user(UserName=iam_username)\n    return response\n\ndef verify_iam_user_status(iam_client, iam_username):\n    try:\n        iam_client.get_user(UserName=iam_username)\n        error_message = f\"VERIFICATION FAILED. AWS IAM USER {iam_username} DELETION UNSUCCESSFUL.\"\n        raise Exception(error_message)\n    except iam_client.exceptions.NoSuchEntityException:\n        return {\"output\": \"Verification of AWS IAM user deletion is successful.\"}\n\n\ndef handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    iam_username = event[\"UserName\"]\n    response = delete_iam_user(iam_client, iam_username)\n    results = verify_iam_user_status(iam_client, iam_username)\n    results[\"DeleteUserResponse\"] = response\n    return results"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        },
+        {
+          "Name": "DeleteUserResponse",
+          "Selector": "$.Payload.DeleteUserResponse",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
