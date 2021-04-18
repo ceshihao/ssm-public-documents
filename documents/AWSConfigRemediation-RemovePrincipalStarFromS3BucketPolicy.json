@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-RemovePrincipalStarFromS3BucketPolicy\n\n## What does this document do?\nThis runbook removes principal policy statements that have wildcards (`Principal: *` or `Principal: \"AWS\": *`) for `Allow` actions from your Amazon Simple Storage Service (Amazon S3) bucket policy using the [DeleteBucketPolicy](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketPolicy.html) and [PutBucketPolicy](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketPolicy.html) APIs. Policy statements with conditions are also removed. Note, the runbook deletes the bucket policy if only `Principal: *` or `Principal: \"AWS\": *` statements exist.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager\n* BucketName: (Required) The name of the Amazon S3 bucket whose policy you want to modify.\n\n## Output Parameters\n* ModifyBucketPolicAndVerify.Output: Success message and HTTP response metadata or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon S3 bucket whose policy you want to modify.",
+      "allowedPattern": "(?=^.{3,63}$)(?!.*[.-]{2})(?!.*[--]{2})(?!^(?:(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(?!$)|$)){4}$)(^(([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])\\.)*([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])$)"
+    }
+  },
+  "outputs": [
+    "ModifyBucketPolicyAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "ModifyBucketPolicyAndVerify",
+      "action": "aws:executeScript",
+      "description": "## ModifyBucketPolicyAndVerify\nModifies the bucket policy and verifies principal policy statements with wildcards have been removed from the Amazon S3 bucket you specify in the `BucketName` parameter.\n## Outputs\n* Output: Success message and HTTP response metadata or failure exception.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}"
+        },
+        "Script": "import json\n\nimport boto3\nimport botocore\n\n\ndef get_bucket_policy(s3_client, bucket_name):\n    try:\n        bucket_policy = s3_client.get_bucket_policy(Bucket=bucket_name)\n        return json.loads(bucket_policy[\"Policy\"])\n    except botocore.exceptions.ClientError as error:\n        if error.response[\"Error\"][\"Code\"] == \"NoSuchBucket\":\n            error_message = f\"BUCKET POLICY MODIFICATION FAILED. AMAZON S3 BUCKET {bucket_name} DOES NOT EXIST.\"\n            raise Exception(error_message)\n        elif error.response[\"Error\"][\"Code\"] == \"NoSuchBucketPolicy\":\n            error_message = f\"BUCKET POLICY MODIFICATION FAILED. AMAZON S3 BUCKET {bucket_name} DOES NOT HAVE A BUCKET POLICY.\"\n            raise Exception(error_message)\n        elif error.response[\"Error\"][\"Code\"] == \"AccessDenied\":\n            error_message = f\"BUCKET POLICY MODIFICATION FAILED. ACCESS DENIED TO AMAZON S3 BUCKET {bucket_name}.\"\n            raise Exception(error_message)\n        else:\n            raise error\n\n\ndef get_allow_principal_star_statements(bucket_policy):\n    statements = []\n    for statement in bucket_policy[\"Statement\"]:\n        effect = statement.get(\"Effect\")\n        principal = statement.get(\"Principal\")\n        if effect == \"Allow\":\n            if isinstance(principal, dict) and \"*\" in principal.get(\"AWS\", []):\n                statements.append(statement)\n            if principal == \"*\":\n                statements.append(statement)\n    return statements\n\n\ndef prep_bucket_policy(bucket_policy):\n    statements_to_delete = get_allow_principal_star_statements(bucket_policy)\n    for statement in statements_to_delete:\n        bucket_policy[\"Statement\"].remove(statement)\n\n    if len(bucket_policy[\"Statement\"]) == 0:\n        return {}\n    return bucket_policy\n\n\ndef put_bucket_policy(s3_client, bucket_name, bucket_policy_changes):\n    bucket_policy = json.dumps(bucket_policy_changes)\n    return s3_client.put_bucket_policy(Bucket=bucket_name, Policy=bucket_policy)\n\n\ndef delete_bucket_policy(s3_client, bucket_name):\n    return s3_client.delete_bucket_policy(Bucket=bucket_name)\n\n\ndef verify_bucket_policy(s3_client, bucket_name):\n    try:\n        bucket_policy = s3_client.get_bucket_policy(Bucket=bucket_name)\n        return json.loads(bucket_policy[\"Policy\"])\n    except botocore.exceptions.ClientError as error:\n        if error.response[\"Error\"][\"Code\"] == \"NoSuchBucketPolicy\":\n            return {}\n        raise error\n\n\ndef is_allow_principal_star_statements_present(bucket_policy):\n    allow_principal_star_statements = get_allow_principal_star_statements(bucket_policy)\n    if not allow_principal_star_statements:\n        return False\n    return True\n\ndef handler(event, context):\n    s3_client = boto3.client(\"s3\")\n    bucket_name = event[\"BucketName\"]\n\n    existing_bucket_policy = get_bucket_policy(s3_client, bucket_name)\n    bucket_policy = prep_bucket_policy(existing_bucket_policy)\n\n    if not bucket_policy:\n        response = delete_bucket_policy(s3_client, bucket_name)\n    else:\n        response = put_bucket_policy(s3_client, bucket_name, bucket_policy)\n\n    bucket_policy = verify_bucket_policy(s3_client, bucket_name)\n    if not bucket_policy:\n        return {\"output\": \"Verification of Amazon S3 Bucket Policy is successful.\", \"http_response\": response}\n    allow_principal_star_statements_present = is_allow_principal_star_statements_present(bucket_policy)\n    if not allow_principal_star_statements_present:\n        return {\"output\": \"Verification of Amazon S3 Bucket Policy is successful.\", \"http_response\": response}\n    error_message = f\"VERIFICATION FAILED. AMAZON S3 {bucket_name} BUCKET POLICY MODIFICATION UNSUCCESSFUL.\"\n    raise Exception(error_message)"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
