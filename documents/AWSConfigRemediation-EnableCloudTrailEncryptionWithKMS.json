@@ -1,0 +1,88 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document Name - AWSConfigRemediation-EnableCloudTrailEncryptionWithKMS\n\n## What does this document do?\nThis runbook encrypts an AWS CloudTrail (CloudTrail) trail using the AWS Key Management Service (AWS KMS) customer master key (CMK) you specify. This runbook should only be used as a baseline to ensure that your CloudTrail trails are encrypted according to minimum recommended security best practices. We recommend encrypting multiple trails with different CMKs. CloudTrail digest files are not encrypted. If you have previously set the EnableLogFileValidation parameter to true for the trail, see the \"Use server-side encryption with AWS KMS managed keys\" section of the [CloudTrail Preventative Security Best Practices](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/best-practices-security.html#best-practices-security-preventative) topic in the AWS CloudTrail User Guide for more information.\n\n## Input Parameters\n* TrailName: (Required) The ARN or name of the trail you want to update to be encrypted.\n* KmsKeyId: (Required) The ARN, key ID, or the key alias of the of the CMK you want to use to encrypt the trail you specify in the TrailName parameter.\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n\n## Output Parameters\n* UpdateTrail.UpdateTrailResponse: JSON formatted response from the UpdateTrail API call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "TrailName": {
+      "type": "String",
+      "description": "(Required) The ARN or name of the trail you want to update to be encrypted.",
+      "allowedPattern": "(^arn:(aws[a-zA-Z-]*)?:cloudtrail:[a-z0-9-]+:\\d{12}:trail\\/(?![-_.])(?!.*[-_.]{2})(?!.*[-_.]$)(?!^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$)[-\\w.]{3,128}$)|(^(?![-_.])(?!.*[-_.]{2})(?!.*[-_.]$)(?!^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$)[-\\w.]{3,128}$)"
+    },
+    "KmsKeyId": {
+      "description": "(Required) The ARN, key ID, or the key alias of the of the CMK you want to use to encrypt the trail you specify in the TrailName parameter.",
+      "type": "String",
+      "allowedPattern": "(^arn:(aws[a-z-]*)?:kms:.*:\\d{12}:alias/[a-zA-Z0-9/_-]{1,256}$)|(^alias/[a-zA-Z0-9/_-]{1,256}$)|(^arn:(aws[a-z-]*)?:kms:.*:\\d{12}:key/[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}$)|(^[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}$)"
+    },
+    "AutomationAssumeRole": {
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "type": "String",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    }
+  },
+  "outputs": [
+    "UpdateTrail.UpdateTrailResponse"
+  ],
+  "mainSteps": [
+    {
+      "name": "UpdateTrail",
+      "action": "aws:executeAwsApi",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 600,
+      "description": "## UpdateTrail\nEnables encryption on the trail you specify in the TrailName parameter.\n## Outputs\n* UpdateTrailResponse: Response from the UpdateTrail API call.\n",
+      "inputs": {
+        "Service": "cloudtrail",
+        "Api": "UpdateTrail",
+        "Name": "{{ TrailName }}",
+        "KmsKeyId": "{{ KmsKeyId }}"
+      },
+      "outputs": [
+        {
+          "Name": "UpdateTrailResponse",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "GetKMSKeyArn"
+    },
+    {
+      "name": "GetKMSKeyArn",
+      "action": "aws:executeAwsApi",
+      "description": "## GetKMSKeyArn\nGathers the ARN for the CMK you specify in the KMSKeyId parameter.\n## Outputs\nKMSKeyArn: The AWS KMS key ARN of the given KeyId parameter.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "kms",
+        "Api": "DescribeKey",
+        "KeyId": "{{ KmsKeyId }}"
+      },
+      "outputs": [
+        {
+          "Name": "KMSKeyArn",
+          "Selector": "$.KeyMetadata.Arn",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "VerifyTrail"
+    },
+    {
+      "name": "VerifyTrail",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "description": "## VerifyTrail\nVerifies that encryption has been enabled on the CloudTrail trail.\n",
+      "inputs": {
+        "Service": "cloudtrail",
+        "Api": "GetTrail",
+        "Name": "{{ TrailName }}",
+        "PropertySelector": "$.Trail.KmsKeyId",
+        "DesiredValues": [
+          "{{ GetKMSKeyArn.KMSKeyArn }}"
+        ]
+      }
+    }
+  ]
+}

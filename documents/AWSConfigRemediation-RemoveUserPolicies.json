@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-RemoveUserPolicies\n\n## What does this document do?\nThe AWSConfigRemediation-RemoveUserPolicies runbook deletes the AWS Identity and Access Management (IAM) inline policies and detaches any managed policies attached to the IAM user you specify using the [DeleteUserPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DeleteUserPolicy.html) and\n[DetachUserPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_DetachUserPolicy.html) APIs.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.\n* IAMUserID: (Required) The ID of the IAM user you want to remove policies from.\n* PolicyType: (Optional) The type of IAM policies you want to remove from IAM user.\n\n## Output Parameters\n* RemoveUserPoliciesAndVerify.Output: Success message and HTTP response metadata or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+"
+    },
+    "IAMUserID": {
+      "type": "String",
+      "description": "(Required) The ID of the IAM user you want to remove policies from.",
+      "allowedPattern": "^AIDA[A-Z0-9]+$"
+    },
+    "PolicyType": {
+      "type": "String",
+      "description": "(Optional) The type of IAM policies you want to remove from IAM user.",
+      "default": "All",
+      "allowedValues": [
+        "Inline",
+        "Managed",
+        "All"
+      ]
+    }
+  },
+  "outputs": [
+    "RemoveUserPoliciesAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "RemoveUserPoliciesAndVerify",
+      "action": "aws:executeScript",
+      "description": "## RemoveUserPoliciesAndVerify\nDeletes and detaches IAM policies from the IAM user you specify in the IAMUserID parameter.\n## Outputs\n* Output: Success message and HTTP response metadata or failure exception.\n",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "IAMUserID": "{{ IAMUserID }}",
+          "PolicyType": "{{ PolicyType }}"
+        },
+        "Script": "from time import sleep\n\nimport boto3\n\nPAGE_SIZE = 1000\nTHROTTLE_PERIOD = 0.05\n\n\ndef get_username(iam_client, iam_user_id):\n    paginator = iam_client.get_paginator(\"list_users\")\n    page_iterator = paginator.paginate(PaginationConfig={\"PageSize\": PAGE_SIZE})\n    for page in page_iterator:\n        for user in page[\"Users\"]:\n            username = user[\"UserName\"]\n            user_id = user[\"UserId\"]\n            if user_id == iam_user_id:\n                return username\n        sleep(THROTTLE_PERIOD)\n\n\ndef get_inline_policies(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_user_policies\")\n    page_iterator = paginator.paginate(UserName=iam_username, PaginationConfig={\"PageSize\": PAGE_SIZE})\n    policies = []\n    for page in page_iterator:\n        policy_names = page[\"PolicyNames\"]\n        policies.extend(policy_names)\n        sleep(THROTTLE_PERIOD)\n    return policies\n\n\ndef delete_inline_policies(iam_client, iam_username, user_policies):\n    responses = []\n    for policy in user_policies:\n        response = iam_client.delete_user_policy(UserName=iam_username, PolicyName=policy)\n        responses.append(response)\n    return responses\n\n\ndef get_managed_policies(iam_client, iam_username):\n    paginator = iam_client.get_paginator(\"list_attached_user_policies\")\n    page_iterator = paginator.paginate(UserName=iam_username, PaginationConfig={\"PageSize\": PAGE_SIZE})\n    policies = []\n    for page in page_iterator:\n        for policy in page[\"AttachedPolicies\"]:\n            policies.append(policy[\"PolicyArn\"])\n        sleep(THROTTLE_PERIOD)\n    return policies\n\n\ndef detach_managed_policies(iam_client, iam_username, attached_user_policies):\n    responses = []\n    for policy in attached_user_policies:\n        response = iam_client.detach_user_policy(UserName=iam_username, PolicyArn=policy)\n        responses.append(response)\n    return responses\n\n\ndef check_existing_policies(iam_user_id, policy_type, inline_policies_response, managed_policies_response):\n    error_message = None\n    if policy_type == \"All\" and not inline_policies_response and not managed_policies_response:\n        error_message = f\"AWS IAM user with user id, {iam_user_id}, has no inline user policies and no managed user policies.\"\n    if policy_type == \"Inline\" and not inline_policies_response:\n        error_message = f\"AWS IAM user with user id, {iam_user_id}, has no inline user policies.\"\n    if policy_type == \"Managed\" and not managed_policies_response:\n        error_message = f\"AWS IAM user with user id, {iam_user_id}, has no managed user policies.\"\n\n    if error_message is not None:\n        raise Exception(error_message)\n\n\ndef verify_user_policy_status(iam_client, iam_username, policy_type):\n    if policy_type in [\"Inline\", \"All\"]:\n        inline_policies = get_inline_policies(iam_client, iam_username)\n    if policy_type in [\"Managed\", \"All\"]:\n        managed_policies = get_managed_policies(iam_client, iam_username)\n\n    if policy_type == \"All\":\n        if not inline_policies and not managed_policies:\n            return {\"output\": \"Verification of AWS IAM user, deletion of inline user policies and detachment of managed user policies is successful.\"}\n        if inline_policies and managed_policies:\n            error_message = f\"VERIFICATION FAILED. AWS IAM USER WITH USERNAME, {iam_username}, DELETION OF INLINE USER POLICIES AND DETACHMENT OF MANAGED USER POLICIES UNSUCCESSFUL.\"\n        if inline_policies:\n            error_message = f\"VERIFICATION FAILED. AWS IAM USER WITH USERNAME, {iam_username}, DELETION OF INLINE USER POLICIES UNSUCCESSFUL.\"\n        if managed_policies:\n            error_message = f\"VERIFICATION FAILED. AWS IAM USER WITH USERNAME, {iam_username}, DETACHMENT OF MANAGED USER POLICIES UNSUCCESSFUL.\"\n    if policy_type == \"Inline\":\n        if not inline_policies:\n            return {\"output\": \"Verification of AWS IAM user, deletion of inline user policies is successful.\"}\n        else:\n            error_message = f\"VERIFICATION FAILED. AWS IAM WITH USERNAME, {iam_username}, DELETION OF INLINE USER POLICIES UNSUCCESSFUL.\"\n    if policy_type == \"Managed\":\n        if not managed_policies:\n            return {\"output\": \"Verification of AWS IAM user, detachment of managed policies is successful.\"}\n        else:\n            error_message = f\"VERIFICATION FAILED. AWS IAM WITH USERNAME, {iam_username}, DETACHMENT OF MANAGED USER POLICIES UNSUCCESSFUL.\"\n\n    if error_message:\n        raise Exception(error_message)\n\n\ndef handler(event, context):\n    iam_client = boto3.client(\"iam\")\n    iam_user_id = event[\"IAMUserID\"]\n    policy_type = event[\"PolicyType\"]\n\n    iam_username = get_username(iam_client, iam_user_id)\n    if iam_username is None:\n        error_message = f\"IAM user with user id, {iam_user_id}, does not exist.\"\n        raise Exception(error_message)\n\n    inline_policies_response = []\n    managed_policies_response = []\n    if policy_type in [\"Inline\", \"All\"]:\n        inline_policies = get_inline_policies(iam_client, iam_username)\n        if inline_policies:\n            inline_policies_response = delete_inline_policies(iam_client, iam_username, inline_policies)\n    if policy_type in [\"Managed\", \"All\"]:\n        managed_policies = get_managed_policies(iam_client, iam_username)\n        if managed_policies:\n            managed_policies_response = detach_managed_policies(iam_client, iam_username, managed_policies)\n\n    check_existing_policies(iam_user_id, policy_type, inline_policies_response, managed_policies_response)\n\n    results = verify_user_policy_status(iam_client, iam_username, policy_type)\n    if policy_type == \"All\":\n        results[\"delete_inline_policies_http_response\"] = inline_policies_response\n        results[\"detach_managed_policies_http_response\"] = managed_policies_response\n    if policy_type == \"Inline\":\n        results[\"delete_inline_policies_http_response\"] = inline_policies_response\n    if policy_type == \"Managed\":\n        results[\"detach_managed_policies_http_response\"] = managed_policies_response\n    return results"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
