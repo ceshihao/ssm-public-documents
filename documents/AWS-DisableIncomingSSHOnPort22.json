@@ -1,0 +1,47 @@
+{
+  "description": "#### Document Name - AWS-DisableIncomingSSHOnPort22\n\n## What does this document do?\nThis document disables unrestricted incoming SSH traffic on port 22 for EC2 security groups.\nTraffic to the targeted security groups is restricted by removing the ingress rule that allows unrestricted incoming SSH traffic from anywhere ('0.0.0.0/0' and '::/0').\n\n## Input Parameters\n* SecurityGroupIds: (Required) A comma separated list of security group IDs to restrict SSH traffic for.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* DisableIncomingSSHTemplate.RestrictedSecurityGroupIds: The list of the security group IDs with disabled incoming SSH on port 22.\n\n## Minimum Permissions Required\n* `ec2:DescribeSecurityGroups` and `ec2:RevokeSecurityGroupIngress` on the target security groups\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "SecurityGroupIds": {
+      "type": "StringList",
+      "description": "(Required) A comma separated list of security group IDs to restrict SSH traffic for.",
+      "allowedPattern": "^sg-[a-z0-9]{8,17}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "outputs": [
+    "DisableIncomingSSHTemplate.RestrictedSecurityGroupIds"
+  ],
+  "mainSteps": [
+    {
+      "name": "DisableIncomingSSHTemplate",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## DisableIncomingSSHTemplate\nDisables all incoming traffic on port 22 on the security groups.\n## Inputs\n* SecurityGroupIds: The list of targeted security group IDs.\n## Outputs\n* RestrictedSecurityGroupIds: The list of the security group IDs with disabled incoming SSH on port 22.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "disable_incoming_ssh_handler",
+        "InputPayload": {
+          "SecurityGroupIds": "{{SecurityGroupIds}}"
+        },
+        "Script": "import boto3\nimport time\nimport json\n\nSSH_PORT = 22\nTCP = 'tcp'\nPUBLIC_IPV4_CIDR = '0.0.0.0/0'\nPUBLIC_IPV6_CIDR = '::/0'\n\nec2_resource = boto3.resource(\"ec2\")\nec2_client = boto3.client(\"ec2\")\n\ndef is_sg_open_ssh_ipv4(sg_description):\n    for rule in sg_description[\"SecurityGroups\"][0][\"IpPermissions\"]:\n        if rule['FromPort'] == SSH_PORT and rule['ToPort'] == SSH_PORT:\n            for ip_range in rule['IpRanges']:\n                if ip_range['CidrIp'] == PUBLIC_IPV4_CIDR:\n                    return True,rule\n    return False, \"None\"\n\ndef is_sg_open_ssh_ipv6(sg_description):\n    for rule in sg_description[\"SecurityGroups\"][0][\"IpPermissions\"]:\n        if rule['FromPort'] == SSH_PORT and rule['ToPort'] == SSH_PORT:\n            for ip_range in rule['Ipv6Ranges']:\n                if ip_range['CidrIpv6'] == PUBLIC_IPV6_CIDR:\n                    print(rule)\n                    return True,rule\n    return False, \"None\"\n\ndef disable_incoming_ssh_handler(event, context):\n    sg_ids = event[\"SecurityGroupIds\"]\n    Restricted_sg_ids = []\n    Unrestricted_sg_ids = []\n    errorMsg = \"N/A\"\n    currentSg = None\n    successful = True\n    try:\n        for sg_id in sg_ids:\n            currentSg = sg_id\n            sg_description = ec2_client.describe_security_groups(GroupIds = [sg_id])\n            sg_resource = ec2_resource.SecurityGroup(sg_id)\n            open,rule = is_sg_open_ssh_ipv4(sg_description)\n            if open:\n                sg_resource.revoke_ingress(\n                    GroupId = sg_id,\n                    IpPermissions = [rule],\n                    DryRun = False\n                )\n            sg_description = ec2_client.describe_security_groups(GroupIds = [sg_id])\n            open, rule = is_sg_open_ssh_ipv6(sg_description)\n            if open:\n                sg_resource.revoke_ingress(\n                    GroupId = sg_id,\n                    IpPermissions = [rule],\n                    DryRun = False\n                )\n\n        time.sleep(3)\n        for sg_id in sg_ids:\n            sg_description = ec2_client.describe_security_groups(GroupIds = [sg_id])\n            openv4,rule = is_sg_open_ssh_ipv4(sg_description)\n            openv6,rule = is_sg_open_ssh_ipv6(sg_description)\n\n            if openv4 or openv6:\n                successful = False\n                Unrestricted_sg_ids.append(sg_id)\n            else:\n                Restricted_sg_ids.append(sg_id)\n\n    except Exception as e:\n        errorMsg = str(e)\n        successful = False\n        if \"InvalidGroup.NotFound\" in errorMsg:\n            errorMsg = \"The security group '{}' does not exist\".format(currentSg)\n\n    if not successful:\n        raise Exception(\"Unable to restrict one or more of the security groups Unrestricted_sg_ids: '{}', Restricted_sg_ids: '{}'. errorMsg: '{}'\".format(\n            Unrestricted_sg_ids, Restricted_sg_ids, errorMsg))\n\n    out = {\n        \"RestrictedSecurityGroupIds\": Restricted_sg_ids\n    }\n    return out\n"
+      },
+      "outputs": [
+        {
+          "Name": "RestrictedSecurityGroupIds",
+          "Selector": "$.Payload.RestrictedSecurityGroupIds",
+          "Type": "StringList"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "description": "### Document Name - AWS-ChangeDDBRWCapacityMode\n\n## What does this document do?\nThis document changes the read/write capacity mode for one or more DynamoDB tables to on-demand mode or provisioned mode.\n\n## Input Parameters\n* TableNames: (Required) Comma separated list of DynamoDB table names to change the read/write capacity mode for.\n* CapacityMode: (Required) The desired read/write capacity mode. When switching from on-demand(pay-per-request) to provisioned capacity, initial provisioned capacity values must be set. The initial provisioned capacity values are estimated based on the consumed read and write capacity of your table and global secondary indexes over the past 30 minutes.\n  * Allowed Values: PROVISIONED | PAY_PER_REQUEST\n* ReadCapacityUnits: (Optional) The maximum number of strongly consistent reads consumed per second before DynamoDB returns a ThrottlingException.\n* WriteCapacityUnits: (Optional) The maximum number of writes consumed per second before DynamoDB returns a ThrottlingException.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* ChangeDDBRWCapacityMode.SuccessesTables: List of DynamoDB table names where the capacity mode was successfully changed.\n* ChangeDDBRWCapacityMode.FailedTables: Maplist of DynamoDB table names where changing the capacity mode failed and the reason for the failure.\n\n## Minimum Permissions Required\n* `dynamodb:DescribeTable` on the target DynamoDB table.\n* `dynamodb:UpdateTable` on the target DynamoDB table.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "TableNames": {
+      "type": "StringList",
+      "description": "(Required) Comma separated string list for Dynamo DB table names to change Read/write capacity mode  to on-demand mode or provisioned mode.",
+      "allowedPattern": "[a-zA-Z0-9_.-]+"
+    },
+    "CapacityMode": {
+      "type": "String",
+      "description": "(Required) The desired read/write capacity mode.",
+      "allowedValues": [
+        "PROVISIONED",
+        "PAY_PER_REQUEST"
+      ]
+    },
+    "ReadCapacityUnits": {
+      "type": "Integer",
+      "description": "The maximum number of strongly consistent reads consumed per second before DynamoDB returns a ThrottlingException.",
+      "default": 0,
+      "allowedPattern": "^[0-9]\\d*$"
+    },
+    "WriteCapacityUnits": {
+      "type": "Integer",
+      "description": "The maximum number of writes consumed per second before DynamoDB returns a ThrottlingException.",
+      "default": 0,
+      "allowedPattern": "^[0-9]\\d*$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "outputs": [
+    "ChangeDDBRWCapacityMode.SuccessesTables",
+    "ChangeDDBRWCapacityMode.FailedTables"
+  ],
+  "mainSteps": [
+    {
+      "name": "ChangeDDBRWCapacityMode",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## RestrictIncomingTrafficTemplate\nChanges DynamoDB databases' read/write capacity mode to the desired setting.\n## Inputs\n* TableNames: The list of DynamoDB tables to change the read/write capacity mode for.\n* CapacityMode: The desired read/write capacity mode for the DynamoDB tables\n* ReadCapacityUnits: The maximum number of strongly consistent reads consumed per second before DynamoDB returns a ThrottlingException.\n* WriteCapacityUnits: The maximum number of writes consumed per second before DynamoDB returns a ThrottlingException.\n## Outputs\n* SuccessesTables: List of DynamoDB table names where the capacity mode was successfully changed.\n* FailedTables: Maplist of DynamoDB table names where changing the capacity mode failed and the reason for the failure.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "change_DDB_RW_capacity",
+        "InputPayload": {
+          "TableNames": "{{TableNames}}",
+          "CapacityMode": "{{CapacityMode}}",
+          "ReadCapacityUnits": "{{ReadCapacityUnits}}",
+          "WriteCapacityUnits": "{{WriteCapacityUnits}}"
+        },
+        "Script": "import json\nimport boto3\n\nclient = boto3.client('dynamodb')\n\ndef change_DDB_RW_capacity(event, context):\n    TableNames = event['TableNames']\n    CapacityMode = event['CapacityMode']\n    if 'ReadCapacityUnits' in event.keys():\n        ReadCapacityUnits = event['ReadCapacityUnits']\n    else:\n        ReadCapacityUnits = 0\n\n    if 'WriteCapacityUnits' in event.keys():\n        WriteCapacityUnits = event['WriteCapacityUnits']\n    else:\n        WriteCapacityUnits = 0\n    FailedTables = []\n    SuccessesTable = []\n    for TableName in TableNames:\n      try:\n          currentMode = get_current_capacity_mode(TableName)\n          if(currentMode.lower() == CapacityMode.lower()):\n              raise Exception(\"Table \" + \" already in \" + currentMode + \" mode.\")\n          if CapacityMode.lower() == \"PROVISIONED\".lower():\n              if ReadCapacityUnits > 0 and WriteCapacityUnits > 0:\n                  response = client.update_table(\n                      TableName = TableName,\n                      BillingMode = 'PROVISIONED',\n                      ProvisionedThroughput = {\n                          'ReadCapacityUnits': ReadCapacityUnits,\n                          'WriteCapacityUnits': WriteCapacityUnits\n                      }\n                  )\n              else:\n                  raise Exception(\"You must specify Read/Write capacity units in case of provisioned mode.\")\n          elif CapacityMode.lower() == \"PAY_PER_REQUEST\".lower():\n              response = client.update_table(\n                  TableName=TableName,\n                  BillingMode='PAY_PER_REQUEST'\n              )\n          else:\n              raise Exception(\"No capacity mode called: \" + CapacityMode)\n          SuccessesTable.append(TableName)\n      except Exception as e:\n          FailedTables.append({\"TableName\" : TableName , \"errorMsg\" : str(e)})\n      out = {\n          \"SuccessesTables\":SuccessesTable,\n          \"FailedTables\":FailedTables\n      }\n    return out\n\ndef get_current_capacity_mode(TableName):\n    TableDetails = client.describe_table(TableName = TableName)\n    current_RCU = TableDetails.get('Table').get('ProvisionedThroughput').get('ReadCapacityUnits')\n    current_WCU = TableDetails.get('Table').get('ProvisionedThroughput').get('WriteCapacityUnits')\n    if current_RCU == 0 or current_WCU == 0 :\n        return 'PAY_PER_REQUEST'\n    else :\n        return 'PROVISIONED'\n"
+      },
+      "outputs": [
+        {
+          "Name": "SuccessesTables",
+          "Selector": "$.Payload.SuccessesTables",
+          "Type": "StringList"
+        },
+        {
+          "Name": "FailedTables",
+          "Selector": "$.Payload.FailedTables",
+          "Type": "MapList"
+        }
+      ]
+    }
+  ]
+}

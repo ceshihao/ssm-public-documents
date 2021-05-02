@@ -1,0 +1,69 @@
+{
+  "description": "### Document Name - AWS-StartStopAuroraCluster\n\n## What does this document do?\nThis document starts or stops an Amazon Aurora DB cluster.\n\n## Notes:\nAurora DB clusters can't be started or stopped under certain conditions:\n* To start a cluster it must be in 'stopped' status.\n* To stop a cluster it must be in 'available' status.\n* You can't start or stop a cluster that's part of an [Aurora global database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html).\n* You can't start or stop a cluster that uses the [Aurora parallel query](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-mysql-parallel-query.html).\n* You can't start or stop an [Aurora Serverless cluster](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless.html).\n* You can't start or stop an [Aurora multi-master cluster](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-multi-master.html).\n\nIf an existing cluster can't be stopped and started, the automation will fail and will return a message describing the failure cause.\n\nFor more information, see [Stopping and Starting an Aurora Cluster](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-cluster-stop-start.html) in the Amazon Aurora User Guide.\n\n## Input Parameters\n* ClusterName: (Required) The name of the Aurora DB cluster.\n* Action: (Required) The action to take on the cluster. The cluster can be started or stopped.\n  * Allowed Values: Start | Stop\n  * Default: Start\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* StartStopAuroraCluster.ClusterName: The name of the Aurora DB cluster.\n* StartStopAuroraCluster.CurrentStatus: The current state of this DB cluster.\n* StartStopAuroraCluster.Message: Details of the execution result.\n\n## Minimum Permissions Required\n* `rds:StartDBCluster` on the targeted cluster.\n* `rds:StopDBCluster` on the targeted cluster.\n* `rds:DescribeDBClusters` on all clusters.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "ClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the Aurora DB cluster.",
+      "allowedPattern": "^[A-Za-z0-9_-]*$"
+    },
+    "Action": {
+      "type": "String",
+      "description": "(Required) The action to take on the cluster.",
+      "default": "Start",
+      "allowedValues": [
+        "Start",
+        "Stop"
+      ]
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "outputs": [
+    "StartStopAuroraCluster.ClusterName",
+    "StartStopAuroraCluster.Message",
+    "StartStopAuroraCluster.CurrentStatus"
+  ],
+  "mainSteps": [
+    {
+      "name": "StartStopAuroraCluster",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## StartStopAuroraCluster\nStarts or stops the targeted Aurora DB Cluster.\n## Inputs\n* ClusterName: The name of the Aurora DB cluster.\n* Action: The action to take on the cluster.\n## Outputs\n* ClusterName: Aurora cluster name.\n* CurrentStatus: Specifies the current state of this DB cluster.\n* Message: Details of the execution result.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_stop_aurora_cluster_handler",
+        "InputPayload": {
+          "ClusterName": "{{ClusterName}}",
+          "Action": "{{Action}}"
+        },
+        "Script": "import time\nimport boto3\n\nrds_client = boto3.client('rds')\n\nSTART= \"Start\"\nSTOP= \"Stop\"\nDB_AVAILABLE= \"available\"\nDB_STARTING= \"starting\"\nDB_STOPPED= \"stopped\"\nDB_STOPPING= \"stopping\"\n\ndef get_rejection_msg(engine_mode):\n\n    if engine_mode.lower() == \"global\":\n        return \"You can't start or stop a cluster that's part of an Aurora global database.\"\n\n    if engine_mode.lower() == \"parallelquery\":\n        return \"You can't start or stop a cluster that uses the Aurora parallel query.\"\n\n    if  engine_mode.lower() == \"serverless\":\n        return \"You can't start or stop an Aurora Serverless cluster.\"\n\n    if engine_mode.lower() == \"multimaster\":\n        return \"You can't start or stop an Aurora multi-master cluster.\"\n\n    return \"Unknown Engine Mode '{}'.\".format(engine_mode)\n\ndef start_cluster(cluster_name):\n    response = rds_client.start_db_cluster(\n        DBClusterIdentifier = cluster_name\n    )\n    time.sleep(1)\n    response = rds_client.describe_db_clusters(DBClusterIdentifier = cluster_name)\n    return response.get(\"DBClusters\")[0].get('Status')\n\ndef stop_cluster(cluster_name):\n    response = rds_client.stop_db_cluster(\n        DBClusterIdentifier = cluster_name\n    )\n    time.sleep(1)\n    response = rds_client.describe_db_clusters(DBClusterIdentifier = cluster_name)\n    return response.get(\"DBClusters\")[0].get('Status')\n\ndef start_stop_aurora_cluster_handler(event, context):\n    cluster_name = event.get(\"ClusterName\")\n    action = event.get(\"Action\")\n\n    out = {\n        \"ClusterName\": cluster_name,\n        \"Message\": \"None\",\n        \"CurrentStatus\": \"Not defined\"\n    }\n\n    try:\n        res = rds_client.describe_db_clusters(DBClusterIdentifier = cluster_name)\n        engine_mode = res.get(\"DBClusters\")[0].get('EngineMode')\n        db_cluster_status = res.get(\"DBClusters\")[0].get('Status')\n\n        if not engine_mode:\n            raise Exception(\"Aurora cluster '{}' not found.\".format(cluster_name))\n\n        if engine_mode.lower() != 'provisioned':\n            raise Exception(get_rejection_msg(engine_mode))\n\n        if action.lower() == START.lower():\n\n            if db_cluster_status in [DB_STARTING, DB_AVAILABLE]:\n                userMsg = \"Aurora cluster '{}' is in '{}' state.\".format(cluster_name, db_cluster_status)\n\n                out[\"Message\"] = userMsg\n                out[\"CurrentStatus\"] = db_cluster_status\n                return out\n\n            if db_cluster_status.lower() != DB_STOPPED:\n                raise Exception(\"Aurora cluster '{}' is not in valid state to be started, cluster status = '{}'.\".format(cluster_name, db_cluster_status))\n\n            db_cluster_status = start_cluster(cluster_name)\n            userMsg = \"Action 'Start' initiated on cluster '{}'.\".format(cluster_name)\n\n        elif action == STOP:\n            if db_cluster_status in  [DB_STOPPED, DB_STOPPING]:\n                userMsg = \"Aurora cluster '{}' is in '{}' state.\".format(cluster_name, db_cluster_status)\n                out[\"Message\"] = userMsg\n                out[\"CurrentStatus\"] = db_cluster_status\n                return out\n\n            if db_cluster_status.lower() != DB_AVAILABLE:\n                raise Exception(\"Aurora cluster '{}' is not in valid state to be stopped, cluster status = '{}'.\".format(cluster_name, db_cluster_status))\n\n            db_cluster_status = stop_cluster(cluster_name)\n\n            userMsg = \"Action 'Stop' initiated on Aurora cluster '{}'.\".format(cluster_name)\n\n        else:\n            raise Exception(\"Unknown Action '{}'.\".format(action))\n\n        out[\"Message\"] = userMsg\n        out[\"CurrentStatus\"] = db_cluster_status\n\n    except Exception as e:\n        errorMsg = str(e)\n        raise Exception(\"Unable to perform the required action '{}' on cluster '{}', error = '{}'.\".format(action, cluster_name, errorMsg))\n\n    return out\n"
+      },
+      "outputs": [
+        {
+          "Name": "ClusterName",
+          "Selector": "$.Payload.ClusterName",
+          "Type": "String"
+        },
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        },
+        {
+          "Name": "CurrentStatus",
+          "Selector": "$.Payload.CurrentStatus",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}
