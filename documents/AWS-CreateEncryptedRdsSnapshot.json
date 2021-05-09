@@ -1,0 +1,143 @@
+{
+  "description": "### Document Name - AWS-CreateEncryptedRdsSnapshot\n\n## What does this document do?\nThis document creates an encrypted RDS Snapshot for an unencrypted RDS instance.\n\n## Input Parameters\n* DBInstanceIdentifier: (Required) The identifier of the DB instance that you want to create the snapshot of.\n* DBSnapshotIdentifier: (Optional) The name template for the unencrypted RDS snapshot. The default name is the `DBInstanceIdentifier` parameter value appended with the the date and time of the snapshot's creation (DBInstanceIdentifier-yyyymmddhhmmss). Note that this snapshot will be deleted as part of this document's execution.\n* EncryptedDBSnapshotIdentifier: (Optional) The name for the final encrypted snapshot. The default name is the `DBSnapshotIdentifier` parameter value appended with `-encrypted`.\n* KmsKeyId: (Optional) ID, ARN or Alias for the AWS KMS Customer Master Key (CMK) to use. If no key is specified, the default encryption key for snapshots (`alias/aws/rds`) will be used.\n* InstanceTags: (Optional) Tags to add to the DB instance. (example: Key=tagKey1,Value=tagValue1;Key=tagKey2,Value=tagValue2)\n* SnapshotTags: (Optional) Tags to add to the snapshot. (example: Key=tagKey1,Value=tagValue1;Key=tagKey2,Value=tagValue2)\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* CopyRdsSnapshotToEncryptedRdsSnapshot.EncryptedSnapshotId: The ID of the encrypted RDS snapshot.\n\n## Minimum Permissions Required\n* `rds:DescribeDBSnapshots`\n* `rds:AddTagsToResource`\n* `rds:ListTagsForResource`\n* `rds:CreateDBSnapshot`\n* `rds:CopyDBSnapshot`\n* `rds:DeleteDBSnapshot`\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "DBInstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) The identifier of the DB instance that you want to create the snapshot of.",
+      "allowedPattern": "^[a-zA-Z]*([-]?[\\w]+)*$"
+    },
+    "DBSnapshotIdentifier": {
+      "type": "String",
+      "description": "(Optional) The name template for the RDS snapshot. The default name template is DBInstanceIdentifier-yyyymmddhhmmss.",
+      "default": "",
+      "allowedPattern": "^([\\w{}]*[\\-\\w]*[\\w{}])*$"
+    },
+    "EncryptedDBSnapshotIdentifier": {
+      "type": "String",
+      "description": "(Optional) The name for the encrypted snapshot. The default name is the `DBSnapshotIdentifier` parameter value appended with `-encrypted`.",
+      "default": "",
+      "allowedPattern": "^([\\w{}]*[\\-\\w]*[\\w{}])*$"
+    },
+    "KmsKeyId": {
+      "type": "String",
+      "description": "(Optional) ID, ARN or Alias for the AWS KMS Customer Master Key (CMK) to use.",
+      "default": "alias/aws/rds",
+      "allowedPattern": "^([\\w\\s_.:\\/=+\\-;{},@]*)$"
+    },
+    "InstanceTags": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) Tags to add to the DB instance. (example: Key=tagKey1,Value=tagValue1;Key=tagKey2,Value=tagValue2)",
+      "allowedPattern": "^([\\w\\s_.:\\/=+\\-;{},@]*)$"
+    },
+    "SnapshotTags": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) Tags to add to the snapshot. (example: Key=tagKey1,Value=tagValue1;Key=tagKey2,Value=tagValue2)",
+      "allowedPattern": "^([\\w\\s_.:\\/=+\\-;{},@]*)$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "outputs": [
+    "CopyRdsSnapshotToEncryptedRdsSnapshot.EncryptedSnapshotId"
+  ],
+  "mainSteps": [
+    {
+      "name": "CreateRdsSnapshot",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "## CreateRdsSnapshot\nCreates an unencrypted snapshot of the instance. This snapshot will be copied to an encrypted snapshot and then deleted in later steps.\n## Inputs\n* DBInstanceIdentifier: The identifier of the DB instance that you want to create the snapshot of.\n* DBSnapshotIdentifier: The name template for the RDS snapshot.\n* InstanceTags: Tags to add to the DB instance.\n* SnapshotTags: Tags to add to the snapshot.\n## Outputs\n* SnapshotId: The ID of the unencrypted snapshot.\n",
+      "outputs": [
+        {
+          "Name": "SnapshotId",
+          "Selector": "$.Payload.snapshot_id",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBInstanceIdentifier": "{{DBInstanceIdentifier}}",
+          "DBSnapshotIdentifier": "{{DBSnapshotIdentifier}}",
+          "InstanceTags": "{{InstanceTags}}",
+          "SnapshotTags": "{{SnapshotTags}}"
+        },
+        "Script": "import json\nimport re\nfrom datetime import datetime\nimport boto3\n\nDB_INSTANCE_ID = \"DBInstanceIdentifier\"\nINSTANCE_TAGS = \"InstanceTags\"\nSNAPSHOT_ARN = \"DBSnapshotArn\"\nSNAPSHOT_ID = \"DBSnapshotIdentifier\"\nSNAPSHOT_TAGS = \"SnapshotTags\"\nPH_DATE = \"date\"\nPH_DATETIME = \"datetime\"\nPH_EXECUTION_ID = \"execution-id\"\nPH_INSTANCE_ID = \"db-instance-id\"\nPH_SNAPSHOT_ID = \"db-snapshot-id\"\nPH_TIME = \"time\"\nPH_TAG_VAL_STR = \"{{{}}}\"\nTAG_SHORTCUT_EXPR = \"Key=(.+),\\s*Value=(.*)\"\n\ndef parse_tags(tags_str):\n    if re.match(\"({};?)+\".format(TAG_SHORTCUT_EXPR), tags_str):\n        matches = [re.match(TAG_SHORTCUT_EXPR, t.strip()) for t in tags_str.split(\";\")]\n        return [{\"Key\": m.group(1), \"Value\": m.group(2) if m.lastindex > 1 else \"\"} for m in matches]\n    else:\n        return json.loads(tags_str)\n\ndef build_tags(tag_str, context, tag_vars=None):\n    if tag_str == \"\":\n        return []\n    placeholders = tag_data(ctx=context, tag_vars=tag_vars)\n    tags = parse_tags(tag_str)\n    for tag in tags:\n        value = tag.get(\"Value\")\n        for p in placeholders:\n            value = value.replace(PH_TAG_VAL_STR.format(p), str(placeholders[p]))\n        tag[\"Value\"] = value\n    return tags\n\ndef template_string(s, context, str_vars=None):\n    result = s\n    data = tag_data(ctx=context, tag_vars=str_vars)\n    for p in data:\n        result = result.replace(PH_TAG_VAL_STR.format(p), str(data[p]))\n    return result\ndef tag_data(ctx, tag_vars):\n    def clean(s):\n        return s.replace(\":\", \"\").replace(\"-\", \"\").replace(\"T\", \"\")\n    dt = datetime.now().replace(microsecond=0)\n    data = {\n        PH_DATETIME: clean(dt.isoformat()),\n        PH_DATE: clean(dt.date().isoformat()),\n        PH_TIME: clean(dt.time().isoformat()),\n        PH_EXECUTION_ID: ctx.get('automation:EXECUTION_ID')\n    }\n    if tag_vars is not None:\n        for t in tag_vars:\n            data[t] = tag_vars[t]\n    return data\n\ndef handler(event, context):\n    client = boto3.client('rds')\n    inst_id = event[DB_INSTANCE_ID]\n    snapshot_str = event.get(SNAPSHOT_ID, \"\").strip()\n    if snapshot_str == \"\":\n        snapshot_str = \"{db-instance-id}-{datetime}\"\n    tag_vars = {\n        PH_INSTANCE_ID: inst_id,\n        SNAPSHOT_ID: \"\"\n    }\n    snapshot_id = template_string(snapshot_str, context, tag_vars)\n    args = {\n        DB_INSTANCE_ID: inst_id,\n        SNAPSHOT_ID: snapshot_id\n    }\n    response = client.create_db_snapshot(**args)\n    snapshot_arn = response[\"DBSnapshot\"][\"DBSnapshotArn\"]\n\n    snapshot_tag_str = event.get(SNAPSHOT_TAGS, \"\")\n    if len(snapshot_tag_str) > 0:\n        snapshot_tags = build_tags(snapshot_tag_str, context, tag_vars)\n        if len(snapshot_tags) > 0:\n            client.add_tags_to_resource(ResourceName=snapshot_arn, Tags=snapshot_tags)\n\n    instance_tag_str = event.get(INSTANCE_TAGS, \"\")\n    if len(instance_tag_str) > 0:\n        tag_vars[PH_SNAPSHOT_ID] = snapshot_id\n        instance_tags = build_tags(instance_tag_str, context, tag_vars)\n        if len(instance_tags) > 0:\n            db_arn = \":\".join(snapshot_arn.split(\":\")[0:5]) + \":db:\" + inst_id\n            client.add_tags_to_resource(ResourceName=db_arn, Tags=instance_tags)\n    return {'snapshot_id' : snapshot_id}\n"
+      }
+    },
+    {
+      "name": "VerifyRdsSnapshot",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "## VerifyRdsSnapshot\nVerifies that the snapshot created in the previous step exists.\n## Inputs\n* DBSnapshotId: The ID of the unencrypted snapshot.\n## Outputs\nThis step has no outputs.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBSnapshotId": "{{CreateRdsSnapshot.SnapshotId}}"
+        },
+        "Script": "import boto3\nimport time\n\nrds_client = boto3.client('rds')\n\ndef handler(event, context):\n    snapshot_id = event[\"DBSnapshotId\"]\n    while True:\n        try:\n            snapshots = rds_client.describe_db_snapshots(DBSnapshotIdentifier=snapshot_id).get(\"DBSnapshots\", [{}])\n            if snapshots[0].get(\"Status\", \"\") == \"available\":\n                return\n            time.sleep(20)\n        except Exception as e:\n            print(e)\n            time.sleep(20)\n            pass\n"
+      }
+    },
+    {
+      "name": "CopyRdsSnapshotToEncryptedRdsSnapshot",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "## CopyRdsSnapshotToEncryptedRdsSnapshot\nCopies the previously created snapshot to an encrypted snapshot.\n## Inputs\n* DBSnapshotId: The ID of the unencrypted snapshot.\n## Outputs\n* EncryptedSnapshotId: The ID of the encrypted snapshot.\n",
+      "outputs": [
+        {
+          "Name": "EncryptedSnapshotId",
+          "Selector": "$.Payload.snapshot_id",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBSnapshotId": "{{CreateRdsSnapshot.SnapshotId}}",
+          "EncryptedDBSnapshotIdentifier": "{{EncryptedDBSnapshotIdentifier}}",
+          "KmsKeyIdentifier": "{{KmsKeyId}}"
+        },
+        "Script": "import boto3\nfrom datetime import datetime\n\ndef handler(event, context):\n    SOURCE_SNAPSHOT_ID = event[\"DBSnapshotId\"]\n    DEST_SNAPSHOT_ID = event[\"EncryptedDBSnapshotIdentifier\"]\n    if event[\"EncryptedDBSnapshotIdentifier\"] == \"\":\n        DEST_SNAPSHOT_ID = event[\"DBSnapshotId\"] + \"-encrypted\"\n    kmskey_id = event[\"KmsKeyIdentifier\"]\n    if event[\"KmsKeyIdentifier\"] == \"\":\n        kmskey_id = \"alias/aws/rds\"\n    client = boto3.client('rds')\n    response = client.copy_db_snapshot(\n        SourceDBSnapshotIdentifier=SOURCE_SNAPSHOT_ID,\n        TargetDBSnapshotIdentifier=DEST_SNAPSHOT_ID,\n        KmsKeyId=kmskey_id,\n        CopyTags=True,\n    )\n    snapshot_id = response[\"DBSnapshot\"][\"DBSnapshotIdentifier\"]\n    return {'snapshot_id' : snapshot_id}\n"
+      }
+    },
+    {
+      "name": "VerifyRdsEncryptedSnapshot",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "## VerifyRdsEncryptedSnapshot\nVerifies that the encrypted snapshot created in the previous step exists.\n## Inputs\n* EncryptedDBSnapshotId: The ID of the encrypted snapshot.\n## Outputs\nThis step has no outputs.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "EncryptedDBSnapshotId": "{{CopyRdsSnapshotToEncryptedRdsSnapshot.EncryptedSnapshotId}}"
+        },
+        "Script": "import boto3\nimport time\n\nrds_client = boto3.client('rds')\n\ndef handler(event, context):\n    snapshot_id = event[\"EncryptedDBSnapshotId\"]\n    while True:\n        try:\n            snapshots = rds_client.describe_db_snapshots(DBSnapshotIdentifier = snapshot_id).get(\"DBSnapshots\", [{}])\n            if snapshots[0].get(\"Status\", \"\") == \"available\" and snapshots[0].get(\"Encrypted\", False) == True:\n                return\n            time.sleep(20)\n        except Exception as e:\n            print(e)\n            time.sleep(20)\n            pass\n"
+      }
+    },
+    {
+      "name": "DeleteUnencryptedRdsSnapshot",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "description": "## DeleteUnencryptedRdsSnapshot\nDeletes the unencrypted snapshot.\n## Inputs\n* DBSnapshotId: The ID of the unencrypted snapshot.\n## Outputs\nThis step has no outputs.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBSnapshotId": "{{CreateRdsSnapshot.SnapshotId}}"
+        },
+        "Script": "import boto3\nimport time\n\nrds_client = boto3.client('rds')\n\ndef handler(event, context):\n    snapshot_id = event[\"DBSnapshotId\"]\n    wait_period = 5\n    retries = 5\n    while True:\n        try:\n            rds_client.delete_db_snapshot(DBSnapshotIdentifier=snapshot_id)\n            return True\n        except Exception as ex:\n            # As the list of snapshot is eventually consistent old snapshots might appear in listed snapshots\n            if getattr(ex, \"response\", {}).get(\"Error\", {}).get(\"Code\", \"\") == \"InvalidSnapshot.NotFound\":\n                return False\n            # Throttling might occur when deleting snapshots too fast\n            if \"throttling\" in ex.message.lower():\n                retries -= 1\n                if retries == 0:\n                    raise ex\n                time.sleep(wait_period)\n                wait_period = min(wait_period + 10 , 30)\n                continue\n            raise ex\n"
+      }
+    }
+  ]
+}

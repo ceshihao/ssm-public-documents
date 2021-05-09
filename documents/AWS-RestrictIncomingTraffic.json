@@ -1,0 +1,58 @@
+{
+  "description": "## Document Name - AWS-RestrictIncomingTraffic\n\n## What does this document do?\nThis document restricts incoming TCP traffic to EC2 security groups on specified ports.\nThe incoming traffic is restricted by removing the ingress rule that allows unrestricted incoming traffic from anywhere ('0.0.0.0/0' and '::/0') to the specified ports.\n\n## Notes\nThis document will successfully execute even if restricting the traffic fails for one or more security groups.\nPlease check the execution output for complete information on successes and failures.\n\n## Input Parameters\n* SecurityGroupIds: (Required) A comma separated list of security group IDs to restrict traffic for.\n* Ports: (Required) A comma separated list of ports to restrict incoming traffic for.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* RestrictIncomingTraffic.RestrictedSecurityGroupIds: A list of the security groups which were successfully restricted.\n* RestrictIncomingTraffic.UnrestrictedSecurityGroupIds: A maplist of the security groups which were not successfully restricted and the ports it failed for.\n\n## Minimum Permissions Required\n* `ec2:DescribeSecurityGroups` and `ec2:RevokeSecurityGroupIngress` on the targeted security groups.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "SecurityGroupIds": {
+      "type": "StringList",
+      "description": "(Required) A comma separated list of security group IDs to restrict traffic for.",
+      "allowedPattern": "^sg-[a-z0-9]{8,17}$"
+    },
+    "Ports": {
+      "type": "StringList",
+      "description": "(Required) A comma separated list of ports to restrict incoming traffic for.",
+      "allowedPattern": "^[0-9]*$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "outputs": [
+    "RestrictIncomingTraffic.RestrictedSecurityGroupIds",
+    "RestrictIncomingTraffic.UnrestrictedSecurityGroupIds"
+  ],
+  "mainSteps": [
+    {
+      "name": "RestrictIncomingTraffic",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## RestrictIncomingTraffic\nRestricts ingress to the targeted security groups and ports.\n## Inputs\n* SecurityGroupIds: The list of security groups to restrict incoming traffic for.\n* Ports: The list of ports to restrict incoming traffic for.\n## Outputs\n* RestrictedSecurityGroupIds: A list of the security groups which were successfully restricted.\n* UnrestrictedSecurityGroupIds: A maplist of the security groups which were not successfully restricted and the ports it failed for.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "restrict_incoming_traffic",
+        "InputPayload": {
+          "SecurityGroupIds": "{{SecurityGroupIds}}",
+          "Ports": "{{Ports}}"
+        },
+        "Script": "import boto3\n\nTCP = 'tcp'\nPUBLIC_IPV4_CIDR = '0.0.0.0/0'\nPUBLIC_IPV6_CIDR = '::/0'\nec2_resource = boto3.resource(\"ec2\")\nec2_client = boto3.client(\"ec2\")\n\ndef is_sg_open_port_ipv4(port, sg_description):\n    port = int(port)\n    for rule in sg_description[\"SecurityGroups\"][0][\"IpPermissions\"]:\n        if rule['FromPort'] == port and rule['ToPort'] == port:\n            for ip_range in rule['IpRanges']:\n                if ip_range['CidrIp'] == PUBLIC_IPV4_CIDR:\n                    return True, rule\n    return False, \"None\"\n\ndef is_sg_open_port_ipv6(port, sg_description):\n    port = int(port)\n    for rule in sg_description[\"SecurityGroups\"][0][\"IpPermissions\"]:\n        if rule['FromPort'] == port and rule['ToPort'] == port:\n            for ip_range in rule['Ipv6Ranges']:\n                if ip_range['CidrIpv6'] == PUBLIC_IPV6_CIDR:\n                    return True, rule\n    return False, \"None\"\n\ndef restrict_incoming_traffic(event, context):\n    sg_ids = event[\"SecurityGroupIds\"]\n    ports = event[\"Ports\"]\n    Restricted_sg_ids = []\n    UnRestricted_sg_ids = []\n    errorMsg = \"N/A\"\n    try:\n        for sg_id in sg_ids:\n            isSuccessful = False\n            try:\n                sg_description = ec2_client.describe_security_groups(GroupIds = [sg_id])\n                sg_resource = ec2_resource.SecurityGroup(sg_id)\n                for port in ports:\n                    openv4, rule = is_sg_open_port_ipv4(port, sg_description)\n                    if openv4:\n                        response = sg_resource.revoke_ingress(\n                            GroupId = sg_id,\n                            IpPermissions = [{\n                                'FromPort': int(port),\n                                'IpProtocol': TCP,\n                                'ToPort': int(port),\n                                'IpRanges': [{'CidrIp': PUBLIC_IPV4_CIDR}]\n                            }],\n                            DryRun = False\n                        )\n                        if response:\n                            if \"Return\" in response:\n                                if response[\"Return\"]:\n                                    isSuccessful = True\n                        if not isSuccessful:\n                            errorMsg = \"Request revoke_ingress on port {} for security group '{}' failed for IPv4.\".format(port, sg_id)\n\n                    openv6, rule = is_sg_open_port_ipv6(port,sg_description)\n                    if openv6:\n                        response = sg_resource.revoke_ingress(\n                            GroupId = sg_id,\n                            IpPermissions = [{\n                                'FromPort': int(port),\n                                'IpProtocol': TCP,\n                                'ToPort': int(port),\n                                'Ipv6Ranges': [{'CidrIpv6': PUBLIC_IPV6_CIDR}]\n                            }],\n                            DryRun = False\n                        )\n                        if response:\n                            if \"Return\" in response:\n                                if response[\"Return\"] == True:\n                                    isSuccessful = True\n                        if isSuccessful:\n                            errorMsg = \"Request revoke_ingress on port {} for security group '{}' failed for IPv6.\".format(port, sg_id)\n\n                    if not openv6 and not openv4:\n                        isSuccessful = True\n\n            except Exception as e:\n                isSuccessful = False\n                errorMsg = str(e)\n\n            if isSuccessful:\n                Restricted_sg_ids.append(sg_id)\n            else:\n                UnRestricted_sg_ids.append({\"groupId\": sg_id, \"error\": errorMsg})\n\n    except Exception as e:\n        isSuccessful = False\n        errorMsg = str(e)\n\n    return {\n        \"RestrictedSecurityGroupIds\": Restricted_sg_ids,\n        \"UnrestrictedSecurityGroupIds\": UnRestricted_sg_ids\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "RestrictedSecurityGroupIds",
+          "Selector": "$.Payload.RestrictedSecurityGroupIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "UnrestrictedSecurityGroupIds",
+          "Selector": "$.Payload.UnrestrictedSecurityGroupIds",
+          "Type": "MapList"
+        }
+      ]
+    }
+  ]
+}

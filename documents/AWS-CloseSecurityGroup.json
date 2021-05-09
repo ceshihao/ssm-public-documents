@@ -1,0 +1,37 @@
+{
+  "description": "### Document Name - AWS-CloseSecurityGroup\n\n## What does this document do?\nThis document closes traffic to and from a security group by removing any ingress and egress rules from it.\n\n## Input Parameters\n* SecurityGroupId: (Required) Security group id, This security group will be closed by removing any ingress or egress rules.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\nThis document has no outputs.\n\n## Minimum Permissions Required\n* `ec2:RevokeSecurityGroupIngress`\n* `ec2:RevokeSecurityGroupEgress`\n* `ec2:DescribeSecurityGroups`\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "SecurityGroupId": {
+      "type": "String",
+      "description": "(Required) The security group ID.",
+      "allowedPattern": "^(sg-)([0-9a-f]){1,}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CloseSecurityGroup",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## CloseSecurityGroup\nRemoves any ingress and egress rules from the security group.\n## Inputs\n* SecurityGroupId: The security group ID.\n## Outputs\nThis step has no outputs.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "close_security_group_handler",
+        "InputPayload": {
+          "SecurityGroupId": "{{SecurityGroupId}}"
+        },
+        "Script": "import boto3\n\nec2_resource = boto3.resource(\"ec2\")\nec2_client = boto3.client(\"ec2\")\n\ndef close_security_group_handler(event, context):\n    sg_id = event[\"SecurityGroupId\"]\n    sg_resource = ec2_resource.SecurityGroup(sg_id)\n    successful = True\n    errorMsg = \"\"\n    try:\n        sg_description = ec2_client.describe_security_groups(GroupIds = [sg_id])\n        ip_permissions = sg_description[\"SecurityGroups\"][0][\"IpPermissions\"]\n        ip_permissions_egress = sg_description[\"SecurityGroups\"][0][\"IpPermissionsEgress\"]\n\n        if ip_permissions:\n            revoke_response = sg_resource.revoke_ingress(\n                    GroupId = sg_id,\n                    IpPermissions = ip_permissions,\n                    DryRun = False\n            )\n            if not revoke_response.get(\"Return\"):\n                successful = False\n\n        if ip_permissions_egress:\n            revoke_egress_response = sg_resource.revoke_egress(\n                    GroupId = sg_id,\n                    IpPermissions = ip_permissions_egress,\n                    DryRun = False\n            )\n            if not revoke_egress_response.get(\"Return\"):\n                successful = False\n\n    except Exception as e:\n        errorMsg = str(e)\n        successful = False\n        if \"InvalidGroup.NotFound\" in errorMsg or \"InvalidGroupId.Malformed\" in errorMsg:\n            errorMsg = \"The security group '{}' does not exist\".format(sg_id)\n\n    if not successful:\n        raise Exception(\"Unable to close the security group '{}'. error: '{}'.\".format(sg_id, errorMsg))\n"
+      }
+    }
+  ]
+}
