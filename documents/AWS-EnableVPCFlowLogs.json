@@ -1,0 +1,87 @@
+{
+  "description": "### Document Name - AWS-EnableVPCFlowLogs\n\n## What does this document do?\nThis document creates a flow log for a VPC to capture information about its IP traffic. The logs can be published to CloudWatch or S3.\nWhen publishing to CloudWatch logs, the flow log records are published to a log group and each network interface has a unique log stream in the log group.\nWhen publishing to Amazon S3, the flow log records for all of the monitored network interfaces are published to a single log file object that is stored in the specified bucket.\n\n## Notes\nThis document will execute successfully even if enabling flow logs fails for one or more VPCs. Please check the execution output for complete information on successes and failures.\n\n## Input Parameters\n* VPCIds: (Required) A comma separated list of the VPC IDs.\n* LogDestinationType: (Optional) The destination type to which the flow log data should be published.\n  * Allowed Values: cloud-watch-logs | s3\n  * Default: cloud-watch-logs\n* LogDestinationArn: (Required) The destination to which the flow log data should be published. Flow log data\n  can be published to a CloudWatch Logs log group or an Amazon S3 bucket. The value specified for this parameter depends on the value specified for LogDestinationType.\n* DeliverLogsPermissionArn: (Optional) The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account.\n  If you specified LogDestinationType as `s3`, do not specify DeliverLogsPermissionArn.\n* TrafficType: (Optional) The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.\n  * Allowed Values: ALL | ACCEPT | REJECT\n  * Default: ALL\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* EnableVPCFlowLogs.SuccessfulVPCs: A list of VPC IDs for which flow logs were successfully enabled.\n* EnableVPCFlowLogs.FailedVPCs: A mapList of VPC IDs for which flow logs could not be enabled and the reason for the failure.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "outputs": [
+    "EnableVPCFlowLogs.SuccessfulVPCs",
+    "EnableVPCFlowLogs.FailedVPCs"
+  ],
+  "parameters": {
+    "VPCIds": {
+      "type": "StringList",
+      "description": "(Required) A comma separated list of the VPC IDs.",
+      "allowedPattern": "^(vpc-.*\\S.*)"
+    },
+    "LogDestinationType": {
+      "type": "String",
+      "allowedValues": [
+        "cloud-watch-logs",
+        "s3"
+      ],
+      "description": "(Optional) The destination type to which the flow log data should be published.",
+      "default": "cloud-watch-logs"
+    },
+    "LogDestinationArn": {
+      "type": "String",
+      "description": "(Required) The destination to which the flow log data should be published.",
+      "allowedPattern": "^(arn:aws(-cn|-us-gov)?:.*\\S.*)"
+    },
+    "DeliverLogsPermissionArn": {
+      "type": "String",
+      "description": "(Optional) The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account.",
+      "default": "",
+      "allowedPattern": "^(arn:aws(-cn|-us-gov)?:.*\\S.*)|^$"
+    },
+    "TrafficType": {
+      "type": "String",
+      "description": "(Optional) The type of traffic to log.",
+      "allowedValues": [
+        "ACCEPT",
+        "REJECT",
+        "ALL"
+      ],
+      "default": "ALL"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "EnableVPCFlowLogs",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## EnableVPCFlowLogs\nEnables flow logs for the target VPCs.\n## Inputs\n* VPCIds: A comma separated list of the VPC IDs.\n* LogDestinationType: The destination type to which the flow log data should be published.\n* LogDestinationArn: The destination to which the flow log data should be published.\n* DeliverLogsPermissionArn: The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account.\n* TrafficType: The type of traffic to log.\n## Output parameters\n* SuccessfulVPCs: A list of VPC IDs for which flow logs were successfully enabled.\n* FailedVPCs: A mapList of VPC IDs for which flow logs could not be enabled and the reason for the failure.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "enable_VPC_FlowLogs",
+        "InputPayload": {
+          "VPCIds": "{{VPCIds}}",
+          "LogDestinationType": "{{LogDestinationType}}",
+          "LogDestinationArn": "{{LogDestinationArn}}",
+          "DeliverLogsPermissionArn": "{{DeliverLogsPermissionArn}}",
+          "TrafficType": "{{TrafficType}}"
+        },
+        "Script": "import json\nimport boto3\n\ndef enable_VPC_FlowLogs(event, context):\n  client = boto3.client('ec2')\n\n  FailedVPCs = []\n  SuccessesVPCs = []\n\n  VPCIds = event['VPCIds']\n  LogDestinationType  = event['LogDestinationType']\n  LogDestinationArn  = event['LogDestinationArn']\n  TrafficType = event['TrafficType']\n\n  if 'DeliverLogsPermissionArn' in event.keys():\n      DeliverLogsPermissionArn  = event['DeliverLogsPermissionArn']\n\n  for vpcid in VPCIds:\n      try:\n          if LogDestinationType.lower() == \"cloud-watch-logs\".lower():\n              response = client.create_flow_logs(\n                  LogDestinationType = 'cloud-watch-logs',\n                  ResourceIds = [vpcid],\n                  ResourceType = 'VPC',\n                  TrafficType = TrafficType,\n                  LogDestination = LogDestinationArn,\n                  DeliverLogsPermissionArn = DeliverLogsPermissionArn\n              )\n\n          elif LogDestinationType.lower() == \"s3\".lower():\n              response = client.create_flow_logs(\n                  LogDestinationType = 's3',\n                  ResourceIds = [vpcid],\n                  ResourceType = 'VPC',\n                  TrafficType = TrafficType,\n                  LogDestination = LogDestinationArn,\n              )\n\n          if not response['FlowLogIds']:\n              errorMsg = response['Unsuccessful'][0]['Error']['Message']\n              FailedVPCs.append({\"VPCId\": vpcid , \"error\": errorMsg})\n          else:\n              SuccessesVPCs.append(vpcid)\n      except Exception as e :\n          FailedVPCs.append({\"VPCId\": vpcid , \"error\":  str(e)})\n\n  return {\n      'FailedVPCs': FailedVPCs,\n      'SuccessfulVPCs': SuccessesVPCs\n  }\n"
+      },
+      "outputs": [
+        {
+          "Name": "SuccessfulVPCs",
+          "Selector": "$.Payload.SuccessfulVPCs",
+          "Type": "StringList"
+        },
+        {
+          "Name": "FailedVPCs",
+          "Selector": "$.Payload.FailedVPCs",
+          "Type": "MapList"
+        }
+      ]
+    }
+  ]
+}

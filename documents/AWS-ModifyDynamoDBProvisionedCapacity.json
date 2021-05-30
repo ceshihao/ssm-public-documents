@@ -1,0 +1,70 @@
+{
+  "description": "### AWS-ModifyDynamoDBProvisionedCapacity\n\n## What does this document do?\nThis document modifies the read/write provisioned capacity of a DynamoDB table.\n\n## Notes\n* Consider the [Throughput Default Quotas](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Limits.html#default-limits-throughput-capacity-modes)\n* While the document is executing, the table status changes from ACTIVE to UPDATING. While it is UPDATING, you cannot issue another execution on the same table. When the table returns to the ACTIVE state, the document execution will complete.\n\n## Input Parameters\n* TableName: (Required) The name of the DynamoDB table to be modified.\n* ReadCapacityUnits: (Required) The maximum number of strongly consistent reads consumed per second before DynamoDB returns a ThrottlingException. For more information, see [Specifying Read and Write Requirements](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithTables.html#ProvisionedThroughput) in the Amazon DynamoDB Developer Guide.\n* WriteCapacityUnits: (Required) The maximum number of writes consumed per second before DynamoDB returns a ThrottlingException. For more information, see [Specifying Read and Write Requirements](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithTables.html#ProvisionedThroughput) in the Amazon DynamoDB Developer Guide.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* ModifyDynamoDBProvisionedCapacity.TableName: The name of the modified DynamoDB table.\n* ModifyDynamoDBProvisionedCapacity.TableStatus: The status of the modified DynamoDB table.\n* ModifyDynamoDBProvisionedCapacity.Message: Details of the execution result.\n\n## Minimum Permissions Required\n* `dynamodb:DescribeTable` on the targeted table.\n* `dynamodb:UpdateTable` on the targeted table.\n* `dynamodb:DescribeLimits` on \"Resource\": \"*\".\n* `application-autoscaling:DescribeScalingPolicies` on \"Resource\": \"*\".\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "TableName": {
+      "type": "String",
+      "description": "(Required) The name of the DynamoDB table to be modified.",
+      "allowedPattern": "(?=^.{3,255}$)(^[A-Za-z0-9_.-]*$)"
+    },
+    "ReadCapacityUnits": {
+      "type": "Integer",
+      "description": "(Required) The maximum number of strongly consistent reads consumed per second before DynamoDB returns a ThrottlingException.",
+      "allowedPattern": "^[0-9]\\d*$"
+    },
+    "WriteCapacityUnits": {
+      "type": "Integer",
+      "description": "(Required) The maximum number of writes consumed per second before DynamoDB returns a ThrottlingException.",
+      "allowedPattern": "^[0-9]\\d*$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    }
+  },
+  "outputs": [
+    "ModifyDynamoDBProvisionedCapacity.TableName",
+    "ModifyDynamoDBProvisionedCapacity.TableStatus",
+    "ModifyDynamoDBProvisionedCapacity.Message"
+  ],
+  "mainSteps": [
+    {
+      "name": "ModifyDynamoDBProvisionedCapacity",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "description": "## ModifyDynamoDBProvisionedCapacity\nModifies the read/write provisioned capacity of the targeted table.\n## Inputs\n* TableName: The name of the DynamoDB table to be Modified.\n* ReadCapacityUnits: (Required) The maximum number of strongly consistent reads consumed per second before DynamoDB returns a ThrottlingException.\n* WriteCapacityUnits: (Required): The maximum number of writes consumed per second before DynamoDB returns a ThrottlingException.\n## Outputs\n* TableName: The name of the modified DynamoDB table.\n* TableStatus: The status of the modified DynamoDB table.\n* Message: Details of the execution result.\n",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "modify_dynamodb_provisioned_capacity_handler",
+        "InputPayload": {
+          "TableName": "{{TableName}}",
+          "ReadCapacityUnits": "{{ReadCapacityUnits}}",
+          "WriteCapacityUnits": "{{WriteCapacityUnits}}"
+        },
+        "Script": "import boto3\nimport time\nimport json\n\ndynamodb_client = boto3.client('dynamodb')\nasg_client = boto3.client('application-autoscaling')\n\nACTIVE_STATUS = 'ACTIVE'\nMAX_RETRIALS = 10\ncount = 0\nupdate_retries = 0\ndescribe_limits_response = dynamodb_client.describe_limits()\nTableMaxReadCapacityUnits = describe_limits_response.get(\"TableMaxReadCapacityUnits\")\nTableMaxWriteCapacityUnits = describe_limits_response.get(\"TableMaxWriteCapacityUnits\")\n\ndef check_autoScaling_config(table_name):\n    resource_id ='table/'+table_name\n    result = ''\n    response = asg_client.describe_scaling_policies(\n        ServiceNamespace='dynamodb',\n        ResourceId=resource_id,\n        ScalableDimension='dynamodb:table:ReadCapacityUnits',\n        MaxResults=50\n    )\n    if \"ScalingPolicies\" in response:\n        if response[\"ScalingPolicies\"]:\n            result += 'r'\n    else:\n        raise Exception(\"Unexpected error: Can't get scaling policies for table '{}'\".format(table_name))\n    response = asg_client.describe_scaling_policies(\n        ServiceNamespace='dynamodb',\n        ResourceId=resource_id,\n        ScalableDimension='dynamodb:table:WriteCapacityUnits',\n        MaxResults=50\n    )\n    if \"ScalingPolicies\" in response:\n        if response[\"ScalingPolicies\"]:\n            result += 'w'\n    else:\n        raise Exception(\"Unexpected error: Can't get scaling policies for table '{}'\".format(table_name))\n    return result\n\ndef wait_table_active(table_name):\n    global count\n    time.sleep(3)\n    response = dynamodb_client.describe_table(\n            TableName=table_name\n        )\n    if response.get('Table').get('TableStatus') != ACTIVE_STATUS and count < MAX_RETRIALS:\n        count+=1\n        response = wait_table_active(table_name)\n    return response\n\ndef update_capacity_units(table_name,RCU,WCU):\n    global update_retries\n    dynamodb_client.update_table(\n        ProvisionedThroughput={\n            'ReadCapacityUnits': RCU,\n            'WriteCapacityUnits': WCU,\n        },\n        TableName=table_name,\n    )\n\n    response = wait_table_active(table_name)\n\n    current_RCU = response.get('Table').get('ProvisionedThroughput').get('ReadCapacityUnits')\n    current_WCU = response.get('Table').get('ProvisionedThroughput').get('WriteCapacityUnits')\n\n    if ( current_RCU != RCU or  current_WCU != WCU ) and update_retries < 3:\n        update_retries+=1\n        table_status = update_capacity_units(RCU)\n\n    return response.get('Table').get('TableStatus')\n\n\ndef modify_dynamodb_provisioned_capacity_handler(event, context):\n    table_name = event['TableName']\n    RCU = event['ReadCapacityUnits']\n    WCU = event['WriteCapacityUnits']\n    global update_retries\n    table_status = 'UNKNOWN'\n    msg = \"Table: '{}' Provisioned capacity modified successfully, RCU: '{}' WCU: '{}'. \".format(table_name,RCU,WCU)\n\n    out = {\n        'TableName': table_name,\n        'TableStatus': table_status,\n        'Message': {}\n    }\n\n    try:\n        response = dynamodb_client.describe_table(\n            TableName=table_name\n        )\n\n        table_status = response.get('Table').get('TableStatus')\n\n        if table_status != ACTIVE_STATUS:\n            raise Exception(\"Table: '{}' not in 'ACTIVE' status. You can't update the table unless it's in 'ACTIVE' status.\".format(table_name))\n\n        current_RCU = response.get('Table').get('ProvisionedThroughput').get('ReadCapacityUnits')\n        current_WCU = response.get('Table').get('ProvisionedThroughput').get('WriteCapacityUnits')\n\n        if  current_RCU == 0 or current_WCU == 0 :\n            raise Exception(\"Table: '{}' is using On-demand Read/Write Capacity Mode. Update Failed.\".format(table_name))\n\n        if current_RCU == RCU and current_WCU == WCU:\n\n            out['TableStatus'] = table_status\n            out['Message'] = \"Table: '{}' Provisioned capacity already have the required values, RCU: '{}' WCU: '{}'\".format(table_name,RCU,WCU)\n\n            return {\n                'output': json.dumps(out)\n            }\n\n        if RCU > TableMaxReadCapacityUnits:\n            raise Exception(\"ReadCapacityUnits: '{}' not allowed as it exceeds the Max Read Capacity Unit per Table : '{}'\".format(RCU,TableMaxReadCapacityUnits))\n        if WCU > TableMaxWriteCapacityUnits:\n            raise Exception(\"WriteCapacityUnits: '{}' not allowed as it exceeds the Max Write Capacity Units per Table: '{}'\".format(WCU,TableMaxWriteCapacityUnits))\n\n        ## what if it's using Autoscaling\n        result = check_autoScaling_config(table_name)\n        if result:\n            if result == 'rw':\n                raise Exception(\"Auto Scaling is enabled on table '{}' for both Read Capacity and Write Capacity. Provisioned Read/Write capacity can't be updated.\".format(table_name))\n            elif result == 'r':\n                msg += \"WARNING: AutoScaling is enabled for Read Capacity.\"\n            elif result == 'w':\n                msg += \"WARNING: AutoScaling is enabled for Write Capacity.\"\n\n        table_status = update_capacity_units(table_name,RCU,WCU)\n\n    except dynamodb_client.exceptions.ResourceNotFoundException as ex:\n        raise Exception(\"Table: '{}' not found\".format(table_name))\n\n    except dynamodb_client.exceptions.LimitExceededException as ex:\n\n        if update_retries < 3:\n            update_retries+=1\n            time.sleep(3)\n            modify_dynamodb_provisioned_capacity_handler(event,context)\n\n    out['TableStatus'] = table_status\n    out['Message'] = msg\n\n    return out\n"
+      },
+      "outputs": [
+        {
+          "Name": "TableName",
+          "Selector": "$.Payload.TableName",
+          "Type": "String"
+        },
+        {
+          "Name": "TableStatus",
+          "Selector": "$.Payload.TableStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}
