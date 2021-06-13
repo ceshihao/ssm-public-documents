@@ -1,0 +1,298 @@
+{
+  "description": "---\nThis runbook helps you configure Instance Metadata Service (IMDS) options for Amazon Elastic Compute Cloud (Amazon EC2) instances. Using this runbook, you can configure the following:\n* Enforce the use of IMDSv2 for instance metadata\n* Configure the `HttpPutResponseHopLimit` value\n* Allow or deny instance metadata access\n\nFor information about instance metadata, see [Configuring the Instance Metadata Service](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html) in the *Amazon EC2 User Guide for Linux Instances*.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "outputs": [
+    "describeMetadataOptions.State",
+    "describeMetadataOptions.MetadataAccess",
+    "describeMetadataOptions.IMDSv2",
+    "describeMetadataOptions.HttpPutResponseHopLimit"
+  ],
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "allowedPattern": "^i-[a-z0-9]{8}$|^i-[a-z0-9]{17}$",
+      "description": "(Required) The ID of the Amazon EC2 instance whose metadata settings you want to configure."
+    },
+    "HttpPutResponseHopLimit": {
+      "type": "Integer",
+      "allowedPattern": "^([0-9]|[1-5][0-9]|6[0-4])$",
+      "default": 0,
+      "description": "(Optional) The desired HTTP PUT response hop limit value (1-64) for instance metadata requests. This value controls the number of hops the PUT response can traverse. Recommended value for HttpPutResponseHopLimit is \"1\" which prevents the response from traveling outside of the instance. Specify \"0\" to maintain the current value. Default is \"0\"."
+    },
+    "EnforceIMDSv2": {
+      "type": "String",
+      "default": "optional",
+      "allowedValues": [
+        "optional",
+        "required"
+      ],
+      "description": "(Optional) Enforce IMDSv2. If you choose \"required\", IMDSv2 will be enforced. If you choose \"optional\", you can choose between IMDSv1 and IMDSv2 for metadata access. If you enforce IMDSv2, the applications that use IMDSv1 might not function correctly. Before enforcing IMDSv2, make sure your applications that uses IMDS are upgraded to a version that support IMDSv2. Default is \"optional\"."
+    },
+    "MetadataAccess": {
+      "type": "String",
+      "default": "enabled",
+      "allowedValues": [
+        "enabled",
+        "disabled"
+      ],
+      "description": "(Optional) Allow or deny instance metadata access in the Amazon EC2 instance. If you specify \"disabled\", all other parameters will be ignored and the metadata access will be denied for the instance. Default is \"enabled\"."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that runs this runbook."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "branchOnMetadataAccess",
+      "action": "aws:branch",
+      "description": "Branch execution based on the value of MetadataAccess parameter",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "disableMetadataAccess",
+            "Variable": "{{MetadataAccess}}",
+            "StringEquals": "disabled"
+          }
+        ],
+        "Default": "branchOnHttpPutResponseHopLimit"
+      }
+    },
+    {
+      "name": "disableMetadataAccess",
+      "action": "aws:executeAwsApi",
+      "description": "Disable Metadata endpoint and ignore other parameters",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceMetadataOptions",
+        "InstanceId": "{{InstanceId}}",
+        "HttpEndpoint": "disabled"
+      },
+      "timeoutSeconds": 300,
+      "isEnd": false,
+      "isCritical": true,
+      "nextStep": "waitBeforeAssertingMetadataState",
+      "maxAttempts": 3
+    },
+    {
+      "name": "branchOnHttpPutResponseHopLimit",
+      "action": "aws:branch",
+      "description": "Branch execution based on the value of HttpPutResponseHopLimit parameter",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "maintainHopLimitAndConfigureImdsVersion",
+            "Variable": "{{HttpPutResponseHopLimit}}",
+            "NumericEquals": 0
+          }
+        ],
+        "Default": "setHopLimitAndConfigureImdsVersion"
+      }
+    },
+    {
+      "name": "maintainHopLimitAndConfigureImdsVersion",
+      "action": "aws:executeAwsApi",
+      "description": "Maintain current hop limit and configure IMDS version",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceMetadataOptions",
+        "InstanceId": "{{InstanceId}}",
+        "HttpEndpoint": "{{MetadataAccess}}",
+        "HttpTokens": "{{EnforceIMDSv2}}"
+      },
+      "timeoutSeconds": 300,
+      "isEnd": false,
+      "isCritical": true,
+      "maxAttempts": 3
+    },
+    {
+      "name": "waitBeforeAssertingIMDSv2State",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT30S"
+      },
+      "description": "Wait 30 seconds before asserting IMDSv2 status",
+      "nextStep": "branchVerificationOnIMDSv2Option",
+      "onFailure": "step:branchVerificationOnIMDSv2Option",
+      "isCritical": false
+    },
+    {
+      "name": "setHopLimitAndConfigureImdsVersion",
+      "action": "aws:executeAwsApi",
+      "description": "Set hop limit and configure IMDS version",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceMetadataOptions",
+        "InstanceId": "{{InstanceId}}",
+        "HttpEndpoint": "{{MetadataAccess}}",
+        "HttpTokens": "{{EnforceIMDSv2}}",
+        "HttpPutResponseHopLimit": "{{HttpPutResponseHopLimit}}"
+      },
+      "timeoutSeconds": 300,
+      "isEnd": false,
+      "isCritical": true,
+      "maxAttempts": 3
+    },
+    {
+      "name": "waitBeforeAssertingHopLimit",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT30S"
+      },
+      "description": "Wait 30 seconds before asserting metadata options",
+      "isCritical": false,
+      "onFailure": "Continue"
+    },
+    {
+      "name": "assertHopLimit",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].MetadataOptions.HttpPutResponseHopLimit",
+        "DesiredValues": [
+          "{{HttpPutResponseHopLimit}}"
+        ]
+      },
+      "description": "Assert HopLimit value set",
+      "isEnd": false,
+      "isCritical": true,
+      "onFailure": "Continue",
+      "maxAttempts": 3,
+      "timeoutSeconds": 60
+    },
+    {
+      "name": "branchVerificationOnIMDSv2Option",
+      "action": "aws:branch",
+      "description": "Branch verification based on the value of EnforceIMDSv2 parameter",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "assertIMDSv2IsEnforced",
+            "Variable": "{{EnforceIMDSv2}}",
+            "StringEquals": "required"
+          }
+        ],
+        "Default": "assertIMDSv2IsOptional"
+      }
+    },
+    {
+      "name": "assertIMDSv2IsOptional",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].MetadataOptions.HttpTokens",
+        "DesiredValues": [
+          "optional"
+        ]
+      },
+      "description": "Assert IMDSv2 is optional",
+      "isEnd": false,
+      "isCritical": true,
+      "onFailure": "step:describeMetadataOptions",
+      "nextStep": "describeMetadataOptions",
+      "maxAttempts": 3,
+      "timeoutSeconds": 60
+    },
+    {
+      "name": "assertIMDSv2IsEnforced",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].MetadataOptions.HttpTokens",
+        "DesiredValues": [
+          "required"
+        ]
+      },
+      "description": "Assert IMDSv2 is enforced",
+      "isEnd": false,
+      "isCritical": true,
+      "onFailure": "step:describeMetadataOptions",
+      "nextStep": "describeMetadataOptions",
+      "maxAttempts": 3,
+      "timeoutSeconds": 60
+    },
+    {
+      "name": "waitBeforeAssertingMetadataState",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT30S"
+      },
+      "description": "Wait 30 seconds before asserting metadata is disabled",
+      "onFailure": "Continue",
+      "isCritical": false
+    },
+    {
+      "name": "assertMetadataIsDisabled",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].MetadataOptions.HttpEndpoint",
+        "DesiredValues": [
+          "disabled"
+        ]
+      },
+      "description": "Assert metadata is disabled",
+      "isEnd": false,
+      "isCritical": true,
+      "onFailure": "Continue",
+      "maxAttempts": 3,
+      "timeoutSeconds": 60
+    },
+    {
+      "name": "describeMetadataOptions",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "State",
+          "Selector": "$.Reservations[0].Instances[0].MetadataOptions.State",
+          "Type": "String"
+        },
+        {
+          "Name": "MetadataAccess",
+          "Selector": "$.Reservations[0].Instances[0].MetadataOptions.HttpEndpoint",
+          "Type": "String"
+        },
+        {
+          "Name": "IMDSv2",
+          "Selector": "$.Reservations[0].Instances[0].MetadataOptions.HttpTokens",
+          "Type": "String"
+        },
+        {
+          "Name": "HttpPutResponseHopLimit",
+          "Selector": "$.Reservations[0].Instances[0].MetadataOptions.HttpPutResponseHopLimit",
+          "Type": "Integer"
+        }
+      ],
+      "description": "Describe current metadata options for the instance",
+      "isEnd": true,
+      "isCritical": false,
+      "maxAttempts": 3,
+      "timeoutSeconds": 60
+    }
+  ]
+}
