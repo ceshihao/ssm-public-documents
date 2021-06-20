@@ -1,0 +1,937 @@
+{
+  "description": "### Document name - AWS-CreateDSManagementInstance\n\n## What does this document do?\nCreates an AWS Directory Service Windows Management instance. This document will create an Amazon EC2 instance running the Microsoft Windows Server 2019 base AMI. Create an EC2 security group for the instance to give you RDP access (Default CIDR: 0.0.0.0/0). Create an IAM instance profile and IAM role that will be attached to the instance to provide the permission needed to join the instance to your Active Directory managed by AWS Directory Service. The document will then launch the Amazon EC2 instance into the same VPC and subnet your AWS Directory Service is installed in. The document will also domain join the Amazon EC2 instance to your Active Directory managed by AWS Directory Service and install the Active Directory administration tools that you will use to manage your directory.\n\n## Input Parameters\n* DirectoryId: (Required) The Directory Id of your AWS Directory Service directory.\n* KeyPairName: (Optional) Key pair to use when launching instance. By Default the instance is launched without a key pair (NoKeyPair).\n* IamInstanceProfileName: (Optional) IAM instance profile name. By Default, if no instance profile exists with the name AmazonSSMDirectoryServiceInstanceProfileRole, an instance profile with the name AmazonSSMDirectoryServiceInstanceProfileRole will be created.\n* SecurityGroupName: (Optional) Security group name. By Default, if no security group exists with the name AmazonSSMDirectoryServiceSecurityGroup, a security group with the name AmazonSSMDirectoryServiceSecurityGroup will be created.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.\n* AmiId: (Optional) AMI id to use for launching the instance. By Default the instance will launch with the latest Microsoft Windows Server 2019 Base AMI.\n* InstanceType: (Optional) Type of instance to launch. Default is t3.medium.\n* RemoteAccessCidr: (Optional) Creates Security group with port for RDP (Port range 3389) open to IPs specified by CIDR (default is 0.0.0.0/0). If the security group already exists it will not be modified and rules will not be changed.\n* Tags: (Optional) Resource tag key and value pair. The tag key and value pair is added to the resources created by the automation document. By Default the document will add a tag key \"Description\" and tag value \"Created by AWS Systems Manager Automation\".\n## Output Parameters\nThe automation execution has no outputs\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DirectoryId": {
+      "type": "String",
+      "description": "(Required) The Directory Id of your AWS Directory Service directory.",
+      "default": "",
+      "allowedPattern": "^d-[a-z0-9]{10}$"
+    },
+    "KeyPairName": {
+      "type": "String",
+      "description": "(Optional) Key pair to use when launching instance. By Default the instance is launched without a key pair (NoKeyPair).",
+      "default": "NoKeyPair",
+      "allowedPattern": "^[A-Za-z0-9_-]*$"
+    },
+    "IamInstanceProfileName": {
+      "type": "String",
+      "description": "(Optional) IAM instance profile name. By Default, if no instance profile exists with the name AmazonSSMDirectoryServiceInstanceProfileRole, an instance profile with the name AmazonSSMDirectoryServiceInstanceProfileRole will be created.",
+      "default": "AmazonSSMDirectoryServiceInstanceProfileRole",
+      "allowedPattern": "^\\S|\\S[A-Za-z0-9_-]*$"
+    },
+    "SecurityGroupName": {
+      "type": "String",
+      "description": "(Optional) Security group name. By Default, if no security group exists with the name AmazonSSMDirectoryServiceSecurityGroup, a security group with the name AmazonSSMDirectoryServiceSecurityGroup will be created.",
+      "default": "AmazonSSMDirectoryServiceSecurityGroup",
+      "allowedPattern": "^\\S|\\S[A-Za-z0-9_-]*$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^$|arn:aws:iam::\\w+:role/.*"
+    },
+    "AmiId": {
+      "type": "String",
+      "description": "(Optional) AMI id to use for launching the instance. By Default the instance will launch with the latest Microsoft Windows Server 2019 Base AMI.",
+      "default": "{{ssm:/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base}}",
+      "allowedPattern": "(^\\{\\{ssm:\\/aws\\/service\\/ami-windows-latest\\/[a-zA-Z0-9._-]{1,255}\\}\\}|^ami-[a-z0-9]{1,255})"
+    },
+    "InstanceType": {
+      "description": "(Optional) Type of instance to launch. Default is t3.medium.",
+      "type": "String",
+      "default": "t3.medium",
+      "allowedValues": [
+        "t2.nano",
+        "t2.micro",
+        "t2.small",
+        "t2.medium",
+        "t2.large",
+        "t2.xlarge",
+        "t2.2xlarge",
+        "t3.nano",
+        "t3.micro",
+        "t3.small",
+        "t3.medium",
+        "t3.large",
+        "t3.xlarge",
+        "t3.2xlarge"
+      ]
+    },
+    "RemoteAccessCidr": {
+      "type": "String",
+      "description": "(Optional) Creates Security group with port for RDP (Port range 3389) open to IPs specified by CIDR (default is 0.0.0.0/0). If the security group already exists it will not be modified and rules will not be changed.",
+      "default": "0.0.0.0/0",
+      "allowedPattern": "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})|^pl-[a-z0-9]{8,15}$"
+    },
+    "Tags": {
+      "type": "MapList",
+      "allowedPattern": "\\{([a-zA-Z0-9\" ]{1,255}:[a-zA-Z0-9\", ]{1,255})+\\}",
+      "description": "(Optional) Resource tag key and value pair. The tag key and value pair is added to the resources created by the automation document. By Default the document will add a tag key \"Description\" and tag value \"Created by AWS Systems Manager Automation\".",
+      "default": [
+        {
+          "Key": "Description",
+          "Value": "Created by AWS Systems Manager Automation"
+        },
+        {
+          "Key": "Created By",
+          "Value": "AWS Systems Manager Automation"
+        }
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetDirectoryDomainName",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ds",
+        "Api": "DescribeDirectories",
+        "DirectoryIds": [
+          "{{ DirectoryId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DirectoryDomainName",
+          "Selector": "$.DirectoryDescriptions[0].Name",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcID",
+          "Selector": "$.DirectoryDescriptions[0].VpcSettings.VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "DnsIpAddrsPrimary",
+          "Selector": "$.DirectoryDescriptions[0].DnsIpAddrs[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "DnsIpAddrsSecondary",
+          "Selector": "$.DirectoryDescriptions[0].DnsIpAddrs[1]",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetID1",
+          "Selector": "$.DirectoryDescriptions[0].VpcSettings.SubnetIds[0]",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetVpcSettings",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVpcs",
+        "VpcIds": [
+          "{{ GetDirectoryDomainName.VpcID }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CidrBlock",
+          "Selector": "$.Vpcs[0].CidrBlock",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DescribeSecurityGroup",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSecurityGroups",
+        "Filters": [
+          {
+            "Name": "group-name",
+            "Values": [
+              "{{ SecurityGroupName }}"
+            ]
+          },
+          {
+            "Name": "vpc-id",
+            "Values": [
+              "{{ GetDirectoryDomainName.VpcID }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroup",
+          "Selector": "$.SecurityGroups[0].GroupName",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupId",
+          "Selector": "$.SecurityGroups[0].GroupId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckSecurityGroupStatus",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetIAMRole",
+            "Variable": "{{ DescribeSecurityGroup.SecurityGroup }}",
+            "StringEquals": "{{ SecurityGroupName }}"
+          }
+        ],
+        "Default": "CreateSecurityGroup"
+      }
+    },
+    {
+      "name": "CreateSecurityGroup",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateSecurityGroup",
+        "GroupName": "{{ SecurityGroupName }}",
+        "Description": "AWS created security group for {{ DirectoryId }} management instance",
+        "VpcId": "{{GetDirectoryDomainName.VpcID}}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "security-group",
+            "Tags": "{{ Tags }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroupId",
+          "Selector": "$.GroupId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "AuthorizeSecurityGroup",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "AuthorizeSecurityGroupIngress",
+        "CidrIp": "{{ RemoteAccessCidr }}",
+        "FromPort": 3389,
+        "ToPort": 3389,
+        "GroupId": "{{ CreateSecurityGroup.SecurityGroupId }}",
+        "IpProtocol": "tcp"
+      }
+    },
+    {
+      "name": "GetIAMRole",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "GetRole",
+        "RoleName": "{{ IamInstanceProfileName }}"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceRoleName",
+          "Selector": "$.Role.RoleName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ChoiceIAMRole",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetAttachedRolePolicies",
+            "Variable": "{{ GetIAMRole.InstanceRoleName }}",
+            "StringEquals": "{{ IamInstanceProfileName }}"
+          }
+        ],
+        "Default": "CreateIAMRole"
+      }
+    },
+    {
+      "name": "GetAttachedRolePolicies",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "ListAttachedRolePolicies",
+        "RoleName": "{{IamInstanceProfileName}}"
+      },
+      "outputs": [
+        {
+          "Name": "SSMManagedInstanceCore",
+          "Selector": "$.AttachedPolicies[0].PolicyName",
+          "Type": "String"
+        },
+        {
+          "Name": "SSMDirectoryServiceAccess",
+          "Selector": "$.AttachedPolicies[1].PolicyName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ChoiceSSMManagedInstanceCore",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ChoiceSSMDirectoryServiceAccess",
+            "Variable": "{{ GetAttachedRolePolicies.SSMManagedInstanceCore }}",
+            "StringEquals": "AmazonSSMManagedInstanceCore"
+          }
+        ],
+        "Default": "AttachSSMIAMPolicy"
+      }
+    },
+    {
+      "name": "ChoiceSSMDirectoryServiceAccess",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetIAMInstanceRole",
+            "Variable": "{{ GetAttachedRolePolicies.SSMDirectoryServiceAccess }}",
+            "StringEquals": "AmazonSSMDirectoryServiceAccess"
+          }
+        ],
+        "Default": "AttachDsIAMPolicy"
+      }
+    },
+    {
+      "name": "CreateIAMRole",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:DeleteCreatedSecurityGroup",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "iam",
+        "Api": "CreateRole",
+        "RoleName": "{{ IamInstanceProfileName }}",
+        "AssumeRolePolicyDocument": "{\"Version\": \"2012-10-17\",\"Statement\": [{\"Sid\": \"\",\"Effect\": \"Allow\",\"Principal\": {\"Service\": [\"ec2.amazonaws.com\"]},\"Action\": \"sts:AssumeRole\"}]}",
+        "Description": "Instance Profile created by SSM Automation",
+        "Tags": "{{ Tags }}"
+      },
+      "outputs": [
+        {
+          "Name": "ManagedInstanceRole",
+          "Selector": "$.Role.RoleName"
+        }
+      ]
+    },
+    {
+      "name": "AttachSSMIAMPolicy",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "AttachRolePolicy",
+        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        "RoleName": "{{ IamInstanceProfileName }}"
+      }
+    },
+    {
+      "name": "AttachDsIAMPolicy",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "AttachRolePolicy",
+        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess",
+        "RoleName": "{{ IamInstanceProfileName }}"
+      }
+    },
+    {
+      "name": "GetIAMInstanceRole",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "GetInstanceProfile",
+        "InstanceProfileName": "{{ IamInstanceProfileName }}"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceProfile",
+          "Selector": "$.InstanceProfile.InstanceProfileName",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileId",
+          "Selector": "$.InstanceProfile.InstanceProfileId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceArn",
+          "Selector": "$.InstanceProfile.Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "Roles",
+          "Selector": "$.InstanceProfile.Roles[0].RoleName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ChoiceIAMInstanceRole",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ChoiceIAMRoleAttached",
+            "Variable": "{{ GetIAMInstanceRole.InstanceProfile }}",
+            "StringEquals": "{{ IamInstanceProfileName }}"
+          }
+        ],
+        "Default": "CreateInstanceProfile"
+      }
+    },
+    {
+      "name": "ChoiceIAMRoleAttached",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DescribeKeyPair",
+            "Variable": "{{ GetIAMInstanceRole.Roles }}",
+            "StringEquals": "{{ IamInstanceProfileName }}"
+          }
+        ],
+        "Default": "AddRoleInstanceProfile"
+      }
+    },
+    {
+      "name": "CreateInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:DetachSSMIAMPolicy",
+      "inputs": {
+        "Service": "iam",
+        "Api": "CreateInstanceProfile",
+        "InstanceProfileName": "{{ IamInstanceProfileName }}"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceProfile",
+          "Selector": "$.InstanceProfile.InstanceProfileName",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileId",
+          "Selector": "$.InstanceProfile.InstanceProfileId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceArn",
+          "Selector": "$.InstanceProfile.Arn",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "TagInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "TagInstanceProfile",
+        "InstanceProfileName": [
+          "{{ CreateInstanceProfile.InstanceProfile}}"
+        ],
+        "Tags": "{{ Tags }}"
+      }
+    },
+    {
+      "name": "AddRoleInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:DetachSSMIAMPolicy",
+      "inputs": {
+        "Service": "iam",
+        "Api": "AddRoleToInstanceProfile",
+        "InstanceProfileName": "{{ IamInstanceProfileName }}",
+        "RoleName": "{{ IamInstanceProfileName }}"
+      },
+      "nextStep": "SleepIamRoleReady"
+    },
+    {
+      "name": "SleepIamRoleReady",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT10S"
+      }
+    },
+    {
+      "name": "DescribeKeyPair",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeKeyPairs",
+        "Filters": [
+          {
+            "Name": "key-name",
+            "Values": [
+              "{{ KeyPairName }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "KeyPair",
+          "Selector": "$.KeyPairs[0].KeyName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetSecurityGroupId",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSecurityGroups",
+        "Filters": [
+          {
+            "Name": "group-id",
+            "Values": [
+              "{{ DescribeSecurityGroup.SecurityGroupId }}",
+              "{{ CreateSecurityGroup.SecurityGroupId }}"
+            ]
+          },
+          {
+            "Name": "vpc-id",
+            "Values": [
+              "{{ GetDirectoryDomainName.VpcID }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroup",
+          "Selector": "$.SecurityGroups[0].GroupName",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupId",
+          "Selector": "$.SecurityGroups[0].GroupId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckKeyPair",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "LaunchInstance",
+            "Variable": "{{ DescribeKeyPair.KeyPair }}",
+            "StringEquals": "{{ KeyPairName }}"
+          }
+        ],
+        "Default": "LaunchInstanceNoKey"
+      }
+    },
+    {
+      "name": "LaunchInstance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:RemoveRoleFromInstanceProfile",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "RunInstances",
+        "ImageId": "{{ AmiId }}",
+        "InstanceType": "{{ InstanceType }}",
+        "MaxCount": 1,
+        "MinCount": 1,
+        "IamInstanceProfile": {
+          "Name": "{{ IamInstanceProfileName }}"
+        },
+        "KeyName": "{{ KeyPairName }}",
+        "SubnetId": "{{ GetDirectoryDomainName.SubnetID1 }}",
+        "SecurityGroupIds": [
+          "{{ GetSecurityGroupId.SecurityGroupId }}"
+        ],
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "{{ DirectoryId }}_managementInstance"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Instances[0].InstanceId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GetLaunchedInstance"
+    },
+    {
+      "name": "LaunchInstanceNoKey",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:RemoveRoleFromInstanceProfile",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "RunInstances",
+        "ImageId": "{{ AmiId }}",
+        "InstanceType": "{{ InstanceType }}",
+        "MaxCount": 1,
+        "MinCount": 1,
+        "IamInstanceProfile": {
+          "Name": "{{ IamInstanceProfileName }}"
+        },
+        "SubnetId": "{{ GetDirectoryDomainName.SubnetID1 }}",
+        "SecurityGroupIds": [
+          "{{ GetSecurityGroupId.SecurityGroupId }}"
+        ],
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "{{ DirectoryId }}_managementInstance"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Instances[0].InstanceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetLaunchedInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "Filters": [
+          {
+            "Name": "vpc-id",
+            "Values": [
+              "{{ GetDirectoryDomainName.VpcID }}"
+            ]
+          },
+          {
+            "Name": "instance-id",
+            "Values": [
+              "{{ LaunchInstanceNoKey.InstanceId }}",
+              "{{ LaunchInstance.InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "EC2InstanceId",
+          "Selector": "$.Reservations[0].Instances[0].InstanceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitUntilInstanceStateRunning",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 240,
+      "maxAttempts": 3,
+      "onFailure": "step:TerminateInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ GetLaunchedInstance.EC2InstanceId }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceState.Name",
+        "DesiredValues": [
+          "running"
+        ]
+      }
+    },
+    {
+      "name": "GetDomainJoinDocument",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "ListDocuments",
+        "DocumentFilterList": [
+          {
+            "key": "Name",
+            "value": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DomainJoinDocument",
+          "Selector": "$.DocumentIdentifiers[0].Name",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetCustomDomainJoinDocument",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "ListDocuments",
+        "DocumentFilterList": [
+          {
+            "key": "Name",
+            "value": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}_Custom"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CustomDomainJoinDocument",
+          "Selector": "$.DocumentIdentifiers[0].Name",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitUntilInstanceSSMManaged",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 240,
+      "onFailure": "step:TerminateInstance",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ GetLaunchedInstance.EC2InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      }
+    },
+    {
+      "name": "CheckDocument",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DomainJoin",
+            "Variable": "{{ GetDomainJoinDocument.DomainJoinDocument }}",
+            "StringEquals": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}"
+          },
+          {
+            "NextStep": "DomainJoinCustom",
+            "Variable": "{{GetCustomDomainJoinDocument.CustomDomainJoinDocument}}",
+            "StringEquals": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}_Custom"
+          }
+        ],
+        "Default": "CreateDomainJoinDocument"
+      }
+    },
+    {
+      "name": "CreateDomainJoinDocument",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:TerminateInstance",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "CreateDocument",
+        "Name": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}_Custom",
+        "DocumentFormat": "JSON",
+        "DocumentType": "Command",
+        "Content": "{\"schemaVersion\": \"1.0\",\"description\": \"Custom Domain Join Configuration created by Automation Document.\", \"runtimeConfig\": {\"aws:domainJoin\": {\"properties\": {\"directoryId\":\"{{ DirectoryId }}\",\"directoryName\": \"{{ GetDirectoryDomainName.DirectoryDomainName }}\",\"dnsIpAddresses\": [\"{{ GetDirectoryDomainName.DnsIpAddrsPrimary }}\",\"{{ GetDirectoryDomainName.DnsIpAddrsSecondary}}\"]}}}}",
+        "Tags": "{{ Tags }}"
+      }
+    },
+    {
+      "name": "DomainJoinCustom",
+      "action": "aws:runCommand",
+      "onFailure": "step:DeleteCustomDomainJoinDocumentOnError",
+      "timeoutSeconds": 240,
+      "isCritical": "true",
+      "inputs": {
+        "DocumentName": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}_Custom",
+        "InstanceIds": [
+          "{{ GetLaunchedInstance.EC2InstanceId }}"
+        ]
+      }
+    },
+    {
+      "name": "DeleteCustomDomainJoinDocumentOnSuccess",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DeleteDocument",
+        "Name": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}_Custom"
+      },
+      "nextStep": "InstallRsatTools"
+    },
+    {
+      "name": "DeleteCustomDomainJoinDocumentOnError",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DeleteDocument",
+        "Name": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}_Custom"
+      },
+      "nextStep": "TerminateInstance"
+    },
+    {
+      "name": "DomainJoin",
+      "action": "aws:runCommand",
+      "onFailure": "step:TerminateInstance",
+      "timeoutSeconds": 240,
+      "isCritical": "true",
+      "inputs": {
+        "DocumentName": "awsconfig_Domain_{{ DirectoryId }}_{{ GetDirectoryDomainName.DirectoryDomainName }}",
+        "InstanceIds": [
+          "{{ GetLaunchedInstance.EC2InstanceId }}"
+        ]
+      }
+    },
+    {
+      "name": "InstallRsatTools",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ GetLaunchedInstance.EC2InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "Install-WindowsFeature -Name GPMC,RSAT-AD-PowerShell,RSAT-AD-AdminCenter,RSAT-ADDS-Tools,RSAT-DNS-Server"
+          ]
+        }
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TerminateInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "TerminateInstances",
+        "InstanceIds": [
+          "{{ GetLaunchedInstance.EC2InstanceId }}"
+        ]
+      },
+      "maxAttempts": 3,
+      "isCritical": "true",
+      "onFailure": "Continue",
+      "timeoutSeconds": 240
+    },
+    {
+      "name": "WaitUntilInstanceStateTerminated",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "IncludeAllInstances": true,
+        "InstanceIds": [
+          "{{ GetLaunchedInstance.EC2InstanceId }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceState.Name",
+        "DesiredValues": [
+          "terminated"
+        ]
+      }
+    },
+    {
+      "name": "RemoveRoleFromInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "iam",
+        "Api": "RemoveRoleFromInstanceProfile",
+        "InstanceProfileName": "{{ CreateInstanceProfile.InstanceProfile}}",
+        "RoleName": "{{ CreateIAMRole.ManagedInstanceRole }}"
+      }
+    },
+    {
+      "name": "DetachSSMIAMPolicy",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "DetachRolePolicy",
+        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        "RoleName": "{{ CreateIAMRole.ManagedInstanceRole }}"
+      }
+    },
+    {
+      "name": "DetachDsIAMPolicy",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "DetachRolePolicy",
+        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess",
+        "RoleName": "{{ CreateIAMRole.ManagedInstanceRole }}"
+      }
+    },
+    {
+      "name": "DeleteCreatedIAMRole",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "iam",
+        "Api": "DeleteRole",
+        "RoleName": "{{ CreateIAMRole.ManagedInstanceRole }}"
+      }
+    },
+    {
+      "name": "DeleteCreatedInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "iam",
+        "Api": "DeleteInstanceProfile",
+        "InstanceProfileName": "{{ CreateInstanceProfile.InstanceProfile}}"
+      }
+    },
+    {
+      "name": "DeleteCreatedSecurityGroup",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "timeoutSeconds": 240,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteSecurityGroup",
+        "GroupId": "{{ CreateSecurityGroup.SecurityGroupId }}"
+      },
+      "isEnd": true
+    }
+  ]
+}
