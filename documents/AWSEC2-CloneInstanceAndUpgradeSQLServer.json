@@ -1,6 +1,6 @@
 {
   "schemaVersion": "0.3",
-  "description": "SSM Automation for upgrading SQL Server 2008 (or later) to SQL Server 2016. The running instance remains untouched, while the automation upgrades a cloned instance. If the instance is running Windows Server 2008 R2, the automation will upgrade the operating system to Windows Server 2012 R2.",
+  "description": "SSM Automation for upgrading SQL Server 2008 (or later) to SQL Server 2014/2016/2017/2019.  The running instance remains untouched, while the automation upgrades a cloned instance. If the instance is running Windows Server 2008 R2, the automation will upgrade the operating system to Windows Server 2012 R2. If you are upgrading the SQL Server to 2019  and your Windows is 2008/2012, it will first upgrade your Windows Server to 2016 and upgrade  SQL Server afterwards.",
   "parameters": {
     "InstanceId": {
       "type": "String",
@@ -17,7 +17,7 @@
     },
     "SQLServerSnapshotId": {
       "type": "String",
-      "description": "(Conditional) The snapshot id for SQL Server 2016 installation media. This parameter is optional for SQL Server license-included instances (instances launched using an AWS provided Amazon Machine Image for Windows Server with Microsoft SQL Server.",
+      "description": "(Conditional) The snapshot id for target SQL Server installation media. This parameter  is not required for SQL Server license-included instances (instances launched using an  AWS provided Amazon Machine Image for Windows Server with Microsoft SQL Server), only  required if you are running BYOL instance.",
       "default": ""
     },
     "KeepPreUpgradeImageBackUp": {
@@ -36,6 +36,17 @@
       "allowedValues": [
         "True",
         "False"
+      ]
+    },
+    "TargetSQLVersion": {
+      "type": "String",
+      "description": "(Optional) Select the target SQL Server version. Default is SQL Server 2016.",
+      "default": "2016",
+      "allowedValues": [
+        "2014",
+        "2016",
+        "2017",
+        "2019"
       ]
     }
   },
@@ -115,6 +126,8 @@
             "\t$instanceDetails = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\$instance\\Setup\")",
             "\t$edition = $instanceDetails.Edition",
             "",
+            "  $targetSQLVersion = {{ TargetSQLVersion }}",
+            "",
             "\tWrite-Host \"SQL Server Edition is $edition\"",
             "",
             "\tif ($instanceDetails.Cluster) {",
@@ -122,23 +135,36 @@
             "\t\texit 1",
             "\t}",
             "\t$v = $instanceDetails.Version.subString(0, $instanceDetails.Version.indexOf(\".\"))",
-            "\tif ($v -ge 10) {",
-            "\t\tif ($v -eq 10 ) {",
-            "\t\t\tif ($instanceDetails.SP -lt 3) {",
-            "\t\t\t\tWrite-host \"SQL Server Version 2008 , apply patch for SQL Server 2008\"",
-            "\t\t\t}",
-            "\t\t\tElseIf ($instanceDetails.SP -eq 3) {",
-            "\t\t\t\tWrite-host \"Supported SQL Version 2008 R2 SP3\"",
-            "\t\t\t}",
-            "\t\t}",
-            "\t\telse {",
-            "\t\t\tWrite-host \"Supported SQL Version\"",
-            "\t\t}",
-            "\t}",
-            "\telse {",
-            "\t\tWrite-host \" SQL Server Version $instanceDetails.Version is presently not supported\"",
-            "\t\texit 1",
-            "\t}",
+            "if ($v -ge 10) {",
+            "if ($v -eq 10 ) {",
+            "if ($instanceDetails.SP -lt 3) {",
+            "  Write-host \"SQL Server Version 2008 , apply patch for SQL Server 2008\"",
+            "}",
+            "ElseIf ($instanceDetails.SP -eq 3) {",
+            "  Write-host \"Supported SQL Version 2008 R2 SP3\"",
+            "}",
+            "}",
+            "else {",
+            "if (($v -eq 13) -and ($targetSQLVersion -eq '2014'))",
+            "{ ",
+            "Write-Host \"Current SQL Version 2016, cannot downgrade to 2014.\"",
+            "  exit 1",
+            "}",
+            "elseif (($v -eq 14) -and (($targetSQLVersion -eq '2016') -or ($targetSQLVersion -eq '2014')))",
+            "{ ",
+            "Write-Host \"Current SQL Version 2017, cannot downgrade to $targetSQLVersion.\"",
+            "  exit 1",
+            "}",
+            "else",
+            "{ ",
+            "Write-host \"Supported SQL Version\"",
+            "}",
+            "}",
+            "}",
+            "else {",
+            "Write-host \" SQL Server Version $instanceDetails.Version is presently not supported\"",
+            "exit 1",
+            "}",
             "\t[System.Reflection.Assembly]::LoadWithPartialName(\"Microsoft.SqlServer.SMO\") | out-null",
             "\t$SQLServer = New-Object (\"Microsoft.SqlServer.Management.Smo.Server\")",
             "\tForeach ($Database in $SQLServer.Databases) {",
@@ -150,16 +176,27 @@
             "\t\t}",
             "\t}",
             "",
-            "\tif ($OSVersion.indexOf(\"2012 R2\") -ge 0 -and (($OSVersion.indexOf(\"STANDARD\") -ge 0) -or ($OSVersion.indexOf(\"DATACENTER\") -ge 0))) {",
-            "\t\tWrite-Host \"OSVersion : $OSVersion \"",
-            "\t}",
-            "\telseif ($OSVersion.indexOf(\"2008 R2\") -ge 0 -and (($OSVersion.indexOf(\"STANDARD\") -ge 0) -or ($OSVersion.indexOf(\"DATACENTER\") -ge 0))) {",
-            "\t\tWrite-Host \"WINDOWSUPGRADE Will be done first\"",
-            "\t}",
-            "\telse {",
-            "\t\tWrite-Host \"This document support upgrades of 2012 R2 Standard or 2012 R2 Datacenter\"",
-            "\t\texit 1",
-            "\t}",
+            "$targetVersion = {{ TargetSQLVersion }}",
+            "if (($OSVersion.indexOf(\"2016\")  -ge 0) -and (($OSVersion.indexOf(\"STANDARD\") -ge 0) -or ($OSVersion.indexOf(\"DATACENTER\") -ge 0))) {",
+            "Write-Host \"OSVersion : $OSVersion \"",
+            "}",
+            "elseif (($OSVersion.indexOf(\"2012\") -ge 0 ) -and (($OSVersion.indexOf(\"STANDARD\") -ge 0) -or ($OSVersion.indexOf(\"DATACENTER\") -ge 0))) {",
+            "if($targetVersion -eq \"2019\")",
+            "{",
+            "Write-Host \"WINDOWSUPGRADE 2016 Will be done first\"",
+            "}",
+            "else",
+            "{",
+            "Write-Host \"OSVersion : $OSVersion \"",
+            "}",
+            "}",
+            "elseif ($OSVersion.indexOf(\"2008\") -ge 0 -and (($OSVersion.indexOf(\"STANDARD\") -ge 0) -or ($OSVersion.indexOf(\"DATACENTER\") -ge 0))) {",
+            "\tWrite-Host \"WINDOWSUPGRADE 2012 Will be done first\"",
+            "}",
+            "else {",
+            "\tWrite-Host \"This document support upgrades of 2012 R2/RTM Standard, 2012 R2/RTM Datacenter, 2016 Standard and 2016 Datacenter\"",
+            "\texit 1",
+            "}",
             "}",
             "",
             "",
@@ -300,7 +337,12 @@
           {
             "NextStep": "putWindowsUpgradeRequiredMetric",
             "Variable": "{{ assertReadyToUpgradeSQLServer.Output }}",
-            "Contains": "WINDOWSUPGRADE"
+            "Contains": "WINDOWSUPGRADE 2012"
+          },
+          {
+            "NextStep": "putWindows2016UpgradeRequiredMetric",
+            "Variable": "{{ assertReadyToUpgradeSQLServer.Output }}",
+            "Contains": "WINDOWSUPGRADE 2016"
           }
         ],
         "Default": "branchOnRebootInstanceBeforeTakingImage"
@@ -320,6 +362,20 @@
       },
       "isCritical": "true",
       "nextStep": "upgradeWindowsFirst"
+    },
+    {
+      "name": "putWindows2016UpgradeRequiredMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeSQLServer",
+        "MetricName": "Windows_Upgrade_Required",
+        "MetricValue": "1.0"
+      },
+      "isCritical": "true",
+      "nextStep": "upgradeWindows2016First"
     },
     {
       "name": "putNoWindowsUpgradeRequiredMetric",
@@ -358,6 +414,31 @@
       "nextStep": "getWindowsUpgradeAMI"
     },
     {
+      "name": "upgradeWindows2016First",
+      "action": "aws:executeAutomation",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSEC2-CloneInstanceAndUpgradeWindows",
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ InstanceId }}"
+          ],
+          "IamInstanceProfile": [
+            "{{ IamInstanceProfile }}"
+          ],
+          "SubnetId": [
+            "{{ SubnetId }}"
+          ],
+          "TargetWindowVersion": [
+            "2016"
+          ]
+        }
+      },
+      "isCritical": "true",
+      "nextStep": "getWindows2016UpgradeAMI"
+    },
+    {
       "name": "getWindowsUpgradeAMI",
       "action": "aws:executeAwsApi",
       "onFailure": "Abort",
@@ -377,12 +458,50 @@
       "nextStep": "addUniqueTagForTheAMI"
     },
     {
+      "name": "getWindows2016UpgradeAMI",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetAutomationExecution",
+        "AutomationExecutionId": "{{ upgradeWindows2016First.ExecutionId }}"
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.AutomationExecution.Outputs.'UpgradedFrom2012R2Or2016.ImageId'[0]",
+          "Type": "String"
+        }
+      ],
+      "isCritical": "true",
+      "nextStep": "addUniqueTagForThe2016AMI"
+    },
+    {
       "name": "addUniqueTagForTheAMI",
       "action": "aws:createTags",
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "ResourceIds": [
           "{{ getWindowsUpgradeAMI.ImageId }}"
+        ],
+        "Tags": [
+          {
+            "Key": "AWSEC2-ORIG-IMAGE-{{ automation:EXECUTION_ID }}",
+            "Value": "AWSEC2-IMAGE: {{ InstanceId }}"
+          }
+        ],
+        "ResourceType": "EC2"
+      },
+      "isCritical": "true",
+      "nextStep": "describeOriginalInstanceImage"
+    },
+    {
+      "name": "addUniqueTagForThe2016AMI",
+      "action": "aws:createTags",
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "ResourceIds": [
+          "{{ getWindows2016UpgradeAMI.ImageId }}"
         ],
         "Tags": [
           {
@@ -1139,7 +1258,7 @@
       "maxAttempts": 3,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
-        "SQLServerVersion": "2016",
+        "SQLServerVersion": "{{ TargetSQLVersion }}",
         "InstanceId": "{{ InstanceId }}",
         "SQLServerEdition": "{{ getSQLServerEdition.Output }}"
       },
@@ -1332,6 +1451,160 @@
       },
       "onFailure": "step:deleteServerUpgradeInstance",
       "isCritical": "true",
+      "nextStep": "checkSSRSSetupRequirement"
+    },
+    {
+      "name": "checkSSRSSetupRequirement",
+      "action": "aws:branch",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "setupSSRS",
+            "Or": [
+              {
+                "Variable": "{{ TargetSQLVersion }}",
+                "EqualsIgnoreCase": "2014"
+              },
+              {
+                "Variable": "{{ TargetSQLVersion }}",
+                "EqualsIgnoreCase": "2016"
+              }
+            ]
+          }
+        ],
+        "Default": "runSQLServerUpgrade"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "setupSSRS",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            " ##################################################",
+            "### Objective of this PS module is check if reporting service installed and",
+            "### DB is absent, create the DB in native way to bypass the error",
+            "### during SQL Server upgrade as listed https://blog.sqlauthority.com/2015/09/25/sql-server-failed-rule-valid-dsn-and-valid-database-compatibility-level-and-successful-connection/",
+            "### This is needed for upgrading SQL Server 2012-14/16 etc..",
+            "### This script needs to be executed conditionally... ",
+            "##################################################",
+            "",
+            "## Check WMI action result ",
+            "function CheckWmiAction",
+            "{",
+            "param($wmi_result, $actionname)",
+            "if ($wmi_result.HRESULT -ne 0) {",
+            "write-error \"$actionname failed. Error from WMI: $($wmi_result.Error)\"",
+            "}",
+            "}",
+            "",
+            "",
+            "## Get the SSRS Wmiobject",
+            "function Get-ReportingServerObject()",
+            "{",
+            "##objective is to get MS Name and Version before initialize WmiObject",
+            "$instances = (get-itemproperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\").InstalledInstances",
+            "$instance = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL\").$instances",
+            "$instanceDetails = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\$instance\\Setup\")",
+            "$version = $instanceDetails.Version.subString(0, $instanceDetails.Version.indexOf(\".\"))",
+            "",
+            "return Get-WmiObject –namespace \"root\\Microsoft\\SqlServer\\ReportServer\\RS_$instances\\v$version\\Admin\" `",
+            "-class MSReportServer_ConfigurationSetting -ComputerName localhost",
+            "}",
+            "",
+            "try",
+            "{",
+            "$ErrorActionPreference = \"Stop\"",
+            "$server = $env:COMPUTERNAME",
+            "$HTTPport = 80 ",
+            "",
+            "## initialize SSRS WMIObject",
+            "$RSObject = Get-ReportingServerObject",
+            " ",
+            "if(![string]::IsNullOrEmpty($RSObject.DatabaseName))",
+            "{",
+            "return; #Reporting server DB set up is present, don't do anything.",
+            "}",
+            "",
+            "$starttime=Get-Date",
+            "$dbName='ReportServer'",
+            "$LocalDetails =  GET-WinSystemLocale ",
+            "$localeId = $LocalDetails.LCID ",
+            "",
+            " ##check for service status, if it's stopped, first start for WMI object to work",
+            " $reportServerService = $RSObject.ServiceName",
+            " $service = Get-Service -Name $reportServerService",
+            " if($service.Status -ne 'Running')",
+            " {",
+            " Start-Service -Name $reportServerService",
+            " $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running)",
+            " }",
+            " ##end of check ",
+            " ",
+            "## Setting the web service URL ##",
+            "write-host -foregroundcolor green \"Setting the web service URL\"",
+            "write-host 'Calling SetVirtualDirectory'",
+            "$r = $RSObject.SetVirtualDirectory('ReportServerWebService','ReportServer',$localeId)",
+            "CheckWmiAction $r \"SetVirtualDirectory for ReportServer\"",
+            "",
+            "## ReserveURL for ReportServerWebService - port $HTTPport (for local usage)",
+            "write-host \"Calling ReserveURL port $HTTPport\"",
+            "$r = $RSObject.ReserveURL('ReportServerWebService',\"http://+:$HTTPport\",$localeId)",
+            "CheckWmiAction $r \"ReserveURL for ReportServer port $HTTPport\" ",
+            " ",
+            "## Setting the Database ##",
+            "write-host -foregroundcolor green \"Setting the Database\"",
+            "",
+            "write-host \"Calling GenerateDatabaseCreationScript for database $dbName\"",
+            "$r = $RSObject.GenerateDatabaseCreationScript($dbName,$localeId,$false)",
+            "CheckWmiAction $r \"GenerateDatabaseCreationScript\"",
+            "$script = $r.Script",
+            " ",
+            "## Execute sql script to create the database",
+            "write-host 'Executing Database Creation Script'",
+            "$savedcvd = Get-Location",
+            "Import-Module SQLPS",
+            "Invoke-SqlCmd -Query $script",
+            "Set-Location $savedcvd",
+            " ",
+            "## GenerateGrantRightsScript ",
+            "$DBUser = $RSObject.WindowsServiceIdentityActual",
+            "write-host \"Calling GenerateDatabaseRightsScript with user $DBUser\"",
+            "$r = $RSObject.GenerateDatabaseRightsScript($DBUser,$dbName,$false,$true)",
+            "CheckWmiAction $r \"GenerateDatabaseRightsScript\"",
+            "$script = $r.Script",
+            " ",
+            "## Execute grant rights script",
+            "write-host 'Executing Database Rights Script'",
+            "$savedcvd = Get-Location",
+            "cd sqlserver:\\",
+            "Invoke-SqlCmd -Query $script",
+            "Set-Location $savedcvd",
+            " ",
+            "## SetDBConnection - uses Windows Service (type 2), username is ignored",
+            "write-host \"Calling SetDatabaseConnection server $server, DB $dbName\"",
+            "$r = $RSObject.SetDatabaseConnection($server,$dbName,2,'','')",
+            "CheckWmiAction $r \"SetDatabaseConnection\"  ",
+            "",
+            "write-host 'Operations completed, Report Server is ready' ",
+            "}",
+            "catch {",
+            "Write-Error $_.Exception.Message",
+            "exit 1",
+            "}"
+          ]
+        }
+      },
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
       "nextStep": "runSQLServerUpgrade"
     },
     {
@@ -1395,7 +1668,13 @@
             "\tWrite-host \"Olddrives $OLDDRIVES , Currentdrives $CURRENTDRIVE, Newdrive $NEWDRIVE\"",
             "\tWrite-Host \"SQL Server Installed media present in Drive $NEWDRIVE \"",
             "\t$INSTANCENAME = (get-itemproperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\").InstalledInstances",
-            "\tInvoke-expression \"$NEWDRIVE\\setup.exe /q /ACTION=upgrade /INSTANCEID=$INSTANCENAME /INSTANCENAME=$INSTANCENAME\t/IACCEPTSQLSERVERLICENSETERMS \"",
+            "  $targetVersion = {{ TargetSQLVersion }}",
+            "  if(($targetVersion -eq '2016') -or ($targetVersion -eq '2014')) {",
+            "  Invoke-expression \"$NEWDRIVE\\setup.exe /q /ACTION=upgrade /INSTANCEID=$INSTANCENAME /INSTANCENAME=$INSTANCENAME\t/IACCEPTSQLSERVERLICENSETERMS \"",
+            "  }",
+            "  else {",
+            "  Invoke-expression \"$NEWDRIVE\\setup.exe /q /ACTION=upgrade /INSTANCEID=$INSTANCENAME /INSTANCENAME=$INSTANCENAME\t/IACCEPTSQLSERVERLICENSETERMS /IACCEPTRSUNINSTALL \"",
+            "  }",
             "}",
             "catch {",
             "\tWrite-Error $_.Exception.Message",
@@ -1476,9 +1755,11 @@
             "$instance = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL\").$instances",
             "$instanceDetails = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\$instance\\Setup\")",
             "$v = $instanceDetails.Version.subString(0, $instanceDetails.Version.indexOf(\".\"))",
-            "if ($v -eq 13) {",
-            "\twrite-host \" SQL Server upgrades successfully\"",
-            "\texit 0",
+            "$targetVersion = {{ TargetSQLVersion }}",
+            "if (($targetVersion -eq '2014' -and $v -eq 12) -or ($targetVersion -eq '2016' -and $v -eq 13) -or ($targetVersion -eq '2017' -and $v -eq 14) -or ($targetVersion -eq '2019' -and $v -eq 15))",
+            "{",
+            "  write-host \" SQL Server upgrades successfully\"",
+            "  exit 0",
             "}",
             "else {",
             "\texit 1",

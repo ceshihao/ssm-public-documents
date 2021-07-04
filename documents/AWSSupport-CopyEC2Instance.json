@@ -1,0 +1,485 @@
+{
+  "description": "# AWSSupport-CopyEC2Instance\n---\nThis is an automation document that will copy an EC2 instance to a desired subnet or region.\nUsing this document you can make the following mutating changes in your account:\n* Copy an instance within same region - Creates a local AMI of the instance and launches a new instance from the AMI in the desired local subnet.\n* Copy an instance to a different region - Creates a local AMI of the instance, copies the AMI to the desired region and then launches a new instance from the AMI in the desired target subnet.\n\nWhen no **Region** or **SubnetId** is provided the automation will default to launching the copy instance in the same subnet and region.\nIf no **SubnetId** is present but a **Region** is provided, the instance will be launched in the default subnet of the specified region.\n\nOther optional user inputs such as Key pair, Instance type, Security Group Ids can be used when launching the copied instance.\n\nThis document also allows the AMIs taken to be retained or deleted from the Parameters: **KeepImageSourceRegion** and **KeepImageDestinationRegion.**\n\nThe Source Instance remains untouched, and will only reboot if the Input parameter **NoRebootInstanceBeforeTakingImage** option is set to false (default for that parameter is true).\n\n**Considerations**: \n  \n* When copying to a different region an **AutomationAssumeRole** must be provided, otherwise the document will fail with a NoCredentialsError.\n* When copying to a different region, if the automation fails/times out on the *waitForAvailableDestinationAmi* step the AMI might still be copying. In that case you will need to manually launch the instance in the destination region once the AMI finishes copying.\n* The new EC2 instance has a different private IPv4 or public IPv6 IP address. If you are using this document with the intention to move to another region/subnet you must update all references to the old IP addresses (for example, in DNS entries) with the new IP addresses that are assigned to the new instance. If you're using an Elastic IP address on your source instance, be sure to attach it to the new instance.\n* AMIs are based on Amazon Elastic Block Store (Amazon EBS) snapshots. For large file systems without a previous snapshot, AMI creation can take several hours resulting in the automation timing out. To decrease the AMI creation time, create an Amazon EBS snapshot before you create the AMI.\n* AMIs are essentially a clone of the whole instance. This means everything within the operating system such as networking settings, domain settings, user accounts and password are preserved on the new instance. You will not be able to retrieve the password from the console unless you prepare your instance prior to using this automation.\n* Domain security identifier (SID) conflict issues can occur when the copy launches and tries to contact the domain. When running the automation specify a security group with locked down rules to prevent the machine from contacting the domain and causing conflict issues.\n\n---\n## Parameters\n**InstanceId:**\n* **Type:** String\n* **Description:** **(Required)** _Instance id for the instance that needs to be copied (e.g. i-abcd1234567890)._\n* **AllowedPattern:** ^i-[a-z0-9]{8,17}$\n\n**AutomationAssumeRole:**\n* **Type:** String\n* **Description:** **(Optional)** _IAM role which SSM Systems Manager will assume to execute this automation. If no role is provided, this automation will use the permissions of the user that executes this document. Note: A role must be provided when copying the instance to a different region, otherwise the copy will fail with \"NoCredentialsError - Unable to locate credentials\"._\n* **AllowedPattern:** ^$|^arn:aws:iam::[0-9]*:role/[/\\\\w+=,.@-]+$\n\n**KeyPair:**\n* **Type:** String\n* **Description:** **(Optional)** _KeyPair to use when launching the copied instance. The KeyPair must exist in the specified region or the automation will fail. When using username and password access, AWS best practices recommends that you have a KeyPair. If no KeyPair is provided the destination instance will not have a KeyPair._\n* **AllowedPattern:** ^$|^[\\x00-\\x7F]{1,255}$\n\n**Region:**\n* **Type:** String\n* **Description:** **(Optional)** _Region for the for the copied instance (e.g. eu-west-1). If this option is not provided, then this automation will copy the instance within the same Region as the source. If this parameter is provided (copy to a different region) and SubnetId/SecurityGroupIds are not provided, then the automation will attempt to launch the Instance in the default VPC with the default Security Group which will work only if ec2-classic network is not enabled on that destination region. AutomationAssumeRole must be specified for copy to another region, otherwise the copy will fail with \"NoCredentialsError - Unable to locate credentials\"._\n* **AllowedPattern:** ^$|^[a-zA-Z]{2}-[a-zA-Z-]+-[1-9]$\n\n**SubnetId:**\n* **Type:** String\n* **Description:** **(Optional)** _An existing subnet for the copied instance. If this option is not provided, for a same region copy, this automation will copy the Instance to the same Subnet. For a copy to a different region, the instance will be launched in a default subnet from the default VPC if: The destination region has a default VPC and is not enabled for ec2-classic network. Note: If ec2-classic is enabled on the destination region, then subnetId must be specified._\n* **AllowedPattern:** ^$|^subnet-[a-z0-9]{8,17}$\n\n**InstanceType:**\n* **Type:** String\n* **Description:** **(Optional)** _Instance type for the copied instance. If this option is not provided, then the source instance type will be used. If the source instance type does not exist in the target region the automation will fail._\n* **AllowedPattern:** ^$|^[a-z0-9-]{1,7}\\\\.[a-z0-9]+$\n\n**SecurityGroupIds:**\n* **Type:** String\n* **Description:** **(Optional)** _Security Group Id(s) for the copied instance. Multiple Security Group Ids can be provided, separated by a comma (\",\")  (e.g. sg-xxxxxx, sg-yyyyy). If this option is not provided, for a same region copy the automation will use the same Security Groups as the source instance. For a copy to different region, the automation will use the default VPC security group._\n* **AllowedPattern:** ^$|^sg-[0-9a-f]{8,17}$\n\n**KeepImageSourceRegion:**\n* **Type:** Boolean\n* **Description:** **(Optional)** _Default is true. This parameter determines if the AMI of the source instance should be preserved. If this parameter is set to true, then the automation will keep this image and it can be found under EC2 console (Under Images, AMI). If this parameter is set to false, then the automation will deregister the AMI and delete the associated snapshots. [Allowed values: true|false]_\n* **Default:** true\n\n**KeepImageDestinationRegion:**\n* **Type:** Boolean\n* **Description:** **(Optional)** _Default is true. This parameter is ignored for a same region copy. For a copy to a different region, this parameter determines if the AMI copied to the target region, should be preserved. If this parameter is set to true, then the automation will keep this image and it can be found under EC2 console (Under Images, AMI) on the target Region. If this parameter is set to false, then the automation will deregister the AMI and delete the associated snapshots. [Allowed values: true|false]_\n* **Default:** true\n\n**NoRebootInstanceBeforeTakingImage:**\n* **Type:** Boolean\n* **Description:** **(Optional)** _Default is true (no reboot). This parameter determines if the source instance should be restarted while taking the AMI that will be used to launch the copied instance. [Allowed values: true|false]_\n* **Default:** true",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "sameRegionLaunchInstanceWithKeyPair.InstanceIds",
+    "sameRegionLaunchInstanceWithoutKeyPair.InstanceIds",
+    "destinationRegionLaunchInstance.DestinationInstanceId"
+  ],
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) Instance id for the instance that needs to be copied (e.g. i-abcd1234567890).",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) IAM role which SSM Systems Manager will assume to execute this automation. If no role is provided, this automation will use the permissions of the user that executes this document. Note: A role must be provided when copying the instance to a different region, otherwise the copy will fail with \"NoCredentialsError - Unable to locate credentials\".",
+      "default": "",
+      "allowedPattern": "^$|^arn:aws:iam::[0-9]*:role/[/\\w+=,.@-]+$"
+    },
+    "KeyPair": {
+      "type": "String",
+      "description": "(Optional) KeyPair to use when launching the copied instance. The KeyPair must exist in the specified region or the automation will fail. When using username and password access, AWS best practices recommends that you have a KeyPair. If no KeyPair is provided the destination instance will not have a KeyPair.",
+      "default": "",
+      "allowedPattern": "^$|^[\u0000-\u007f]{1,255}$"
+    },
+    "Region": {
+      "type": "String",
+      "description": "(Optional) Region for the for the copied instance (e.g. eu-west-1). If this option is not provided, then this automation will copy the instance within the same Region as the source. If this parameter is provided (copy to a different region) and SubnetId/SecurityGroupIds are not provided, then the automation will attempt to launch the Instance in the default VPC with the default Security Group which will work only if ec2-classic network is not enabled on that destination region. AutomationAssumeRole must be specified for copy to another region, otherwise the copy will fail with \"NoCredentialsError - Unable to locate credentials\".",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z]{2}-[a-zA-Z-]+-[1-9]$"
+    },
+    "SubnetId": {
+      "type": "String",
+      "description": "(Optional) An existing subnet for the copied instance. If this option is not provided, for a same region copy, this automation will copy the Instance to the same Subnet. For a copy to a different region, the instance will be launched in a default subnet from the default VPC if: The destination region has a default VPC and is not enabled for ec2-classic network. Note: If ec2-classic is enabled on the destination region, then subnetId must be specified.",
+      "default": "",
+      "allowedPattern": "^$|^subnet-[a-z0-9]{8,17}$"
+    },
+    "InstanceType": {
+      "type": "String",
+      "description": "(Optional) Instance type for the copied instance. If this option is not provided, then the source instance type will be used. If the source instance type does not exist in the target region the automation will fail.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z0-9-]{1,7}\\.[a-z0-9]+$"
+    },
+    "SecurityGroupIds": {
+      "type": "StringList",
+      "description": "(Optional) Security Group Id(s) for the copied instance. Multiple Security Group Ids can be provided, separated by a comma (\",\")  (e.g. sg-xxxxxx, sg-yyyyy). If this option is not provided, for a same region copy the automation will use the same Security Groups as the source instance. For a copy to different region, the automation will use the default VPC security group.",
+      "default": [
+        ""
+      ],
+      "allowedPattern": "^$|^sg-[0-9a-f]{8,17}$"
+    },
+    "KeepImageSourceRegion": {
+      "type": "Boolean",
+      "description": "(Optional) Default is true. This parameter determines if the AMI of the source instance should be preserved. If this parameter is set to true, then the automation will keep this image and it can be found under EC2 console (Under Images, AMI). If this parameter is set to false, then the automation will deregister the AMI and delete the associated snapshots. [Allowed values: true|false]",
+      "default": true
+    },
+    "KeepImageDestinationRegion": {
+      "type": "Boolean",
+      "description": "(Optional) Default is true. This parameter is ignored for a same region copy. For a copy to a different region, this parameter determines if the AMI copied to the target region, should be preserved. If this parameter is set to true, then the automation will keep this image and it can be found under EC2 console (Under Images, AMI) on the target Region. If this parameter is set to false, then the automation will deregister the AMI and delete the associated snapshots. [Allowed values: true|false]",
+      "default": true
+    },
+    "NoRebootInstanceBeforeTakingImage": {
+      "type": "Boolean",
+      "description": "(Optional) Default is true (no reboot). This parameter determines if the source instance should be restarted while taking the AMI that will be used to launch the copied instance. [Allowed values: true|false]",
+      "default": true
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "describeOriginalInstanceDetails",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SourceInstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceAvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceSubnetId",
+          "Selector": "$.Reservations[0].Instances[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceKeyPair",
+          "Selector": "$.Reservations[0].Instances[0].KeyName",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceSecurityGroupIds",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups..GroupId",
+          "Type": "StringList"
+        },
+        {
+          "Name": "SourceRootDeviceName",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "assertRootVolumeIsEbs"
+    },
+    {
+      "name": "assertRootVolumeIsEbs",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].RootDeviceType",
+        "DesiredValues": [
+          "ebs"
+        ]
+      },
+      "isCritical": true,
+      "nextStep": "evalInputParameters"
+    },
+    {
+      "name": "evalInputParameters",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "This step will check all the Input Parameters (if provided), and outputs the Destination Region, the Subnet ID, The KeyPair name and The Security Groups to use for the destination Instance. ",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "InputDestinationRegion": "{{ Region }}",
+          "InputDestinationSubnetId": "{{ SubnetId }}",
+          "InputDestinationInstanceType": "{{ InstanceType }}",
+          "InputDestinationKeyName": "{{ KeyPair }}",
+          "InputDestinationSecurityGroupIds": "{{ SecurityGroupIds }}",
+          "SourceInstanceType": "{{ describeOriginalInstanceDetails.SourceInstanceType }}",
+          "SourceInstanceAZ": "{{ describeOriginalInstanceDetails.SourceAvailabilityZone }}",
+          "SourceInstanceSubnetId": "{{ describeOriginalInstanceDetails.SourceSubnetId }}",
+          "SourceInstanceKeyName": "{{ describeOriginalInstanceDetails.SourceKeyPair }}",
+          "SourceInstanceSecurityGroupIds": "{{ describeOriginalInstanceDetails.SourceSecurityGroupIds }}"
+        },
+        "Script": "def script_handler(events, context):\n    # Set Destination Region to use\n    sourceInstanceRegion = events['SourceInstanceAZ'][:-1]\n    finalRegion = sourceInstanceRegion if not events['InputDestinationRegion'] else events['InputDestinationRegion']\n    isSameRegion = True if finalRegion.strip() == sourceInstanceRegion else False\n\n    # Set KeyPair. Uses user specified KeyPair. If no KeyPair provided, final KeyPair will be empty.\n    finalKeyPair = \"\" if not events['InputDestinationKeyName'] else events['InputDestinationKeyName']\n    finalInstanceType = events['SourceInstanceType'] if not events['InputDestinationInstanceType'] else events['InputDestinationInstanceType']\n\n    # Set parameter to use\n    if isSameRegion:\n        # Set Subnet ID to use if on same region\n        finalSubnetId = events['SourceInstanceSubnetId'] if not events['InputDestinationSubnetId'] else events['InputDestinationSubnetId']\n        # Set Security Group to use if on same region\n        finalSecurityGroupIds = events['SourceInstanceSecurityGroupIds'] if not events['InputDestinationSecurityGroupIds'][0] else events['InputDestinationSecurityGroupIds']\n    else:\n        # Set Subnet ID to use if on different region\n        finalSubnetId = events['InputDestinationSubnetId']\n        # Set Security Group to use if on different region\n        finalSecurityGroupIds = [sg for sg in events['InputDestinationSecurityGroupIds']]\n        \n    # Output Dict\n    # function_outputs = [finalRegion, finalSubnetId, finalInstanceType, finalKeyPair, finalSecurityGroupIds, isSameRegion, assertSourceInstanceHadNoKeyPairAndNoneSpecified]\n    function_outputs = {\n        \"FinalRegion\": finalRegion,\n        \"FinalSubnetId\": finalSubnetId,\n        \"FinalInstanceType\": finalInstanceType,\n        \"FinalKeyPair\": finalKeyPair,\n        \"FinalSecurityGroupIds\": finalSecurityGroupIds,\n        \"AssertSameRegion\": isSameRegion\n    }\n\n    # Return a map with the Final Parameters to use\n    return function_outputs\n"
+      },
+      "outputs": [
+        {
+          "Name": "RegionToUse",
+          "Selector": "$.Payload.FinalRegion",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetToUse",
+          "Selector": "$.Payload.FinalSubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceTypeToUse",
+          "Selector": "$.Payload.FinalInstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "KeyNameToUse",
+          "Selector": "$.Payload.FinalKeyPair",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupsToUse",
+          "Selector": "$.Payload.FinalSecurityGroupIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "AssertRegionIsSame",
+          "Selector": "$.Payload.AssertSameRegion",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "createLocalAmi"
+    },
+    {
+      "name": "createLocalAmi",
+      "action": "aws:createImage",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceId": "{{ InstanceId }}",
+        "ImageName": "AWSSupport-CopyEC2Instance LocalAmi for {{ InstanceId }}_{{ global:DATE_TIME }}",
+        "NoReboot": "{{ NoRebootInstanceBeforeTakingImage }}",
+        "ImageDescription": "AWSSupport-CopyEC2Instance LocalAmi for {{ InstanceId }} at {{ global:DATE_TIME }}."
+      },
+      "nextStep": "tagLocalAmi"
+    },
+    {
+      "name": "tagLocalAmi",
+      "action": "aws:createTags",
+      "onFailure": "Continue",
+      "inputs": {
+        "ResourceType": "EC2",
+        "ResourceIds": [
+          "{{ createLocalAmi.ImageId }}"
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-CopyEC2Instance LocalAmi for {{ InstanceId }}"
+          },
+          {
+            "Key": "AWSSupport-CopyEC2Instance",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "CreatedBy",
+            "Value": "AWSSupport-CopyEC2Instance"
+          },
+          {
+            "Key": "CreatedTime",
+            "Value": "{{ global:DATE_TIME }}"
+          }
+        ]
+      },
+      "nextStep": "branchAssertRegionIsSame"
+    },
+    {
+      "name": "branchAssertRegionIsSame",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "branchAssertSameRegionWithKeyPair",
+            "Variable": "{{ evalInputParameters.AssertRegionIsSame }}",
+            "BooleanEquals": true
+          },
+          {
+            "NextStep": "copyAmiToRegion",
+            "Variable": "{{ evalInputParameters.AssertRegionIsSame }}",
+            "BooleanEquals": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "branchAssertSameRegionWithKeyPair",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "sameRegionLaunchInstanceWithoutKeyPair",
+            "Variable": "{{ evalInputParameters.KeyNameToUse }}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "sameRegionLaunchInstanceWithKeyPair"
+      }
+    },
+    {
+      "name": "sameRegionLaunchInstanceWithKeyPair",
+      "action": "aws:runInstances",
+      "maxAttempts": 3,
+      "timeoutSeconds": 1200,
+      "isCritical": true,
+      "onFailure": "step:branchAssertSourceAmiToDelete",
+      "inputs": {
+        "ImageId": "{{ createLocalAmi.ImageId }}",
+        "InstanceType": "{{ evalInputParameters.InstanceTypeToUse }}",
+        "KeyName": "{{ evalInputParameters.KeyNameToUse }}",
+        "SubnetId": "{{ evalInputParameters.SubnetToUse }}",
+        "SecurityGroupIds": "{{ evalInputParameters.SecurityGroupsToUse }}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "AWSSupport-CopyEC2Instance Source: {{ InstanceId }}"
+              },
+              {
+                "Key": "AWSSupport-CopyEC2Instance",
+                "Value": "{{ automation:EXECUTION_ID }}"
+              },
+              {
+                "Key": "CreatedBy",
+                "Value": "AWSSupport-CopyEC2Instance"
+              },
+              {
+                "Key": "CreatedTime",
+                "Value": "{{ global:DATE_TIME }}"
+              }
+            ]
+          }
+        ]
+      },
+      "nextStep": "branchAssertSourceAmiToDelete"
+    },
+    {
+      "name": "sameRegionLaunchInstanceWithoutKeyPair",
+      "action": "aws:runInstances",
+      "maxAttempts": 3,
+      "timeoutSeconds": 1200,
+      "isCritical": true,
+      "onFailure": "step:branchAssertSourceAmiToDelete",
+      "inputs": {
+        "ImageId": "{{ createLocalAmi.ImageId }}",
+        "InstanceType": "{{ evalInputParameters.InstanceTypeToUse }}",
+        "SubnetId": "{{ evalInputParameters.SubnetToUse }}",
+        "SecurityGroupIds": "{{ evalInputParameters.SecurityGroupsToUse }}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "AWSSupport-CopyEC2Instance Source: {{ InstanceId }}"
+              },
+              {
+                "Key": "AWSSupport-CopyEC2Instance",
+                "Value": "{{ automation:EXECUTION_ID }}"
+              },
+              {
+                "Key": "CreatedBy",
+                "Value": "AWSSupport-CopyEC2Instance"
+              },
+              {
+                "Key": "CreatedTime",
+                "Value": "{{ global:DATE_TIME }}"
+              }
+            ]
+          }
+        ]
+      },
+      "nextStep": "branchAssertSourceAmiToDelete"
+    },
+    {
+      "name": "copyAmiToRegion",
+      "action": "aws:executeScript",
+      "isCritical": true,
+      "onFailure": "step:branchAssertSourceAmiToDelete",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "crossRegionImageCopy",
+        "InputPayload": {
+          "AutomationExecutionId": "{{ automation:EXECUTION_ID }}",
+          "CreatedTime": "{{ global:DATE_TIME }}",
+          "SourceLocalImageId": "{{ createLocalAmi.ImageId }}",
+          "SourceRegion": "{{ global:REGION }}",
+          "DestinationRegion": "{{ evalInputParameters.RegionToUse }}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom botocore.exceptions import ClientError\n\ndef crossRegionImageCopy(events, context):\n    try:\n        # Initialize client\n        ec2 = boto3.client('ec2', region_name=events['DestinationRegion'])\n\n        name = 'AMI Copied from ' + events['SourceLocalImageId'] + ' located in ' + events['SourceRegion'] + ' by AWSSupport-CopyEC2Instance at ' + events['CreatedTime']\n        # Copy Image\n        remote_image = ec2.copy_image(\n            Name=name,\n            Description=name + ': ' + events['AutomationExecutionId'],\n            SourceImageId=events['SourceLocalImageId'],\n            SourceRegion=events['SourceRegion']\n        )\n\n        # Return ImageId\n        return remote_image['ImageId']\n    except ClientError as e:\n        raise Exception (\"[ERROR]\", e)\n"
+      },
+      "outputs": [
+        {
+          "Name": "DestinationAmiId",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "waitForAvailableDestinationAmi"
+    },
+    {
+      "name": "waitForAvailableDestinationAmi",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "onFailure": "step:branchAssertSourceAmiToDelete",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "crossRegionImageWait",
+        "InputPayload": {
+          "ImageId": "{{ copyAmiToRegion.DestinationAmiId }}",
+          "Region": "{{ evalInputParameters.RegionToUse }}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom botocore.exceptions import ClientError\n\ndef crossRegionImageWait(events, context):\n    try:\n        # Initialize client\n        ec2 = boto3.client('ec2', region_name=events['Region'])\n\n        # Wait for the image to be available\n        print(\"[INFO] Waiting for the Image\", events['ImageId'], \"in Region\", events['Region'], \"to be in available state...\")\n        ec2.get_waiter('image_available').wait(ImageIds=[events['ImageId']])\n        print(\"[INFO] Image\", events['ImageId'], \"is now Available!\")\n\n        # Return ImageId\n        return events['ImageId']\n    except ClientError as e:\n        raise Exception (\"[ERROR]\", e)\n"
+      },
+      "nextStep": "destinationRegionLaunchInstance"
+    },
+    {
+      "name": "destinationRegionLaunchInstance",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "timeoutSeconds": 1200,
+      "isCritical": true,
+      "onFailure": "step:branchAssertSourceAmiToDelete",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "crossRegionRunInstances",
+        "InputPayload": {
+          "AutomationExecutionId": "{{ automation:EXECUTION_ID }}",
+          "CreatedTime": "{{ global:DATE_TIME }}",
+          "SourceInstanceId": "{{ InstanceId }}",
+          "ImageId": "{{ copyAmiToRegion.DestinationAmiId }}",
+          "Region": "{{ evalInputParameters.RegionToUse }}",
+          "InstanceType": "{{ evalInputParameters.InstanceTypeToUse }}",
+          "KeyName": "{{ evalInputParameters.KeyNameToUse }}",
+          "SubnetId": "{{ evalInputParameters.SubnetToUse }}",
+          "SecurityGroupIds": "{{ evalInputParameters.SecurityGroupsToUse }}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom botocore.exceptions import ClientError\n\ndef crossRegionRunInstances(events, context):\n    try:\n        # Initialize client\n        ec2 = boto3.client('ec2', region_name=events['Region'])\n\n        # Build argument for runInstances\n        arg_run_instance = {\n            'ImageId': events['ImageId'],\n            'MinCount': 1,\n            'MaxCount': 1,\n            'InstanceType': events['InstanceType'],\n            'TagSpecifications': [\n                {\n                    \"ResourceType\": \"instance\",\n                    \"Tags\": [\n                        {\n                            \"Key\": \"Name\",\n                            \"Value\": \"AWSSupport-CopyEC2Instance Source: \" + events['SourceInstanceId']\n                        },\n                        {\n                            \"Key\": \"AWSSupport-CopyEC2Instance\",\n                            \"Value\": events['AutomationExecutionId']\n                        },\n                        {\n                            \"Key\": \"CreatedBy\",\n                            \"Value\": \"AWSSupport-CopyEC2Instance\"\n                        },\n                        {\n                            \"Key\": \"CreatedTime\",\n                            \"Value\": events['CreatedTime']\n                        }\n                    ]\n                }\n            ]\n        }\n\n        # Add Key Pair if not empty\n        if events['KeyName']:\n            arg_run_instance['KeyName'] = events['KeyName']\n\n        # Add SubnetId list if not empty\n        if events['SubnetId']:\n            arg_run_instance['SubnetId'] = events['SubnetId']\n\n        # Add Security Groups if not empty\n        if events['SecurityGroupIds'][0]:\n            arg_run_instance['SecurityGroupIds'] = events['SecurityGroupIds']\n\n        # Run Instance with provided parameter \n        print('[INFO] RunInstances parameters:', arg_run_instance)\n        remote_instance = ec2.run_instances(**arg_run_instance)\n\n        instanceId = remote_instance['Instances'][0]['InstanceId']\n        print(\"[INFO] Successfully launched\", instanceId)\n\n        # Return Instance Id\n        return instanceId\n    except ClientError as e:\n        raise Exception (\"[ERROR]\", e)\n"
+      },
+      "outputs": [
+        {
+          "Name": "DestinationInstanceId",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchAssertDestinationAmiToDelete"
+    },
+    {
+      "name": "branchAssertDestinationAmiToDelete",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "deregisterDestinationAmiAndDeleteSnapshots",
+            "Variable": "{{ KeepImageDestinationRegion }}",
+            "BooleanEquals": false
+          }
+        ],
+        "Default": "branchAssertSourceAmiToDelete"
+      }
+    },
+    {
+      "name": "deregisterDestinationAmiAndDeleteSnapshots",
+      "action": "aws:executeScript",
+      "isCritical": true,
+      "onFailure": "step:branchAssertSourceAmiToDelete",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "deregisterAmiAndDeleteSnapshots",
+        "InputPayload": {
+          "Region": "{{ evalInputParameters.RegionToUse }}",
+          "ImageId": "{{ copyAmiToRegion.DestinationAmiId }}"
+        },
+        "Script": "import boto3\nimport botocore\nfrom botocore.exceptions import ClientError\n\ndef deregisterAmiAndDeleteSnapshots(events, context):\n    try:\n        # Initialize client\n        ec2 = boto3.client('ec2', region_name=events['Region'])\n\n        print(\"[INFO] Deleting the destination region Image:\", events['ImageId'], \"as requested in the document parameters\")\n\n        # Describe the image first so we can get the snapshotsIds from the BlockDeviceMappings\n        print(\"[INFO] Retrieving snapshots for\", events['ImageId'] + \"...\")\n        snapshotIds = []\n        images = ec2.describe_images(ImageIds=[events['ImageId']])['Images']\n        if len(images):\n            for device in images[0]['BlockDeviceMappings']:\n                if 'Ebs' in device and 'SnapshotId' in device['Ebs']:\n                    snapshotIds.append(device['Ebs']['SnapshotId'])\n        print(\"[INFO] SnapshotIds to delete:\", snapshotIds)\n\n        '''\n        Sample response\n        {\n            'ResponseMetadata': {\n                'RequestId': 'c45b0378-3be1-4abd-af66-f097c95b6501',\n                'HTTPStatusCode': 200,\n                'HTTPHeaders': {\n                    'x-amzn-requestid': 'c45b0378-3be1-4abd-af66-f097c95b6501',\n                    'content-type': 'text/xml;charset=UTF-8',\n                    'content-length': '231',\n                    'date': 'Tue, 15Sep202007: 50: 41GMT',\n                    'server': 'AmazonEC2'\n                },\n                'RetryAttempts': 0\n            }\n        }\n        '''\n        print(\"[INFO] Deregistering AMI:\", events['ImageId'] + \"...\")\n        response = ec2.deregister_image(ImageId=events['ImageId'])\n\n        if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n            print(\"[INFO] Successfully deleted:\", events['ImageId'])\n        \n        # After AMI is deregistered, loop through snapshotIds and delete the snapshot\n        for snapshotId in snapshotIds:\n            print(\"[INFO] Deleting snapshot:\", snapshotId + \"...\")\n            response = ec2.delete_snapshot(SnapshotId=snapshotId)\n            if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n                print(\"[INFO] Successfully deleted:\", snapshotId)\n\n        # Return ImageId\n        return events['ImageId']\n    except ClientError as e:\n        raise Exception (\"[ERROR]\", e)\n"
+      },
+      "nextStep": "branchAssertSourceAmiToDelete"
+    },
+    {
+      "name": "branchAssertSourceAmiToDelete",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "deregisterSourceAmiAndDeleteSnapshots",
+            "Variable": "{{ KeepImageSourceRegion }}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "sleep",
+            "Variable": "{{ KeepImageSourceRegion }}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "deregisterSourceAmiAndDeleteSnapshots",
+      "action": "aws:deleteImage",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "ImageId": "{{ createLocalAmi.ImageId }}"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "sleep",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT2S"
+      },
+      "isEnd": true
+    }
+  ]
+}
