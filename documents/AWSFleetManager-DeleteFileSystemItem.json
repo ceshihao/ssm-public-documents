@@ -1,0 +1,76 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Deletes a local file or directory.",
+  "parameters": {
+    "Path": {
+      "type": "String",
+      "description": "Path of file or directory to be deleted.",
+      "allowedPattern": "^\\w:$|^\\w:\\\\[^\"'|\\r\\n]*$|^\\/[^\"'|\\r\\n]*$|^([A-Za-z0-9-_\\/+]{4})*([A-Za-z0-9-_\\/+]{4}|[A-Za-z0-9-_\\/+]{3}=|[A-Za-z0-9-_\\/+]{2}==)$"
+    },
+    "Recurse": {
+      "type": "String",
+      "description": "(Optional) Set this to 'Yes' to perform recursive deletion of a directory.",
+      "default": "No",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ]
+    },
+    "PerformAction": {
+      "type": "String",
+      "description": "(Optional) Set this to 'Yes' to perform the action.",
+      "default": "No",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "action": "aws:runPowerShellScript",
+      "name": "InvokeWindowsScript",
+      "inputs": {
+        "runCommand": [
+          "$ErrorActionPreference = 'Stop'\n\nFunction ParseInputParameter {\n    param (\n        [string]$Name,\n        [string]$Value,\n        [string]$Regex\n    )\n\n    $ValidParameterRegex = '^--%[ +{|{].*}( +)?$'\n    if ($Value -notmatch $ValidParameterRegex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    }\n    $parameterValue = $Value.Substring(3)\n\n    $trimmedParameterValue = $parameterValue.TrimStart().TrimEnd()\n    $trimmedParameterValue = $trimmedParameterValue.Substring(1)\n    $trimmedParameterValue = $trimmedParameterValue.Substring(0, $trimmedParameterValue.Length - 1)\n\n    if ($Regex -and $trimmedParameterValue -notmatch $Regex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\"\n    } else {\n        $trimmedParameterValue\n    }\n}\n\nfunction ExitWithFailureMessage {\n    param (\n        [string]$Message,\n        [string]$ExceptionMessage,\n        [Switch]$PrintJson\n    )\n    if ([string]::IsNullOrWhitespace($ExceptionMessage)) {\n        $errorMessage = $Message\n    } else {\n        $errorMessage = '{0} {1}' -f $Message, $ExceptionMessage\n    }\n    if ($PrintJson) {ConvertTo-Json -InputObject @{error = $errorMessage} -Compress}\n    WriteStandardError -Message $errorMessage\n    [System.Environment]::Exit(1)\n}\n\nfunction ExitWithSuccessMessage {\n    param (\n        [string]$Message\n    )\n    Write-Host $Message\n    [System.Environment]::Exit(0)\n}\n\nfunction WriteStandardError {\n    param (\n        [string]$Message\n    )\n    $Host.UI.WriteErrorLine($Message)\n}\n\nfunction TestPerformAction {\n    param ( [string]$PerformAction )\n    if ($PerformAction -ne 'Yes') {\n        ExitWithFailureMessage -Message \"No action was taken because the PerformAction parameter is set to $PerformAction. To make the desired change, set this parameter to Yes.\"\n    }\n}\n\n$Path = Write-Output --%{{{ Path }}}\n$Path = ParseInputParameter -Name 'Path' -Value $Path\n\n$Recurse = Write-Output --%{{{ Recurse }}}\n$Recurse = ParseInputParameter -Name 'Recurse' -Value $Recurse -Regex '(Yes|No)'\n\n$PerformAction = Write-Output --%{{{ PerformAction }}}\n$PerformAction = ParseInputParameter -Name 'PerformAction' -Value $PerformAction -Regex '(Yes|No)'\nTestPerformAction -PerformAction $PerformAction\n\ntry {$resolvedPath = (Resolve-Path -Path $Path).Path}\ncatch {ExitWithFailureMessage -Message 'The specified path is invalid.' -PrintJson}\n\ntry {\n    if ($Recurse -eq 'Yes') {\n        $null = Remove-Item -Path $Path -recurse\n    } else {\n        $null = Remove-Item -Path $Path\n    }\n    ExitWithSuccessMessage 'The specified file/directory has been deleted.'\n} catch {\n    ExitWithFailureMessage -Message \"Failed to delete the specified file/directory.\" -PrintJson\n}\n"
+        ]
+      }
+    },
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "action": "aws:runShellScript",
+      "name": "InvokeLinuxScript",
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash\nset -e\n\nif [ -f /etc/os-release ]; then\n    . /etc/os-release\n    OS_RELEASE=\"$ID${VERSION_ID:+.${VERSION_ID}}\"\nelif [ -f /etc/centos-release ]; then\n    OS_RELEASE=\"centos.$(awk '{print $3}' /etc/centos-release)\"\nelif [ -f /etc/redhat-release ]; then\n    OS_RELEASE=\"rhel.$(lsb_release -r | awk '{print $2}')\"\nfi\n\ncase \"$OS_RELEASE\" in\n    amzn.2|centos.7*|centos.8*|fedora.*|rhel.7*|rhel.8*|sles*|ubuntu.20*)\n        command_path='/usr/bin/'\n        ;;\n    amzn.2018.03|centos.6*|debian.*|rhel.6*|ubuntu.16*|ubuntu.18*)\n        command_path='/bin/'\n        ;;\n    *)\n        # Catch all without the full path for untested platforms\n        command_path=''\nesac\n\nExitWithFailureMessage() {\n    MESSAGE=\"$1\"\n    JSON=\"$2\"\n    if [[ \"$JSON\" == \"PRINT_JSON\" ]]; then\n        \"${command_path}echo\" \"{\\\"error\\\":\\\"$MESSAGE\\\"}\"\n    fi\n    WriteStandardError \"$MESSAGE\"\n    exit 1\n}\n\nExitWithSuccessMessage() {\n    \"${command_path}echo\" \"$1\"\n    exit 0\n}\n\nWriteStandardError() {\n    MESSAGE=\"$1\"\n    (>&2 \"${command_path}echo\" \"$MESSAGE\")\n}\n\nTestPerformAction() {\n    if [[ \"$1\" != \"Yes\" ]]; then\n        ExitWithFailureMessage \"No action was taken because the PerformAction parameter is set to $1. To make the desired change, set this parameter to Yes.\"\n    fi\n}\n\nPath='{{ Path }}'\nRecurse='{{ Recurse }}'\nPERFORMACTION='{{ PerformAction }}'\n\nTestPerformAction \"$PERFORMACTION\"\n\nif [ ! -f \"$Path\" -a ! -d \"$Path\" ]; then\n    ExitWithFailureMessage 'The specified path is invalid.' 'PRINT_JSON'\nfi\n\nif [ -f \"${command_path}rm\" ]; then\n    COMMAND=\"${command_path}rm\"\nelse\n    ExitWithFailureMessage 'Required rm command does not exist.' 'PRINT_JSON'\nfi\n\nFlags=''\nif [ \"$Recurse\" = 'Yes' ]; then\n    Flags='-r'\nfi\n\nif [[ -n \"$Flags\" ]]; then\n  \"$COMMAND\" \"$Flags\" \"$Path\" || ExitWithFailureMessage \"Failed to delete file/directory at the specified path $Path\" 'PRINT_JSON'\nelse\n  \"$COMMAND\" \"$Path\" || ExitWithFailureMessage \"Failed to delete file/directory at the specified path $Path\" 'PRINT_JSON'\nfi\n\nExitWithSuccessMessage 'File/Directory has been deleted.' 'PRINT_JSON'\n"
+        ]
+      }
+    },
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "MacOS"
+        ]
+      },
+      "action": "aws:runShellScript",
+      "name": "InvokeMacOSScript",
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash\nset -e\n\nExitWithFailureMessage() {\n    MESSAGE=\"$1\"\n    JSON=\"$2\"\n    if [[ \"$JSON\" == \"PRINT_JSON\" ]]; then\n        /bin/echo \"{\\\"error\\\":\\\"$MESSAGE\\\"}\"\n    fi\n    WriteStandardError \"$MESSAGE\"\n    exit 1\n}\n\nExitWithSuccessMessage() {\n    /bin/echo \"$1\"\n    exit 0\n}\n\nWriteStandardError() {\n    MESSAGE=\"$1\"\n    (>&2 /bin/echo \"$MESSAGE\")\n}\n\nTestPerformAction() {\n    if [[ \"$1\" != \"Yes\" ]]; then\n        ExitWithFailureMessage \"No action was taken because the PerformAction parameter is set to $1. To make the desired change, set this parameter to Yes.\"\n    fi\n}\n\nJQ=\"jq\"\nVERSION=\"1.6\"\nPRODUCT_PATH=\"/opt/amazon/ssm/fleet_manager\"\nJQ_BINARY=\"$PRODUCT_PATH/$JQ-$VERSION\"\n\nCheckSha256FileHash() {\n    FILE_PATH=\"$1\"\n    SHA256=\"$2\"\n\n    if [ -f \"$FILE_PATH\" ]; then\n        TEST=$(/bin/echo \"$SHA256  $FILE_PATH\" | /usr/bin/shasum -c 2>&1) || return 1\n        return 0\n    fi\n\n    return 1\n}\n\nSetLockedDownPermissions() {\n    /bin/chmod u+rwx \"$1\"\n    /bin/chmod go-rwx \"$1\"\n    /usr/sbin/chown \"$(/usr/bin/whoami)\":\"$(/usr/bin/id -g -nr)\" \"$1\"\n}\n\nCreateLockedDownFolder() {\n    /bin/mkdir -p \"$1\"\n    SetLockedDownPermissions \"$1\"\n}\n\nDownloadFile() {\n    SOURCE=\"$1\"\n    DESTINATION=\"$2\"\n    /usr/bin/curl -s \"$SOURCE\" -o \"$DESTINATION\"\n}\n\nGetJQSHA256Hash() {\n    case \"$1\" in\n        'x86_64')\n            /bin/echo \"5c0a0a3ea600f302ee458b30317425dd9632d1ad8882259fcaf4e9b868b2b1ef\"\n            ;;\n        *)\n            ExitWithFailureMessage \"The CPU architecture '$1' is not supported. Failing execution.\" 'PRINT_JSON'\n            ;;\n    esac\n}\n\nRandomString() {\n    /usr/bin/openssl rand -base64 6\n}\n\nInstallJQ() {\n    CreateLockedDownFolder \"$PRODUCT_PATH\"\n\n    CPU_ARCH=$(/usr/bin/uname -m)\n    JQ_SHA256=$(GetJQSHA256Hash \"$CPU_ARCH\")\n\n    CheckSha256FileHash \"$JQ_BINARY\" \"$JQ_SHA256\" || {\n        JQ_TEMP_BINARY=\"$PRODUCT_PATH/$(RandomString)\"\n\n        OS_NAME=$(/usr/bin/uname -s)\n        REGION=\"us-east-1\"\n        S3_BUCKET=\"aws-fleet-manager-artifacts-us-east-1\"\n        S3_DNS=\"s3.us-east-1.amazonaws.com\"\n        SOURCE=\"https://$S3_BUCKET.$S3_DNS/$JQ/$VERSION/$OS_NAME/$CPU_ARCH/$JQ\"\n        DownloadFile \"$SOURCE\" \"$JQ_TEMP_BINARY\"\n\n        CheckSha256FileHash \"$JQ_TEMP_BINARY\" \"$JQ_SHA256\" || {\n            /bin/rm -f \"$JQ_TEMP_BINARY\"\n            ExitWithFailureMessage \"Downloading the $JQ binary failed. Failing execution.\"\n        }\n\n        /bin/mv \"$JQ_TEMP_BINARY\" \"$JQ_BINARY\"\n    }\n\n    SetLockedDownPermissions \"$JQ_BINARY\"\n}\n\nInstallJQ\n\nConvertBase64ToString() {\n    /bin/echo \"$1\" | /usr/bin/base64 --decode\n}\n\nConvertStringToBase64() {\n    /bin/echo \"$1\" | /usr/bin/base64\n}\n\nGetBase64EncodedGzipString() {\n    /bin/echo \"$1\" | /usr/bin/gzip -f --best | /usr/bin/base64\n}\n\nGetResultAsString() {\n    TempString=\"$1\"\n    ItemCount=\"$2\"\n    OutputTooBig=\"$3\"\n    EnableCompression=\"$4\"\n    ForceEmptyNextToken=\"$5\"\n    ConvertToBase64=\"$6\"\n\n    nextToken='\"\"'\n    if [ \"$OutputTooBig\" == \"0\" ] && [ \"$ItemCount\" -ge 1 ] && [ \"$ForceEmptyNextToken\" != \"Yes\" ]; then\n        nextToken=$(/bin/echo \"$TempString\" | \"$JQ_BINARY\" '.[-1].null' | \"$JQ_BINARY\" -r .)\n    fi\n\n    if [ \"$ConvertToBase64\" == \"CONVERT_NEXT_TOKEN_TO_BASE64\" ] && [ \"$nextToken\" != '\"\"' ]; then\n        nextToken=\"\\\"$(/bin/echo \"$nextToken\" | /usr/bin/base64)\\\"\"\n    fi\n\n    data=$(/bin/echo [\"$nextToken\", \"$TempString\"] | \"$JQ_BINARY\" -c '{nextToken: .[0], results: .[1]}')\n\n    if [ \"$EnableCompression\" == \"Yes\" ]; then\n        compressed=$(GetBase64EncodedGzipString \"$data\")\n        \"$JQ_BINARY\" -n -c \"{data:\\\"$compressed\\\"}\"\n    else\n        /bin/echo \"$data\" | \"$JQ_BINARY\" -c '{data: .}'\n    fi\n}\n\nGetMaximumOutputBytes() {\n    AllowTruncatedOutput=\"$1\"\n    MAXIMUM_OUTPUT_SIZE=2500\n\n    if [[ \"$AllowTruncatedOutput\" == 'Yes' ]]; then\n        /bin/echo 0\n    else\n        padding=$(/bin/echo '{\"data\":{\"nextToken\":\"\",\"results\":\"\"}}' | /usr/bin/awk '{print length}')\n        /bin/echo \"$((MAXIMUM_OUTPUT_SIZE-padding))\"\n    fi\n}\n\nProcessItems() {\n    ITEMS=\"$1\"\n    CONVERT_TO_BASE64=\"$2\"\n\n    declare -a chunkedArray\n\n    counter=0\n    chunksPerLoop=5\n    outputTooBig=0\n\n    OIFS=\"$IFS\"\n    IFS=$'\\n'\n    for item in $(/bin/echo \"$ITEMS\" | \"$JQ_BINARY\" -c '.[]'); do\n        if [[ \"$outputTooBig\" == 1 ]]; then\n            break\n        fi\n\n        chunkedArray+=(\"$item\")\n\n        if [ \"$counter\" -lt \"$chunksPerLoop\" ]; then\n            counter=$((counter+1))\n            continue\n        fi\n\n        counter=0\n\n        tempString=$(/bin/echo \"${chunkedArray[@]}\" | \"$JQ_BINARY\" -c --slurp .)\n        arrayLength=$(/bin/echo \"$tempString\" | \"$JQ_BINARY\" '. | length')\n        tempContent=$(GetResultAsString \"$tempString\" \"$arrayLength\" \"$outputTooBig\" \"$CompressOutput\" 'No' \"$CONVERT_TO_BASE64\")\n\n        tempContentLength=$(/bin/echo \"$tempContent\" | /usr/bin/awk '{print length}')\n        if [ \"$MaximumOutputBytes\" -eq 0 ] || [ \"$tempContentLength\" -le \"$MaximumOutputBytes\" ]; then\n            outputContent=\"$tempContent\"\n        else\n            outputTooBig=1\n        fi\n    done\n    IFS=\"$OIFS\"\n\n    # If the output is not too large, processing any remaining items\n    if [ \"$outputTooBig\" -eq \"0\" ]; then\n        tempString=$(/bin/echo \"${chunkedArray[@]}\" | \"$JQ_BINARY\" -c --slurp .)\n        arrayLength=$(/bin/echo \"$tempString\" | \"$JQ_BINARY\" '. | length')\n        tempContent=$(GetResultAsString \"$tempString\" \"$arrayLength\" \"$outputTooBig\" \"$CompressOutput\" 'Yes' \"$CONVERT_TO_BASE64\")\n\n        tempContentLength=$(/bin/echo \"$tempContent\" | /usr/bin/awk '{print length}')\n        if [ \"$MaximumOutputBytes\" -eq 0 ] || [ \"$tempContentLength\" -le \"$MaximumOutputBytes\" ]; then\n            outputContent=\"$tempContent\"\n        fi\n    fi\n\n    /bin/echo \"$outputContent\"\n}\n\nPath='{{ Path }}'\nRecurse='{{ Recurse }}'\nPERFORMACTION='{{ PerformAction }}'\n\nTestPerformAction \"$PERFORMACTION\"\n\nif [ ! -f \"$Path\" -a ! -d \"$Path\" ]; then\n    ExitWithFailureMessage 'The specified path is invalid.' 'PRINT_JSON'\nfi\n\nif [ -f '/bin/rm' ]; then\n    COMMAND='/bin/rm'\nelse\n    ExitWithFailureMessage 'Required rm command does not exist.' 'PRINT_JSON'\nfi\n\nFlags=''\nif [ \"$Recurse\" = 'Yes' ]; then\n    Flags='-r'\nfi\n\nif [[ -n \"$Flags\" ]]; then\n  \"$COMMAND\" \"$Flags\" \"$Path\" || ExitWithFailureMessage \"Failed to delete file/directory at the specified path $Path\" 'PRINT_JSON'\nelse\n  \"$COMMAND\" \"$Path\" || ExitWithFailureMessage \"Failed to delete file/directory at the specified path $Path\" 'PRINT_JSON'\nfi\n\nExitWithSuccessMessage 'File/Directory has been deleted.' 'PRINT_JSON'\n"
+        ]
+      }
+    }
+  ]
+}

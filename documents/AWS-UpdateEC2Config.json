@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "1.2",
+  "schemaVersion": "2.2",
   "description": "Update the EC2Config service to the latest version or specify an older version.",
   "parameters": {
     "version": {
@@ -17,14 +17,77 @@
       ]
     }
   },
-  "runtimeConfig": {
-    "aws:updateAgent": {
-      "properties": {
+  "mainSteps": [
+    {
+      "action": "aws:runPowerShellScript",
+      "name": "createUpdateFolder",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "try {",
+          "  $sku = (Get-CimInstance -ClassName Win32_OperatingSystem).OperatingSystemSKU",
+          "  if ($sku -eq 143 -or $sku -eq 144) {",
+          "    Write-Host \"This document is not supported on Windows 2016 Nano Server.\"",
+          "    exit 40",
+          "  }",
+          "  $ssmAgentService = Get-ItemProperty 'HKLM:SYSTEM\\\\CurrentControlSet\\\\Services\\\\AmazonSSMAgent\\\\'",
+          "  if ($ssmAgentService -and [System.Version]$ssmAgentService.Version -ge [System.Version]'3.0.1031.0') {",
+          "     exit 0",
+          "  }",
+          "  $DataFolder = \"Application Data\"",
+          "  if ( ![string]::IsNullOrEmpty($env:ProgramData) ) {",
+          "    $DataFolder = $env:ProgramData",
+          "  } elseif ( ![string]::IsNullOrEmpty($env:AllUsersProfile) ) {",
+          "    $DataFolder = \"$env:AllUsersProfile\\Application Data\"",
+          "  }",
+          "  $TempFolder = \"/\"",
+          "  if ( $env:Temp -ne $null ) {",
+          "    $TempFolder = $env:Temp",
+          "  }",
+          "  $DataFolder = Join-Path $DataFolder 'Amazon\\SSM'",
+          "  $UpdateFolder = Join-Path $TempFolder 'Amazon\\Ec2Config'",
+          "  if ( !( Test-Path -LiteralPath $DataFolder )) {",
+          "    $none = New-Item -ItemType directory -Path $DataFolder",
+          "  }",
+          "  $DataACL = Get-Acl $DataFolder",
+          "  if ( Test-Path -LiteralPath $UpdateFolder ) {",
+          "    $UpdateACL = Get-Acl $UpdateFolder",
+          "    $ACLDiff = Compare-Object ($UpdateACL.AccessToString) ($DataACL.AccessToString)",
+          "    if ( $ACLDiff.count -eq 0 ) {",
+          "      exit 0",
+          "    }",
+          "    Remove-Item $UpdateFolder -Recurse -Force",
+          "  }",
+          "  $none = New-Item -ItemType directory -Path $UpdateFolder",
+          "  Set-Acl $UpdateFolder -aclobject $DataACL",
+          "  $UpdateACL = Get-Acl $UpdateFolder",
+          "  $ACLDiff = Compare-Object ($UpdateACL.AccessToString) ($DataACL.AccessToString)",
+          "  if ( $ACLDiff.count -ne 0 ) {",
+          "    Write-Error \"Failed to create update folder\" -ErrorAction Continue",
+          "    exit 41",
+          "  }",
+          "} catch {",
+          "  Write-Host  \"Failed to create update folder\"",
+          "  Write-Error  $Error[0]  -ErrorAction Continue",
+          "  exit 42",
+          "}"
+        ]
+      }
+    },
+    {
+      "action": "aws:updateAgent",
+      "name": "updateAgent",
+      "inputs": {
         "agentName": "Ec2Config",
         "source": "https://s3.{Region}.amazonaws.com/aws-ssm-{Region}/manifest.json",
         "allowDowngrade": "{{ allowDowngrade }}",
         "targetVersion": "{{ version }}"
       }
     }
-  }
+  ]
 }
