@@ -1,0 +1,111 @@
+{
+  "description": "### Document name - AWS-BulkEditOpsItems\n\n## What does this document do?\nThis document updates a given list of up to 50 OpsItemIds with the new specified status, severity, category, or priority.\n\n## Input Parameters\n* AutomationAssumeRoleARN (Optional): The ARN of the role that allows Systems Manager Automation to perform actions on your behalf.\n* OpsItemIds: List of up to 50 OpsItemIds to be edited in bulk  (e.g. oi-XXXXXXXXXXXX, oi-XXXXXXXXXXXX, ...).\n* Status: Specify a new status for OpsItems (\"NoChange\", \"Open\", \"InProgress\", \"Resolved\").\n* Severity: Specify a new severity for OpsItems (\"NoChange\", \"1\", \"2\", \"3\", \"4\").\n* Category: Specify a new category for OpsItems (\"NoChange\", \"Availability\", \"Cost\", \"Performance\", \"Recovery\", \"Security\").\n* Priority: The importance of OpsItems in relation to other OpsItems in the system (\"NoChange\", \"1\", \"2\", \"3\", \"4\", \"5\").\n* WaitTimeBetweenEditsInSecs: The time to wait between UpdateOpsItems calls in seconds (String representation of 0.0 to 2.0 up to 1 decimal point).\n\n## Output parameters\n* BulkEditOpsItemsStep.IsSuccessful: A boolean variable describing whether or not the edit was completely successful or not\n* BulkEditOpsItemsStep.OpsItemsFailedEdit: A list of the OpsItems that failed to update if the status was false \n\n## Minimum Permissions Required\n* `ssm:UpdateOpsItem`",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "outputs": [
+    "BulkEditOpsItemsStep.IsSuccessful",
+    "BulkEditOpsItemsStep.OpsItemsFailedEdit"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The role ARN to assume during automation execution.",
+      "default": "",
+      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+    },
+    "OpsItemIds": {
+      "type": "StringList",
+      "description": "(Required) List of up to 50 OpsItemIds to be edited in bulk (e.g. oi-XXXXXXXXXXXX, oi-XXXXXXXXXXXX, ...).",
+      "allowedPattern": "^(oi)-[0-9a-f]{12}$"
+    },
+    "Status": {
+      "type": "String",
+      "description": "(Optional) Specify a new status for OpsItems (\"NoChange\", \"Open\", \"InProgress\", \"Resolved\").",
+      "default": "NoChange",
+      "allowedValues": [
+        "NoChange",
+        "Open",
+        "InProgress",
+        "Resolved"
+      ]
+    },
+    "Severity": {
+      "type": "String",
+      "description": "(Optional) Specify a new severity for OpsItems (\"NoChange\", \"1\", \"2\", \"3\", \"4\").",
+      "default": "NoChange",
+      "allowedValues": [
+        "NoChange",
+        "1",
+        "2",
+        "3",
+        "4"
+      ]
+    },
+    "Category": {
+      "type": "String",
+      "description": "(Optional) Specify a new category for OpsItems (\"NoChange\", \"Availability\", \"Cost\", \"Performance\", \"Recovery\", \"Security\").",
+      "default": "NoChange",
+      "allowedValues": [
+        "NoChange",
+        "Availability",
+        "Cost",
+        "Performance",
+        "Recovery",
+        "Security"
+      ]
+    },
+    "Priority": {
+      "type": "String",
+      "description": "(Optional) The importance of OpsItems in relation to other OpsItems in the system (\"NoChange\", \"1\", \"2\", \"3\", \"4\", \"5\").",
+      "default": "NoChange",
+      "allowedValues": [
+        "NoChange",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5"
+      ]
+    },
+    "WaitTimeBetweenEditsInSecs": {
+      "type": "String",
+      "description": "(Optional) The time to wait between UpdateOpsItems calls in seconds (String representation of 0.0 to 2.0 up to 1 decimal point).",
+      "default": ".8",
+      "allowedPattern": "^((2(\\.0)?)|(?!$)([0-1]?(\\.[0-9])?))$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "BulkEditOpsItemsStep",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "function_start",
+        "Script": "import boto3\nimport botocore\nfrom botocore.config import Config\n\nimport os, time\n\nregion = os.environ['AWS_REGION']\n\nMAXIMUM_OPS_ITEMS = 50\n\nconfig = Config(\n  retries = {\n      'max_attempts': 5,\n      'mode': 'standard'\n  }\n)\n\nssm_client = boto3.client(\"ssm\", region_name=region, config=config)\n\ndef function_start(event, context):\n\n    # Get parameters\n    ops_item_ids = event.get('OpsItemIds')\n    status = event.get('Status')\n    severity = event.get('Severity')\n    category = event.get('Category')\n    priority = event.get('Priority')\n    spacing = event.get('WaitTimeBetweenEditsInSecs')\n    \n    # Testing parameters existence\n    if ops_item_ids is None or len(ops_item_ids) is 0:\n        raise ValueError(\"OpsItemIds is a required field.\")\n\n    # Testing parameters length\n    if len(ops_item_ids) > MAXIMUM_OPS_ITEMS:\n        raise ValueError(\"No more than \" + MAXIMUM_OPS_ITEMS + \" OpsItems can be edited at a time\")\n\n    # Get data\n    params = create_params(status, severity, category, priority)\n    response = bulk_edit(ops_item_ids, params, spacing)\n\n    # Return outputs\n    return response\n\ndef create_params(status, severity, category, priority):\n    # Only include params if changed from default\n    params = {}\n    NO_CHANGE = \"NoChange\"\n    if severity != NO_CHANGE:\n        params[\"Severity\"] = severity\n    if category != NO_CHANGE:\n        params[\"Category\"] = category\n    if priority != NO_CHANGE:\n        params[\"Priority\"] = int(priority)\n    if status != NO_CHANGE:\n        params[\"Status\"] = status\n    if not params:\n        raise ValueError(\"No input parameters were given\")\n    return params\n\n\ndef bulk_edit(ops_item_ids, params, spacing):\n\n    ops_items_failed_edit = []\n\n    # Loop through each OpsItem\n    for curr_id in ops_item_ids:\n\n        # Update each OpsItem\n        response = update_ops_item(curr_id, params)\n\n        # Append to list of failed OpsItems on error\n        if response is not None:\n            ops_items_failed_edit.append({\n                'OpsItemId': curr_id,\n                'Response': str(response)\n            })\n        \n        time.sleep(float(spacing))\n\n    # Determine if bulk edit failed\n    is_successful = False\n    if len(ops_items_failed_edit) is 0:\n        is_successful = True\n\n    return {\n        \"is_successful\": is_successful,\n        \"ops_items_failed_edit\": ops_items_failed_edit\n    }\n\ndef update_ops_item(ops_item_id, params):\n\n    error = None\n    hasPermissions = True\n\n    try:\n        # Try to update\n        params[\"OpsItemId\"] = ops_item_id\n        ssm_client.update_ops_item(**params)\n    except botocore.exceptions.ClientError as e:\n        # If there is a permission error, fail early\n        if e.response['Error']['Code'].strip() == \"AccessDeniedException\":\n            hasPermissions = False\n    except botocore.exceptions.NoCredentialsError as e:\n        hasPermissions = False\n    except Exception as e:\n        # Return error if it fails   \n        error = e\n\n    if not hasPermissions:\n        raise PermissionError(\"Role provided does not have permission to perform ssm:UpdateOpsItem\")\n        \n    return error",
+        "InputPayload": {
+          "OpsItemIds": "{{OpsItemIds}}",
+          "Status": "{{Status}}",
+          "Severity": "{{Severity}}",
+          "Category": "{{Category}}",
+          "Priority": "{{Priority}}",
+          "WaitTimeBetweenEditsInSecs": "{{WaitTimeBetweenEditsInSecs}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "IsSuccessful",
+          "Selector": "$.Payload.is_successful",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "OpsItemsFailedEdit",
+          "Selector": "$.Payload.ops_items_failed_edit",
+          "Type": "MapList"
+        }
+      ],
+      "description": "## BulkEditOpsItemsStep\nThis step iterates through each OpsItem and calls UpdateOpsItem with the specified parameters\n## Inputs\n  * OpsItemIds: List of up to 50 OpsItemIds to be edited in bulk  (e.g. oi-XXXXXXXXXXXX, oi-XXXXXXXXXXXX, ...).\n  * Status: Specify a new status for OpsItems (\"NoChange\", \"Open\", \"InProgress\", \"Resolved\").\n  * Severity: Specify a new severity for OpsItems (\"NoChange\", \"1\", \"2\", \"3\", \"4\").\n  * Category: Specify a new category for OpsItems (\"NoChange\", \"Availability\", \"Cost\", \"Performance\", \"Recovery\", \"Security\").\n  * Priority: The importance of OpsItems in relation to other OpsItems in the system (\"NoChange\", \"1\", \"2\", \"3\", \"4\", \"5\").\n  * WaitTimeBetweenEditsInSecs: The time to wait between UpdateOpsItems calls in seconds (String representation of 0.0 to 2.0 up to 1 decimal point).\n## Outputs\n  * IsSuccessful: A boolean variable describing whether or not the edit was completely successful or not\n  * OpsItemsFailedEdit: A list of the OpsItems that failed to update if the status was false ",
+      "timeoutSeconds": 300,
+      "isEnd": true
+    }
+  ]
+}
