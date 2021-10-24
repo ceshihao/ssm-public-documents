@@ -1,0 +1,282 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWSSupport-CheckXenToNitroMigrationRequirements\n\nThis automation document checks for the pre-requisites to migrate a Xen based EC2 Linux instance to [EC2 Nitro platform](https://aws.amazon.com/about-aws/whats-new/2019/12/amazon-ec2-nitro-system-based-instances-now-support-36-faster-amazon-ebs-optimized-instance-performance/) by performing the following checks:\n\n- Checks if the root volume is an EBS device\n- Checks if the [Enhanced networking (ENA) attribute](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enhanced-networking-ena.html#enable-enhanced-networking-ena-AL) is enabled.\n- Verifies if the ENA module is installed on your EC2 instance.\n- Verifies if the NVMe module is installed on your EC2 instance. If yes, then the script verifies that the module is loaded in the initramfs image.\n- Analyzes /etc/fstab and looks for block devices being mounted using device names.\n- Determines if Operating System(OS) uses predictable network interface names by default.\n\nThis document is supported on the following OS versions:\n\n- Red Hat derivatives: Red Hat Linux, Red Hat Enterprise Linux, CentOS\n- Amazon Linux, Amazon Linux 2\n- Debian derivatives: Debian, Ubuntu\n- SUSE12SP5, SUSE15SP2\n\n\n### **Parameters**\n1.  **InstanceId**:\n\nType: String\n\nDescription: **(Required)** Xen based EC2 Instance you want to migrate to Nitro platform. (e.g. i-05fa91429c6cdcb49).\n\n2. **AutomationAssumeRole**:\n\nType: String\n\nDescription: **(Optional)** The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, this document will use the permissions of the user that executes this document.\n",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "default": "",
+      "type": "String",
+      "description": "(Optional)The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified,this document will use the permissions of the user that executes this document. For more information, visit - https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-setup.html",
+      "allowedPattern": "^$|^arn:aws:iam::[0-9]*:role/[/\\w+=,.@-]+$"
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) Provide the Xen based EC2 InstanceId you want to migrate to Nitro platform",
+      "allowedPattern": "^[m]{0,1}i-[a-z0-9]{8,17}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the details of the EC2 instance",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "maxAttempts": 3,
+      "nextStep": "getInstanceHypervisorType",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PlatformType",
+          "Selector": "$.Reservations[0].Instances[0].Platform",
+          "Type": "String"
+        },
+        {
+          "Name": "RootVolumeType",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceType",
+          "Type": "String"
+        },
+        {
+          "Name": "ENASupport",
+          "Selector": "$.Reservations[0].Instances[0].EnaSupport",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "getInstanceHypervisorType",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the Hypervisor information for the current EC2 Instance Type",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "maxAttempts": 3,
+      "nextStep": "checkIfInstanceHypervisorIsNitroAlready",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceTypes",
+        "InstanceTypes": [
+          "{{getInstanceProperties.InstanceType}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Hypervisor",
+          "Selector": "$.InstanceTypes[0].Hypervisor",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "checkIfInstanceHypervisorIsNitroAlready",
+      "action": "aws:branch",
+      "description": "Checks if the current EC2 instance is already running on Nitro platform",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfPlatformIsLinux",
+            "Variable": "{{getInstanceHypervisorType.Hypervisor}}",
+            "StringEquals": "xen"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfPlatformIsLinux",
+      "action": "aws:branch",
+      "description": "Checks if the current EC2 instance is based on Linux Operating System",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "verifySSMConnectivity",
+            "Not": {
+              "Variable": "{{getInstanceProperties.PlatformType}}",
+              "StringEquals": "windows"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifySSMConnectivity",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Verifies if the EC2 instance is connected & online with AWS Systems Manager",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": true,
+      "nextStep": "checkIfRootVolumeIsEBS"
+    },
+    {
+      "name": "checkIfRootVolumeIsEBS",
+      "action": "aws:branch",
+      "description": "Checks if EC2 instance's root volume type is EBS",
+      "isCritical": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkENAAttribute",
+            "Variable": "{{getInstanceProperties.RootVolumeType}}",
+            "StringEquals": "ebs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkENAAttribute",
+      "action": "aws:branch",
+      "description": "Checks if the Enhanced Networking Adapter(ENA) attribute is enabled on the EC2 instance",
+      "isCritical": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkENADrivers",
+            "Variable": "{{getInstanceProperties.ENASupport}}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkENADrivers",
+      "action": "aws:runCommand",
+      "description": "Validates the availability of Enhanced Networking Adapter(ENA) drivers on the Operating System(OS)",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "Parameters": {
+          "commands": "#!/bin/bash\n\nmodinfo ena > /dev/null 2>&1\nif [ $? -ne 0 ]\n    then\n    # ENA Module is not installed.\n    echo -e \"[FAILED] ENA Module is not available on your EC2 instance. \\n\\t- Please install ENA module before changing your EC2 instance type to M5/C5. Look at the following link for further guidance:\"\n    echo -e \"\\t> https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enhanced-networking-ena.html#enhanced-networking-ena-linux\"\nelif grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n    LINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\n    UBUNTU_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    if  [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk '{print $2}')\n        echo -e \"[PASSED] ENA Module with version $ena_version is installed and available on your EC2 instance\"\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n        echo -e \"[PASSED] ENA Module with version $ena_version is installed and available on your EC2 instance\"\n    fi\nelse\n    ena_version=`modinfo ena|grep -Eo '^version:.*' | awk '{print $2}'`\n    echo -e \"[PASSED] ENA Module with version $ena_version is installed and available on your EC2 instance\"\n\nfi\n"
+        }
+      },
+      "nextStep": "checkNVMEDrivers"
+    },
+    {
+      "name": "checkNVMEDrivers",
+      "action": "aws:runCommand",
+      "description": "Validates the availability of NVMe drivers on the Operating System(OS)",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": "#!/bin/bash\n\n\ncheck_NVMe_omitted () {\n##Checking if module is omitted out in initramfs\n    if [ -s /tmp/initrd/initrd.img ]; then\n        lsinitrd /tmp/initrd/initrd.img | grep -e \"--omit-drivers\" -e \"-o\" | grep nvme > /dev/null 2>&1\n   else\n        lsinitrd /boot/initramfs-$(uname -r).img| grep -e \"--omit-drivers\" -e \"-o\" | grep nvme > /dev/null 2>&1\n    fi\n    if [ $? -eq 0 ]; then \n        echo -e \"[ERROR] NVME module is ommited in initramfs image using parameter --omit-drivers or -o\"\n    else\n        echo -e \"[INFO] NVME module is not ommited in initramfs image using parameter --omit-drivers or -o\"\n    fi\n}\n\ncheck_NVMe_in_initrd () {\n    \n    if [ -f /etc/redhat-release ] ; then\n        # Distribution is Red hat\n        if ! rpm -ql dracut | grep skipcpio  > /dev/null 2>&1 ; then\n            mkdir /tmp/initrd/\n            cd /tmp/initrd\n\n            if file /boot/initramfs-$(uname -r).img | grep -i xz > /dev/null 2>&1; then\n                xz -dc < /boot/initramfs-$(uname -r).img | cpio -icdt > out 2>error\n            elif file /boot/initramfs-$(uname -r).img| grep gzip > /dev/null 2>&1 ; then\n                zcat < /boot/initramfs-$(uname -r).img | cpio -icdt > out 2>error\n            else\n                cpio  -icd < /boot/initramfs-$(uname -r).img > out 2>error\n            fi\n            \n            if grep blocks out; then\n                skip=`cat out | grep blocks | awk '{print $1}'`\n            else \n                skip=`cat error | grep blocks | awk '{print $1}'`\n            fi\n\n            dd if=/boot/initramfs-$(uname -r).img of=initrd.img bs=512 skip=${skip} > /dev/null 2>&1\n        fi\n\n        #Checking if NVME module is ommited in initramfs file        \n        check_NVMe_omitted\n\n        if [ -s /tmp/initrd/initrd.img ]; then\n            lsinitrd /tmp/initrd/initrd.img | grep -i nvme| grep nvmem > /dev/null 2>&1\n        else\n            lsinitrd /boot/initramfs-$(uname -r).img|grep nvme| grep -v nvmem > /dev/null 2>&1\n        fi\n\n\n        if [ $? -ne 0 ]; then\n        # NVMe module is not loaded in initrd/initramfs\n            echo -e \"[FAILED] NVMe Module is not loaded in the initramfs image\"\n        else\n            Kernel_version=`uname -r`\n            echo -e \"[PASSED] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n        fi\n        rm -rf /tmp/initrd\n\n    elif grep 'Amazon Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n        # Distribution is Amazon Linux\n        if ! rpm -ql dracut | grep skipcpio  > /dev/null 2>&1; then\n            mkdir /tmp/initrd/\n            cd /tmp/initrd\n            cpio  -icd < /boot/initramfs-$(uname -r).img > out 2>error\n            if grep blocks out; then\n                skip=`cat out | grep blocks | awk '{print $1}'`\n            else \n                skip=`cat error | grep blocks | awk '{print $1}'`\n            fi\n            dd if=/boot/initramfs-$(uname -r).img of=initrd.img bs=512 skip=${skip} > /dev/null 2>&1\n        fi\n\n            #Checking if NVME module is ommited in initramfs file        \n            check_NVMe_omitted\n\n        if [ -f /tmp/initrd/initrd.img ]; then\n            lsinitrd /tmp/initrd/initrd.img | grep -i nvme| grep -v nvmem > /dev/null 2>&1\n        else\n            lsinitrd /boot/initramfs-$(uname -r).img|grep nvme| grep -v nvmem > /dev/null 2>&1\n        fi        \n\n        if [ $? -ne 0 ]; then\n        echo -e \"[FAILED] NVMe Module is not loaded in the initramfs image\"\n        else\n            Kernel_version=`uname -r`\n            echo -e \"[PASSED] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"         \n        fi\n        rm -rf /tmp/initrd\n\n    elif grep 'SUSE Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n        # Distribution is SuSe Linux\n        if ! rpm -ql dracut | grep skipcpio  > /dev/null 2>&1; then\n            mkdir /tmp/initrd/\n            cd /tmp/initrd\n\n            if file /boot/initrd-$(uname -r) | grep -i xz; then\n                xz -dc < /boot/initrd | cpio -icdt > out 2>error\n            else\n                cpio  -icd < /boot/initrd > out 2>error\n            fi\n\n            if grep blocks out; then\n                skip=`cat out | grep blocks | awk '{print $1}'`\n            else \n                skip=`cat error | grep blocks | awk '{print $1}'`\n            fi\n            dd if=/boot/initrd of=initrd.img bs=512 skip=${skip} > /dev/null 2>&1\n        fi\n\n            #Checking if NVME module is ommited in initramfs file        \n            check_NVMe_omitted\n\n        if [ -s /tmp/initrd/initrd.img ]; then\n            lsinitrd /tmp/initrd/initrd.img | grep -i nvme| grep -v nvmem > /dev/null 2>&1\n        else\n            lsinitrd /boot/initrd|grep nvme| grep -v nvmem > /dev/null 2>&1\n        fi        \n        if [ $? -ne 0 ]; then\n        echo -e \"[FAILED] NVMe Module is not loaded in the initramfs image\"\n        else\n            Kernel_version=`uname -r`\n            echo -e \"[PASSED] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"     \n        fi\n        rm -rf /tmp/initrd\n\n    elif [ -f /etc/debian_version ] ; then\n        # Distribution is debian based(Debian/Ubuntu)\n        ( lsinitramfs /boot/initrd.img-$(uname -r)|grep nvme| grep -v nvmem > /dev/null 2>&1 ) || (cat /lib/modules/`(uname -r)`/modules.builtin | grep nvme | grep -v nvmem > /dev/null 2>&1)\n        if [ $? -ne 0 ]; then\n        # NVMe module is not loaded in initrd/initramfs\n            echo -e \"[FAILED] NVMe Module is not loaded in the initramfs image\"\n        else\n            Kernel_version=`uname -r`\n            echo -e \"[PASSED] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"       \n        fi\n\n    else\n        echo -e \"[ERROR] Unsupported OS for this document.\"\n        exit 1\n    fi\n}\n\n\n(grep 'nvme' /boot/System.map-$(uname -r) | grep -v nvmem) > /dev/null 2>&1\nif [ $? -ne 0 ]\n    then\n    # NVMe modules is not built into the kernel\n    (modinfo nvme) > /dev/null 2>&1\n    if [ $? -ne 0 ]\n        then\n        # NVMe Module is not installed.\n        echo -e \"[FAILED] NVMe Module is not available on your EC2 instance. \\n\\t- Please install NVMe module before changing your EC2 instance type to Nitro. Follow the instructions in the documentation to install NVME module:\"\n        echo -e \"\\t> https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvme-ebs-volumes.html\"\n    else\n        Kernel_version=`uname -r`\n        echo -e \"[PASSED] NVMe module is installed on your EC2 instance for Kernel version $Kernel_version\"\n        echo -e \"[INFO] Checking if NVME module is loaded in initramfs/initrd\"\n        check_NVMe_in_initrd                # Calling function to check if NVMe module is loaded in initramfs.\n    fi\nelse\n    # NVMe modules is built into the kernel\n    echo -e \"[PASSED] NVMe Module is installed and loaded in kernel on your EC2 instance\"\nfi\n"
+        }
+      },
+      "nextStep": "checkFSTABEntries"
+    },
+    {
+      "name": "checkFSTABEntries",
+      "action": "aws:runCommand",
+      "description": "Checks if the /etc/fstab contains entries with device names",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "isCritical": true,
+      "nextStep": "checkPredictableNames",
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "Parameters": {
+          "commands": "#!/bin/bash\ntime_stamp=$(date +%F-%H:%M:%S)\ncp -p /etc/fstab /etc/fstab.backup.$time_stamp\ncp -p /etc/fstab /etc/fstab.modified.$time_stamp\n\ncat /etc/fstab | grep '^/dev' | grep -E 'sd[a-z]|xvd[a-z]|nvme([0-9]|1[0-9]|2[0-7])n1p?' | awk -F '/' '{print $3}'>/tmp/device_names\n\nwhile read LINE; do \n    UUID=`ls -l /dev/disk/by-uuid | grep \"$LINE\" | sed -n \"s/^.* \\([^ ]*\\) -> .*$/\\1/p\"`;\n    if [ ! -z \"$UUID\" ]\n    then \n        sed -i \"s|^/dev/${LINE}|UUID=${UUID}|\" /etc/fstab.modified.$time_stamp\n    fi\ndone </tmp/device_names\n\nif [ -s /tmp/device_names ]; then\n    echo -e \"[FAILED] Your FSTAB file contains device names. Mount the partitions using UUIDs before changing the EC2 instance type to Nitro instances.\\n\"\n    echo -e \"[INFO] Printing correct FSTAB file below:\"\n    cat /etc/fstab.modified.$time_stamp\n    rm -rf /etc/fstab.modified.$time_stamp\n    rm -rf /etc/fstab.backup.$time_stamp\n    rm -rf /tmp/device_names\nelse \n    rm -rf /etc/fstab.backup.$time_stamp\n    rm -rf /etc/fstab.modified.$time_stamp \n    echo -e \"[PASSED] FSTAB file looks fine and does not contain any entry with device names and are with UUID\"\nfi\n\n"
+        }
+      }
+    },
+    {
+      "name": "checkPredictableNames",
+      "action": "aws:runCommand",
+      "description": "Determines if Operating System(OS) uses predictable network interface names by default",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Continue",
+      "nextStep": "generateReport",
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "Parameters": {
+          "commands": "#!/bin/bash\n\ncheck_predictable_interface_name() {\n    if [ -f /etc/default/grub ]; then\n\t   grep -i -q \"net.ifnames=0\" /etc/default/grub\n\t    if [ $? -eq 0 ]; then\n\t       echo -e \"[PASSED] The option net.ifnames=0 is present in /etc/default/grub file. No changes needed. \\n\"\n\t    else\n\t       \techo -e \"[FAILED] The option net.ifnames=0 is not present on the /etc/default/grub file. It is recommended to add this kernel parameter to disable predictable interface naming. \\n\"\n\n\t    fi\n    fi\n}\n\n\n    if [ -f /etc/os-release ]; then\n        find_distro=$( < /etc/os-release sed -n 's|^ID=\"\\([a-z]\\{4\\}\\).*|\\1|p')\n        version_id=$( < /etc/os-release sed -n 's|^VERSION_ID=\"\\([0-99]\\{2\\}\\).*|\\1|p')\n        sp=$( < /etc/os-release grep VERSION= | tr -d '\"'| tail -c 4)     # Check if instance is using amazon AMI.\n    fi\n\n    if [ -f /etc/redhat-release ] ; then\n        # Distribution is Red hat\n        version=$(rpm -qa | grep -i '^systemd-[0-9]\\+\\|^udev-[0-9]\\+' | cut -d- -f2)\n        if [[ \"${version}\" -gt \"197\" ]]; then\n        \tcheck_predictable_interface_name\n        else\n        \techo \"[PASSED] Predictable interface naming isn't supported.\"\n        fi\n\n    elif [[ \"${find_distro}\" == \"amzn\" ]]; then\n        # Distribution is Amazon Linux\n        version=$(rpm -qa | grep -i '^systemd-[0-9]\\+\\|^udev-[0-9]\\+' | cut -d- -f2)\n        if [[ \"${version}\" -gt \"197\" ]]; then\n        \tcheck_predictable_interface_name\n        else\n        \techo \"[PASSED] Predictable interface naming isn't supported.\"        \t\n        fi\n\n    elif [[ \"${find_distro}\" == \"sles\" ]] ; then\n        # Distribution is SuSe Linux\n        version=$(rpm -qa | grep -i '^systemd-[0-9]\\+\\|^udev-[0-9]\\+' | cut -d- -f2 | head -1)\n        if [[ \"${version}\" -gt \"197\" ]]; then\n        \tcheck_predictable_interface_name\n        else\n        \techo \"[PASSED] Predictable interface naming isn't supported.\"        \t\n        fi       \n\n    elif [ -f /etc/debian_version ] ; then\n        # Distribution is debian based(Debian/Ubuntu)\n \t\tversion=$(apt list --installed 2> /dev/null | grep '^systemd\\|^udev' | cut -d, -f2 | cut -d ' ' -f2 | cut -d- -f1 | head -1)\n \t\tif [[ \"${version}\" -gt \"197\" ]]; then\n        \tcheck_predictable_interface_name\n        else\n        \techo \"[PASSED] Predictable interface naming isn't supported.\"        \t\n        fi\n\n    else\n        echo -e \"[ERROR] Unsupported OS for this document.\"\n        exit 1\n    fi\n    \n    if [ -f /etc/udev/rules.d/70-persistent-net.rules ]; then\n        echo \"[WARNING] EC2 instance contains /etc/udev/rules.d/70-persistent-net.rules file, which must be deleted before creating the AMI. The file contains the MAC address for the Ethernet adapter of the original EC2 instance. If another EC2 instance boots with this file, the operating system will be unable to find the device and eth0 might fail, causing boot issues.\"\n    fi\n\n\n"
+        }
+      }
+    },
+    {
+      "name": "generateReport",
+      "action": "aws:executeScript",
+      "description": "Consolidates the results of all steps and generates a report on the passed and failed checks.",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "isEnd": "true",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "rootVolumeCheck": "{{getInstanceProperties.RootVolumeType}}",
+          "checkENAattribute": "{{getInstanceProperties.ENASupport}}",
+          "checkENADriversOutput": "{{checkENADrivers.Output}}",
+          "checkNVMEDriversOutput": "{{checkNVMEDrivers.Output}}",
+          "checkFSTABEntriesOutput": "{{checkFSTABEntries.Output}}",
+          "checkFSTABEntriesStatus": "{{checkFSTABEntries.Status}}",
+          "checkPredictableNamesOutput": "{{checkPredictableNames.Output}}"
+        },
+        "Script": "def script_handler(events, context):\n   import json\n\n   #Capturing other steps output.\n\n   Heading = \"Total Number of Tests: 6\\n\\n\"\n   rootVolumeCheckOutput = events['rootVolumeCheck']\n   checkENAattributeOutput = events['checkENAattribute']\n   checkENADriversOutput = events['checkENADriversOutput']\n   checkNVMEDriversOutput = events['checkNVMEDriversOutput']\n   checkFSTABEntriesOutput = events['checkFSTABEntriesOutput']\n   checkFSTABEntriesStatus = events['checkFSTABEntriesStatus']\n   checkPredictableNamesOutput = events['checkPredictableNamesOutput']\n   Footer = (\"\\n\\n For more information about these checks, refer to AWS Premium Support Knowledge Center Article\\n\"\n   \"https://aws.amazon.com/premiumsupport/knowledge-center/boot-error-linux-nitro-instance/\")\n\n   stepsHeaders = [\"\\n 1. Checking if the root volume is EBS: \\n\",\n              \"\\n \\n 2. Determining if ENA Attribute is enabled:\\n\",\n              \"\\n \\n 3. Checking ENA drivers status on the instance:\\n\",\n              \"\\n \\n 4. Checking NVME drivers status on the instance:\\n\",\n              \"\\n \\n 5. Checking FSTAB for entries with devices names:\\n\",\n              \"\\n \\n 6. Determine if OS uses predictable network interface names by default:\\n\"\n   ]\n   # Checking Root Volume results\n   if rootVolumeCheckOutput == \"ebs\":\n          checkrootvolume_result= \"[PASSED] Root Volume attached with the instance is an EBS device.\"\n   else:\n          checkrootvolume_result= \"[FAILED] Root Volume attached with the instance is not an EBS device.\"\n\n   # Checking FSTAB results\n   if checkFSTABEntriesStatus == \"Failed\":\n          fstab_warning = \"\\n\\n Step checkFSTABEntries failed during execution. Make sure to delete the /etc/fstab backup files created by script. To list all the FSTAB files, run the command 'ls -lhtr /etc/fstab.*' manually on the EC2 instance. \\n\"\n   else:\n          fstab_warning= \"\"\n   # Checking Root Volume results\n   if checkENAattributeOutput == \"true\":\n          checkENA_output= \"[PASSED] Enhanced networking (ENA) attribute  is ENABLED on the EC2 Instance\"\n          Result = Heading + stepsHeaders[0] + checkrootvolume_result + stepsHeaders[1] + checkENA_output + stepsHeaders[2] + checkENADriversOutput + stepsHeaders[3] + checkNVMEDriversOutput + stepsHeaders[4] + checkFSTABEntriesOutput + fstab_warning + stepsHeaders[5] + checkPredictableNamesOutput + Footer\n\n   else:\n          checkENA_output= (\"[FAILED] Enhanced networking (ENA) attribute is NOT ENABLED on the EC2 Instance. Use the ModifyInstanceAttribute[1] API call or modify-instance-attribute[2] AWS CLI command to enable the enhanced networking enaSupport attribute.\\n For more details, refer to the Enhanced networking (ENA) documentation[3].\\n\"\n          \"\\n       [1] https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html\"\n          \"\\n       [2] https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html|\"\n          \"\\n       [3] https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enhanced-networking-ena.html#enable-enhanced-networking-ena-AL\")\n\n          Result = Heading + stepsHeaders[0] + checkrootvolume_result + stepsHeaders[1] + checkENA_output + stepsHeaders[2] + checkENADriversOutput + stepsHeaders[3] + checkNVMEDriversOutput + stepsHeaders[4] + checkFSTABEntriesOutput + fstab_warning + stepsHeaders[5] + checkPredictableNamesOutput + Footer\n\n   return {'output': Result}\n\n\n\n\n\n\n\n\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "generateReport.output"
+  ]
+}

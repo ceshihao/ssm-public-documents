@@ -1,5 +1,5 @@
 {
-  "description": "### Document name - AWSFIS-Run-CPU-Stress\n\n## What does this document do?\nIt runs CPU stress on an instance via stress-ng tool.\n\n## Input Parameters\n* DurationSeconds: (Required) The duration - in seconds - of the CPU stress.\n* CPU: Specify the number of CPU stressors to use (default 0 = all)\n* InstallDependencies: If set to True, Systems Manager installs the required dependencies on the target instances. (default True)\n\n## Output Parameters\nNone.\n",
+  "description": "### Document name - AWSFIS-Run-CPU-Stress\n\n## What does this document do?\nIt runs CPU stress on an instance via stress-ng tool. If stress-ng is not already installed on the instance, this SSM document will install it, unless InstallDependencies parameter is set to False.\nThis SSM document supports Amazon Linux and Ubuntu operating systems only.\n\n## Dependencies installed by this SSM Document\n* stress-ng\nNote: This SSM document does not uninstall dependencies once installed. If you don't want this SSM document to install any dependencies, set InstallDependencies to False and bake the dependencies into your EC2 instance. For example, by using image-builder (https://aws.amazon.com/image-builder/).\n\n## Input Parameters\n* DurationSeconds: (Required) The duration - in seconds - of the CPU stress.\n* CPU: Specify the number of CPU stressors to use (default 0 = all)\n* InstallDependencies: If set to True, this SSM document installs the required dependencies on the target instances. (default True)\n\n## Output Parameters\nNone.",
   "schemaVersion": "2.2",
   "parameters": {
     "DurationSeconds": {
@@ -12,6 +12,12 @@
       "description": "Specify the number of CPU stressors to use (default: 0 which means \"all CPUs\")",
       "default": "0",
       "allowedPattern": "^[0-9]+$"
+    },
+    "LoadPercent": {
+      "type": "String",
+      "description": "Specify the target CPU load percentage. Valid values are between 0 (no load) and 100 (full load) (default: 100)",
+      "default": "100",
+      "allowedPattern": "^(100|[1-9]?[0-9])$"
     },
     "InstallDependencies": {
       "type": "String",
@@ -35,8 +41,9 @@
       },
       "description": "## Parameter: InstallDependencies\nIf set to True, this step installs the required dependecy via operating system's repository. It supports both\nDebian (apt) and CentOS (yum) based package managers.\n",
       "inputs": {
+        "onFailure": "exit",
         "runCommand": [
-          "#!/bin/bash\nif  [[ \"{{ InstallDependencies }}\" == True ]] ; then\n  if [[ \"$( which stress-ng 2>/dev/null )\" ]] ; then echo Dependency is already installed. ; exit ; fi\n  echo \"Installing required dependencies\"\n  if [ -f  \"/etc/system-release\" ] ; then\n    if cat /etc/system-release | grep -i 'Amazon Linux' ; then\n      sudo amazon-linux-extras install testing\n      sudo yum -y install stress-ng\n    else\n      echo \"There was a problem installing dependencies.\"\n      exit 1\n    fi\n  elif cat /etc/issue | grep -i Ubuntu ; then\n    sudo apt-get update -y\n    sudo DEBIAN_FRONTEND=noninteractive sudo apt-get install -y stress-ng\n  else\n    echo \"There was a problem installing dependencies.\"\n    exit 1\n  fi\nfi\n"
+          "#!/bin/bash\n\nif [[ \"$( which stress-ng 2>/dev/null )\" ]] ; then echo Dependency is already installed. ; exit ; fi\nif  [[ \"{{ InstallDependencies }}\" == True ]] ; then\n  echo \"Installing required dependencies\"\n  if [ -f  \"/etc/system-release\" ] ; then\n    if cat /etc/system-release | grep -i 'Amazon Linux' ; then\n      # Use amazon-linux-extras if available (Amazon Linux 2). Don't need it otherwise (Amazon Linux 1)\n      which amazon-linux-extras 2>/dev/null 1>&2 && sudo amazon-linux-extras install testing\n      sudo yum -y install stress-ng\n    else\n      echo \"There was a problem installing dependencies.\"\n      exit 1\n    fi\n  elif cat /etc/issue | grep -i Ubuntu ; then\n    sudo apt-get update -y\n    sudo DEBIAN_FRONTEND=noninteractive sudo apt-get install -y stress-ng\n  else\n    echo \"There was a problem installing dependencies.\"\n    exit 1\n  fi\nelse\n  echo \"Dependencies are not installed - Please set InstallDependencies to True.\"\n  exit 1\nfi\n"
         ]
       }
     },
@@ -53,7 +60,7 @@
       "inputs": {
         "maxAttempts": 1,
         "runCommand": [
-          "if [ {{ DurationSeconds }} -lt 1 ] || [ {{ DurationSeconds }} -gt 43200 ] ; then echo DurationSeconds parameter value must be between 1 and 43200 && exit; fi\npgrep stress-ng && echo Another stress-ng command is running, exiting... && exit\necho Initiating CPU stress for {{ DurationSeconds }} seconds...\nstress-ng --cpu {{ CPU }} --cpu-method matrixprod -t {{ DurationSeconds }}s\necho Finished CPU stress."
+          "#!/bin/bash\n\n########################\n# Fault-specific logic #\n########################\n\nif [ {{ DurationSeconds }} -lt 1 ] || [ {{ DurationSeconds }} -gt 43200 ] ; then echo DurationSeconds parameter value must be between 1 and 43200 && exit 1; fi\nif [ {{ LoadPercent }} -lt 0 ] || [ {{ LoadPercent }} -gt 100 ] ; then echo LoadPercent parameter value must be between 0 and 100 && exit 1; fi\npgrep stress-ng && echo Another stress-ng command is running, exiting... && exit 1\necho Initiating CPU stress for {{ DurationSeconds }} seconds...\nstress-ng --cpu {{ CPU }} --cpu-method matrixprod -t {{ DurationSeconds }}s --cpu-load {{ LoadPercent }}\necho Finished CPU stress.\n"
         ]
       }
     }
