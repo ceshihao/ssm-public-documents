@@ -1,0 +1,222 @@
+{
+  "description": "## Id\nAWSResilienceHub-RestoreEFSBackupInAnotherRegionSOP_2020-10-26\n\n## Intent\nRestore file system backup in another region in case of region failure\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * Recovery point for EFS volume\n  * IAM role with [AWSBackupServiceRolePolicyForBackup](https://docs.aws.amazon.com/aws-backup/latest/devguide/iam-service-roles.html) policy\n  * IAM role with [AWSBackupServiceRolePolicyForRestores](https://docs.aws.amazon.com/aws-backup/latest/devguide/iam-service-roles.html) policy\n  * Multi-region KMS key if encryption of the target EFS filesystem is required\n\n## Permissions required for AutomationAssumeRole\n  * elasticfilesystem:DescribeFileSystems\n  * backup:StartBackupJob\n  * backup:DescribeBackupJob\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) FileSystemID\n  * type: String\n  * description: ID of the EFS file system\n\n### (Required) RecoveryPointArn\n  * type: String\n  * description: The Recovery Point Arn to restore\n\n### (Required) CopyJobIAMRoleArn\n  * type: String\n  * description: IAM role ARN with policy [AWSBackupServiceRolePolicyForBackup](https://docs.aws.amazon.com/aws-backup/latest/devguide/iam-service-roles.html) used to start the copy job\n\n### (Required) RestoreJobIAMRoleArn\n  * type: String\n  * description: IAM role ARN with policy [AWSBackupServiceRolePolicyForRestores](https://docs.aws.amazon.com/aws-backup/latest/devguide/iam-service-roles.html) used to start the restore job\n\n### (Required) BackupVaultSourceName\n  * type: String\n  * description: Name of the source backup vault\n\n### (Required) BackupVaultDestinationArn\n  * type: String\n  * description: Name of the destination backup vault in target region\n\n### (Required) DestinationRegionName\n  * type: String\n  * description: Region name to restore backup into\n\n### (Optional) KmsKeyId\n  * type: String\n  * description: The AWS KMS key id (ARN) in the specified region to perform the restore job. Leave empty if encryption of target EFS file system is not required.\n\n## Details\nThe document copies file system backup to the target region, creates restart job in the target region and\nwaits for its completion.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * GetFileSystemMetadata\n  * CreateCopyJob\n  * WaitForCopyJobCompletion\n  * GetDestinationRecoveryPointArn\n  * RestoreBackupJob\n  * WaitForRestoreJobCompletion\n  * OutputRecoveryTime\n\n## Outputs\n### RestoreBackupJob.RestoreJobId\n  * type: String\n  * description: Restore backup job ID\n\n### GetDestinationRecoveryPointArn.DestinationRecoveryPointArn\n  * type: String\n  * description: ARN of the copied Recovery Point in the target region\n\n### WaitForRestoreJobCompletion.RestoredFSArn\n  * type: String\n  * description: ARN of the restored EFS file system in the target region\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "FileSystemID": {
+      "type": "String",
+      "description": "(Required) ID of the EFS file system"
+    },
+    "RecoveryPointArn": {
+      "type": "String",
+      "description": "(Required) The Recovery Point Arn to restore."
+    },
+    "CopyJobIAMRoleArn": {
+      "type": "String",
+      "description": "(Required) IAM role ARN with AWSBackupServiceRolePolicyForBackup policy used to start the copy job."
+    },
+    "RestoreJobIAMRoleArn": {
+      "type": "String",
+      "description": "(Required) IAM role ARN with AWSBackupServiceRolePolicyForRestores policy used to start the restore job."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "BackupVaultSourceName": {
+      "type": "String",
+      "description": "(Required) The name of the source backup vault to copy from."
+    },
+    "BackupVaultDestinationArn": {
+      "type": "String",
+      "description": "(Required) The name of the destination backup vault to copy to."
+    },
+    "DestinationRegionName": {
+      "type": "String",
+      "description": "(Required) The region name to restore backup into"
+    },
+    "KmsKeyId": {
+      "type": "String",
+      "description": "(Optional) The AWS KMS key id (ARN) in the specified region to perform the restore job. Leave empty if encryption of target EFS file system is not required.",
+      "allowedPattern": "(arn:aws:kms:\\S+:\\d+:key\\/\\S+)|(^$)",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      },
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetFileSystemMetadata",
+      "description": "Get file system metadata to use same values for restore",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "efs",
+        "Api": "describeFileSystems",
+        "FileSystemId": "{{ FileSystemID }}"
+      },
+      "outputs": [
+        {
+          "Name": "PerformanceMode",
+          "Selector": "$.FileSystems[0].PerformanceMode",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateCopyJob",
+      "description": "Create copy job to copy restore point to the target region",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "copy_backup_in_region",
+        "Script": "import logging\nimport time\n\nimport boto3\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef copy_backup_in_region(events, context):\n    required_params = [\n        'IamRoleArn',\n        'RecoveryPointArn',\n        'IdempotencyToken',\n        'DestinationBackupVaultArn',\n        'SourceBackupVaultName'\n    ]\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    backup_client = boto3.client('backup')\n    logger.info(f'Running Copy backup with the following args: {events}')\n    response = backup_client.start_copy_job(\n        RecoveryPointArn=events['RecoveryPointArn'],\n        SourceBackupVaultName=events['SourceBackupVaultName'],\n        DestinationBackupVaultArn=events['DestinationBackupVaultArn'],\n        IamRoleArn=events['IamRoleArn'],\n        IdempotencyToken=events['IdempotencyToken']\n    )\n    return {\n        'CopyJobId': response.get('CopyJobId')\n    }",
+        "InputPayload": {
+          "IamRoleArn": "{{ CopyJobIAMRoleArn }}",
+          "RecoveryPointArn": "{{ RecoveryPointArn }}",
+          "SourceBackupVaultName": "{{BackupVaultSourceName}}",
+          "DestinationBackupVaultArn": "{{BackupVaultDestinationArn}}",
+          "IdempotencyToken": "{{ global:DATE_TIME }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CopyJobId",
+          "Selector": "$.Payload.CopyJobId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitForCopyJobCompletion",
+      "description": "Wait for copy job completion",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "backup",
+        "Api": "DescribeCopyJob",
+        "CopyJobId": "{{ CreateCopyJob.CopyJobId }}",
+        "PropertySelector": "$.CopyJob.State",
+        "DesiredValues": [
+          "COMPLETED"
+        ]
+      }
+    },
+    {
+      "name": "GetDestinationRecoveryPointArn",
+      "description": "Get ARN of the copied recovery point",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "backup",
+        "Api": "DescribeCopyJob",
+        "CopyJobId": "{{ CreateCopyJob.CopyJobId }}"
+      },
+      "outputs": [
+        {
+          "Name": "DestinationRecoveryPointArn",
+          "Selector": "$.CopyJob.DestinationRecoveryPointArn",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "RestoreBackupJob",
+      "description": "Restore EFS file system from the copied recovery point in the target region",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "restore_backup_in_region",
+        "Script": "import logging\nimport time\n\nimport boto3\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef restore_backup_in_region(events, context):\n    \"\"\"\n    Restore the backup from the EFS recovery point in some region\n    \"\"\"\n    required_params = [\n        'IamRoleArn',\n        'RecoveryPointArn',\n        'IdempotencyToken',\n        'Region',\n        'Metadata',\n        'ResourceType'\n    ]\n    required_metadata = [\n        'file-system-id',\n        'KmsKeyId',\n        'PerformanceMode',\n        'newFileSystem',\n        'CreationToken'\n    ]\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n    for key in required_metadata:\n        if key not in events['Metadata']:\n            raise KeyError(f'Requires {key} in events[\\'Metadata\\']')\n\n    backup_client = boto3.client('backup', region_name=events['Region'])\n\n    metadata = {\n        'file-system-id': events['Metadata']['file-system-id'],\n        'PerformanceMode': events['Metadata']['PerformanceMode'],\n        'CreationToken': events['Metadata']['CreationToken'],\n        'newFileSystem': events['Metadata']['newFileSystem']\n    }\n    if events['Metadata']['KmsKeyId'] == \"\":\n        metadata['Encrypted'] = 'false'\n    else:\n        metadata['KmsKeyId'] = events['Metadata']['KmsKeyId']\n        metadata['Encrypted'] = 'true'\n\n    logger.info(f\"Calling backup_client.start_restore_job:\"\n                f\"RecoveryPointArn={events['RecoveryPointArn']}\"\n                f\"Metadata={metadata}\"\n                f\"IamRoleArn={events['IamRoleArn']}\"\n                f\"IdempotencyToken={events['IdempotencyToken']}\"\n                f\"ResourceType={events['ResourceType']}\")\n    response = backup_client.start_restore_job(\n        RecoveryPointArn=events['RecoveryPointArn'],\n        Metadata=metadata,\n        IamRoleArn=events['IamRoleArn'],\n        IdempotencyToken=events['IdempotencyToken'],\n        ResourceType=events['ResourceType'],\n    )\n    return {\n        'RestoreJobId': response.get('RestoreJobId')\n    }",
+        "InputPayload": {
+          "IamRoleArn": "{{ RestoreJobIAMRoleArn }}",
+          "RecoveryPointArn": "{{ GetDestinationRecoveryPointArn.DestinationRecoveryPointArn }}",
+          "IdempotencyToken": "{{ global:DATE_TIME }}",
+          "Region": "{{ DestinationRegionName }}",
+          "ResourceType": "EFS",
+          "Metadata": {
+            "file-system-id": "{{ FileSystemID }}",
+            "PerformanceMode": "{{GetFileSystemMetadata.PerformanceMode}}",
+            "newFileSystem": "true",
+            "CreationToken": "{{ global:DATE_TIME }}",
+            "KmsKeyId": "{{ KmsKeyId}}"
+          }
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RestoreJobId",
+          "Selector": "$.Payload.RestoreJobId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitForRestoreJobCompletion",
+      "description": "Wait for restore job completion",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "wait_restore_job_in_region",
+        "Script": "import logging\nimport time\n\nimport boto3\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef wait_restore_job_in_region(events, context):\n    required_params = [\n        'RestoreJobId',\n        'Region',\n    ]\n    wait_timeout = 3600\n    result = {}\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    if 'WaitTimeout' in events:\n        wait_timeout = events['WaitTimeout']\n    backup_client = boto3.client('backup', region_name=events['Region'])\n    logger.info(f\"Waiting for restore job id {events['RestoreJobId']} in region: {events['Region']}\")\n\n    timeout_timestamp = time.time() + int(wait_timeout)\n    while time.time() < timeout_timestamp:\n        response = backup_client.describe_restore_job(\n            RestoreJobId=events['RestoreJobId']\n        )\n        if response.get('Status') == 'COMPLETED':\n            result = {\n                'RestoreJobId': response.get('RestoreJobId'),\n                'CreatedResourceArn': response.get('CreatedResourceArn')\n            }\n            break\n        elif response.get('Status') in ['ABORTED', 'FAILED']:\n            raise AssertionError(f\"Restore job resulted with {response.get('Status')} status\")\n        time.sleep(20)\n    if not result:\n        raise TimeoutError(f\"Restore job couldn't be completed within {wait_timeout} seconds\")\n    return result",
+        "InputPayload": {
+          "RestoreJobId": "{{ RestoreBackupJob.RestoreJobId }}",
+          "Region": "{{ DestinationRegionName }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RestoredFSArn",
+          "Selector": "$.Payload.CreatedResourceArn",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ],
+  "outputs": [
+    "RestoreBackupJob.RestoreJobId",
+    "GetDestinationRecoveryPointArn.DestinationRecoveryPointArn",
+    "OutputRecoveryTime.RecoveryTime",
+    "WaitForRestoreJobCompletion.RestoredFSArn"
+  ]
+}

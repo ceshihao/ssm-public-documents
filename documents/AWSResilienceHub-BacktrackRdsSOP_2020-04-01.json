@@ -1,0 +1,108 @@
+{
+  "description": "SOP from AWSResilienceHub to backtrack an RDS Aurora cluster",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime",
+    "BacktrackDb.RecoveryPoint"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    },
+    "DbClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) The identifier for the db cluster"
+    },
+    "BacktrackTo": {
+      "type": "String",
+      "description": "(Required) An ISO 8601 date and time"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "BacktrackDb",
+      "action": "aws:executeAwsApi",
+      "description": "Backtrack an RDS Aurora cluster to a date",
+      "outputs": [
+        {
+          "Name": "RecoveryPoint",
+          "Selector": "$.BacktrackTo",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Service": "rds",
+        "Api": "BacktrackDBCluster",
+        "DBClusterIdentifier": "{{DbClusterIdentifier}}",
+        "BacktrackTo": "{{BacktrackTo}}",
+        "UseEarliestTimeOnPointInTimeUnavailable": true
+      }
+    },
+    {
+      "name": "WaitForBacktrackCompletion",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBClusterBacktracks",
+        "DBClusterIdentifier": "{{ DbClusterIdentifier }}",
+        "PropertySelector": "$.DBClusterBacktracks[0].Status",
+        "DesiredValues": [
+          "COMPLETED",
+          "FAILED"
+        ]
+      }
+    },
+    {
+      "name": "VerifyBacktrackSuccess",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBClusterBacktracks",
+        "DBClusterIdentifier": "{{ DbClusterIdentifier }}",
+        "PropertySelector": "$.DBClusterBacktracks[0].Status",
+        "DesiredValues": [
+          "COMPLETED"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

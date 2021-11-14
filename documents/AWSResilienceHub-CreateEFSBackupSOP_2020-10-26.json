@@ -1,0 +1,125 @@
+{
+  "description": "## Id\nAWSResilienceHub-CreateEFSBackupSOP_2020-10-26\n\n## Intent\nCreate a backup of a EFS file system before major changes in configuration or deployment\n\n## Type\nSOP\n\n## Risk\nLow\n\n## Requirements\n  * EFS file system\n  * Backup vault exists to store backup\n  * IAM role with [AWSBackupServiceRolePolicyForBackup](https://docs.aws.amazon.com/aws-backup/latest/devguide/iam-service-roles.html) policy\n  * All processes that write to EFS file system should be stopped before running SOP to avoid data inconsistency\n\n## Permissions required for AutomationAssumeRole\n  * elasticfilesystem:DescribeFileSystems\n  * backup:StartBackupJob\n  * backup:DescribeBackupJob\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) FileSystemId\n  * type: String\n  * description: ID of the EFS file system\n\n### (Required) BackupVaultName\n  * type: String\n  * description: The name of a logical container where backups are stored\n\n### (Required) BackupJobIamRoleArn\n  * type: String\n  * description: IAM role ARN with policy [AWSBackupServiceRolePolicyForBackup](https://docs.aws.amazon.com/aws-backup/latest/devguide/iam-service-roles.html) used to create the target recovery point\n\n## Details\nThe document creates AWS Backup job to backup the specified file system and waits for its completion.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * GetFileSystemArn\n  * CreateBackupJob\n  * WaitForBackupJobCompletion\n  * OutputRecoveryTime\n\n## Outputs\n### CreateBackupJob.RecoveryPointArn\n  * type: String\n  * description: ARN of the created Recovery Point\n\n### CreateBackupJob.BackupJobId\n  * type: String\n  * description: Create backup job ID\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "FileSystemId": {
+      "type": "String",
+      "description": "(Required) ID of the EFS file system"
+    },
+    "BackupVaultName": {
+      "type": "String",
+      "description": "(Required) The name of a logical container where backups are stored"
+    },
+    "BackupJobIamRoleArn": {
+      "type": "String",
+      "description": "(Required) IAM role ARN with policy AWSBackupServiceRolePolicyForBackup used to create the target recovery point"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    }
+  },
+  "outputs": [
+    "CreateBackupJob.RecoveryPointArn",
+    "CreateBackupJob.BackupJobId",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "GetFileSystemArn",
+      "description": "Get ARN of the file system using provided ID",
+      "action": "aws:executeAwsApi",
+      "outputs": [
+        {
+          "Name": "FileSystemArn",
+          "Selector": "$.FileSystems[0].FileSystemArn",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Service": "efs",
+        "Api": "DescribeFileSystems",
+        "FileSystemId": "{{ FileSystemId }}"
+      }
+    },
+    {
+      "name": "CreateBackupJob",
+      "description": "Create backup job for the specified file system",
+      "action": "aws:executeAwsApi",
+      "outputs": [
+        {
+          "Name": "BackupJobId",
+          "Selector": "$.BackupJobId",
+          "Type": "String"
+        },
+        {
+          "Name": "RecoveryPointArn",
+          "Selector": "$.RecoveryPointArn",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Service": "backup",
+        "Api": "startBackupJob",
+        "BackupVaultName": "{{ BackupVaultName }}",
+        "ResourceArn": "{{ GetFileSystemArn.FileSystemArn }}",
+        "IamRoleArn": "{{ BackupJobIamRoleArn }}",
+        "IdempotencyToken": "{{ global:DATE_TIME }}"
+      }
+    },
+    {
+      "name": "WaitForBackupJobCompletion",
+      "description": "Wait until backup job is completed",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Service": "backup",
+        "Api": "DescribeBackupJob",
+        "BackupJobId": "{{ CreateBackupJob.BackupJobId }}",
+        "PropertySelector": "$.State",
+        "DesiredValues": [
+          "COMPLETED"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

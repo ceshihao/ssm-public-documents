@@ -1,0 +1,229 @@
+{
+  "description": "## Id\nAWSResilienceHub-RestoreDynamoDBTableToPointInTimeSOP_2020-04-01\n\n## Intent\nRecover the table into an old stable state using existing Point in Time snapshot\n\n## Type\nSOP\n\n## Risk\nSmall\n\n## Requirements\n  * Source DynamoDB table\n  * The point in time recovery property has to be enabled for the source DynamoDB table\n  * Target DynamoDB table\n\n## Permissions required for AutomationAssumeRole\n  * dynamodb:RestoreTableToPointInTime\n  * dynamodb:DescribeTable\n  * dynamodb:Scan\n  * dynamodb:Query\n  * dynamodb:UpdateItem\n  * dynamodb:PutItem\n  * dynamodb:GetItem\n  * dynamodb:DeleteItem\n  * dynamodb:BatchWriteItem\n\n##### Permissions required in case Kinesis Streaming destination is enabled\n  * kinesis:DescribeStream\n  * kinesis:PutRecord\n  * kinesis:PutRecords\n\n##### Permissions required to copy properties from source to restored table if `CopyAllProperties` option is enabled\n  * dynamodb:UpdateTable\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * dynamodb:CreateTableReplica\n  * dynamodb:CreateTable\n  * dynamodb:DescribeKinesisStreamingDestination\n  * dynamodb:EnableKinesisStreamingDestination\n  * dynamodb:DescribeTimeToLive\n  * dynamodb:UpdateTimeToLive\n  * dynamodb:ListTagsOfResource\n  * dynamodb:TagResource\n  * dynamodb:DescribeContributorInsights\n  * dynamodb:UpdateContributorInsights\n  * dynamodb:DescribeContinuousBackups\n  * dynamodb:UpdateContinuousBackups\n  * application-autoscaling:DescribeScalableTargets\n  * application-autoscaling:RegisterScalableTarget\n  * iam:PassRole (passed to application-autoscaling.amazonaws.com)\n  * cloudwatch:DescribeAlarms\n  * cloudwatch:PutMetricAlarm\n\n## Depends on\nAWSResilienceHub-CopyDynamoDBTablePropertiesUtil_2020-04-01\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) DynamoDBTableSourceName\n  * type: String\n  * description: DynamoDB Table Source Name\n\n### (Required) DynamoDBTableTargetName\n  * type: String\n  * description: DynamoDB Table Target Name\n\n### (Optional) RecoveryPointDateTime\n  * type: String\n  * description: The recovery point in time in format YYYY-MM-DDTHH:MM:SSZ\n  * default: \"latest\"\n\n### (Optional) CopyAllProperties\n  * type: Boolean\n  * description: True of False. If True copies all the settings from Source table to the restored one\n  * default: True\n\n### (Optional) DynamoDBSourceTableAlarmNames\n  * type: StringList\n  * description: The DynamoDB Source Table Alarm Names to recover (only metric alarms based on metrics with AWS/DynamoDB namespace)\n  * max items: 10\n  * default: []\n\n## Details\nThe document verifies that DynamoDB table is active and point in time recovery is enabled, then restores\nthe table to the latest snapshot or to the specified point in time snapshot, waits for table to become\nactive, and if `CopyAllProperties` is set to True copies all possible properties from the source table\nto the restored one. If `DynamoDBSourceTableAlarmNames` is provided copies the specified alarms from\nthe source table, up to 10 alarms. Note that triggers and IAM policy can't be copied from source. Item\ncount doesn't appear immediately because DynamoDB updates this value every 6 hours.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * verifyDynamoDBTableTargetStatus\n  * verifyDynamoDBTargetTablePointInTimeRecovery\n  * CheckIfUseLatestRecoveryPoint\n  * RestoreDynamoDBTableToPointInTime or RestoreDynamoDBTableLatestToPointInTime\n  * WaitTableToBeActive\n  * CheckIfNeedToCopyAllProperties\n  * CopyAllTableProperties\n  * OutputRecoveryTime\n\n## Outputs\n### RestoreDynamoDBTableLatestToPointInTime.TargetTableArn\n  * type: String\n  * description: ARN of the restored table (if recovered to the latest snapshot)\n\n### RestoreDynamoDBTableLatestToPointInTime.RecoveryPoint\n  * type: String\n  * description: Timestamp of the snapshot used to restore (if recovered to the latest snapshot)\n\n### RestoreDynamoDBTableToPointInTime.TargetTableArn\n  * type: String\n  * description: ARN of the restored table\n\n### RestoreDynamoDBTableToPointInTime.RecoveryPoint\n  * type: String\n  * description: Timestamp of the snapshot used to restore\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: Time to recover in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DynamoDBTableSourceName": {
+      "type": "String",
+      "description": "(Required) The DynamoDB Table Source Name."
+    },
+    "DynamoDBTableTargetName": {
+      "type": "String",
+      "description": "(Required) The DynamoDB Table Target Name."
+    },
+    "RecoveryPointDateTime": {
+      "type": "String",
+      "description": "(Optional) The recovery point in time in format YYYY-MM-DDTHH:MM:SSZ",
+      "allowedPattern": "^latest$|^\\d{4}-[01]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d([+-][0-2]\\d[0-5]\\d|Z)$",
+      "default": "latest"
+    },
+    "CopyAllProperties": {
+      "type": "Boolean",
+      "description": "(Optional) If True copies all the settings from Source table to the restored on",
+      "default": true
+    },
+    "DynamoDBSourceTableAlarmNames": {
+      "type": "StringList",
+      "description": "(Optional) The DynamoDB Source Table Alarm Names (only metric alarms based on metrics with AWS/DynamoDB namespace)",
+      "maxItems": 10,
+      "default": []
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "RestoreDynamoDBTableLatestToPointInTime.TargetTableArn",
+    "RestoreDynamoDBTableToPointInTime.TargetTableArn",
+    "OutputRecoveryTime.RecoveryTime",
+    "RestoreDynamoDBTableLatestToPointInTime.RecoveryPoint",
+    "RestoreDynamoDBTableToPointInTime.RecoveryPoint"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "verifyDynamoDBTableTargetStatus",
+      "description": "Verify that the target table is active",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "DescribeTable",
+        "TableName": "{{ DynamoDBTableSourceName }}",
+        "PropertySelector": "$.Table.TableStatus",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      },
+      "nextStep": "verifyDynamoDBTargetTablePointInTimeRecovery"
+    },
+    {
+      "name": "verifyDynamoDBTargetTablePointInTimeRecovery",
+      "description": "Verify that ContinuousBackupsStatus for the target table is enabled",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "DescribeContinuousBackups",
+        "TableName": "{{ DynamoDBTableSourceName }}",
+        "PropertySelector": "$.ContinuousBackupsDescription.ContinuousBackupsStatus",
+        "DesiredValues": [
+          "ENABLED"
+        ]
+      }
+    },
+    {
+      "name": "CheckIfUseLatestRecoveryPoint",
+      "description": "Check if recover from the latest snapshot or from the spicifed point in time",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RestoreDynamoDBTableLatestToPointInTime",
+            "Variable": "{{RecoveryPointDateTime}}",
+            "EqualsIgnoreCase": "latest"
+          }
+        ],
+        "Default": "RestoreDynamoDBTableToPointInTime"
+      }
+    },
+    {
+      "name": "RestoreDynamoDBTableLatestToPointInTime",
+      "description": "Restore target table to the latest snapshot",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "RestoreTableToPointInTime",
+        "SourceTableName": "{{ DynamoDBTableSourceName }}",
+        "TargetTableName": "{{ DynamoDBTableTargetName }}",
+        "UseLatestRestorableTime": true
+      },
+      "outputs": [
+        {
+          "Name": "RecoveryPoint",
+          "Selector": "$.TableDescription.RestoreSummary.RestoreDateTime",
+          "Type": "String"
+        },
+        {
+          "Name": "TargetTableArn",
+          "Selector": "$.TableDescription.TableArn",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "WaitTableToBeActive"
+    },
+    {
+      "name": "RestoreDynamoDBTableToPointInTime",
+      "description": "Restore target table to the specified snapshot",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "RestoreTableToPointInTime",
+        "SourceTableName": "{{ DynamoDBTableSourceName }}",
+        "TargetTableName": "{{ DynamoDBTableTargetName }}",
+        "RestoreDateTime": "{{ RecoveryPointDateTime }}"
+      },
+      "outputs": [
+        {
+          "Name": "RecoveryPoint",
+          "Selector": "$.TableDescription.RestoreSummary.RestoreDateTime",
+          "Type": "String"
+        },
+        {
+          "Name": "TargetTableArn",
+          "Selector": "$.TableDescription.TableArn",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "WaitTableToBeActive"
+    },
+    {
+      "name": "WaitTableToBeActive",
+      "description": "Wait for the table to become active",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "DescribeTable",
+        "TableName": "{{DynamoDBTableTargetName}}",
+        "PropertySelector": "$.Table.TableStatus",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      }
+    },
+    {
+      "name": "CheckIfNeedToCopyAllProperties",
+      "description": "Check that CopyAllProperties is enabled",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CopyAllTableProperties",
+            "Variable": "{{CopyAllProperties}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "OutputRecoveryTime"
+      }
+    },
+    {
+      "name": "CopyAllTableProperties",
+      "description": "Execute script to copy properties and alarms from the source table to the restored one",
+      "action": "aws:executeAutomation",
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSResilienceHub-CopyDynamoDBTablePropertiesUtil_2020-04-01",
+        "RuntimeParameters": {
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}",
+          "DynamoDBTableSourceName": "{{DynamoDBTableSourceName}}",
+          "DynamoDBTableTargetName": "{{DynamoDBTableTargetName}}",
+          "DynamoDBSourceTableAlarmNames": "{{DynamoDBSourceTableAlarmNames}}"
+        }
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      },
+      "isEnd": true
+    }
+  ]
+}

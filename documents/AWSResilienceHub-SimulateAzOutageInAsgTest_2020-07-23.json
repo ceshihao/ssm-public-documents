@@ -1,0 +1,233 @@
+{
+  "description": "## Intent\n'Test that the application can withstand az outage in ASG.'\n\n## Type\nTest\n\n## Requirements\n  * ASG has more than 1 instance\n  * There is a synthetic alarm setup for application\n  * Application should be scaled sufficiently to handle expected traffic with one az loss\n\n## Permissions required for AutomationAssumeRole\n  * autoscaling:DescribeAutoScalingGroups\n  * autoscaling:SuspendProcesses\n  * autoscaling:ResumeProcesses\n  * ec2:TerminateInstances\n  * ec2:DescribeInstanceStatus\n  * cloudwatch:DescribeAlarms\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * iam:PassRole (restricted to same role)\n\n## Supports Rollback\n  Yes. If executed in rollback mode, any previous suspended launch processes in ASG will be resumed.\n\n## Cancellation behavior\n  Suspended launch processes in ASG will be resumed.\n\n## Inputs\n### (Required) AutoScalingGroupName:\n  * type: String\n  * description: Name of AutoScalingGroup.\n\n### (Required) SyntheticAlarmName:\n  * type: String\n  * description: Synthetic Canary Alarm for the application which should stay green during this test.\n\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: The ARN of the role that allows Automation to perform the actions on your behalf.\n\n### (Optional) TestDurationInMinutes:\n  * type: String\n  * description: Test duration in minutes.\n  * default: \"10\"\n\n### (Optional) IsRollback:\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.\n  * default: 'false'\n\n### (Optional) PreviousExecutionId:\n  * type: String\n  * description: (Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.\n  * default: ''\n\n## Details\n  * Select AZ where majority of instances are in.\n  * Prevent new instances in AZ from turning on (use suspendLaunch API)\n  * Inject an error to all instances in AZ together (terminate all instances in az)\n  * Verify alarms alert in (alarms a)\n  * Verify that Synthetic monitor stays green / turns green within x minutes.\n\n## Steps executed in normal flow\n  * SelectExecutionMode\n  * AssertNoSuspendedProcesses\n  * AssertAlarmToBeGreenBeforeTest\n  * SuspendLaunchProcessInAsg\n  * GetInstancesInRandomAz\n  * TerminateInstances\n  * WaitForTestCompletion\n  * AssertAlarmToBeGreen\n  * ResumeLaunchProcessInAsg\n\n## Steps executed in rollback flow\n  * SelectExecutionMode\n  * GetInputsFromPreviousExecution\n  * AssertAutoScalingGroupName\n  * ResumeLaunchProcessInAsg\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutoScalingGroupName": {
+      "type": "String",
+      "description": "(Required) Name of AutoScalingGroup."
+    },
+    "CanaryAlarmName": {
+      "type": "String",
+      "description": "(Required) Synthetic Canary Alarm for the application which should stay green during this test."
+    },
+    "TestDurationInMinutes": {
+      "type": "String",
+      "description": "(Optional) Test duration in minutes.",
+      "default": "10"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "SelectExecutionMode",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AssertNoSuspendedProcesses",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "false"
+          }
+        ],
+        "Default": "GetInputsFromPreviousExecution"
+      }
+    },
+    {
+      "name": "AssertNoSuspendedProcesses",
+      "description": "Check that there are no suspended processes before proceeding.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "assert_no_suspended_process",
+        "InputPayload": {
+          "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+        },
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef assert_no_suspended_process(events, context):\n    if 'AutoScalingGroupName' not in events:\n        raise KeyError('Requires AutoScalingGroupName in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    autoscaling = boto3.client('autoscaling', config=config)\n    auto_scaling_groups = autoscaling.describe_auto_scaling_groups(\n        AutoScalingGroupNames=[\n            events['AutoScalingGroupName']\n        ]\n    )\n\n    if len(auto_scaling_groups['AutoScalingGroups'][0]['SuspendedProcesses']) > 0:\n        raise Exception('ASG % has suspended processes', events['AutoScalingGroupName'])"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "SuspendLaunchProcessInAsg",
+      "description": "Suspend launch process in asg to simulate AZ outage when instances are terminated.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "SuspendProcesses",
+        "AutoScalingGroupName": "{{AutoScalingGroupName}}",
+        "ScalingProcesses": [
+          "Launch"
+        ]
+      }
+    },
+    {
+      "name": "GetInstancesInRandomAz",
+      "description": "Get all instances in a random AZ.",
+      "action": "aws:executeScript",
+      "onFailure": "step:ResumeLaunchProcessInAsg",
+      "onCancel": "step:TriggerRollback",
+      "maxAttempts": 10,
+      "timeoutSeconds": 900,
+      "outputs": [
+        {
+          "Name": "InstanceIds",
+          "Selector": "$.Payload.InstanceIds",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_instance_ids_in_asg_random_az",
+        "InputPayload": {
+          "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+        },
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_instance_ids_in_asg_random_az(events, context):\n    if 'AutoScalingGroupName' not in events:\n        raise KeyError('Requires AutoScalingGroupName in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    autoscaling = boto3.client('autoscaling', config=config)\n\n    auto_scaling_groups = autoscaling.describe_auto_scaling_groups(\n        AutoScalingGroupNames=[\n            events['AutoScalingGroupName']\n        ]\n    )\n\n    instances_by_az = {}\n    for instance in auto_scaling_groups['AutoScalingGroups'][0]['Instances']:\n        instances_by_az.setdefault(instance['AvailabilityZone'], []).append(instance['InstanceId'])\n\n    output = {}\n    output['InstanceIds'] = random.choice(list(instances_by_az.values()))\n    return output"
+      }
+    },
+    {
+      "name": "TerminateInstances",
+      "description": "Terminate all instances from GetInstancesInRandomAz step output.",
+      "action": "aws:changeInstanceState",
+      "onFailure": "step:ResumeLaunchProcessInAsg",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "InstanceIds": "{{GetInstancesInRandomAz.InstanceIds}}",
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "WaitForTestCompletion",
+      "description": "Wait for test duration specified in input.",
+      "action": "aws:sleep",
+      "onFailure": "step:ResumeLaunchProcessInAsg",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Duration": "PT{{TestDurationInMinutes}}M"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "onFailure": "step:ResumeLaunchProcessInAsg",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "ResumeLaunchProcessInAsg",
+      "description": "Resume launch process after test is over or test fails to remove AZ outage simulation.",
+      "action": "aws:executeAwsApi",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "ResumeProcesses",
+        "AutoScalingGroupName": "{{AutoScalingGroupName}}",
+        "ScalingProcesses": [
+          "Launch"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "AutoScalingGroupName",
+          "Selector": "$.Payload.AutoScalingGroupName[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertAutoScalingGroupName",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ResumeLaunchProcessInAsg",
+            "Variable": "{{ GetInputsFromPreviousExecution.AutoScalingGroupName }}",
+            "StringEquals": "{{ AutoScalingGroupName }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress and starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

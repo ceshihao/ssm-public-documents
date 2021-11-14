@@ -1,0 +1,101 @@
+{
+  "description": "## Id\nAWSResilienceHub-ChangeLambdaProvisionedConcurrencySOP_2020-10-26\n\n## Intent\nChange provisioned concurrency of a Lambda function\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * Lambda Function\n\n## Permissions required for AutomationAssumeRole\n  * lambda:PutProvisionedConcurrencyConfig\n  * lambda:GetProvisionedConcurrencyConfig\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) LambdaARN\n  * type: String\n  * description: The ARN of the Lambda function\n\n### (Required) ProvisionedConcurrentExecutions\n  * type: Integer\n  * description: New ProvisionedConcurrency value\n\n### (Required) LambdaQualifier\n  * type: String\n  * description: The version number or alias name\n\n## Details\nThe document updates provisioned concurrency configuration of the specified Lambda function's version or alias and waits for the config to be in status \"ready\".\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * PutProvisionedConcurrencyConfig\n  * WaitForProvisionedConcurrencyConfigToBeReady\n  * OutputRecoveryTime\n\n## Outputs\n### SetMemorySize.NewMemorySizeValue\n  * type: Integer\n  * description: Updated memory size value\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: Execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "LambdaARN": {
+      "type": "String",
+      "description": "(Required) The ARN of the Lambda function."
+    },
+    "ProvisionedConcurrentExecutions": {
+      "type": "Integer",
+      "description": "(Required) New ProvisionedConcurrency value."
+    },
+    "LambdaQualifier": {
+      "type": "String",
+      "description": "(Required) The version number or alias name"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "PutProvisionedConcurrencyConfig.NewValueOfProvisionedConcurrency",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "PutProvisionedConcurrencyConfig",
+      "description": "Updates provisioned concurrency for the specified Lambda",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "PutProvisionedConcurrencyConfig",
+        "FunctionName": "{{ LambdaARN }}",
+        "ProvisionedConcurrentExecutions": "{{ ProvisionedConcurrentExecutions }}",
+        "Qualifier": "{{ LambdaQualifier }}"
+      },
+      "outputs": [
+        {
+          "Name": "NewValueOfProvisionedConcurrency",
+          "Selector": "$.RequestedProvisionedConcurrentExecutions",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "WaitForProvisionedConcurrencyConfigToBeReady",
+      "description": "Wait for the provisioned concurrency config to be ready",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "lambda",
+        "Api": "GetProvisionedConcurrencyConfig",
+        "FunctionName": "{{ LambdaARN }}",
+        "Qualifier": "{{ LambdaQualifier }}",
+        "PropertySelector": "$.Status",
+        "DesiredValues": [
+          "READY"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

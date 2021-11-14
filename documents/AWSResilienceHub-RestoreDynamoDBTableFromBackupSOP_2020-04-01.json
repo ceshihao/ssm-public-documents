@@ -1,0 +1,149 @@
+{
+  "description": "## Id\nAWSResilienceHub-RestoreDynamoDBTableFromBackupSOP_2020-04-01\n\n## Intent\nRecover the table into a known good state using existing backup of a DynamoDB table\n\n## Type\nSOP\n\n## Risk\nSmall\n\n## Requirements\n  * DynamoDB table\n  * DynamoDB table backup\n\n## Permissions required for AutomationAssumeRole\n  * dynamodb:RestoreTableFromBackup\n  * dynamodb:DescribeTable\n  * dynamodb:Scan\n  * dynamodb:Query\n  * dynamodb:UpdateItem\n  * dynamodb:PutItem\n  * dynamodb:GetItem\n  * dynamodb:DeleteItem\n  * dynamodb:BatchWriteItem\n\n##### Permissions required in case Kinesis Streaming destination is enabled\n  * kinesis:DescribeStream\n  * kinesis:PutRecord\n  * kinesis:PutRecords\n\n##### Permissions required to copy properties from source to restored table if `CopyAllProperties` option is enabled\n  * dynamodb:UpdateTable\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * dynamodb:CreateTableReplica\n  * dynamodb:CreateTable\n  * dynamodb:DescribeKinesisStreamingDestination\n  * dynamodb:EnableKinesisStreamingDestination\n  * dynamodb:DescribeTimeToLive\n  * dynamodb:UpdateTimeToLive\n  * dynamodb:ListTagsOfResource\n  * dynamodb:TagResource\n  * dynamodb:DescribeContributorInsights\n  * dynamodb:UpdateContributorInsights\n  * dynamodb:DescribeContinuousBackups\n  * dynamodb:UpdateContinuousBackups\n  * application-autoscaling:DescribeScalableTargets\n  * application-autoscaling:RegisterScalableTarget\n  * iam:PassRole (passed to application-autoscaling.amazonaws.com)\n  * cloudwatch:DescribeAlarms\n  * cloudwatch:PutMetricAlarm\n\n## Depends on\nAWSResilienceHub-CopyDynamoDBTablePropertiesUtil_2020-04-01\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) DynamoDBTableSourceName\n  * type: String\n  * description: DynamoDB Table Source Name\n\n### (Required) DynamoDBSourceTableBackupArn\n  * type: String\n  * description: DynamoDB Source Table Backup ARN\n\n### (Required) DynamoDBTableTargetName\n  * type: String\n  * description: DynamoDB Table Target Name\n\n### (Optional) CopyAllProperties\n  * type: Boolean\n  * description: True of False. If True copies all the settings from Source table to the restored one\n  * default: True\n\n### (Optional) DynamoDBSourceTableAlarmNames\n  * type: StringList\n  * description: The DynamoDB Source Table Alarm Names to recover (only metric alarms based on metrics with AWS/DynamoDB namespace)\n  * max items: 10\n  * default: []\n\n## Details\nThe document creates DynamoDB table from backup, waits for the table to become active, and if\n`CopyAllProperties` is set to True copies all possible properties from the source table to the restored\none. If `DynamoDBSourceTableAlarmNames` is provided copies the specified alarms from the source table, up\nto 10 alarms. Note that triggers and IAM policy can't be copied from source. Item count doesn't appear\nimmediately because DynamoDB updates this value every 6 hours.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * RestoreDynamoDBTableFromBackup\n  * WaitTableToBeActive\n  * CheckIfNeedToCopyAllProperties\n  * CopyAllTableProperties\n  * OutputRecoveryTime\n\n## Outputs\n### RestoreDynamoDBTableFromBackup.TargetTableArn\n  * type: String\n  * description: ARN of the restored table\n\n### RestoreDynamoDBTableFromBackup.RecoveryPoint\n  * type: String\n  * description: Timestamp of the backup used to restore\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: Time to recover in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DynamoDBTableSourceName": {
+      "type": "String",
+      "description": "(Required) The DynamoDB Table Source Name."
+    },
+    "DynamoDBSourceTableBackupArn": {
+      "type": "String",
+      "description": "(Required) The DynamoDB Source Table Backup ARN."
+    },
+    "DynamoDBTableTargetName": {
+      "type": "String",
+      "description": "(Required) The DynamoDB Table Target Name."
+    },
+    "CopyAllProperties": {
+      "type": "Boolean",
+      "description": "(Optional) If True copies all the settings from Source table to the restored one",
+      "default": true
+    },
+    "DynamoDBSourceTableAlarmNames": {
+      "type": "StringList",
+      "description": "(Optional) The DynamoDB Source Table Alarm Names (only metric alarms based on metrics with AWS/DynamoDB namespace)",
+      "maxItems": 10,
+      "default": []
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "RestoreDynamoDBTableFromBackup.TargetTableArn",
+    "RestoreDynamoDBTableFromBackup.RecoveryPoint",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "RestoreDynamoDBTableFromBackup",
+      "description": "Restore table from backup",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "RestoreTableFromBackup",
+        "BackupArn": "{{ DynamoDBSourceTableBackupArn }}",
+        "TargetTableName": "{{ DynamoDBTableTargetName }}"
+      },
+      "outputs": [
+        {
+          "Name": "TargetTableArn",
+          "Selector": "$.TableDescription.TableArn",
+          "Type": "String"
+        },
+        {
+          "Name": "RecoveryPoint",
+          "Selector": "$.TableDescription.RestoreSummary.RestoreDateTime",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitTableToBeActive",
+      "description": "Wait for the table to become active",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "DescribeTable",
+        "TableName": "{{ DynamoDBTableTargetName }}",
+        "PropertySelector": "$.Table.TableStatus",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      }
+    },
+    {
+      "name": "CheckIfNeedToCopyAllProperties",
+      "description": "Check that CopyAllProperties is enabled",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CopyAllTableProperties",
+            "Variable": "{{CopyAllProperties}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "OutputRecoveryTime"
+      }
+    },
+    {
+      "name": "CopyAllTableProperties",
+      "description": "Execute script to copy properties and alarms from the source table to the restored one",
+      "action": "aws:executeAutomation",
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSResilienceHub-CopyDynamoDBTablePropertiesUtil_2020-04-01",
+        "RuntimeParameters": {
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}",
+          "DynamoDBTableSourceName": "{{DynamoDBTableSourceName}}",
+          "DynamoDBTableTargetName": "{{DynamoDBTableTargetName}}",
+          "DynamoDBSourceTableAlarmNames": "{{DynamoDBSourceTableAlarmNames}}"
+        }
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      },
+      "isEnd": true
+    }
+  ]
+}

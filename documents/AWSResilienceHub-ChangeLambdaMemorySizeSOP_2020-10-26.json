@@ -1,0 +1,111 @@
+{
+  "description": "## Id\nAWSResilienceHub-ChangeLambdaMemorySizeSOP_2020-10-26\n\n## Intent\nChange memory size of a Lambda function\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * Lambda Function\n\n## Permissions required for AutomationAssumeRole\n  * lambda:UpdateFunctionConfiguration\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) LambdaARN\n  * type: String\n  * description: The ARN of the Lambda function\n\n### (Required) NewMemorySizeValue\n  * type: Integer\n  * description: The new RAM value in Megabytes  (128 MB — 10,240 MB)\n\n## Details\nThe document updates memory size of the specified Lambda function and waits for the new configuration to be\nsuccefully applied.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * WaitForLabmdaSuccessfulUpdatedStatusBeforeModification\n  * UpdateMemorySize\n  * WaitForLabmdaSuccessfulUpdatedStatusAfterModification\n  * OutputRecoveryTime\n\n## Outputs\n### UpdateMemorySize.NewMemorySizeValue\n  * type: Integer\n  * description: Updated memory size value\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: Execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "LambdaARN": {
+      "type": "String",
+      "description": "(Required) The ARN of the Lambda function."
+    },
+    "NewMemorySizeValue": {
+      "type": "Integer",
+      "description": "(Required) The new RAM value in Megabytes  (128 MB — 10,240 MB)."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "UpdateMemorySize.NewMemorySizeValue",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "WaitForLabmdaSuccessfulUpdatedStatusBeforeModification",
+      "description": "Wait for Lambda function's congifuration to be ready for update",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "GetFunction",
+        "FunctionName": "{{ LambdaARN }}",
+        "PropertySelector": "$.Configuration.LastUpdateStatus",
+        "DesiredValues": [
+          "Successful"
+        ]
+      }
+    },
+    {
+      "name": "UpdateMemorySize",
+      "description": "Update memory size of the specified Lambda",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "UpdateFunctionConfiguration",
+        "FunctionName": "{{ LambdaARN }}",
+        "MemorySize": "{{ NewMemorySizeValue }}"
+      },
+      "outputs": [
+        {
+          "Name": "NewMemorySizeValue",
+          "Selector": "$.MemorySize",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "WaitForLabmdaSuccessfulUpdatedStatusAfterModification",
+      "description": "Wait for Lambda function's congifuration update to be applied successfully",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "lambda",
+        "Api": "GetFunction",
+        "FunctionName": "{{ LambdaARN }}",
+        "PropertySelector": "$.Configuration.LastUpdateStatus",
+        "DesiredValues": [
+          "Successful"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "description": "Clean S3 bucket",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    },
+    "S3BucketNameToClean": {
+      "type": "String",
+      "description": "(Required) The name of S3 bucket to clean"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CleanRestoreBucket",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "NumberOfDeletedObjects",
+          "Selector": "$.Payload.NumberOfDeletedObjects",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "clean_bucket",
+        "InputPayload": {
+          "S3BucketNameToClean": "{{S3BucketNameToClean}}"
+        },
+        "Script": "import boto3\nfrom datetime import datetime\nfrom botocore.config import Config\n\n\n\n\ndef clean_bucket(events, context):\n    \"\"\"\n    Clean bucket by removing versioned objects and delete markers\n    :return: Number of removed versioned objects and delete markers\n    \"\"\"\n    if 'S3BucketNameToClean' not in events:\n        raise KeyError('Requires S3BucketNameToClean in events')\n\n    s3_bucket_name_to_clean = events['S3BucketNameToClean']\n\n    print(f'Sending the list_object_versions request fore the {s3_bucket_name_to_clean} bucket...')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    s3_client = boto3.client('s3', config=config)\n    paginator = s3_client.get_paginator('list_object_versions')\n    pages = paginator.paginate(Bucket=s3_bucket_name_to_clean)\n\n    number_of_deleted_objects = 0\n\n    for page in pages:\n        print(f'The response from the list_object_versions: {page}')\n\n        versions: list = page.get('Versions')\n        if versions is not None:\n            for version in versions:\n                key = version.get('Key')\n                version_id = version.get('VersionId')\n                s3_client.delete_object(Bucket=s3_bucket_name_to_clean, Key=key, VersionId=version_id)\n\n                print(f'The versioned object with Bucket={s3_bucket_name_to_clean}, '\n                      f'Key={key}, VersionId={version_id} was deleted')\n\n                number_of_deleted_objects += 1\n\n        delete_markers: list = page.get('DeleteMarkers')\n        if delete_markers is not None:\n            for delete_marker in delete_markers:\n                key = delete_marker.get('Key')\n                version_id = delete_marker.get('VersionId')\n                s3_client.delete_object(Bucket=s3_bucket_name_to_clean, Key=key, VersionId=version_id)\n\n                print(f'The delete marker with Bucket={s3_bucket_name_to_clean},'\n                      f' Key={key}, VersionId={version_id} was deleted')\n\n                number_of_deleted_objects += 1\n\n    print(f'The number of deleted versioned objects and delete markers '\n          f'in restore bucket is {number_of_deleted_objects}')\n\n    return {'NumberOfDeletedObjects': number_of_deleted_objects}"
+      }
+    }
+  ]
+}

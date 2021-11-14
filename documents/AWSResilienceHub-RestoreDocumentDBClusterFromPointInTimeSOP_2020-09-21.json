@@ -1,0 +1,329 @@
+{
+  "description": "## Id\nAWSResilienceHub-RestoreDocumentDBClusterFromPointInTimeSOP_2020-09-21\n\n## Intent\nUsed to restore a database to an old stable state from a Point in Time snapshot\n\n## Type\nSOP\n\n## Risk\nSmall\n\n## Requirements\n  * Available DocumentDB Cluster with a recovery point\n\n## Permissions required for AutomationAssumeRole\n  * rds:CreateDBInstance\n  * rds:DescribeDBClusters\n  * rds:DescribeDBInstances\n  * rds:ModifyDBCluster\n  * rds:ModifyDBInstance\n  * rds:RestoreDBClusterToPointInTime\n\n##### In case cluster is encrypted with a KMS key\n  * kms:CreateGrant\n  * kms:DescribeKey\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) DBClusterIdentifier\n  * type: String\n  * description: DocumentDB Cluster Identifier\n\n### (Required) RestoreToDate\n  * type: String\n  * description: Available Point-in-Time date in UTC timezone following the pattern YYYY-MM-DDTHH:MM:SSZ\n  * default: 'latest'\n\n## Details\nThe document restores DocumentDB cluster from a recovery point. The source cluster and instances are\nreplaced by adding \"-replaced\" to their identifiers while the restored ones are renamed to have the original\nidentifiers of the sources. The document then waits for cluster and instances to become available. Original\ncluster and identifiers are kept with the \"-replaced\" suffix. In case of issues users may need to remove\nrecovered cluster and instances and remove the \"-replaced\" suffix from the original ones. If renaming\nfailed, cluster and instances with the suffix \"-restored\" may remain and should be renamed manually or\nremoved.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * GetRecoveryPoint\n  * BackupDbClusterMetadata\n  * BackupDbClusterInstancesMetadata\n  * RestoreClusterToPointInTime\n  * RestoreDocDbClusterInstances\n  * RenameReplacedDocDbCluster\n  * WaitUntilReplacedInstancesAvailable\n  * RenameReplacedDocDbInstances\n  * WaitUntilRestoredInstancesAvailable\n  * RenameRestoredDocDbInstances\n  * RenameRestoredCluster\n  * WaitUntilRenamedInstancesAvailable\n  * OutputRecoveryTime\n\n## Outputs\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds\n\n### GetRecoveryPoint.RecoveryPoint\n  * type: String\n  * description: Used recovery point ID\n\n### BackupDbClusterMetadata.BackupDbClusterInstancesCountValue\n  * type: MapList\n  * description: List of instances before recovery\n\n### BackupDbClusterMetadata.BackupDbClusterSecurityGroupsId\n  * type: StringList\n  * description: List of cluster's security groups\n\n### BackupDbClusterInstancesMetadata.DBClusterInstancesMetadata\n  * type: StringMap\n  * description: List of instances metadata before recovery\n\n### RestoreClusterToPointInTime.RestoredClusterIdentifier\n  * type: String\n  * description: Cluster ID after recovery\n\n### RestoreDocDbClusterInstances.RestoredInstancesIdentifiers\n  * type: StringList\n  * description: List of restored Instance IDs after recovery",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime",
+    "GetRecoveryPoint.RecoveryPoint",
+    "BackupDbClusterMetadata.BackupDbClusterInstancesCountValue",
+    "BackupDbClusterMetadata.BackupDbClusterSecurityGroupsId",
+    "BackupDbClusterInstancesMetadata.DBClusterInstancesMetadata",
+    "RestoreClusterToPointInTime.RestoredClusterIdentifier",
+    "RestoreDocDbClusterInstances.RestoredInstancesIdentifiers"
+  ],
+  "parameters": {
+    "DBClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) DocDb Cluster Identifier"
+    },
+    "RestoreToDate": {
+      "type": "String",
+      "description": "(Optional) Enter the available Point-in-Time date in UTC timezone following the pattern YYYY-MM-DDTHH:MM:SSZ",
+      "default": "latest"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to run this document."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "GetRecoveryPoint",
+      "action": "aws:executeScript",
+      "description": "Get Recovery Point",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RecoveryPoint",
+          "Selector": "$.Payload.RecoveryPoint"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_recovery_point_input",
+        "InputPayload": {
+          "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+          "RestoreToDate": "{{ RestoreToDate }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef get_recovery_point_input(events, context):\n    try:\n        date = events['RestoreToDate']\n        restorable_cluster_identifier = events['DBClusterIdentifier']\n        if date == 'latest':\n            config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n            docdb = boto3.client('docdb', config=config)\n            response = docdb.describe_db_clusters(DBClusterIdentifier=restorable_cluster_identifier)\n            print(response['DBClusters'][0]['LatestRestorableTime'].strftime(\"%Y-%m-%dT%H:%M:%S%Z\"))\n            return {'RecoveryPoint': response['DBClusters'][0]['LatestRestorableTime'].strftime(\"%Y-%d-%mT%H:%M:%S%Z\")}\n        else:\n            return {'RecoveryPoint': date}\n    except Exception as e:\n        print(f'Error: {e}')\n        raise"
+      }
+    },
+    {
+      "name": "BackupDbClusterMetadata",
+      "action": "aws:executeAwsApi",
+      "description": "Backup restorable cluster metadata",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBClusters",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ DBClusterIdentifier }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "BackupDbClusterInstancesCountValue",
+          "Selector": "$.DBClusters[0].DBClusterMembers",
+          "Type": "MapList"
+        },
+        {
+          "Name": "BackupDbClusterSecurityGroupsId",
+          "Selector": "$.DBClusters..VpcSecurityGroupId",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "BackupDbClusterInstancesMetadata",
+      "action": "aws:executeScript",
+      "description": "Backup current DbClusterInstances type",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "DBClusterInstancesMetadata",
+          "Selector": "$.Payload.DBClusterInstancesMetadata",
+          "Type": "StringMap"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "backup_cluster_instances_type",
+        "InputPayload": {
+          "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+          "DBClusterInstances": "{{ BackupDbClusterMetadata.BackupDbClusterInstancesCountValue }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef backup_cluster_instances_type(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        docdb = boto3.client('docdb', config=config)\n        restorable_instances_metadata = {}\n        instance_type = {}\n        instances = events['DBClusterInstances']\n        for instance in instances:\n            response = docdb.describe_db_instances(DBInstanceIdentifier=instance['DBInstanceIdentifier'])\n            print(response)\n            instance_id = instance['DBInstanceIdentifier']\n            instance_type[instance_id] = {\n                'DBInstanceClass': response['DBInstances'][0]['DBInstanceClass'],\n                'Engine': response['DBInstances'][0]['Engine'],\n                'AvailabilityZone': response['DBInstances'][0]['AvailabilityZone']\n            }\n            restorable_instances_metadata.update(instance_type)\n        return {'DBClusterInstancesMetadata': restorable_instances_metadata}\n    except Exception as e:\n        print(f'Error: {e}')\n        raise"
+      }
+    },
+    {
+      "name": "RestoreClusterToPointInTime",
+      "action": "aws:executeScript",
+      "description": "Restore DocDb Cluster to provided date or last available point in time",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RestoredClusterIdentifier",
+          "Selector": "$.Payload.RestoredClusterIdentifier",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "restore_to_point_in_time",
+        "InputPayload": {
+          "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+          "RestoreToDate": "{{ RestoreToDate }}",
+          "VpcSecurityGroupIds": "{{ BackupDbClusterMetadata.BackupDbClusterSecurityGroupsId }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef restore_to_point_in_time(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        docdb = boto3.client('docdb', config=config)\n        restorable_cluster_identifier = events['DBClusterIdentifier']\n        db_cluster = docdb.describe_db_clusters(\n            DBClusterIdentifier=events['DBClusterIdentifier']\n        )\n        if 'DBClusters' in db_cluster and db_cluster['DBClusters']:\n            db_subnet_group = db_cluster['DBClusters'][0]['DBSubnetGroup']\n        else:\n            raise AssertionError(f'No db cluster found with id: {events[\"DBClusterIdentifier\"]}')\n\n        new_cluster_identifier = restorable_cluster_identifier + '-restored'\n        date = events['RestoreToDate']\n        security_groups = events['VpcSecurityGroupIds']\n        if date == 'latest':\n            docdb.restore_db_cluster_to_point_in_time(\n                DBClusterIdentifier=new_cluster_identifier,\n                SourceDBClusterIdentifier=restorable_cluster_identifier,\n                UseLatestRestorableTime=True,\n                DBSubnetGroupName=db_subnet_group,\n                VpcSecurityGroupIds=security_groups\n            )\n        else:\n            date = datetime.strptime(events['RestoreToDate'], \"%Y-%m-%dT%H:%M:%S%z\")\n            print(date)\n            docdb.restore_db_cluster_to_point_in_time(\n                DBClusterIdentifier=new_cluster_identifier,\n                SourceDBClusterIdentifier=restorable_cluster_identifier,\n                RestoreToTime=date,\n                DBSubnetGroupName=db_subnet_group,\n                VpcSecurityGroupIds=security_groups\n            )\n        return {'RestoredClusterIdentifier': new_cluster_identifier}\n    except Exception as e:\n        print(f'Error: {e}')\n        raise"
+      }
+    },
+    {
+      "name": "RestoreDocDbClusterInstances",
+      "action": "aws:executeScript",
+      "description": "Restore database cluster instances",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RestoredInstancesIdentifiers",
+          "Selector": "$.Payload",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "restore_db_cluster_instances",
+        "InputPayload": {
+          "BackupDbClusterInstancesCountValue": "{{ BackupDbClusterMetadata.BackupDbClusterInstancesCountValue }}",
+          "DBClusterIdentifier": "{{ RestoreClusterToPointInTime.RestoredClusterIdentifier }}",
+          "DBClusterInstancesMetadata": "{{ BackupDbClusterInstancesMetadata.DBClusterInstancesMetadata }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef restore_db_cluster_instances(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        docdb = boto3.client('docdb', config=config)\n        print(events['BackupDbClusterInstancesCountValue'])\n        instances = events['BackupDbClusterInstancesCountValue']\n        instances_sorted = sorted(instances, key=itemgetter('IsClusterWriter'), reverse=True)\n        db_cluster_identifier = events['DBClusterIdentifier']\n        restored_instances_identifiers = []\n        cluster_info = docdb.describe_db_clusters(DBClusterIdentifier=db_cluster_identifier)['DBClusters'][0]\n        new_cluster_azs = cluster_info['AvailabilityZones']\n        instances_by_az = {}\n        for az in new_cluster_azs:\n            instances_by_az[az] = 0\n        for instance in instances_sorted:\n            primary_instance = 1 if instance['IsClusterWriter'] else 2\n            restorable_instance_identifier = instance['DBInstanceIdentifier']\n            restored_instance_identifier = instance['DBInstanceIdentifier'] + '-restored'\n            availability_zone = None\n            if events['DBClusterInstancesMetadata'][restorable_instance_identifier]['AvailabilityZone'] \\\n                    in new_cluster_azs:\n                availability_zone = events['DBClusterInstancesMetadata'][restorable_instance_identifier][\n                    'AvailabilityZone']\n            else:\n                availability_zone = sorted(instances_by_az, key=instances_by_az.get)[0]\n            instances_by_az[availability_zone] += 1\n            docdb.create_db_instance(\n                DBInstanceIdentifier=restored_instance_identifier,\n                DBInstanceClass=events['DBClusterInstancesMetadata'][restorable_instance_identifier]['DBInstanceClass'],\n                Engine=events['DBClusterInstancesMetadata'][restorable_instance_identifier]['Engine'],\n                DBClusterIdentifier=db_cluster_identifier,\n                AvailabilityZone=availability_zone,\n                PromotionTier=primary_instance\n            )\n            restored_instances_identifiers.append(restored_instance_identifier)\n        return restored_instances_identifiers\n    except Exception as e:\n        print(f'Error: {e}')\n        raise"
+      }
+    },
+    {
+      "name": "RenameReplacedDocDbCluster",
+      "action": "aws:executeScript",
+      "description": "Rename original cluster so it can be replaced with the restored one",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "ReplacedClusterIdentifier",
+          "Selector": "$.Payload.ReplacedClusterIdentifier",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "rename_replaced_db_cluster",
+        "InputPayload": {
+          "DBClusterIdentifier": "{{ DBClusterIdentifier }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef rename_replaced_db_cluster(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        docdb = boto3.client('docdb', config=config)\n        db_cluster_identifier = events['DBClusterIdentifier']\n        new_db_cluster_identifier = db_cluster_identifier + '-replaced'\n        docdb.modify_db_cluster(\n            DBClusterIdentifier=db_cluster_identifier,\n            NewDBClusterIdentifier=new_db_cluster_identifier,\n            ApplyImmediately=True,\n        )\n        return {'ReplacedClusterIdentifier': new_db_cluster_identifier}\n    except Exception as e:\n        print(f'Error: {e}')\n        raise"
+      }
+    },
+    {
+      "name": "WaitUntilReplacedInstancesAvailable",
+      "description": "Wait for instances to be in status available",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ RenameReplacedDocDbCluster.ReplacedClusterIdentifier }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.DBInstances..DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "RenameReplacedDocDbInstances",
+      "action": "aws:executeScript",
+      "description": "Rename original instances so they can be replaced with the restored ones",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "ReplacedInstancesIdentifiers",
+          "Selector": "$.Payload",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "rename_replaced_db_instances",
+        "InputPayload": {
+          "DBClusterIdentifier": "{{ RenameReplacedDocDbCluster.ReplacedClusterIdentifier }}",
+          "BackupDbClusterInstancesCountValue": "{{ BackupDbClusterMetadata.BackupDbClusterInstancesCountValue }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef rename_replaced_db_instances(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        docdb = boto3.client('docdb', config=config)\n        instances = events['BackupDbClusterInstancesCountValue']\n        replaced_instances_identifiers = []\n        for instance in instances:\n            docdb.modify_db_instance(\n                DBInstanceIdentifier=instance['DBInstanceIdentifier'],\n                ApplyImmediately=True,\n                NewDBInstanceIdentifier=instance['DBInstanceIdentifier'] + '-replaced',\n            )\n            replaced_instances_identifiers.append(instance['DBInstanceIdentifier'] + '-replaced')\n        return replaced_instances_identifiers\n    except Exception as e:\n        print(f'Error: {e}')\n        raise"
+      }
+    },
+    {
+      "name": "WaitUntilRestoredInstancesAvailable",
+      "description": "Wait for instances to be in status available",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ RestoreClusterToPointInTime.RestoredClusterIdentifier }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.DBInstances..DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "RenameRestoredDocDbInstances",
+      "action": "aws:executeScript",
+      "description": "Rename restored DocumentDB instances so they replace the original ones",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RestoredInstancesIdentifiers",
+          "Selector": "$.Payload",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "rename_restored_db_instances",
+        "InputPayload": {
+          "RestoredInstancesIdentifiers": "{{ RestoreDocDbClusterInstances.RestoredInstancesIdentifiers }}",
+          "RestoredClusterIdentifier": "{{ RestoreClusterToPointInTime.RestoredClusterIdentifier }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef rename_restored_db_instances(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        docdb = boto3.client('docdb', config=config)\n        instances = events['RestoredInstancesIdentifiers']\n        restored_instances_identifiers = []\n        for instance in instances:\n            restored_instance_identifier = instance.replace('-restored', '')\n            docdb.modify_db_instance(\n                DBInstanceIdentifier=instance,\n                ApplyImmediately=True,\n                NewDBInstanceIdentifier=restored_instance_identifier\n            )\n            restored_instances_identifiers.append(restored_instance_identifier)\n        return restored_instances_identifiers\n    except Exception as e:\n        print(f'Error: {e}')\n        raise"
+      }
+    },
+    {
+      "name": "RenameRestoredCluster",
+      "action": "aws:executeAwsApi",
+      "description": "Rename restored DocumentDB cluster so it replaces the original one",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "ModifyDBCluster",
+        "DBClusterIdentifier": "{{ RestoreClusterToPointInTime.RestoredClusterIdentifier }}",
+        "NewDBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "ApplyImmediately": true
+      }
+    },
+    {
+      "name": "WaitUntilRenamedInstancesAvailable",
+      "description": "Wait for instances to be in status available",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ DBClusterIdentifier }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.DBInstances..DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

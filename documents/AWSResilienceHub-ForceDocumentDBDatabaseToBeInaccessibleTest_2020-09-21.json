@@ -1,0 +1,493 @@
+{
+  "description": "## Id\nAWSResilienceHub-ForceDocumentDBDatabaseToBeInaccessibleTest_2020-09-21\n\n## Intent\nTest that the alarm setup detects and alerts when database becomes unavailable and application can reconnect\nwithin expected recovery time\n\n## Type\nTEST\n\n## Risk\nMedium\n\n## Requirements\n  * Available DocumentDB Cluster\n  * There is a [synthetic alarm](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Synthetics_Canaries.html) setup for application that alerts when unable connect to the DocumentDB cluster\n\n## Permissions required for AutomationAssumeRole\n  * cloudwatch:DescribeAlarms\n  * ec2:CreateSecurityGroup\n  * ec2:DescribeSecurityGroups\n  * ec2:DescribeSubnets\n  * rds:DescribeDBClusters\n  * rds:DescribeDBInstances\n  * rds:DescribeDBSubnetGroups\n  * rds:ModifyDBCluster\n  * ssm:GetAutomationExecution\n  * ssm:GetParameters\n  * ssm:StartAutomationExecution\n  * ec2:CreateTags (for `ec2:CreateAction` value \"CreateSecurityGroup\")\n  * iam:PassRole\n\n##### Permissions for security groups with tag `ec2:ResourceTag/AWSResilienceHub` value \"docdb:test:database_alarm\"\n  * ec2:DeleteSecurityGroup\n  * ec2:RevokeSecurityGroupEgress\n  * ec2:RevokeSecurityGroupIngress\n  * ec2:UpdateSecurityGroupRuleDescriptionsIngress\n\n## Supports Rollback\nYes. Restores the original security group\n\n## Cancellation behavior\nRestores the original security group\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) DBClusterIdentifier\n  * type: String\n  * description: DocumentDB Cluster Identifier\n\n### (Required) DatabaseConnectionAttemptAlarmName\n  * type: String\n  * description: Name of the alarm that indicates that the application can't connect to DocumentDB\n\n### (Optional) IsRollback\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n  * default: false\n\n### (Optional) PreviousExecutionId\n  * type: String\n  * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nThe document creates and attaches to a DocumentDB cluster an empty security group which prevents\napplications from connecting. In case of issues users should manually remove the empty security group.\n\n## Steps executed in normal flow\n  * AssertDBClusterExistsInAvailableState\n  * AssertAlarmToBeGreenBeforeTest\n  * BackupDbClusterProperties\n  * GetOneOfSubnets\n  * GetVpc\n  * CreateEmptySecurityGroup\n  * ModifyVpcSecurityGroups\n  * AssertAlarmToBeRed\n  * AssertClusterIsAvailable\n  * AssertInstancesAreAvailable\n  * RestoreSecurityGroupIds\n  * RemoveEmptySecurityGroup\n  * AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n  * CheckIsRollback\n  * GetDBClusterIdentifierFromPreviousExecution\n  * AssertDBClusterIdentifier\n  * PrepareVpcSecurityGroupIds\n  * PrepareEmptyVpcSecurityGroupId\n  * PrepareDBInstanceIdentifiers\n  * AssertInstancesAreAvailableOnRollbackPreviousExecution\n  * RestoreSecurityGroupIdsOnRollbackPreviousExecution\n  * RemoveEmptySecurityGroupOnRollbackPreviousExecution\n\n## Outputs\n### CreateEmptySecurityGroup.EmptySecurityGroupId\n  * type: String\n  * description: Id of the created empty security group",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DBClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) DocDb Cluster Identifier"
+    },
+    "DatabaseConnectionAttemptAlarmName": {
+      "type": "String",
+      "description": "(Required) Name of the alarm for db cluster. This should be green after the test."
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Set true to start the rollback.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which rollback will be started.",
+      "default": ""
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to run this document."
+    }
+  },
+  "outputs": [
+    "CreateEmptySecurityGroup.EmptySecurityGroupId"
+  ],
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetDBClusterIdentifierFromPreviousExecution",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "AssertDBClusterExistsInAvailableState"
+      }
+    },
+    {
+      "name": "GetDBClusterIdentifierFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "DBClusterIdentifier",
+          "Selector": "$.Payload.DBClusterIdentifier[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertDBClusterIdentifier",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AssertDBClusterExistsInAvailableStateOnRollbackPreviousExecution",
+            "Variable": "{{ GetDBClusterIdentifierFromPreviousExecution.DBClusterIdentifier }}",
+            "StringEquals": "{{ DBClusterIdentifier }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "AssertDBClusterExistsInAvailableStateOnRollbackPreviousExecution",
+      "description": "Validate that cluster is available",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "PrepareVpcSecurityGroupIds",
+      "description": "Get original security groups",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "VpcSecurityGroupIds",
+          "Selector": "$.Payload.VpcSecurityGroupIds",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "BackupDbClusterProperties",
+          "ResponseField": "VpcSecurityGroupIds"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "PrepareEmptyVpcSecurityGroupId",
+      "description": "Get empty security group id from the previous execution",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "EmptySecurityGroupId",
+          "Selector": "$.Payload.EmptySecurityGroupId[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "CreateEmptySecurityGroup",
+          "ResponseField": "EmptySecurityGroupId"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "PrepareDBInstanceIdentifiers",
+      "description": "Get original instance ids",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "DBInstanceIdentifiers",
+          "Selector": "$.Payload.DBInstanceIdentifiers",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "BackupDbClusterProperties",
+          "ResponseField": "DBInstanceIdentifiers"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "AssertInstancesAreAvailableOnRollbackPreviousExecution",
+      "action": "aws:executeScript",
+      "description": "Wait that instances are not in CONFIGURE_VPC_SECURITY_GROUP status",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "wait_for_available_instances",
+        "InputPayload": {
+          "DBInstanceIdentifiers": "{{PrepareDBInstanceIdentifiers.DBInstanceIdentifiers}}",
+          "WaitTimeout": 1200
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef wait_for_available_instances(events, context):\n    \"\"\"\n    Wait for available instances\n    \"\"\"\n    required_params = [\n        'DBInstanceIdentifiers',\n        'WaitTimeout',\n    ]\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n    initial_loop_timeout: int = events['WaitTimeout']\n    db_instance_identifiers: List = events['DBInstanceIdentifiers']\n\n    docdb = boto3.client('docdb')\n\n    loop_timeout = initial_loop_timeout\n    start_time = time.time()\n    timeout_between_calls = 20\n    response = None\n    while loop_timeout > 0 and len(db_instance_identifiers) != 0:\n        for identifier in db_instance_identifiers:\n            response = docdb.describe_db_instances(DBInstanceIdentifier=identifier)\n            status = response['DBInstances'][0]['DBInstanceStatus']\n            if status == 'available':\n                db_instance_identifiers.remove(identifier)\n\n        # Leave the loop if remained time less that timeout_between_calls\n        loop_timeout = loop_timeout - (time.time() - start_time)\n        if timeout_between_calls <= loop_timeout:\n            time.sleep(timeout_between_calls)\n        else:\n            break\n\n    if len(db_instance_identifiers) != 0:\n        message = f'DB Instances with identifier(-s) {db_instance_identifiers} ' \\\n                  f'are not available after {initial_loop_timeout} second(-s).'\n        logger.debug(f'{message} describe_db_instances response: {response}, db_instance_identifiers:'\n                     f' {db_instance_identifiers}')\n        raise TimeoutError(message)"
+      }
+    },
+    {
+      "name": "RestoreSecurityGroupIdsOnRollbackPreviousExecution",
+      "description": "Restore original security groups",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "restore_security_group_ids",
+        "InputPayload": {
+          "VpcSecurityGroupIds": "{{PrepareVpcSecurityGroupIds.VpcSecurityGroupIds}}",
+          "DBClusterIdentifier": "{{DBClusterIdentifier}}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef restore_security_group_ids(events, context):\n    \"\"\"\n    Restore security group IDs for DB cluster\n    :return: restored vpc security groups\n    \"\"\"\n    if not events.get('VpcSecurityGroupIds'):\n        raise KeyError('Requires VpcSecurityGroupIds in events')\n    if not events.get('DBClusterIdentifier'):\n        raise KeyError('Requires DBClusterIdentifier in events')\n\n    vpc_security_group_ids: List = events['VpcSecurityGroupIds']\n    db_cluster_identifier: str = events['DBClusterIdentifier']\n    docdb = boto3.client('docdb')\n    response = docdb.modify_db_cluster(DBClusterIdentifier=db_cluster_identifier,\n                                       VpcSecurityGroupIds=vpc_security_group_ids)\n    return {'VpcSecurityGroupIds': [member['VpcSecurityGroupId']\n                                    for member in response['DBCluster']['VpcSecurityGroups']]}"
+      },
+      "outputs": [
+        {
+          "Name": "VpcSecurityGroupIds",
+          "Selector": "$.Payload.VpcSecurityGroupIds",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "RemoveEmptySecurityGroupOnRollbackPreviousExecution",
+      "description": "Delete the empty security group",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 900,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "remove_empty_security_group",
+        "InputPayload": {
+          "EmptySecurityGroupId": "{{PrepareEmptyVpcSecurityGroupId.EmptySecurityGroupId}}"
+        },
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef remove_empty_security_group(events, context):\n    required_params = [\n        'EmptySecurityGroupId'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    time_to_wait = 1800\n    ec2_client = boto3.client('ec2')\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = time.time() + int(time_to_wait)\n\n    while time.time() < timeout_timestamp:\n        try:\n            logger.info(f'Deleting empty security group: {events[\"EmptySecurityGroupId\"]}')\n            group_list = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-id',\n                        'Values': [\n                            events[\"EmptySecurityGroupId\"],\n                        ]\n                    },\n                ]\n            )\n            if not group_list['SecurityGroups']:\n                break\n            group_id = group_list['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {group_id}')\n            response = ec2_client.delete_security_group(\n                GroupId=group_id\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: {events['EmptySecurityGroupId']}\")\n                break\n            elif error.response['Error']['Code'] == 'DependencyViolation' \\\n                    or error.response['Error']['Code'] == 'RequestLimitExceeded':\n                time.sleep(5)\n                continue\n            else:\n                raise error\n\n    if datetime.timestamp(datetime.now()) > timeout_timestamp:\n        raise TimeoutError(f'Security group {events[\"EmptySecurityGroupId\"]} couldn\\'t '\n                           f'be deleted in {time_to_wait} seconds')"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "AssertDBClusterExistsInAvailableState",
+      "description": "Validate that cluster is available",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ DatabaseConnectionAttemptAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "BackupDbClusterProperties",
+      "description": "Backup original security groups for rollback",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_db_cluster_properties",
+        "InputPayload": {
+          "DBClusterIdentifier": "{{ DBClusterIdentifier }}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef get_db_cluster_properties(events, context):\n    \"\"\"\n    Get db cluster properties.\n    \"\"\"\n    if not events.get('DBClusterIdentifier'):\n        raise KeyError('Requires DBClusterIdentifier in events')\n\n    db_cluster_identifier: str = events['DBClusterIdentifier']\n    docdb = boto3.client('docdb')\n    response = docdb.describe_db_clusters(DBClusterIdentifier=db_cluster_identifier)\n    return {'DBInstanceIdentifiers': [member['DBInstanceIdentifier']\n                                      for member in response['DBClusters'][0]['DBClusterMembers']],\n            'DBSubnetGroup': response['DBClusters'][0]['DBSubnetGroup'],\n            'VpcSecurityGroupIds': [member['VpcSecurityGroupId']\n                                    for member in response['DBClusters'][0]['VpcSecurityGroups']]}"
+      },
+      "outputs": [
+        {
+          "Name": "DBInstanceIdentifiers",
+          "Selector": "$.Payload.DBInstanceIdentifiers",
+          "Type": "StringList"
+        },
+        {
+          "Name": "VpcSecurityGroupIds",
+          "Selector": "$.Payload.VpcSecurityGroupIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "DBSubnetGroup",
+          "Selector": "$.Payload.DBSubnetGroup",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetOneOfSubnets",
+      "description": "Get available subnet",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBSubnetGroups",
+        "DBSubnetGroupName": "{{BackupDbClusterProperties.DBSubnetGroup}}"
+      },
+      "outputs": [
+        {
+          "Name": "SubnetIdentifier",
+          "Selector": "$.DBSubnetGroups[0].Subnets[0].SubnetIdentifier",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetVpc",
+      "description": "Get available VPC",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSubnets",
+        "Filters": [
+          {
+            "Name": "subnet-id",
+            "Values": [
+              "{{ GetOneOfSubnets.SubnetIdentifier }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VpcId",
+          "Selector": "$.Subnets[0].VpcId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateEmptySecurityGroup",
+      "description": "Crete an empty security group",
+      "action": "aws:executeScript",
+      "onFailure": "step:AssertClusterIsAvailable",
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "EmptySecurityGroupId",
+          "Selector": "$.Payload.EmptySecurityGroupId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "create_empty_security_group",
+        "InputPayload": {
+          "VpcId": "{{GetVpc.VpcId}}",
+          "Tag": "docdb:test:database_alarm",
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef remove_empty_security_group(events, context):\n    required_params = [\n        'EmptySecurityGroupId'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    time_to_wait = 1800\n    ec2_client = boto3.client('ec2')\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = time.time() + int(time_to_wait)\n\n    while time.time() < timeout_timestamp:\n        try:\n            logger.info(f'Deleting empty security group: {events[\"EmptySecurityGroupId\"]}')\n            group_list = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-id',\n                        'Values': [\n                            events[\"EmptySecurityGroupId\"],\n                        ]\n                    },\n                ]\n            )\n            if not group_list['SecurityGroups']:\n                break\n            group_id = group_list['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {group_id}')\n            response = ec2_client.delete_security_group(\n                GroupId=group_id\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: {events['EmptySecurityGroupId']}\")\n                break\n            elif error.response['Error']['Code'] == 'DependencyViolation' \\\n                    or error.response['Error']['Code'] == 'RequestLimitExceeded':\n                time.sleep(5)\n                continue\n            else:\n                raise error\n\n    if datetime.timestamp(datetime.now()) > timeout_timestamp:\n        raise TimeoutError(f'Security group {events[\"EmptySecurityGroupId\"]} couldn\\'t '\n                           f'be deleted in {time_to_wait} seconds')\n\n\n\n\ndef create_empty_security_group(events: dict, context: dict) -> dict:\n    \"\"\"\n    Creates a empty security group in provided VPC\n    The name of this SG contains Execution Id of the SSM execution\n    :param events: The dictionary that supposed to have the following keys:\n        * `VpcId` - The vpc id to create SG into\n        * `ExecutionId` - The execution id of SSM\n        * `Tag` - a value of `AWSResilienceHub` tag to assign\n    :param context:\n    :return: Dict with two keys:\n        * EmptySecurityGroupId - string wih SG id, you can use it as String parameter in SSM\n        * EmptySecurityGroupId - one element list wih SG id, you can use it as StringList parameter in SSM\n    \"\"\"\n    required_params = [\n        'VpcId',\n        'ExecutionId',\n        'Tag'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    ec2_client = boto3.client('ec2')\n\n    group_id = ec2_client.create_security_group(\n        Description=f'Empty SG for executionID {events[\"ExecutionId\"]}',\n        GroupName=f'EmptySG-{events[\"ExecutionId\"]}',\n        VpcId=events['VpcId'],\n        TagSpecifications=[\n            {\n                'ResourceType': 'security-group',\n                'Tags': [\n                    {\n                        'Key': 'AWSResilienceHub',\n                        'Value': events['Tag']\n                    },\n                ]\n            }\n        ]\n    )['GroupId']\n\n    result = ec2_client.revoke_security_group_egress(\n        GroupId=group_id,\n        IpPermissions=[\n            {\n                \"IpProtocol\": \"-1\",\n                \"IpRanges\": [\n                    {\n                        \"CidrIp\": \"0.0.0.0/0\"\n                    }\n                ],\n                \"Ipv6Ranges\": [],\n                \"PrefixListIds\": [],\n                \"UserIdGroupPairs\": []\n            }\n        ]\n    )\n    if not result['Return']:\n        remove_empty_security_group({'EmptySecurityGroupId': group_id}, context)\n        raise ClientError(\n            error_response={\n                \"Error\":\n                {\n                    \"Code\": \"CouldNotRevoke\",\n                    \"Message\": f\"Could not revoke egress from sg: {group_id}\"\n                }\n            },\n            operation_name='RevokeSecurityGroupEgress'\n        )\n    return {'EmptySecurityGroupId': group_id, 'EmptySecurityGroupIdList': [group_id]}"
+      }
+    },
+    {
+      "name": "ModifyVpcSecurityGroups",
+      "description": "Replace secutiry groups with the empty one",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:AssertClusterIsAvailable",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "ModifyDBCluster",
+        "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "VpcSecurityGroupIds": [
+          "{{CreateEmptySecurityGroup.EmptySecurityGroupId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VpcSecurityGroups",
+          "Selector": "$.DBCluster.VpcSecurityGroups",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for expected alarm to be red after failure is injected",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:AssertClusterIsAvailable",
+      "onCancel": "step:TriggerRollback",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ DatabaseConnectionAttemptAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "AssertClusterIsAvailable",
+      "description": "Validate that cluster is available",
+      "action": "aws:waitForAwsResourceProperty",
+      "onCancel": "step:TriggerRollback",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "AssertInstancesAreAvailable",
+      "action": "aws:executeScript",
+      "description": "Wait that instances are not in CONFIGURE_VPC_SECURITY_GROUP status",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "wait_for_available_instances",
+        "InputPayload": {
+          "DBInstanceIdentifiers": "{{BackupDbClusterProperties.DBInstanceIdentifiers}}",
+          "WaitTimeout": 1200
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef wait_for_available_instances(events, context):\n    \"\"\"\n    Wait for available instances\n    \"\"\"\n    required_params = [\n        'DBInstanceIdentifiers',\n        'WaitTimeout',\n    ]\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n    initial_loop_timeout: int = events['WaitTimeout']\n    db_instance_identifiers: List = events['DBInstanceIdentifiers']\n\n    docdb = boto3.client('docdb')\n\n    loop_timeout = initial_loop_timeout\n    start_time = time.time()\n    timeout_between_calls = 20\n    response = None\n    while loop_timeout > 0 and len(db_instance_identifiers) != 0:\n        for identifier in db_instance_identifiers:\n            response = docdb.describe_db_instances(DBInstanceIdentifier=identifier)\n            status = response['DBInstances'][0]['DBInstanceStatus']\n            if status == 'available':\n                db_instance_identifiers.remove(identifier)\n\n        # Leave the loop if remained time less that timeout_between_calls\n        loop_timeout = loop_timeout - (time.time() - start_time)\n        if timeout_between_calls <= loop_timeout:\n            time.sleep(timeout_between_calls)\n        else:\n            break\n\n    if len(db_instance_identifiers) != 0:\n        message = f'DB Instances with identifier(-s) {db_instance_identifiers} ' \\\n                  f'are not available after {initial_loop_timeout} second(-s).'\n        logger.debug(f'{message} describe_db_instances response: {response}, db_instance_identifiers:'\n                     f' {db_instance_identifiers}')\n        raise TimeoutError(message)"
+      }
+    },
+    {
+      "name": "RestoreSecurityGroupIds",
+      "description": "Restore original security groups",
+      "action": "aws:executeScript",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "restore_security_group_ids",
+        "InputPayload": {
+          "VpcSecurityGroupIds": "{{BackupDbClusterProperties.VpcSecurityGroupIds }}",
+          "DBClusterIdentifier": "{{DBClusterIdentifier}}"
+        },
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef restore_security_group_ids(events, context):\n    \"\"\"\n    Restore security group IDs for DB cluster\n    :return: restored vpc security groups\n    \"\"\"\n    if not events.get('VpcSecurityGroupIds'):\n        raise KeyError('Requires VpcSecurityGroupIds in events')\n    if not events.get('DBClusterIdentifier'):\n        raise KeyError('Requires DBClusterIdentifier in events')\n\n    vpc_security_group_ids: List = events['VpcSecurityGroupIds']\n    db_cluster_identifier: str = events['DBClusterIdentifier']\n    docdb = boto3.client('docdb')\n    response = docdb.modify_db_cluster(DBClusterIdentifier=db_cluster_identifier,\n                                       VpcSecurityGroupIds=vpc_security_group_ids)\n    return {'VpcSecurityGroupIds': [member['VpcSecurityGroupId']\n                                    for member in response['DBCluster']['VpcSecurityGroups']]}"
+      },
+      "outputs": [
+        {
+          "Name": "VpcSecurityGroupIds",
+          "Selector": "$.Payload.VpcSecurityGroupIds",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "RemoveEmptySecurityGroup",
+      "description": "Delete the empty security group",
+      "action": "aws:executeScript",
+      "onCancel": "step:TriggerRollback",
+      "timeoutSeconds": 900,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "remove_empty_security_group",
+        "InputPayload": {
+          "EmptySecurityGroupId": "{{CreateEmptySecurityGroup.EmptySecurityGroupId}}"
+        },
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef remove_empty_security_group(events, context):\n    required_params = [\n        'EmptySecurityGroupId'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    time_to_wait = 1800\n    ec2_client = boto3.client('ec2')\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = time.time() + int(time_to_wait)\n\n    while time.time() < timeout_timestamp:\n        try:\n            logger.info(f'Deleting empty security group: {events[\"EmptySecurityGroupId\"]}')\n            group_list = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-id',\n                        'Values': [\n                            events[\"EmptySecurityGroupId\"],\n                        ]\n                    },\n                ]\n            )\n            if not group_list['SecurityGroups']:\n                break\n            group_id = group_list['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {group_id}')\n            response = ec2_client.delete_security_group(\n                GroupId=group_id\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: {events['EmptySecurityGroupId']}\")\n                break\n            elif error.response['Error']['Code'] == 'DependencyViolation' \\\n                    or error.response['Error']['Code'] == 'RequestLimitExceeded':\n                time.sleep(5)\n                continue\n            else:\n                raise error\n\n    if datetime.timestamp(datetime.now()) > timeout_timestamp:\n        raise TimeoutError(f'Security group {events[\"EmptySecurityGroupId\"]} couldn\\'t '\n                           f'be deleted in {time_to_wait} seconds')"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ DatabaseConnectionAttemptAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress. This step starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

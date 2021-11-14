@@ -1,0 +1,117 @@
+{
+  "description": "## Id\nAWSResilienceHub-SwitchLambdaVersionInAliasSOP_2020-10-26\n\n## Intent\nSwitch alias of Lambda function to another version\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * Lambda Function\n\n## Permissions required for AutomationAssumeRole\n  * lambda:UpdateAlias\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) LambdaARN\n  * type: String\n  * description: The ARN of the Lambda function\n\n### (Required) AliasName\n  * type: String\n  * description: The existing alias of the Lambda function\n\n### (Required) LambdaVersion\n  * type: String\n  * description: The Lambda version\n\n## Details\nThe document switches Lambda function alias to the specified version.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * SwitchVersion\n  * OutputRecoveryTime\n\n## Outputs\n### SwitchVersion.AliasArn\n  * type: String\n  * description: Updated Lambda alias ARN\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: Execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "LambdaARN": {
+      "type": "String",
+      "description": "(Required) The ARN of the Lambda function."
+    },
+    "AliasName": {
+      "type": "String",
+      "description": "(Required) The existing alias of the Lambda function"
+    },
+    "LambdaVersion": {
+      "type": "String",
+      "description": "(Required) The Lambda version"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "SwitchVersion.AliasArn",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "WaitForLabmdaSuccessfulUpdatedStatusBeforeModification",
+      "description": "Wait for Lambda function's congifuration to be ready for update",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "lambda",
+        "Api": "GetFunction",
+        "FunctionName": "{{ LambdaARN }}",
+        "PropertySelector": "$.Configuration.LastUpdateStatus",
+        "DesiredValues": [
+          "Successful"
+        ]
+      }
+    },
+    {
+      "name": "SwitchVersion",
+      "description": "Switch alias of Lambda function to the specified version",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "UpdateAlias",
+        "FunctionName": "{{ LambdaARN }}",
+        "Name": "{{ AliasName }}",
+        "FunctionVersion": "{{ LambdaVersion }}"
+      },
+      "outputs": [
+        {
+          "Name": "AliasArn",
+          "Selector": "$.AliasArn",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitForLabmdaSuccessfulUpdatedStatusAfterModification",
+      "description": "Wait for Lambda function's congifuration update to be applied successfully",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "lambda",
+        "Api": "GetFunction",
+        "FunctionName": "{{ LambdaARN }}",
+        "PropertySelector": "$.Configuration.LastUpdateStatus",
+        "DesiredValues": [
+          "Successful"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

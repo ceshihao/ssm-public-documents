@@ -1,0 +1,93 @@
+{
+  "description": "## Id\nAWSResilienceHub-RebootDocumentDBInstanceTest_2020-09-21\n\n## Intent\nTest DocumentDB cluster availability after rebooting the instance and application can reconnect\nafter temporary network errors within expected recovery time\n\n## Type\nTEST\n\n## Risk\nSmall\n\n## Requirements\n  * Available DocumentDB Cluster\n  * There is a [synthetic alarm](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Synthetics_Canaries.html) setup for application that alerts when application can't connect\n\n## Permissions required for AutomationAssumeRole\n  * cloudwatch:DescribeAlarms\n  * rds:RebootDBInstance\n  * rds:DescribeDBInstances\n\n##### In case cluster is encrypted with a KMS key\n  * kms:DescribeKey\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFails\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) DBClusterIdentifier\n  * type: String\n  * description: DocumentDB Cluster Identifier\n\n### (Required) DatabaseConnectionAttemptAlarmName\n  * type: String\n  * description: Name of the alarm that indicates that the application can't connect to DocumentDB\n\n### (Optional) IsRollback\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n  * default: false\n\n### (Optional) PreviousExecutionId\n  * type: String\n  * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nThe document reboots DocumentDB instance and wait for it to become available. Synthetic alarm should show\nthat application can connect to the DocumentDB instance.\n\n## Steps executed in normal flow\n  * AssertAlarmToBeGreenBeforeTest\n  * RebootDbInstance\n  * WaitUntilInstancesAvailable\n  * AssertAlarmToBeGreen\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DBClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) DocDb Cluster Identifier"
+    },
+    "DBInstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) DocDb Instance Identifier"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "CanaryAlarmName": {
+      "type": "String",
+      "description": "(Required) Alarm which should be green after test."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "RebootDbInstance",
+      "description": "Reboot the DocumentDB instance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "RebootDBInstance",
+        "DBInstanceIdentifier": "{{ DBInstanceIdentifier }}"
+      }
+    },
+    {
+      "name": "WaitUntilInstancesAvailable",
+      "description": "Wait for instance to be in status available",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ DBClusterIdentifier }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.DBInstances..DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    }
+  ]
+}

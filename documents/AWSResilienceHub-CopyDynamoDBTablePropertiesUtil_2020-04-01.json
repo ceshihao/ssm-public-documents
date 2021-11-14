@@ -1,0 +1,271 @@
+{
+  "description": "Restore To Point In Time SOP",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DynamoDBTableSourceName": {
+      "type": "String",
+      "description": "(Required) The DynamoDB Table Source Name."
+    },
+    "DynamoDBTableTargetName": {
+      "type": "String",
+      "description": "(Required) The DynamoDB Table Target Name."
+    },
+    "DynamoDBSourceTableAlarmNames": {
+      "type": "StringList",
+      "description": "(Optional) The DynamoDB Source Table Name Alarm Names.",
+      "default": []
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CopyContinuousBackups",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CopiedContinuousBackupsStatus",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_continuous_backups_properties",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _describe_continuous_backups(table_name: str):\n    \"\"\"\n    Describes continuous backups settings for the given table\n    :param table_name: The table name\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_continuous_backups(TableName=table_name))\n\n\n\ndef _enable_continuous_backups(table_name: str):\n    \"\"\"\n    Enables continuous backups for the given table\n    :param table_name: The table name\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.update_continuous_backups(TableName=table_name,\n                                                       PointInTimeRecoverySpecification={\n                                                           'PointInTimeRecoveryEnabled': True\n                                                       }))\n\n\n\ndef copy_continuous_backups_properties(events: dict, context: dict) -> List:\n    \"\"\"\n    Copies continuous backups properties\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The target table name\n    :return: The status of continuous backup\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n\n    source_table_name: str = events['SourceTableName']\n    target_table_name: str = events['TargetTableName']\n    continuous_backups_settings = _describe_continuous_backups(table_name=source_table_name)\n    continuous_backups_status = continuous_backups_settings\\\n        .get('ContinuousBackupsDescription', {})\\\n        .get('PointInTimeRecoveryDescription', {})\\\n        .get('PointInTimeRecoveryStatus', '')\n\n    if continuous_backups_status in ['ENABLED', 'ENABLING']:\n        _enable_continuous_backups(table_name=target_table_name)\n\n    return continuous_backups_status"
+      }
+    },
+    {
+      "name": "CopyDynamoDBTableStreamSettings",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CopiedStreamSettings",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_table_stream_settings",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _update_table(table_name: str, **kwargs) -> dict:\n    \"\"\"\n    Describes the given dynamodb table\n    :param table_name: The table name\n    :param kwargs: The arguments of `update_table` boto3 call\n    :return: The dictionary of table description properties\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.update_table(TableName=table_name, **kwargs))\n\n\n\ndef _describe_table(table_name: str) -> dict:\n    \"\"\"\n    Describes the given dynamodb table\n    :param table_name: The table name\n    :return: The dictionary of table description properties\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_table(TableName=table_name))\n\n\n\ndef copy_table_stream_settings(events: dict, context: dict):\n    \"\"\"\n    if `StreamEnabled` is True, enabled streaming for the given table according to the given `StreamViewType`\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The target table name\n    :return: The dictionary that contains 'StreamViewType' and `StreamEnabled` values of the target table\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n\n    source_table_name = events['SourceTableName']\n    description = _describe_table(table_name=source_table_name)['Table']\n    stream_enabled = description\\\n        .get('StreamSpecification', {})\\\n        .get('StreamEnabled', False)\n    if stream_enabled:\n        target_table_name = events['TargetTableName']\n        stream_view_type = description['StreamSpecification']['StreamViewType']\n        settings = {\n            \"StreamSpecification\": {\n                \"StreamEnabled\": stream_enabled,\n                \"StreamViewType\": stream_view_type\n            }\n        }\n        result = _update_table(table_name=target_table_name, **settings)\n        specification = result.get('StreamSpecification', {})\n        return specification"
+      }
+    },
+    {
+      "name": "WaitTableToBeActiveAfterSteamSet",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "DescribeTable",
+        "TableName": "{{DynamoDBTableTargetName}}",
+        "PropertySelector": "$.Table.TableStatus",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      }
+    },
+    {
+      "name": "CopyDynamoDBTableKinesisDestination",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CopiedKinesisDestinations",
+          "Selector": "$.Payload",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_active_kinesis_destinations",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _describe_kinesis_destinations(table_name: str) -> dict:\n    \"\"\"\n    Describes the current kinesis destination of the given table\n    :param table_name: The table name\n    :return: The dictionary of kinesis destination settings\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_kinesis_streaming_destination(TableName=table_name))\n\n\n\ndef _enable_kinesis_destinations(table_name: str, kinesis_arn: str) -> dict:\n    \"\"\"\n    Enabled kinesis destination\n    :param table_name: The table name\n    :param kinesis_arn: The Amazon Kinesis Data Streams ARN\n    :return: The dictionary of kinesis destinations\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.enable_kinesis_streaming_destination(TableName=table_name,\n                                                                  StreamArn=kinesis_arn))\n\n\n\ndef copy_active_kinesis_destinations(events: dict, context: dict) -> dict:\n    \"\"\"\n    Returns information about Amazon Kinesis Data Streams destinations of the given Dynamo DB table\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The target table name\n    :return: The list of Amazon Kinesis Data Streams ARNs\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n\n    ACTIVE_STATUSES = ['ACTIVE', 'ENABLING']\n    source_table_name = events['SourceTableName']\n    target_table_name = events['TargetTableName']\n    kinesis_destinations = _describe_kinesis_destinations(table_name=source_table_name)\n    destinations = [d['StreamArn'] for d in kinesis_destinations['KinesisDataStreamDestinations']\n                    if d['DestinationStatus'] in ACTIVE_STATUSES]\n\n    for d in destinations:\n        _enable_kinesis_destinations(table_name=target_table_name, kinesis_arn=d)\n\n    return destinations"
+      }
+    },
+    {
+      "name": "CopyDynamoDBTableTimeToLive",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "TargetTTLCopied",
+          "Selector": "$.Payload.TTLCopied",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "TargetTTLAttribute",
+          "Selector": "$.Payload.TTLAttribute",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_time_to_live",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _describe_time_to_live(table_name: str) -> dict:\n    \"\"\"\n    Describes TTL\n    :param table_name: The table name\n    :return: The dictionary of TTL description\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_time_to_live(TableName=table_name))\n\n\n\ndef _update_time_to_live(table_name: str, is_enabled: bool, attribute_name: str) -> dict:\n    \"\"\"\n    Updates TTL\n    :param table_name: The table name\n    :param is_enabled: The flag to enabled TTL\n    :param attribute_name: The attribute of data to check TTL\n    :return: The dictionary of TTL update response\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.update_time_to_live(TableName=table_name,\n                                                 TimeToLiveSpecification={\n                                                     \"Enabled\": is_enabled,\n                                                     \"AttributeName\": attribute_name\n                                                 }))\n\n\n\ndef copy_time_to_live(events: dict, context: dict) -> dict:\n    \"\"\"\n    Updates TTL for the given table. Enables TTL is the provided `Status` equals to `ENABLED`\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The targe table name\n    :return: The dictionary that contains repose of TTL update AWS API\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n\n    source_table_name = events['SourceTableName']\n    target_table_name = events['TargetTableName']\n    ttl_description = _describe_time_to_live(table_name=source_table_name)\n    is_enabled = ttl_description\\\n        .get('TimeToLiveDescription', {})\\\n        .get('TimeToLiveStatus', '') == 'ENABLED'\n    attribute_name = ttl_description\\\n        .get('TimeToLiveDescription', {})\\\n        .get('AttributeName', '')\n\n    logging.debug(f'table:{target_table_name};TTL is enabled: {is_enabled};')\n    if is_enabled:\n        _update_time_to_live(table_name=target_table_name,\n                             is_enabled=is_enabled,\n                             attribute_name=attribute_name)\n\n    return {\n        'TTLCopied': is_enabled,\n        'TTLAttribute': attribute_name\n    }"
+      }
+    },
+    {
+      "name": "CopyDynamoDBTableTags",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CopiedTags",
+          "Selector": "$.Payload.Tags",
+          "Type": "MapList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_resource_tags",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}",
+          "Region": "{{ global:REGION }}",
+          "Account": "{{ global:ACCOUNT_ID }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _execute_boto3_dynamodb_paginator(func_name: str, search_exp: str = None, **kwargs) -> Iterator[Any]:\n    \"\"\"\n    Executes the given function with pagination\n    :param func_name: The function name of dynamodb client\n    :param search_exp: The search expression to return elements\n    :param kwargs: The arguments of `func_name`\n    :return: The iterator over elements on pages\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    paginator = dynamo_db_client.get_paginator(func_name)\n    page_iterator = paginator.paginate(**kwargs)\n    if search_exp:\n        return page_iterator.search(search_exp)\n    else:\n        return page_iterator\n\n\n\ndef _update_tags(resource_arn: str, tags: List[dict]) -> dict:\n    \"\"\"\n    Updates tags\n    :param table_name: The table name\n    :param tags: The MapList of tags\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.tag_resource(ResourceArn=resource_arn, Tags=tags))\n\n\n\ndef _list_tags(resource_arn: str) -> Iterator[dict]:\n    \"\"\"\n    Lists tags\n    :param table_name: The table name\n    :return: The MapList of tags\n    \"\"\"\n    return _execute_boto3_dynamodb_paginator(func_name='list_tags_of_resource',\n                                             search_exp='Tags[]',\n                                             ResourceArn=resource_arn)\n\n\n\ndef copy_resource_tags(events: dict, context: dict) -> dict:\n    \"\"\"\n    Copied tags of a Dynamo DB table to a target one\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The target table name\n    * `Region` - The region to concatenate ARN\n    * `Account` - The account to concatenate ARN\n    :return: The MapList of copied resource Tags\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n    if 'Region' not in events:\n        raise KeyError('Requires Region')\n    if 'Account' not in events:\n        raise KeyError('Requires Account')\n\n    source_table_name = events['SourceTableName']\n    region = events['Region']\n    account = events['Account']\n    resource_arn = f'arn:aws:dynamodb:{region}:{account}:table/{source_table_name}'\n    tags = list(_list_tags(resource_arn=resource_arn))\n    if tags:\n        target_table_name = events['TargetTableName']\n        resource_arn = f'arn:aws:dynamodb:{region}:{account}:table/{target_table_name}'\n        _update_tags(resource_arn=resource_arn, tags=tags)\n\n    return {\n        \"Tags\": tags\n    }"
+      }
+    },
+    {
+      "name": "CopyDynamoDBTableContributorInsights",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CopiedTableContributorInsightsStatus",
+          "Selector": "$.Payload.CopiedTableContributorInsightsStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "CopiedIndexesContributorInsightsStatus",
+          "Selector": "$.Payload.CopiedIndexesContributorInsightsStatus",
+          "Type": "MapList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_contributor_insights_settings",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _describe_table(table_name: str) -> dict:\n    \"\"\"\n    Describes the given dynamodb table\n    :param table_name: The table name\n    :return: The dictionary of table description properties\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_table(TableName=table_name))\n\n\n\ndef _get_global_secondary_indexes(table_name: str) -> List[str]:\n    \"\"\"\n    Returns the list of global indexes\n    :param table_name: The table name\n    :return: The list of global secondary index names\n    \"\"\"\n    result = _describe_table(table_name=table_name)\n    logger.debug(result)\n\n    return [gsi['IndexName'] for gsi in result['Table'].get('GlobalSecondaryIndexes', [])]\n\n\n\ndef _describe_contributor_insights(table_name: str, index_name: str = None) -> dict:\n    \"\"\"\n    Describes contributor insights for the given table or index\n    :param table_name: The table name\n    :param index_name: The index name\n    \"\"\"\n    if index_name:\n        return _execute_boto3_dynamodb(\n            delegate=lambda x: x.describe_contributor_insights(TableName=table_name, IndexName=index_name))\n\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_contributor_insights(TableName=table_name))\n\n\n\ndef _update_contributor_insights(table_name: str, status: str, index_name: str = None) -> dict:\n    \"\"\"\n    Update contributor insides for the given table or index\n    :param table_name: The table name\n    :param index_name: The index name\n    :param status: The status 'ENABLE'|'DISABLE'\n    \"\"\"\n    if index_name:\n        return _execute_boto3_dynamodb(\n            delegate=lambda x: x.update_contributor_insights(TableName=table_name,\n                                                             IndexName=index_name,\n                                                             ContributorInsightsAction=status))\n\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.update_contributor_insights(TableName=table_name,\n                                                         ContributorInsightsAction=status))\n\n\n\ndef copy_contributor_insights_settings(events: dict, context: dict) -> dict:\n    \"\"\"\n    Returns contributor insights settings for the given table and the list of indexes\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The target table name\n    :return: The dictionary that contains copied contributor insights statuses for the table and also\n    a list of `IndexName`-`Status` map\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n\n    source_table_name: str = events['SourceTableName']\n    target_table_name: str = events['TargetTableName']\n\n    # coping settings for table\n    table_result = _describe_contributor_insights(table_name=source_table_name)\n    table_status = table_result['ContributorInsightsStatus']\n    if table_status in ENABLED_INSIGHTS_STATUSES:\n        _update_contributor_insights(table_name=target_table_name,\n                                     status='ENABLE')\n    # coping settings for indexes\n    indexes = _get_global_secondary_indexes(table_name=source_table_name)\n    indexes_results = [_describe_contributor_insights(\n        table_name=source_table_name, index_name=index_name) for index_name in indexes]\n\n    index_statuses = [{\n        'IndexName': r['IndexName'],\n        'ContributorInsightsStatus': r['ContributorInsightsStatus']\n    } for r in indexes_results]\n    for index_status in index_statuses:\n        if index_status['ContributorInsightsStatus'] in ENABLED_INSIGHTS_STATUSES:\n            _update_contributor_insights(table_name=target_table_name,\n                                         status='ENABLE',\n                                         index_name=index_status['IndexName'])\n\n    return {\n        \"CopiedTableContributorInsightsStatus\": table_result['ContributorInsightsStatus'],\n        \"CopiedIndexesContributorInsightsStatus\": index_statuses\n    }"
+      }
+    },
+    {
+      "name": "CopyScalingTargets",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CopiedScalingTargets",
+          "Selector": "$.Payload",
+          "Type": "MapList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_scaling_targets",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}"
+        },
+        "Script": "\nimport logging\nfrom typing import Any, Callable, Iterator\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n\n\n\n\ndef _execute_boto3_auto_scaling(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate against `application-autoscaling` client.\n    Validates is the response is successfull (return code `200`)\n    :param delegate: The lambda function\n    :return: The response of AWS API\n    \"\"\"\n    auto_scaling_client = boto3.client('application-autoscaling', config=boto3_config)\n    description = delegate(auto_scaling_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _execute_boto3_auto_scaling_paginator(func_name: str, search_exp: str = None, **kwargs) -> Iterator[Any]:\n    \"\"\"\n    Executes the given function with pagination\n    :param func_name: The function name of auto_scaling client\n    :param search_exp: The search expression to return elements\n    :param kwargs: The arguments of `func_name`\n    :return: The iterator over elements on pages\n    \"\"\"\n    autoscaling_db_client = boto3.client('application-autoscaling', config=boto3_config)\n    paginator = autoscaling_db_client.get_paginator(func_name)\n    page_iterator = paginator.paginate(**kwargs)\n    if search_exp:\n        return page_iterator.search(search_exp)\n    else:\n        return page_iterator\n\n\n\ndef _describe_scalable_targets(table_name: str) -> Iterator[dict]:\n    \"\"\"\n    Describes scalable targets\n    :param table_name: The table name\n    :return: The response of AWS API\n    \"\"\"\n    return _execute_boto3_auto_scaling_paginator(func_name='describe_scalable_targets',\n                                                 search_exp='ScalableTargets[]',\n                                                 ServiceNamespace='dynamodb',\n                                                 ResourceIds=[f'table/{table_name}'])\n\n\n\ndef _register_scalable_target(table_name: str, dimension: str,\n                              min_cap: int, max_cap: int, role_arn: str) -> dict:\n    \"\"\"\n    Describes scalable targets\n    :param table_name: The table name\n    :param dimension: The dimension\n    :param min_cap: The minimum of scaling target\n    :param max_cap: The maximum of scaling target\n    :param role_arn: The autoscaling role ARN\n    :return: The response of AWS API\n    \"\"\"\n    return _execute_boto3_auto_scaling(\n        delegate=lambda x: x.register_scalable_target(ServiceNamespace='dynamodb',\n                                                      ScalableDimension=dimension,\n                                                      MinCapacity=min_cap,\n                                                      MaxCapacity=max_cap,\n                                                      RoleARN=role_arn,\n                                                      ResourceId=f'table/{table_name}'))\n\n\n\n\ndef copy_scaling_targets(events: dict, context: dict) -> dict:\n    \"\"\"\n    Copy scaling targets settings from source table and applies to the target one\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The target table name\n    :return: MapList of copied scalable targets\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n\n    source_table_name: str = events['SourceTableName']\n    target_table_name: str = events['TargetTableName']\n    scaling_targets = _describe_scalable_targets(table_name=source_table_name)\n\n    scaling_targets = \\\n        [{'ScalableDimension': x['ScalableDimension'],\n          'MinCapacity':int(x[\"MinCapacity\"]),\n          'MaxCapacity':int(x[\"MaxCapacity\"]),\n          'RoleARN':x['RoleARN']} for x in scaling_targets]\n    for x in scaling_targets:\n        _register_scalable_target(table_name=target_table_name,\n                                  dimension=x['ScalableDimension'],\n                                  min_cap=int(x[\"MinCapacity\"]),\n                                  max_cap=int(x[\"MaxCapacity\"]),\n                                  role_arn=x['RoleARN'])\n\n    return scaling_targets"
+      }
+    },
+    {
+      "name": "CopyAlarms",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "AlarmsChanged",
+          "Selector": "$.Payload.AlarmsChanged",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_alarms_for_dynamo_db_table",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}",
+          "DynamoDBSourceTableAlarmNames": "{{ DynamoDBSourceTableAlarmNames }}"
+        },
+        "Script": "import boto3\nimport logging\nimport time\nfrom botocore.config import Config\nfrom datetime import datetime, timedelta\nfrom typing import Any, Callable, Iterator, List\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n\nPUT_METRIC_ALARM_PARAMS = ['AlarmName', 'AlarmDescription', 'ActionsEnabled', 'OKActions',\n                           'AlarmActions', 'InsufficientDataActions', 'MetricName', 'Namespace', 'Statistic',\n                           'ExtendedStatistic',\n                           'Dimensions', 'Period', 'Unit', 'EvaluationPeriods', 'DatapointsToAlarm',\n                           'Threshold', 'ComparisonOperator', 'TreatMissingData', 'EvaluateLowSampleCountPercentile',\n                           'Metrics', 'Tags', 'ThresholdMetricId']\n\n\n\n\ndef _execute_boto3_cloudwatch(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with cloudwatch client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    cloudwatch_client = boto3.client('cloudwatch', config=boto3_config)\n    response = delegate(cloudwatch_client)\n    if not response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(response)\n        raise ValueError('Failed to execute request')\n    return response\n\n\n\ndef _execute_boto3_cloudwatch_paginator(func_name: str, search_exp: str = None, **kwargs) -> Iterator[Any]:\n    \"\"\"\n    Executes the given function with pagination\n    :param func_name: The function name of cloudwatch client\n    :param search_exp: The search expression to return elements\n    :param kwargs: The arguments of `func_name`\n    :return: The iterator over elements on pages\n    \"\"\"\n    dynamo_db_client = boto3.client('cloudwatch')\n    paginator = dynamo_db_client.get_paginator(func_name)\n    page_iterator = paginator.paginate(**kwargs)\n    if search_exp:\n        return page_iterator.search(search_exp)\n    else:\n        return page_iterator\n\n\n\ndef _describe_metric_alarms(alarm_names: List[str]) -> Iterator[dict]:\n    \"\"\"\n    Returns all alarms setup in the current region\n    \"\"\"\n    return _execute_boto3_cloudwatch_paginator(func_name='describe_alarms',\n                                               search_exp='MetricAlarms[]',\n                                               AlarmTypes=['MetricAlarm'],\n                                               AlarmNames=alarm_names)\n\n\n\ndef _put_metric_alarm(**kwargs):\n    \"\"\"\n    Updates or creates metric alarm with the given paramters:\n    :param kwargs: The parametes for boto3 put_metric_alarm\n    \"\"\"\n    return _execute_boto3_cloudwatch(\n        delegate=lambda x: x.put_metric_alarm(**kwargs))\n\n\n\ndef get_metric_alarms_for_table(table_name: str, alarms_names: List[str]) -> Iterator[dict]:\n    source_alarms = _describe_metric_alarms(alarm_names=alarms_names)\n    for alarm in filter(lambda x: x.get('Namespace', '') == 'AWS/DynamoDB', source_alarms):\n        for dimension in alarm['Dimensions']:\n            if dimension['Name'] == 'TableName' and \\\n                    dimension['Value'] == table_name:\n                yield alarm\n\n\n\ndef copy_alarms_for_dynamo_db_table(events, context):\n    \"\"\"\n    Copies all the given alarm names from the source to the target table\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n    if 'DynamoDBSourceTableAlarmNames' not in events:\n        raise KeyError('Requires DynamoDBSourceTableAlarmNames')\n\n    source_table_name: str = events['SourceTableName']\n    target_table_name: str = events['TargetTableName']\n    alarms_names: str = events.get('DynamoDBSourceTableAlarmNames', [])\n    logging.info(\n        f\"Coping alarms for dynamodb table. Source: {source_table_name}, \"\n        f\"Target: {target_table_name}. Alarm Names: {alarms_names}\")\n\n    source_alarms = get_metric_alarms_for_table(table_name=source_table_name, alarms_names=alarms_names)\n\n    alarms_copied_count: int = 0\n\n    for alarm in source_alarms:\n        for dimension in alarm['Dimensions']:\n            if dimension['Name'] == 'TableName' and \\\n                    dimension['Value'] == source_table_name:\n                dimension['Value'] = target_table_name\n                alarm['AlarmName'] = f\"{alarm['AlarmName']}_{target_table_name}\"\n\n        keys = [*alarm.keys()]\n        for key in keys:\n            if key not in PUT_METRIC_ALARM_PARAMS:\n                del alarm[key]\n        _put_metric_alarm(**alarm)\n        alarms_copied_count += 1\n\n    return {\n        \"AlarmsChanged\": alarms_copied_count\n    }"
+      }
+    },
+    {
+      "name": "CopyReplicationSetting",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CopiedGlobalTableRegions",
+          "Selector": "$.Payload",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "copy_global_table_settings",
+        "InputPayload": {
+          "SourceTableName": "{{ DynamoDBTableSourceName }}",
+          "TargetTableName": "{{ DynamoDBTableTargetName }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _update_table(table_name: str, **kwargs) -> dict:\n    \"\"\"\n    Describes the given dynamodb table\n    :param table_name: The table name\n    :param kwargs: The arguments of `update_table` boto3 call\n    :return: The dictionary of table description properties\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.update_table(TableName=table_name, **kwargs))\n\n\n\ndef _describe_table(table_name: str) -> dict:\n    \"\"\"\n    Describes the given dynamodb table\n    :param table_name: The table name\n    :return: The dictionary of table description properties\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_table(TableName=table_name))\n\n\n\ndef _get_global_table_all_regions(table_name: str) -> List[dict]:\n    \"\"\"\n    Returns all global table regions\n    :param table_name: The table name\n    \"\"\"\n    description = _describe_table(table_name=table_name)\n    replicas = description['Table'].get('Replicas', [])\n    return replicas\n\n\n\ndef copy_global_table_settings(events: dict, context: dict) -> dict:\n    \"\"\"\n    Sets up replicas in the given regions\n    :param events: The dictionary that supposed to have the following keys:\n    * `SourceTableName` - The source table name\n    * `TargetTableName` - The target table name\n    :return: The list of regions where replicas copied\n    \"\"\"\n    if 'SourceTableName' not in events:\n        raise KeyError('Requires SourceTableName')\n    if 'TargetTableName' not in events:\n        raise KeyError('Requires TargetTableName')\n\n    source_table_name: str = events['SourceTableName']\n    target_table_name: str = events['TargetTableName']\n    global_table_all_regions = _get_global_table_all_regions(table_name=source_table_name)\n    global_table_active_regions: str = [r['RegionName']\n                                        for r in global_table_all_regions\n                                        if r['ReplicaStatus'] in GLOBAL_TABLE_ACTIVE_STATUSES]\n    if global_table_active_regions:\n        _update_table(table_name=target_table_name, ReplicaUpdates=[\n            {'Create': {'RegionName': region}} for region in global_table_active_regions])\n\n    return global_table_active_regions"
+      }
+    },
+    {
+      "name": "WaitTableToBeActiveAfterGlobalTable",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 5,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "dynamodb",
+        "Api": "DescribeTable",
+        "TableName": "{{DynamoDBTableTargetName}}",
+        "PropertySelector": "$.Table.TableStatus",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      }
+    },
+    {
+      "name": "WaitActiveStatusOfReplication",
+      "action": "aws:executeScript",
+      "maxAttempts": 5,
+      "outputs": [
+        {
+          "Name": "GlobalTableRegionsAdded",
+          "Selector": "$.Payload.GlobalTableRegionsAdded",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "wait_replication_status_in_all_regions",
+        "InputPayload": {
+          "TableName": "{{ DynamoDBTableTargetName }}",
+          "ReplicasRegionsToWait": "{{ CopyReplicationSetting.CopiedGlobalTableRegions }}",
+          "WaitTimeoutSeconds": 600
+        },
+        "Script": "import logging\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _describe_table(table_name: str) -> dict:\n    \"\"\"\n    Describes the given dynamodb table\n    :param table_name: The table name\n    :return: The dictionary of table description properties\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_table(TableName=table_name))\n\n\n\ndef _get_global_table_all_regions(table_name: str) -> List[dict]:\n    \"\"\"\n    Returns all global table regions\n    :param table_name: The table name\n    \"\"\"\n    description = _describe_table(table_name=table_name)\n    replicas = description['Table'].get('Replicas', [])\n    return replicas\n\n\n\ndef wait_replication_status_in_all_regions(events: dict, context: dict) -> dict:\n    \"\"\"\n    Updates contributor insights settings for the given table and the list of indexes\n    :param events: The dictionary that supposed to have the following keys:\n    * `TableName` - The table name\n    * `ReplicasRegionsToWait` - The list of regions where replicas should be active\n    * `WaitTimeoutSeconds` - The number of seconds to wait Active status\n    :return: The dictionary that contains list of regions where status is Active\n    \"\"\"\n    if 'TableName' not in events:\n        raise KeyError('Requires TableName')\n    if 'ReplicasRegionsToWait' not in events:\n        raise KeyError('Requires ReplicasRegionsToWait')\n    if 'WaitTimeoutSeconds' not in events:\n        raise KeyError('Requires WaitTimeoutSeconds')\n\n    table_name: str = events['TableName']\n    wait_timeout_seconds: int = int(events['WaitTimeoutSeconds'])\n    replicas_regions_to_wait: str = events['ReplicasRegionsToWait']\n    if not replicas_regions_to_wait:\n        return{\n            \"GlobalTableRegionsActive\": []\n        }\n\n    start = time.time()\n    elapsed = 0\n    replicas: List[dict] = []\n    while elapsed < wait_timeout_seconds:\n        replicas = _get_global_table_all_regions(table_name=table_name)\n        all_active = all([r['ReplicaStatus'] in GLOBAL_TABLE_ACTIVE_STATUSES\n                          for r in replicas\n                          if r['RegionName'] in replicas_regions_to_wait])\n        if all_active:\n            return{\n                'GlobalTableRegionsActive': replicas_regions_to_wait\n            }\n\n        end = time.time()\n        logging.debug(f'time elapsed {elapsed} seconds. The last result:{replicas}')\n        time.sleep(20)\n        elapsed = end - start\n\n    raise TimeoutError(f'After {elapsed} not all replicas are Active. '\n                       f'Regions to waits: {replicas_regions_to_wait}. '\n                       f'The latest response: {replicas}')"
+      }
+    }
+  ]
+}

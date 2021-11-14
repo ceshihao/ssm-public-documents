@@ -1,0 +1,222 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## Intent\n'Test app performance and alarm under high CPU load.'\n\n## Type\nTest\n\n## Risk\nHigh\n\n## Requirements\n  * EC2 instance with Linux OS\n  * There is a cpu utilization alarm setup for the ec2 instance\n\n## Permissions required for AutomationAssumeRole\n  * ssm:GetParameters\n  * ssm:SendCommand\n  * ssm:ListCommands\n  * ssm:ListCommandInvocations\n  * ssm:DescribeInstanceInformation\n  * ssm:CancelCommand\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * cloudwatch:DescribeAlarms\n  * cloudwatch:GetMetricStatistics\n  * cloudwatch:DescribeAlarmHistory\n  * iam:PassRole (Restricted to same role)\n\n## Supports Rollback\nYes.\n\n## Cancellation behavior\nRollback execution.\n\n## Inputs\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf\n\n### (Required) InstanceId:\n  * type: String\n  * description: (Required) EC2 instance id\n\n### (Required) CpuUtilizationAlarmName:\n  * type: String\n  * description: (Required) EC2 CPUUtilization alarm which should be triggerred.\n\n### (Optional) DurationSeconds:\n  * type: String\n  * description: (Optional) The duration - in seconds - of the CPU stress.\n  * default: '300'\n\n### (Optional) Cpu\n  * type: String\n  * description: (Optional) Specify the number of CPU stressors to use (default - 0 which means \"all CPUs\")\n  * default: \"0\"\n\n### (Optional) LoadPercent\n  * type: String\n  * description: (Optional) Specify the target CPU load percentage. Valid values are between 0 (no load) and 100 (full load) (default - 100)\n  * default: \"100\"\n\n### (Optional) IsRollback:\n  * type: String\n  * description: (Optional) Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.\n  * default: 'false'\n\n### (Optional) PreviousExecutionId:\n  * type: String\n  * description: (Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.\n  * default: ''\n\n## Details\n  * Use FIS command document to run cpu stress on ec2 instance.\n  * Assert alarm to be red during cpu stress test.\n  * Assert alarm to be green after cpu stress test.\n\n## Steps executed in normal flow\n  * SelectExecutionMode\n  * AssertAlarmToBeGreenBeforeTest\n  * RunCpuStress\n  * AssertAlarmToBeRed\n  * AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n  * SelectExecutionMode\n  * GetPreviousExecutionInstanceId\n  * AssertInstanceId\n  * CancelCommandExecution\n  * KillStressCommandOnRollback\n\n## Outputs\nNone",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) EC2 instance id"
+    },
+    "CpuUtilizationAlarmName": {
+      "type": "String",
+      "description": "(Required) EC2 CPUUtilization alarm which should be triggerred"
+    },
+    "DurationSeconds": {
+      "type": "String",
+      "description": "(Optional) The duration - in seconds - of the CPU stress.",
+      "allowedPattern": "^[0-9]+$",
+      "default": "300"
+    },
+    "Cpu": {
+      "type": "String",
+      "description": "(Optional) Specify the number of CPU stressors to use (default - 0 which means \"all CPUs\")",
+      "default": "0",
+      "allowedPattern": "^[0-9]+$"
+    },
+    "LoadPercent": {
+      "type": "String",
+      "description": "(Optional) Specify the target CPU load percentage. Valid values are between 0 (no load) and 100 (full load) (default - 100)",
+      "default": "100",
+      "allowedPattern": "^(100|[1-9]?[0-9])$"
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "SelectExecutionMode",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AssertAlarmToBeGreenBeforeTest",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "false"
+          }
+        ],
+        "Default": "GetPreviousExecutionInstanceId"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CpuUtilizationAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "RunCpuStress",
+      "description": "Run FIS command document to inject cpu stress.",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:TriggerRollback",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "DocumentName": "AWSFIS-Run-CPU-Stress",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "LoadPercent": "{{LoadPercent}}",
+          "CPU": "{{Cpu}}",
+          "DurationSeconds": "{{DurationSeconds}}"
+        }
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for cpu alarm to be red after cpu injection.",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "verify_alarm_triggered",
+        "InputPayload": {
+          "AlarmName": "{{CpuUtilizationAlarmName}}",
+          "DurationInSeconds": "{{DurationSeconds}}"
+        },
+        "Script": "import boto3\nimport logging\nimport time\nfrom botocore.config import Config\nfrom datetime import datetime, timedelta\nfrom typing import Any, Callable, Iterator, List\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n\nPUT_METRIC_ALARM_PARAMS = ['AlarmName', 'AlarmDescription', 'ActionsEnabled', 'OKActions',\n                           'AlarmActions', 'InsufficientDataActions', 'MetricName', 'Namespace', 'Statistic',\n                           'ExtendedStatistic',\n                           'Dimensions', 'Period', 'Unit', 'EvaluationPeriods', 'DatapointsToAlarm',\n                           'Threshold', 'ComparisonOperator', 'TreatMissingData', 'EvaluateLowSampleCountPercentile',\n                           'Metrics', 'Tags', 'ThresholdMetricId']\n\n\n\n\ndef verify_alarm_triggered(events, context):\n    \"\"\"\n    Verify if alarm triggered\n    \"\"\"\n    if 'AlarmName' not in events or ('DurationInMinutes' not in events and 'DurationInSeconds' not in events):\n        raise KeyError('Requires AlarmName and either DurationInMinutes or DurationInSeconds in events')\n\n    cw = boto3.client('cloudwatch', config=boto3_config)\n\n    if 'DurationInMinutes' in events:\n        start_date = datetime.now() - timedelta(minutes=int(events['DurationInMinutes']))\n    else:\n        start_date = datetime.now() - timedelta(seconds=int(events['DurationInSeconds']))\n\n    response = cw.describe_alarm_history(\n        AlarmName=events['AlarmName'],\n        HistoryItemType='StateUpdate',\n        MaxRecords=5,\n        ScanBy='TimestampDescending',\n        StartDate=start_date)\n\n    for alarm_history_item in response['AlarmHistoryItems']:\n        if alarm_history_item['HistorySummary'] == \"Alarm updated from OK to ALARM\":\n            return\n\n    raise Exception('Alarm was not triggered')"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for cpu alarm to be green after test is complete.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CpuUtilizationAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetPreviousExecutionInstanceId",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Payload.InstanceIds[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_inputs_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "RunCpuStress",
+          "ResponseField": "InstanceIds"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                step_output = step['Inputs'][response_field]\n                output[response_field] = json.loads(step_output)\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "AssertInstanceId",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CancelCommandExecution",
+            "Variable": "{{ GetPreviousExecutionInstanceId.InstanceId }}",
+            "StringEquals": "{{ InstanceId }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "CancelCommandExecution",
+      "description": "Cancel command execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "cancel_command_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "RunCpuStress",
+          "InstanceIds": [
+            "{{GetPreviousExecutionInstanceId.InstanceId}}"
+          ]
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef cancel_command_execution(events, context):\n    if 'ExecutionId' not in events or 'InstanceIds' not in events or 'StepName' not in events:\n        raise KeyError('Requires DocumentName, InstanceIds, Parameters in events')\n    events['ResponseField'] = 'CommandId'\n    command_id = get_output_from_ssm_step_execution(events, context)[events['ResponseField']][0]\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n    ssm.cancel_command(\n        CommandId=command_id,\n        InstanceIds=events['InstanceIds']\n    )\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "KillStressCommandOnRollback",
+      "description": "Kill stress command running on ec2 instance during rollback to stop cpu injection.",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSResilienceHub-KillStressCommand_2020-07-28",
+        "InstanceIds": [
+          "{{GetPreviousExecutionInstanceId.InstanceId}}"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress and starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

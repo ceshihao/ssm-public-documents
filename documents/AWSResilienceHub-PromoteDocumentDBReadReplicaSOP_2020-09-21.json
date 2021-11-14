@@ -1,0 +1,117 @@
+{
+  "description": "## Id\nAWSResilienceHub-PromoteDocumentDBReadReplicaSOP_2020-09-21\n\n## Intent\nUsed to switch database to a read replica\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * Available DocumentDB Cluster with a read replica instance\n\n## Permissions required for AutomationAssumeRole\n  * rds:DescribeDBClusters\n  * rds:DescribeDBInstances\n  * rds:FailoverDBCluster\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) DBClusterIdentifier\n  * type: String\n  * description: DocumentDB Cluster Identifier\n\n### (Required) DBInstanceIdentifier\n  * type: String\n  * description: DocumentDB Replica Identifier\n\n## Details\nThe document promotes a given DocumentDB read replica instance to primary and waits for the cluster\nto become available.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * PromoteReadReplica\n  * WaitUntilClusterAvailable\n  * WaitUntilPrimaryInstanceAvailable\n  * OutputRecoveryTime\n\n## Outputs\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "parameters": {
+    "DBClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) DocDb Cluster Identifier"
+    },
+    "DBInstanceReplicaIdentifier": {
+      "type": "String",
+      "description": "(Required) DocDb Replica Identifier"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to run this document."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "PromoteReadReplica",
+      "description": "Promote Read Replica to Primary instance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "FailoverDBCluster",
+        "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "TargetDBInstanceIdentifier": "{{ DBInstanceReplicaIdentifier }}"
+      }
+    },
+    {
+      "name": "WaitUntilClusterAvailable",
+      "description": "Wait until cluster is in status available",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "WaitUntilPrimaryInstanceAvailable",
+      "description": "Wait until the instance promoted in previous step is in status available",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ DBClusterIdentifier }}"
+            ]
+          },
+          {
+            "Name": "db-instance-id",
+            "Values": [
+              "{{ DBInstanceReplicaIdentifier }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.DBInstances..DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Tarminates stress command on healthy EC2 instances",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    },
+    "AutoScalingGroupName": {
+      "type": "String",
+      "description": "(Required) Name of auto scaling group"
+    },
+    "InstanceIds": {
+      "type": "StringList",
+      "description": "(Otional) Instances on which command will be executed, if healthy"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "FilterHealthyAsgInstances",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceIds",
+          "Selector": "$.Payload.InstanceIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "Count",
+          "Selector": "$.Payload.Count",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "filter_healthy_instance_ids_in_asg",
+        "InputPayload": {
+          "InstanceIds": "{{InstanceIds}}",
+          "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+        },
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef filter_healthy_instance_ids_in_asg(events, context):\n    if 'AutoScalingGroupName' not in events or 'InstanceIds' not in events:\n        raise KeyError('Requires AutoScalingGroupName, InsatnceIds in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    autoscaling = boto3.client('autoscaling', config=config)\n\n    auto_scaling_groups = autoscaling.describe_auto_scaling_groups(\n        AutoScalingGroupNames=[\n            events['AutoScalingGroupName']\n        ]\n    )\n\n    # Take all healthy ASG EC2 instances\n    asg_healthy_instances = []\n    for instance in auto_scaling_groups['AutoScalingGroups'][0]['Instances']:\n        if instance['HealthStatus'] == 'Healthy' and instance['LifecycleState'] == 'InService':\n            asg_healthy_instances.append(instance['InstanceId'])\n\n    output = {}\n    output['InstanceIds'] = []\n    given_instance_ids = events['InstanceIds']\n    # Take only healthy given EC2 instances\n    for instance_id in given_instance_ids:\n        if instance_id in asg_healthy_instances:\n            output['InstanceIds'].append(instance_id)\n    output['Count'] = len(output['InstanceIds'])\n    return output"
+      }
+    },
+    {
+      "name": "CheckInstancesExist",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ExecutingCommand",
+            "Variable": "{{FilterHealthyAsgInstances.Count}}",
+            "NumericGreater": 0
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "ExecutingCommand",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSResilienceHub-KillStressCommand_2020-07-28",
+        "InstanceIds": [
+          "{{ FilterHealthyAsgInstances.InstanceIds }}"
+        ]
+      }
+    }
+  ]
+}

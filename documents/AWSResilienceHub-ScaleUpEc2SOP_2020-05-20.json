@@ -1,0 +1,220 @@
+{
+  "description": "Scale up an ec2 to the successor instance type",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime",
+    "CalculateTargetType.TargetInstanceType"
+  ],
+  "parameters": {
+    "EC2InstanceIdentifier": {
+      "type": "String",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$",
+      "description": "(Required) EC2InstanceIdentifier"
+    },
+    "EC2InstanceTargetInstanceType": {
+      "type": "String",
+      "description": "(Optional) EC2InstanceTargetInstanceType",
+      "default": ""
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "AssertInstanceInAvailableState",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ],
+        "IncludeAllInstances": true,
+        "PropertySelector": "$.InstanceStatuses..InstanceState.Name",
+        "DesiredValues": [
+          "running",
+          "stopped"
+        ]
+      }
+    },
+    {
+      "name": "DescribeEC2Instance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Name": "InstanceType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CalculateTargetType",
+      "description": "Calculates the target instance type",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "OriginalInstanceType",
+          "Selector": "$.Payload.OriginalInstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "TargetInstanceType",
+          "Selector": "$.Payload.TargetInstanceType",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_bigger_instance",
+        "Script": "import boto3\nfrom botocore.config import Config\n\n\n\ndef get_bigger_instance(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ec2 = boto3.client('ec2', config=config)\n    requested_instance_type = events[\"RequestInstanceType\"] or \"\"\n    if requested_instance_type:\n        instance_types_response = ec2.describe_instance_type_offerings(\n            Filters=[{'Name': 'instance-type', \"Values\": [requested_instance_type]}])\n        if instance_types_response:\n            return {**{'TargetInstanceType': requested_instance_type}}\n        else:\n            raise Exception(\"Requested instance type is not valid: \" + requested_instance_type)\n\n    current_instance_type = events[\"CurrentInstanceType\"]\n    instance_type_size = current_instance_type.rsplit(\".\", 1)\n    instance_sizes = [\"nano\", \"micro\", \"small\", \"medium\", \"large\", \"xlarge\", \"2xlarge\", \"3xlarge\", \"4xlarge\",\n                      \"6xlarge\", \"8xlarge\", \"9xlarge\", \"10xlarge\", \"12xlarge\", \"16xlarge\", \"18xlarge\", \"24xlarge\",\n                      \"32xlarge\", \"56xlarge\", \"112xlarge\"]\n    bigger_size_start_idx = instance_sizes.index(instance_type_size[1]) + 1\n    possible_instance_types = []\n    for i in range(len(instance_sizes) - bigger_size_start_idx):\n        possible_instance_types.append(instance_type_size[0] + \".\" + instance_sizes[bigger_size_start_idx + i])\n    instance_types_response = ec2.describe_instance_type_offerings(\n        MaxResults=1000,\n        Filters=[{'Name': 'instance-type', \"Values\": [instance_type_size[0] + \".*\"]}])\n    all_instance_types = [offering['InstanceType'] for offering in instance_types_response['InstanceTypeOfferings']]\n    bigger_instances = [candidate for candidate in possible_instance_types if candidate in all_instance_types]\n    if bigger_instances:\n        return {**{'OriginalInstanceType': current_instance_type}, **{'TargetInstanceType': bigger_instances[0]}}\n    else:\n        raise Exception(\"Could not identify bigger instance type than current instance type: \" + current_instance_type)\n",
+        "InputPayload": {
+          "RequestInstanceType": "{{ EC2InstanceTargetInstanceType }}",
+          "CurrentInstanceType": "{{ DescribeEC2Instance.InstanceType }}"
+        }
+      }
+    },
+    {
+      "name": "StopEC2Instance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "StopInstances",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ]
+      }
+    },
+    {
+      "name": "ValidateInstanceIsStopped",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 900,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ],
+        "IncludeAllInstances": true,
+        "PropertySelector": "$.InstanceStatuses..InstanceState.Name",
+        "DesiredValues": [
+          "stopped"
+        ]
+      }
+    },
+    {
+      "name": "ModifyInstanceAttribute",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{ EC2InstanceIdentifier }}",
+        "InstanceType": {
+          "Value": "{{ CalculateTargetType.TargetInstanceType }}"
+        }
+      },
+      "outputs": [
+        {
+          "Selector": "$.InstanceType",
+          "Name": "InstanceType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "StartEC2Instance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "StartInstances",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ]
+      }
+    },
+    {
+      "name": "ValidateInstanceIsAvailable",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 900,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses..InstanceState.Name",
+        "DesiredValues": [
+          "running"
+        ]
+      }
+    },
+    {
+      "name": "AssertInstanceType",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].InstanceType",
+        "DesiredValues": [
+          "{{ CalculateTargetType.TargetInstanceType }}"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

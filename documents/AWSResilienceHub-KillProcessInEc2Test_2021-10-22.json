@@ -1,0 +1,100 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## Intent\n'Test app can recover if given process dies.'\n\n## Type\nTest\n\n## Risk\nSmall\n\n## Requirements\n  * EC2 instance with Linux OS\n  * There is a canary alarm setup for application\n\n## Permissions required for AutomationAssumeRole\n  * ssm:SendCommand\n  * ssm:ListCommands\n  * ssm:ListCommandInvocations\n  * ssm:DescribeInstanceInformation\n  * cloudwatch:DescribeAlarms\n\n## Supports Rollback\nNo.\n\n## Cancellation behavior\nAbort.\n\n## Inputs\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf\n\n### (Required) InstanceId:\n  * type: String\n  * description: (Required) EC2 instance id\n\n### (Required) ProcessName:\n  * type: String\n  * description: (Required) Process name to be killed.\n\n### (Required) CanaryAlarmName:\n  * type: String\n  * description: (Required) Canary Alarm which should be green within recovery time.\n\n### (Optional) Signal:\n  * type: String\n  * description: (Optional) The SIGNAL to be sent along with the kill command (default: SIGTERM).\n  * default: SIGTERM\n  * allowedValues: SIGTERM, SIGKILL\n\n### (Optional) ExpectedRecoveryTimeInSeconds\n  * type: String\n  * description: (Optional) The expected recovery time after process dies (default 300)\n  * default: \"300\"\n\n## Details\n  * Use FIS command document to kill process on ec2 instance.\n  * Assert alarm to be green after expected recovery time.\n\n## Steps executed in normal flow\n  * AssertAlarmToBeGreenBeforeTest\n  * KillProcess\n  * WaitForRecoveryTime\n  * AssertAlarmToBeGreen\n\n## Outputs\nNone",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) EC2 instance id"
+    },
+    "ProcessName": {
+      "type": "String",
+      "description": "(Required) Process name to be killed"
+    },
+    "Signal": {
+      "type": "String",
+      "description": "(Optional) The SIGNAL to be sent along with the kill command (default: SIGTERM).\nThe allowed values are:\n* SIGTERM: Signal used for graceful process termination. Can be referred as soft kill, because the receiver may choose to ignore it.\n* SIGKILL: Signal used for immediate process termination. Cannot be caught, ignored or blocked. Child processes are killed as well.\n",
+      "default": "SIGTERM",
+      "allowedValues": [
+        "SIGTERM",
+        "SIGKILL"
+      ]
+    },
+    "CanaryAlarmName": {
+      "type": "String",
+      "description": "(Required) Synthetic Alarm which should be green within recovery time."
+    },
+    "ExpectedRecoveryTimeInSeconds": {
+      "type": "String",
+      "description": "(Optional) The expected recovery time after process dies (default 300)",
+      "default": "300"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "KillProcess",
+      "description": "Run FIS command document to kill process",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWSFIS-Run-Kill-Process",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "ProcessName": "{{ProcessName}}",
+          "Signal": "{{Signal}}"
+        }
+      }
+    },
+    {
+      "name": "WaitForRecoveryTime",
+      "description": "Wait for recovery time.",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT{{ExpectedRecoveryTimeInSeconds}}S"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete.",
+      "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}

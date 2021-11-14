@@ -1,0 +1,305 @@
+{
+  "description": "## Id\nAWSResilienceHub-BreakEFSSecurityGroupTest_2020-09-21\n\n## Intent\nTest EFS behavior after breaking security group ID\n\n## Type\nTEST\n\n## Risk\nHigh\n\n## Requirements\n  * EFS file system\n  * EC2 instance or Lambda function with EFS mounted\n  * Alarm for metric [ClientConnections](https://docs.aws.amazon.com/efs/latest/ug/efs-metrics.html) setup for the EFS file system\n  * The security groups associated with EFS must allow inbound access for the TCP protocol on the NFS (port 2049) port from other AWS service on which user wants to mount the file system\n\n## Permissions required for AutomationAssumeRole\n  * elasticfilesystem:DescribeMountTargets\n  * elasticfilesystem:DescribeMountTargetSecurityGroups\n  * elasticfilesystem:ModifyMountTargetSecurityGroups\n  * ec2:CreateSecurityGroup\n  * ec2:DescribeSecurityGroups\n  * ec2:DeleteSecurityGroup\n  * cloudwatch:DescribeAlarms\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * iam:PassRole\n\n## Supports Rollback\nYes. Restore original security group for EFS mount target\n\n## Cancellation behavior\nRestore original security group for EFS mount target\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) FileSystemId\n  * type: String\n  * description: The EFS File System ID\n\n### (Required) ClientConnectionsAlarmName\n  * type: String\n  * description: Alarm for metric [ClientConnections](https://docs.aws.amazon.com/efs/latest/ug/efs-metrics.html) for the EFS file system\n\n### (Optional) MountTargetIds\n  * type: StringList\n  * description: The list of identifiers of the mount targets. The script disassociates security group(-s) from mount target(-s). Empty list means *ALL* targets in randomly selected Availability Zone of the current Region\n  * default: []\n\n### (Optional) IsRollback\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n  * default: false\n\n### (Optional) PreviousExecutionId\n  * type: String\n  * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nThe document injects failure by replacing EFS mount target's security group with an empty one that blocks any inbound connections and waits for alarm for metric `ClientConnections` to trigger. If mount target list is not specified, the document uses first available random mount target which corresponds to one of the Availabilty Zones. In case of issues users should manually restore mount target's security groups from backup.\n\n## Steps executed in normal flow\n  * CheckIsRollback\n  * AssertAlarmToBeGreenBeforeTest\n  * SearchForMountTargetIds\n  * BackupEfsSecurityGroups\n  * EmptyMountTargetSecurityGroups\n  * AssertAlarmToBeRed\n  * RollbackCurrentExecution\n  * AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n  * CheckIsRollback\n  * GetInputsFromPreviousExecution\n  * AssertFileSystemId\n  * GetSecurityGroupsMapFromPreviousExecution\n  * RollbackPreviousExecution\n  * AssertAlarmToBeGreenAfterRollback\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "FileSystemId": {
+      "type": "String",
+      "description": "(Required) The EFS File System ID"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "ClientConnectionsAlarmName": {
+      "type": "String",
+      "description": "(Required) The name of ClientConnections Alarm for specified FileSystemId."
+    },
+    "MountTargetIds": {
+      "type": "StringList",
+      "description": "(Optional) The list of identifiers of the mount targets. The script disassociates security group(-s) from mount target(-s). Empty list means *ALL* targets in randomly selected AZ of the current Region. Provided as a YAML list",
+      "default": []
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`). Can be either true or false.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetInputsFromPreviousExecution",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "AssertAlarmToBeGreenBeforeTest"
+      }
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "nextStep": "AssertFileSystemId",
+      "outputs": [
+        {
+          "Name": "FileSystemId",
+          "Selector": "$.Payload.FileSystemId[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertFileSystemId",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetSecurityGroupsMapFromPreviousExecution",
+            "Variable": "{{ GetInputsFromPreviousExecution.FileSystemId }}",
+            "StringEquals": "{{ FileSystemId }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetSecurityGroupsMapFromPreviousExecution",
+      "description": "Get list of original security groups for selected mount targets for rollback",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "MountTargetIdToSecurityGroupsMap",
+          "Selector": "$.Payload.MountTargetIdToSecurityGroupsMap",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "BackupEfsSecurityGroups",
+          "ResponseField": "MountTargetIdToSecurityGroupsMap"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "RollbackPreviousExecution",
+      "description": "Restore original list of security groups of the mount target",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "revert_fs_security_groups",
+        "InputPayload": {
+          "MountTargetIdToSecurityGroupsMap": "{{ GetSecurityGroupsMapFromPreviousExecution.MountTargetIdToSecurityGroupsMap }}",
+          "FileSystemId": "{{ GetInputsFromPreviousExecution.FileSystemId }}",
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import boto3\nimport logging\n\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef revert_fs_security_groups(events, context):\n    required_params = [\n        'MountTargetIdToSecurityGroupsMap',\n        'ExecutionId'\n    ]\n    check_required_params(required_params, events)\n    efs_client = boto3.client('efs')\n    ec2_client = boto3.client('ec2')\n    for mt_map in events['MountTargetIdToSecurityGroupsMap']:\n        mount_target, security_groups_str = mt_map.split(':', 2)\n        security_groups_list = security_groups_str.split(',')\n        logger.info(f'Reverting Security groups for MountPoint:{mount_target}')\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mount_target,\n            SecurityGroups=security_groups_list\n        )\n        try:\n            logger.info(f'Deleting empty security group: EmptySG-{mount_target}-{events[\"ExecutionId\"]}')\n            sg_id = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-name',\n                        'Values': [\n                            f\"EmptySG-{mount_target}-{events['ExecutionId']}\",\n                        ]\n                    },\n                ]\n            )['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {sg_id}')\n            ec2_client.delete_security_group(\n                GroupId=sg_id\n            )\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: EmptySG-{mount_target}\")\n            else:\n                raise error"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenAfterRollback",
+      "description": "Wait for the alarm to be green after rollback",
+      "action": "aws:waitForAwsResourceProperty",
+      "isEnd": true,
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ ClientConnectionsAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ ClientConnectionsAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "SearchForMountTargetIds",
+      "description": "Get EFS file system mount target in the current AZ or check list of provided mount targets to be valid",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "outputs": [
+        {
+          "Name": "MountTargetIds",
+          "Selector": "$.Payload.MountTargetIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "FileSystemId",
+          "Selector": "$.Payload.FileSystemId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "search_for_mount_target_ids",
+        "InputPayload": {
+          "FileSystemId": "{{ FileSystemId }}",
+          "MountTargetIds": "{{ MountTargetIds }}"
+        },
+        "Script": "import boto3\nimport logging\n\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef search_for_mount_target_ids(events, context):\n    required_params = [\n        'FileSystemId'\n    ]\n    check_required_params(required_params, events)\n    mount_target_ids = []\n    efs_client = boto3.client('efs')\n    logger.info(f'Getting MountPoints with the following args: {events}')\n    if events.get('MountTargetIds'):\n        for mt in events['MountTargetIds']:\n            mt_info = efs_client.describe_mount_targets(  # no need to paginate, only one MT can have the specified id\n                MountTargetId=mt\n            )\n            if mt_info[\"MountTargets\"][0]['FileSystemId'] != events['FileSystemId']:\n                raise AssertionError(f\"MountTarget {mt} doesn't belong to filesystem {events['FileSystemId']}\")\n        mount_target_ids = events['MountTargetIds']\n    else:\n        # There can be only one MT for each EFS volume in each AZ\n        # so we grab any MT and assume it's the only one important for AZ failure test\n        # so no need for pagination\n        logger.info(f\"Getting all MT for FS: {events['FileSystemId']}\")\n        mount_target = efs_client.describe_mount_targets(\n            FileSystemId=events['FileSystemId'],\n            MaxItems=1\n        )['MountTargets'][0]\n        mount_target_ids.append(mount_target['MountTargetId'])\n    return {\n        'MountTargetIds': mount_target_ids,\n        'FileSystemId': events['FileSystemId']\n    }"
+      }
+    },
+    {
+      "name": "BackupEfsSecurityGroups",
+      "description": "Backup list of security groups for selected mount targets",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "outputs": [
+        {
+          "Name": "MountTargetIdToSecurityGroupsMap",
+          "Selector": "$.Payload.MountTargetIdToSecurityGroupsMap",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "list_security_groups_for_mount_targets",
+        "InputPayload": {
+          "MountTargetIds": "{{ SearchForMountTargetIds.MountTargetIds }}"
+        },
+        "Script": "import boto3\nimport logging\n\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef list_security_groups_for_mount_targets(events, context):\n    required_params = [\n        'MountTargetIds'\n    ]\n    check_required_params(required_params, events)\n\n    mt_to_sg_map = []\n    efs_client = boto3.client('efs')\n\n    for mt in events['MountTargetIds']:\n        response = efs_client.describe_mount_target_security_groups(\n            MountTargetId=mt\n        )\n        mt_to_sg_map.append(f\"{mt}:{','.join(response['SecurityGroups'])}\")\n    return {\n        'MountTargetIdToSecurityGroupsMap': mt_to_sg_map\n    }"
+      }
+    },
+    {
+      "name": "EmptyMountTargetSecurityGroups",
+      "description": "Inject failure by replacing mount target's security group with an empty one",
+      "action": "aws:executeScript",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "empty_security_groups_for_mount_targets",
+        "InputPayload": {
+          "MountTargetIds": "{{SearchForMountTargetIds.MountTargetIds}}",
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import boto3\nimport logging\n\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef empty_security_groups_for_mount_targets(events, context):\n    required_params = [\n        'MountTargetIds',\n        'ExecutionId'\n    ]\n    check_required_params(required_params, events)\n    efs_client = boto3.client('efs')\n    ec2_client = boto3.client('ec2')\n\n    if not events['MountTargetIds']:\n        raise AssertionError('MountTargetIds parameter is empty. It past contain at least one MountTarget')\n\n    for mt in events['MountTargetIds']:\n        logger.info(f'Emptying Security groups for mount point:{mt}')\n        vpc_id = efs_client.describe_mount_targets(\n            MountTargetId=mt\n        )['MountTargets'][0]['VpcId']\n        group_id = ec2_client.create_security_group(\n            Description='Empty SG for test efs:test:break_security_group:2020-09-21',\n            GroupName=f'EmptySG-{mt}-{events[\"ExecutionId\"]}',\n            VpcId=vpc_id,\n        )['GroupId']\n\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mt,\n            SecurityGroups=[group_id]\n        )"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for expected alarm to be red after failure is injected",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ ClientConnectionsAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "RollbackCurrentExecution",
+      "description": "Restore mount target's security groups to original state",
+      "action": "aws:executeScript",
+      "onFailure": "step:TriggerRollback",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "revert_fs_security_groups",
+        "InputPayload": {
+          "MountTargetIdToSecurityGroupsMap": "{{ BackupEfsSecurityGroups.MountTargetIdToSecurityGroupsMap }}",
+          "MountTargetIds": "{{ SearchForMountTargetIds.MountTargetIds }}",
+          "FileSystemId": "{{ FileSystemId }}",
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import boto3\nimport logging\n\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef revert_fs_security_groups(events, context):\n    required_params = [\n        'MountTargetIdToSecurityGroupsMap',\n        'ExecutionId'\n    ]\n    check_required_params(required_params, events)\n    efs_client = boto3.client('efs')\n    ec2_client = boto3.client('ec2')\n    for mt_map in events['MountTargetIdToSecurityGroupsMap']:\n        mount_target, security_groups_str = mt_map.split(':', 2)\n        security_groups_list = security_groups_str.split(',')\n        logger.info(f'Reverting Security groups for MountPoint:{mount_target}')\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mount_target,\n            SecurityGroups=security_groups_list\n        )\n        try:\n            logger.info(f'Deleting empty security group: EmptySG-{mount_target}-{events[\"ExecutionId\"]}')\n            sg_id = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-name',\n                        'Values': [\n                            f\"EmptySG-{mount_target}-{events['ExecutionId']}\",\n                        ]\n                    },\n                ]\n            )['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {sg_id}')\n            ec2_client.delete_security_group(\n                GroupId=sg_id\n            )\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: EmptySG-{mount_target}\")\n            else:\n                raise error"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ ClientConnectionsAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress. This step starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

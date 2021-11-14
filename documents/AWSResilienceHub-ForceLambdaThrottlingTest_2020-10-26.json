@@ -1,0 +1,278 @@
+{
+  "description": "## Id\nAWSResilienceHub-ForceLambdaThrottlingTest_2020-10-26\n\n## Intent\nTest Lambda behavior when hitting ReservedConcurrentExecutions value\n\n## Type\nTEST\n\n## Risk\nMedium\n\n## Requirements\n  * Lambda Function\n  * Alarm for metric [Throttles](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-metrics.html) setup for the Lambda function\n\n## Permissions required for AutomationAssumeRole\n  * lambda:PutFunctionConcurrency\n  * lambda:GetFunctionConcurrency\n  * lambda:DeleteFunctionConcurrency\n  * cloudwatch:DescribeAlarms\n\n## Supports Rollback\nYes.\n\n## Cancellation behavior\nFail or rollback with description of what is rolled back\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) LambdaARN\n  * type: String\n  * description: The Lambda function ARN\n\n### (Required) ThrottlesAlarmName\n  * type: String\n  * description: Alarm for metric `Throttles` setup for the Lambda function\n\n### (Optional) IsRollback\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n  * default: false\n\n### (Optional) PreviousExecutionId\n  * type: String\n  * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nThe document injects failure by setting reserved concurrent executions to 0. In case of issues users should\nmanually revert reserved concurrent execution to the original value.\n\n## Steps executed in normal flow\n  * CheckIsRollback\n  * AssertAlarmToBeGreenBeforeTest\n  * BackupReservedConcurrentExecutions\n  * EnableFunctionThrottling\n  * AssertAlarmToBeRed\n  * RollbackCurrentExecution\n  * RemoveConcurrentExecutions/RollbackConcurrentExecutionsValue\n  * AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n  * CheckIsRollback\n  * PrepareRollbackOfPreviousExecution\n  * GetInputsFromPreviousExecution\n  * AssertLambdaARN\n  * RollbackPreviousExecution\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "LambdaARN": {
+      "type": "String",
+      "description": "(Required) LambdaARN"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "ThrottlesAlarmName": {
+      "type": "String",
+      "description": "(Required) Alarm which should be red after injection of the failure and green after the rollback process in the end of the test."
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`). Can be either true or false.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PrepareRollbackOfPreviousExecution",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "AssertAlarmToBeGreenBeforeTest"
+      }
+    },
+    {
+      "name": "PrepareRollbackOfPreviousExecution",
+      "description": "Get reserved concurrent executions value that will be used to revert Lambda function to its original state",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "BackupReservedConcurrentExecutionsValue",
+          "Selector": "$.Payload.BackupReservedConcurrentExecutionsValue",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "BackupReservedConcurrentExecutions",
+          "ResponseField": "BackupReservedConcurrentExecutionsValue"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "LambdaARN",
+          "Selector": "$.Payload.LambdaARN[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertLambdaARN",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RollbackPreviousExecution",
+            "Variable": "{{ GetInputsFromPreviousExecution.LambdaARN }}",
+            "StringEquals": "{{ LambdaARN }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "RollbackPreviousExecution",
+      "description": "Restore original reserved concurrent executions value",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "PutFunctionConcurrency",
+        "FunctionName": "{{LambdaARN}}",
+        "ReservedConcurrentExecutions": "{{PrepareRollbackOfPreviousExecution.BackupReservedConcurrentExecutionsValue}}"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ThrottlesAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "BackupReservedConcurrentExecutions",
+      "description": "Get reserved concurrent executions value for rollback",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "ReservedConcurrentExecutionsConfigured",
+          "Selector": "$.Payload.ReservedConcurrentConfigured",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "BackupReservedConcurrentExecutionsValue",
+          "Selector": "$.Payload.ReservedConcurrentExecutions",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "backup_reserved_concurrent_executions",
+        "InputPayload": {
+          "LambdaARN": "{{LambdaARN}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef backup_reserved_concurrent_executions(events: dict, context):\n    lambda_arn = events.get('LambdaARN')\n    if not lambda_arn:\n        raise KeyError('Requires LambdaARN in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    lambda_client = boto3.client('lambda', config=config)\n    response = lambda_client.get_function_concurrency(\n        FunctionName=lambda_arn\n    )\n    reserved_concurrent_executions_configured = False\n    concurrent_executions_value = 0\n    if response:\n        reserved_concurrent_executions_configured = True\n        concurrent_executions_value = response.get('ReservedConcurrentExecutions')\n    return {\n        'ReservedConcurrentExecutionsConfigured': reserved_concurrent_executions_configured,\n        'BackupReservedConcurrentExecutionsValue': concurrent_executions_value\n    }"
+      }
+    },
+    {
+      "name": "EnableFunctionThrottling",
+      "description": "Set reserved concurrent executions to 0 to inject failure",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "PutFunctionConcurrency",
+        "FunctionName": "{{LambdaARN}}",
+        "ReservedConcurrentExecutions": 0
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for expected alarm to be red after failure is injected",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ThrottlesAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "RollbackCurrentExecution",
+      "description": "Select if reserved concurrent executions has to be removed or restored",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RemoveConcurrentExecutions",
+            "Variable": "{{BackupReservedConcurrentExecutions.ReservedConcurrentExecutionsConfigured}}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "RollbackConcurrentExecutionsValue",
+            "Variable": "{{BackupReservedConcurrentExecutions.ReservedConcurrentExecutionsConfigured}}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "RemoveConcurrentExecutions",
+      "description": "Remove reserved concurrent executions",
+      "maxAttempts": 5,
+      "onCancel": "step:TriggerRollback",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "DeleteFunctionConcurrency",
+        "FunctionName": "{{LambdaARN}}"
+      },
+      "nextStep": "AssertAlarmToBeGreen"
+    },
+    {
+      "name": "RollbackConcurrentExecutionsValue",
+      "description": "Restore original reserved concurrent executions value",
+      "maxAttempts": 5,
+      "onCancel": "step:TriggerRollback",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "PutFunctionConcurrency",
+        "FunctionName": "{{LambdaARN}}",
+        "ReservedConcurrentExecutions": "{{BackupReservedConcurrentExecutions.BackupReservedConcurrentExecutionsValue}}"
+      },
+      "nextStep": "AssertAlarmToBeGreen"
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ThrottlesAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress. This step starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

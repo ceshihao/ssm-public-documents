@@ -1,0 +1,171 @@
+{
+  "description": "SOP By Digito: Digito_EBSRestoreFromBackup_2020_05_26",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "EBSSnapshotIdentifier": {
+      "type": "String",
+      "description": "(Required) The identifier of the snapshot to restore"
+    },
+    "TargetAvailabilityZone": {
+      "type": "String",
+      "description": "(Required) Availability Zone in which to create the volume"
+    },
+    "VolumeType": {
+      "type": "String",
+      "description": "(Optional) The Volume Type. (If omitted the default would be gp2)",
+      "default": ""
+    },
+    "VolumeIOPS": {
+      "type": "Integer",
+      "description": "(Optional) The number of I/O operations per second (IOPS). Not used for gp2. Setting at 0 will use default value.",
+      "default": 0
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "CreateEbsVolume.CreatedVolumeId",
+    "OutputRecoveryTime.RecoveryTime",
+    "EbsDescribeSnapshot.RecoveryPoint"
+  ],
+  "mainSteps": [
+    {
+      "description": "Start the timer when SOP starts",
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "from datetime import datetime, timezone\n\ndef script_handler(params: dict, context):\n    return get_current_time().isoformat()\n\ndef get_current_time():\n    return datetime.now(timezone.utc)\n",
+        "InputPayload": {}
+      },
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Get current snapshot information, validate that the state is \"completed\" by calling [DescribeSnapshot](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeSnapshots.html)",
+      "name": "EbsDescribeSnapshot",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "import boto3\n\ndef script_handler(params: dict, context):\n    response = boto3.client('ec2').describe_snapshots(Filters=[{\n        'Name': 'snapshot-id',\n        'Values': [params['EBSSnapshotIdentifier']]}])\n    return {\n        'VolumeId': response['Snapshots'][0]['VolumeId'],\n        'State': response['Snapshots'][0]['State'],\n        'RecoveryPoint': response['Snapshots'][0]['StartTime'].isoformat()\n    }\n",
+        "InputPayload": {
+          "EBSSnapshotIdentifier": "{{ EBSSnapshotIdentifier }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "VolumeId",
+          "Selector": "$.Payload.VolumeId",
+          "Type": "String"
+        },
+        {
+          "Name": "State",
+          "Selector": "$.Payload.State",
+          "Type": "String"
+        },
+        {
+          "Name": "RecoveryPoint",
+          "Selector": "$.Payload.RecoveryPoint",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Calculate the target VolumeType and IOPS. Requested Params override Original params, use defaults if neither exists",
+      "name": "CalculateIopsAndVolType",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "from botocore.config import Config\nimport boto3\n\ndef script_handler(params: dict, context) -> dict:\n    if params['VolumeId'] != \"vol-ffffffff\":\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        ec2_client = boto3.client('ec2', config=config)\n        describe_response = ec2_client.describe_volumes(VolumeIds=[params['VolumeId']])\n        default_vol_type = describe_response['Volumes'][0]['VolumeType']\n        default_vol_iops = describe_response['Volumes'][0]['Iops']\n    else:\n        default_vol_type = 'gp2'\n        default_vol_iops = 3000\n    volumeType = params['VolumeType'] if params['VolumeType'] != '' else default_vol_type\n    targetOps = params['VolumeIOPS'] if params['VolumeIOPS'] > 0 else default_vol_iops\n    return {\n        'TargetVolumeType': volumeType,\n        'TargetVolumeIOPS': targetOps\n    }\n",
+        "InputPayload": {
+          "VolumeId": "{{ EbsDescribeSnapshot.VolumeId }}",
+          "VolumeType": "{{ VolumeType }}",
+          "VolumeIOPS": "{{ VolumeIOPS }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "TargetVolumeType",
+          "Selector": "$.Payload.TargetVolumeType",
+          "Type": "String"
+        },
+        {
+          "Name": "TargetVolumeIOPS",
+          "Selector": "$.Payload.TargetVolumeIOPS",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "description": "Create the new volume by calling [CreateVolume](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateVolume.html)",
+      "name": "CreateEbsVolume",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "import boto3\n\ndef script_handler(params: dict, context) -> dict:\n    if params['TargetVolumeType'] == 'gp2':\n        response = boto3.client('ec2').create_volume(\n            SnapshotId=params['EBSSnapshotIdentifier'],\n            AvailabilityZone=params['TargetAvailabilityZone'],\n            VolumeType=params['TargetVolumeType']\n        )\n    else:\n        response = boto3.client('ec2').create_volume(\n            SnapshotId=params['EBSSnapshotIdentifier'],\n            AvailabilityZone=params['TargetAvailabilityZone'],\n            VolumeType=params['TargetVolumeType'],\n            Iops=params['TargetVolumeIOPS']\n        )\n    return {'VolumeId': response['VolumeId']}\n",
+        "InputPayload": {
+          "EBSSnapshotIdentifier": "{{ EBSSnapshotIdentifier }}",
+          "TargetAvailabilityZone": "{{ TargetAvailabilityZone }}",
+          "TargetVolumeType": "{{ CalculateIopsAndVolType.TargetVolumeType }}",
+          "TargetVolumeIOPS": "{{ CalculateIopsAndVolType.TargetVolumeIOPS }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CreatedVolumeId",
+          "Selector": "$.Payload.VolumeId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Wait until EBS volume status is running",
+      "name": "WaitUntilVolumeAvailable",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "PropertySelector": "$.Volumes[0].State",
+        "DesiredValues": [
+          "available",
+          "in-use"
+        ],
+        "VolumeIds": [
+          "{{ CreateEbsVolume.CreatedVolumeId }}"
+        ]
+      }
+    },
+    {
+      "description": "Record the runtime in seconds",
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "from datetime import datetime, timezone\nfrom dateutil import parser\n\ndef script_handler(params: dict, context):\n    return (get_current_time() - parser.parse(params['StartTime'])).seconds\n\ndef get_current_time():\n    return datetime.now(timezone.utc)\n",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ]
+    }
+  ]
+}

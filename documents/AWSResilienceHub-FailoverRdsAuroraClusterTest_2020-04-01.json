@@ -1,0 +1,156 @@
+{
+  "description": "## Intent\n'Test that the application automatically recovers in case of a maz failover'\n\n## Type\nTest\n\n## Risk\nSmall\n\n## Requirements\n  * RDS aurora cluster\n  * There is a canary alarm setup for application\n\n## Permissions required for AutomationAssumeRole\n  * rds:DescribeDBClusters\n  * rds:FailoverDBCluster\n  * cloudwatch:DescribeAlarms\n\n## Supports Rollback\nNo.\n\n## Cancellation behavior\nAbort.\n\n## Inputs\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf\n\n### (Required) ClusterId:\n  * type: String\n  * description: (Required) Identifies the aurora db cluster subject to action.\n\n### (Required) CanaryAlarmName:\n  * type: String\n  * description: (Required) Canary Alarm which should be green within recovery time.\n\n### (Optional) InstanceId:\n  * type: String\n  * description: (Optional) The DB instance to promote to the primary instance.\n\n## Details\n  * Failover rds cluster.\n  * Assert canary alarm to be green within expected recovery time.\n\n## Steps executed when Instance Id is provided flow\n  * AssertAlarmToBeGreenBeforeTest\n  * WaitForAvailableStateBeforeFailover\n  * GetClusterWriterId\n  * PrimaryInstanceSelector\n  * FailoverClusterWithPrimary\n  * WaitClusterFailoverCompleted\n  * AssertAlarmToBeGreen\n\n## Steps executed when Instance Id is not provided flow\n  * AssertAlarmToBeGreenBeforeTest\n  * WaitForAvailableStateBeforeFailover\n  * GetClusterWriterId\n  * PrimaryInstanceSelector\n  * FailoverClusterDefault\n  * WaitClusterFailoverCompleted\n  * AssertAlarmToBeGreen\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "ClusterId": {
+      "type": "String",
+      "description": "(Required) Identifies the Aurora cluster subject to action."
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "(Optional) The DB instance to promote to the primary instance.",
+      "default": ""
+    },
+    "CanaryAlarmName": {
+      "type": "String",
+      "description": "(Required) Alarm which should be green after test."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "WaitForAvailableStateBeforeFailover",
+      "description": "Wait for cluster to be in available state before test.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ClusterId}}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "GetClusterWriterId",
+      "description": "Get cluster writer id.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "WriterId",
+          "Selector": "$.Payload.WriterId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_cluster_writer_id",
+        "InputPayload": {
+          "ClusterId": "{{ClusterId}}"
+        },
+        "Script": "import boto3\nfrom datetime import datetime, timezone\nimport time\nfrom botocore.config import Config\n\n\n\n\ndef get_cluster_writer_id(events, context):\n    if 'ClusterId' not in events:\n        raise KeyError('Requires ClusterId in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    rds = boto3.client('rds', config=config)\n    clusters = rds.describe_db_clusters(DBClusterIdentifier=events['ClusterId'])\n    return {'WriterId': _parse_writer_id(clusters)}\n\n\n\ndef _parse_writer_id(clusters):\n    for member in clusters['DBClusters'][0]['DBClusterMembers']:\n        if member['IsClusterWriter'] is True:\n            return member['DBInstanceIdentifier']"
+      }
+    },
+    {
+      "name": "PrimaryInstanceSelector",
+      "description": "Select primary instance branch based on InstanceId parameter.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "FailoverClusterDefault",
+            "Variable": "{{InstanceId}}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "FailoverClusterWithPrimary"
+      }
+    },
+    {
+      "name": "FailoverClusterWithPrimary",
+      "description": "Failover cluster specifying which instance to promote to primary.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "rds",
+        "Api": "FailoverDBCluster",
+        "DBClusterIdentifier": "{{ClusterId}}",
+        "TargetDBInstanceIdentifier": "{{InstanceId}}"
+      },
+      "nextStep": "WaitClusterFailoverCompleted"
+    },
+    {
+      "name": "FailoverClusterDefault",
+      "description": "Failover cluster without specifying primary instance id.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "rds",
+        "Api": "FailoverDBCluster",
+        "DBClusterIdentifier": "{{ClusterId}}"
+      }
+    },
+    {
+      "name": "WaitClusterFailoverCompleted",
+      "description": "Wait for cluster failover to be completed",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "wait_cluster_failover_completed",
+        "InputPayload": {
+          "ClusterId": "{{ClusterId}}",
+          "WriterId": "{{GetClusterWriterId.WriterId}}"
+        },
+        "Script": "import boto3\nfrom datetime import datetime, timezone\nimport time\nfrom botocore.config import Config\n\n\n\n\ndef wait_cluster_failover_completed(events, context):\n    '''\n    Failover times are typically 60–120 seconds, should not be a problem for lambda\n    (Lambda is used for execution SSM scripts):\n    https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html\n    '''\n    if 'ClusterId' not in events or 'WriterId' not in events:\n        raise KeyError('Requires ClusterId, WriterId in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    rds = boto3.client('rds', config=config)\n    clusters = rds.describe_db_clusters(DBClusterIdentifier=events['ClusterId'])\n    current_writer_id = _parse_writer_id(clusters)\n    status = clusters['DBClusters'][0]['Status']\n    while current_writer_id == events['WriterId'] or status != 'available':\n        time.sleep(5)\n        clusters = rds.describe_db_clusters(DBClusterIdentifier=events['ClusterId'])\n        current_writer_id = _parse_writer_id(clusters)\n        status = clusters['DBClusters'][0]['Status']\n\n\n\ndef _parse_writer_id(clusters):\n    for member in clusters['DBClusters'][0]['DBClusterMembers']:\n        if member['IsClusterWriter'] is True:\n            return member['DBInstanceIdentifier']"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}

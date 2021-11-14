@@ -1,0 +1,104 @@
+{
+  "description": "## Intent\n'Test that the application automatically recovers in case of a maz failover'\n\n## Type\nTest\n\n## Risk\nSmall\n\n## Requirements\n  * RDS database\n  * There is a canary alarm setup for application\n\n## Permissions required for AutomationAssumeRole\n  * rds:DescribeDBInstances\n  * rds:RebootDBInstance\n  * cloudwatch:DescribeAlarms\n\n## Supports Rollback\nNo.\n\n## Cancellation behavior\nAbort.\n\n## Inputs\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf\n\n### (Required) DbInstanceId:\n  * type: String\n  * description: (Required) Identifies the db instance subject to action.\n\n### (Required) CanaryAlarmName:\n  * type: String\n  * description: (Required) Canary Alarm which should be green within recovery time.\n\n## Details\n  * Reboot rds instance with failover.\n  * Assert canary alarm to be green within expected recovery time.\n\n## Steps executed in normal flow\n  * AssertAlarmToBeGreenBeforeTest\n  * AssertNotRebooting\n  * RebootDbInstanceWithFailover\n  * WaitForAvailableState\n  * AssertAlarmToBeGreen\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DbInstanceId": {
+      "type": "String",
+      "description": "(Required) Identifies the db instance subject to action."
+    },
+    "CanaryAlarmName": {
+      "type": "String",
+      "description": "(Required) Alarm which should be green after test."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "AssertNotRebooting",
+      "description": "Assert instance not in rebooting state before test.",
+      "action": "aws:assertAwsResourceProperty",
+      "isCritical": false,
+      "onFailure": "step:RebootDbInstanceWithFailover",
+      "nextStep": "WaitForAvailableState",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{DbInstanceId}}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "rebooting"
+        ]
+      }
+    },
+    {
+      "name": "RebootDbInstanceWithFailover",
+      "description": "Reboot rds instance with failover.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "rds",
+        "Api": "RebootDBInstance",
+        "DBInstanceIdentifier": "{{DbInstanceId}}",
+        "ForceFailover": true
+      }
+    },
+    {
+      "name": "WaitForAvailableState",
+      "description": "Wait for database to be in available state.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{DbInstanceId}}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}

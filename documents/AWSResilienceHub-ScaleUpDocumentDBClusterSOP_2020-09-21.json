@@ -1,0 +1,198 @@
+{
+  "description": "## Id\nAWSResilienceHub-ScaleUpDocumentDBClusterSOP_2020-09-21\n\n## Intent\nScale up Amazon Document DB cluster.\n\n## Type\nSOP\n\n## Risk\nHigh\n\n## Requirements\n  * A Document DB cluster in \"available\" state with at least one DB instance in \"available\" state.\n\n## Permissions required for AutomationAssumeRole\n  * rds:CreateDBInstance\n  * rds:DescribeDBClusters\n  * rds:DescribeDBInstances\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above.\n\n### (Required) DBClusterIdentifier\n  * type: String\n  * description: Amazon Document DB cluster identifier.\n\n### (Required) NumberOfInstancesToCreate\n* type: Integer\n* description: The number of DB instances to create. Min: 1. Max: 5.\n\n### (Optional) DBInstanceClass\n  * type: String\n  * description: The class of new DB instances.\n\n## Details\nNote that each new instance will have identifier that consists of cluster identifier followed by dash and random alphanumeric string.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * VerifyDBClusterAvailableStatusBeforeModification\n  * ValidateInput\n  * GetDBClusterEngine\n  * GetCurrentDBInstanceClass\n  * ScaleUpDocDbCLuster\n  * WaitForInstancesAvailableStatus\n  * OutputRecoveryTime\n\n## Outputs\n### OutputRecoveryTime.RecoveryTime\n  * type: String\n  * description: overall recovery time for scaling up Amazon Document DB cluster.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "parameters": {
+    "DBClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) Amazon Document DB cluster identifier.",
+      "allowedPattern": "[a-zA-Z0-9_.-]+"
+    },
+    "DBInstanceClass": {
+      "type": "String",
+      "description": "(Optional) The class of new DB instances.",
+      "default": "current"
+    },
+    "NumberOfInstancesToCreate": {
+      "type": "Integer",
+      "description": "(Optional) The number of DB instances to create. Min 1. Max 5.",
+      "default": 1
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "VerifyDBClusterAvailableStatusBeforeModification",
+      "description": "On this step check, if the cluster is in \"available\" state.",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "ValidateInput",
+      "description": "On this step check, if the input parameter is valid.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "verify_number_is_in_inclusive_range",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events. Allow empty, None or 0 values.\n    \"\"\"\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef verify_number_is_in_inclusive_range(events, context):\n    \"\"\"\n    Check that NumberOfInstancesToCreate is within a defined range.\n    The range is inclusive: [RangeMin, RangeMax]\n    \"\"\"\n    required_params = ['NumberOfInstancesToCreate', 'RangeMin', 'RangeMax']\n    check_required_params(required_params, events)\n\n    try:\n        number = int(events['NumberOfInstancesToCreate'])\n        range_min = int(events['RangeMin'])\n        range_max = int(events['RangeMax'])\n    except Exception:\n        raise ValueError(\"Input parameters should be integers\")\n    else:\n        if range_min <= number <= range_max:\n            return True\n        else:\n            raise AssertionError(\n                f\"Number of desired instances should be within [{range_min}, {range_max}], but found {number}\")",
+        "InputPayload": {
+          "NumberOfInstancesToCreate": "{{ NumberOfInstancesToCreate }}",
+          "RangeMin": 1,
+          "RangeMax": 5
+        }
+      }
+    },
+    {
+      "name": "GetDBClusterEngine",
+      "description": "On this step retrieve Amazon Document DB cluster \"Engine\" value.",
+      "action": "aws:executeAwsApi",
+      "outputs": [
+        {
+          "Name": "Engine",
+          "Selector": "$.DBClusters[0].Engine",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBClusters",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ DBClusterIdentifier }}"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "GetCurrentDBInstanceClass",
+      "description": "On this step retrieve DB instance \"InstanceClass\" value. Either use provided input value or (if input value is \"current\") use current DB instance InstanceClass.",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "DBInstanceClass",
+          "Selector": "$.Payload.DBInstanceClass",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "get_current_db_instance_class",
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef get_current_db_instance_class(events, context):\n    \"\"\"\n    Determine the currently used instance class if not explicitly provided.\n    \"\"\"\n    required_params = ['DBClusterIdentifier', 'DBInstanceClass']\n    check_required_params(required_params, events)\n\n    if events['DBInstanceClass'] != 'current':\n        return {'DBInstanceClass': events['DBInstanceClass']}\n\n    docdb = boto3.client('docdb')\n    paginator = docdb.get_paginator('describe_db_instances')\n    page_iterator = paginator.paginate(\n        Filters=[{\"Name\": \"db-cluster-id\", \"Values\": [events['DBClusterIdentifier']]}]\n    )\n    filtered_iterator = page_iterator.search(\"sort_by(DBInstances, &to_string(InstanceCreateTime))[-1]\")\n    filtered_instances = list(filtered_iterator)\n    if not filtered_instances:\n        raise Exception(\n            f\"No instances found for cluster {events['DBClusterIdentifier']}\")\n    else:\n        return {'DBInstanceClass': filtered_instances[0]['DBInstanceClass']}",
+        "InputPayload": {
+          "DBInstanceClass": "{{ DBInstanceClass }}",
+          "DBClusterIdentifier": "{{ DBClusterIdentifier }}"
+        }
+      }
+    },
+    {
+      "name": "ScaleUpDocDbCLuster",
+      "description": "On this step create new instances with provided Engine, InstanceClass in the cluster. Each new instance will have identifier that consists of cluster identifier followed by dash and random alphanumeric string.",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "DBNewInstancesIdentifiers",
+          "Selector": "$.Payload.DBInstancesIdentifiers",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "scale_up_cluster",
+        "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef create_new_instance_random_az(instance_params):\n    \"\"\"\n    Create a new instance with provided Identifier, Engine and InstanceClass in specified cluster.\n    List of parameters doesn't include AZ.\n    \"\"\"\n    docdb = boto3.client('docdb')\n    response = docdb.create_db_instance(\n        DBInstanceIdentifier=instance_params['DBInstanceIdentifier'],\n        DBInstanceClass=instance_params['DBInstanceClass'],\n        Engine=instance_params['Engine'],\n        DBClusterIdentifier=instance_params['DBClusterIdentifier']\n    )\n    return response['DBInstance']['DBInstanceIdentifier']\n\n\n\ndef scale_up_cluster(events, context):\n    \"\"\"\n    Add new instances to the cluster.\n    The amount of instances to add == events['NumberOfInstancesToCreate'].\n    \"\"\"\n    required_params = [\n        'NumberOfInstancesToCreate',\n        'DBClusterIdentifier',\n        'DBInstanceClass',\n        'DBClusterEngine'\n    ]\n    check_required_params(required_params, events)\n\n    amount = int(events['NumberOfInstancesToCreate'])\n    identifiers = []\n    for _ in range(amount):\n        rnd = str(uuid.uuid4()).split('-')[-1]\n        identifier = f\"{events['DBClusterIdentifier']}-{rnd}\"\n        new_event = {\n            'DBClusterIdentifier': events['DBClusterIdentifier'],\n            'DBInstanceIdentifier': identifier,\n            'DBInstanceClass': events['DBInstanceClass'],\n            'Engine': events['DBClusterEngine'],\n        }\n        create_new_instance_random_az(new_event)\n        identifiers.append(identifier)\n\n    return {'DBInstancesIdentifiers': identifiers}",
+        "InputPayload": {
+          "NumberOfInstancesToCreate": "{{ NumberOfInstancesToCreate }}",
+          "DBClusterIdentifier": "{{ DBClusterIdentifier }}",
+          "DBInstanceClass": "{{ GetCurrentDBInstanceClass.DBInstanceClass }}",
+          "DBClusterEngine": "{{ GetDBClusterEngine.Engine }}"
+        }
+      }
+    },
+    {
+      "name": "WaitForInstancesAvailableStatus",
+      "description": "On this step wait for instances provided in previous step are in \"available\" state.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "docdb",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "db-cluster-id",
+            "Values": [
+              "{{ DBClusterIdentifier }}"
+            ]
+          },
+          {
+            "Name": "db-instance-id",
+            "Values": [
+              "{{ ScaleUpDocDbCLuster.DBNewInstancesIdentifiers }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.DBInstances..DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      },
+      "isEnd": true
+    }
+  ]
+}

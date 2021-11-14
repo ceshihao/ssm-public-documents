@@ -1,0 +1,132 @@
+{
+  "description": "## Id\nAWSResilienceHub-UpdateHttpWsApiGwVersionSOP_2020-10-26\n\n## Intent\nUpdate HTTP or WS API Gateway Stage deployment version\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * HTTP or WebSocket API Gateway\n\n## Permissions required for AutomationAssumeRole\n  * apigateway:GET\n  * apigateway:PATCH\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) HttpWsApiGwId\n  * type: String\n  * description: The ID of the HTTP or WS API Gateway\n\n### (Required) HttpWsStageName\n  * type: String\n  * description: The stage name of the HTTP or WS API Gateway\n\n### (Optional) HttpWsDeploymentId\n  * type: String\n  * description: The Id of the deployment of the ApiGateway\n  * default: ''\n\n## Details\nThe document validates that auto deployment is turned off for the specified stage and applies the previous\ndeployment (by creation date) or the specified deployment on the HTTP or WS API Gateway stage.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * ValidateStage\n  * FindPreviousDeploymentIfNotProvided\n  * ApplyDeploymentOnStage\n  * OutputRecoveryTime\n\n## Outputs\n### FindPreviousDeploymentIfNotProvided.DeploymentIdOriginalValue\n  * type: String\n  * description: Deployment Id before update\n\n### FindPreviousDeploymentIfNotProvided.DeploymentIdToApply\n  * type: String\n  * description: Previous deployment Id selected to apply if Id is not specified\n\n### ApplyDeploymentOnStage.DeploymentIdNewValue\n  * type: String\n  * description: Deployment Id after update\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime",
+    "FindPreviousDeploymentIfNotProvided.DeploymentIdOriginalValue",
+    "FindPreviousDeploymentIfNotProvided.DeploymentIdToApply",
+    "ApplyDeploymentOnStage.DeploymentIdNewValue"
+  ],
+  "parameters": {
+    "HttpWsApiGwId": {
+      "type": "String",
+      "description": "(Required) The Id of the ApiGateway"
+    },
+    "HttpWsStageName": {
+      "type": "String",
+      "description": "(Required) The stage name of the ApiGateway stage"
+    },
+    "HttpWsDeploymentId": {
+      "type": "String",
+      "description": "(Optional) The Id of the deployment of the ApiGateway",
+      "default": ""
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "ValidateStage",
+      "description": "Validate that AutoDeploy option is turned off for the specified Stage",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "validate_auto_deploy",
+        "InputPayload": {
+          "HttpWsApiGwId": "{{ HttpWsApiGwId }}",
+          "HttpWsStageName": "{{ HttpWsStageName }}"
+        },
+        "Script": "import logging\n\nimport boto3\nfrom botocore.config import Config\n\nlog = logging.getLogger()\nlog.setLevel(logging.DEBUG)\n\n\n\ndef assert_https_status_code_200(response: dict, error_message: str) -> None:\n    if not response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        raise ValueError(f'{error_message} Response is: {response}')\n\n\n\ndef get_stage(gateway_id: str, stage_name: str) -> dict:\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    client = boto3.client('apigatewayv2', config=config)\n    response = client.get_stage(ApiId=gateway_id, StageName=stage_name)\n    assert_https_status_code_200(response, f'Failed to perform get_stage with '\n                                           f'ApiId: {gateway_id} and StageName: {stage_name}')\n    return response\n\n\n\ndef validate_auto_deploy(events: dict, context: dict) -> bool:\n    \"\"\"\n    Validate that AutoDeploy is turned off for stage StageName\n    \"\"\"\n    if 'HttpWsApiGwId' not in events:\n        raise KeyError('Requires HttpWsApiGwId in events')\n\n    if 'HttpWsStageName' not in events:\n        raise KeyError('Requires HttpWsStageName in events')\n\n    gateway_id: str = events['HttpWsApiGwId']\n    stage_name: str = events['HttpWsStageName']\n\n    response = get_stage(gateway_id, stage_name)\n\n    if 'AutoDeploy' in response and response['AutoDeploy']:\n        raise ValueError('AutoDeploy must be turned off to update deployment manually')\n    return True"
+      }
+    },
+    {
+      "name": "FindPreviousDeploymentIfNotProvided",
+      "description": "Find previous deployment by creation date if `HttpWsDeploymentId` not specified",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "DeploymentIdOriginalValue",
+          "Selector": "$.Payload.OriginalDeploymentId",
+          "Type": "String"
+        },
+        {
+          "Name": "DeploymentIdToApply",
+          "Selector": "$.Payload.DeploymentIdToApply",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "find_deployment_id_for_update",
+        "InputPayload": {
+          "HttpWsApiGwId": "{{ HttpWsApiGwId }}",
+          "HttpWsStageName": "{{ HttpWsStageName }}",
+          "HttpWsDeploymentId": "{{ HttpWsDeploymentId }}"
+        },
+        "Script": "import logging\n\nimport boto3\nfrom botocore.config import Config\n\nlog = logging.getLogger()\nlog.setLevel(logging.DEBUG)\n\n\n\ndef get_stage(gateway_id: str, stage_name: str) -> dict:\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    client = boto3.client('apigatewayv2', config=config)\n    response = client.get_stage(ApiId=gateway_id, StageName=stage_name)\n    assert_https_status_code_200(response, f'Failed to perform get_stage with '\n                                           f'ApiId: {gateway_id} and StageName: {stage_name}')\n    return response\n\n\n\ndef get_deployment(gateway_id: str, deployment_id: str) -> dict:\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    client = boto3.client('apigatewayv2', config=config)\n    response = client.get_deployment(ApiId=gateway_id, DeploymentId=deployment_id)\n    assert_https_status_code_200(response, f'Failed to perform get_deployment with '\n                                           f'ApiId: {gateway_id} and DeploymentId: {deployment_id}')\n    return response\n\n\n\ndef get_deployments(gateway_id: str, limit: str = '25') -> dict:\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    client = boto3.client('apigatewayv2', config=config)\n    response = client.get_deployments(ApiId=gateway_id, MaxResults=limit)\n    assert_https_status_code_200(response, f'Failed to perform get_deployments with ApiId: {gateway_id}')\n    return response\n\n\n\ndef assert_https_status_code_200(response: dict, error_message: str) -> None:\n    if not response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        raise ValueError(f'{error_message} Response is: {response}')\n\n\n\ndef find_deployment_id_for_update(events: dict, context: dict) -> dict:\n    \"\"\"\n    Find deployment id for update\n    \"\"\"\n    if 'HttpWsApiGwId' not in events:\n        raise KeyError('Requires HttpWsApiGwId in events')\n\n    if 'HttpWsStageName' not in events:\n        raise KeyError('Requires HttpWsStageName in events')\n\n    output: dict = {}\n    gateway_id: str = events['HttpWsApiGwId']\n    stage_name: str = events['HttpWsStageName']\n    provided_deployment_id: str = events.get('HttpWsDeploymentId', '')\n\n    current_deployment_id = get_stage(gateway_id, stage_name)['DeploymentId']\n    output['OriginalDeploymentId'] = current_deployment_id\n\n    if provided_deployment_id and provided_deployment_id == current_deployment_id:\n        raise ValueError('Provided deployment ID and current deployment ID should not be the same')\n\n    if provided_deployment_id:\n        output['DeploymentIdToApply'] = get_deployment(gateway_id, provided_deployment_id)['DeploymentId']\n        return output\n\n    deployment_items = get_deployments(gateway_id, '500')['Items']\n    if len(deployment_items) == 1 and deployment_items[0]['DeploymentId'] == current_deployment_id:\n        raise ValueError(f'There are no deployments found to apply in ApiGateway ID: {gateway_id}, '\n                         f'except current deployment ID: {current_deployment_id}')\n\n    current_deployment_creation_date = get_deployment(gateway_id, current_deployment_id)['CreatedDate']\n    deployment_items.sort(key=lambda x: x['CreatedDate'], reverse=True)\n    for item in deployment_items:\n        if item['CreatedDate'] < current_deployment_creation_date and item['DeploymentId'] != current_deployment_id:\n            output['DeploymentIdToApply'] = item['DeploymentId']\n            return output\n\n    raise ValueError(f'Could not find any existing deployment which has createdDate less than current deployment ID: '\n                     f'{current_deployment_id}, with createdDate: {current_deployment_creation_date}')"
+      }
+    },
+    {
+      "name": "ApplyDeploymentOnStage",
+      "description": "Apply the specified or previous deployment to stage",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "DeploymentIdNewValue",
+          "Selector": "$.Payload.DeploymentIdNewValue",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "update_deployment",
+        "InputPayload": {
+          "HttpWsApiGwId": "{{ HttpWsApiGwId }}",
+          "HttpWsStageName": "{{ HttpWsStageName }}",
+          "HttpWsDeploymentId": "{{ FindPreviousDeploymentIfNotProvided.DeploymentIdToApply }}"
+        },
+        "Script": "import logging\n\nimport boto3\nfrom botocore.config import Config\n\nlog = logging.getLogger()\nlog.setLevel(logging.DEBUG)\n\n\n\ndef assert_https_status_code_200(response: dict, error_message: str) -> None:\n    if not response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        raise ValueError(f'{error_message} Response is: {response}')\n\n\n\ndef update_deployment(events: dict, context: dict) -> dict:\n    \"\"\"\n    Apply DeploymentId to provided StageName\n    \"\"\"\n    if 'HttpWsApiGwId' not in events:\n        raise KeyError('Requires HttpWsApiGwId in events')\n\n    if 'HttpWsStageName' not in events:\n        raise KeyError('Requires HttpWsStageName in events')\n\n    if 'HttpWsDeploymentId' not in events:\n        raise KeyError('Requires HttpWsDeploymentId in events')\n\n    gateway_id: str = events['HttpWsApiGwId']\n    stage_name: str = events['HttpWsStageName']\n    deployment_id: str = events['HttpWsDeploymentId']\n\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    client = boto3.client('apigatewayv2', config=config)\n    response = client.update_stage(\n        ApiId=gateway_id,\n        StageName=stage_name,\n        DeploymentId=deployment_id\n    )\n    assert_https_status_code_200(response, f'Failed to perform update_stage with ApiId: {gateway_id},'\n                                           f' StageName: {stage_name} and DeploymentId: {deployment_id}')\n\n    return {'DeploymentIdNewValue': response['DeploymentId'],\n            'StageName': response['StageName']}"
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

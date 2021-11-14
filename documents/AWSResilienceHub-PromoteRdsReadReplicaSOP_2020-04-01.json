@@ -1,0 +1,331 @@
+{
+  "description": "SOP from AWSResilienceHub to recover an instance by promoting a replica to master in case of failure in the master instance",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "Dryrun": {
+      "type": "Boolean",
+      "default": false,
+      "description": "(Optional) Dryrun indicates a testing run, changes will be rolled back."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "DbInstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) The identifier of the source DB instance with at least one read replica"
+    }
+  },
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "Dryrun_StartBranch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "TrafficRedirectionPause",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "CreateReadReplica",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": true
+          }
+        ]
+      },
+      "description": ""
+    },
+    {
+      "name": "TrafficRedirectionPause",
+      "action": "aws:pause",
+      "inputs": {
+        "Message": "Resume execution once traffic has been redirected from the resource"
+      }
+    },
+    {
+      "name": "FetchFirstReadReplicaName",
+      "action": "aws:executeAwsApi",
+      "nextStep": "ReplicaIdParameter",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{DbInstanceIdentifier}}"
+      },
+      "outputs": [
+        {
+          "Name": "ReplicaId",
+          "Selector": "$.DBInstances[0].ReadReplicaDBInstanceIdentifiers[0]",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateReadReplica",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "rds",
+        "Api": "CreateDBInstanceReadReplica",
+        "DBInstanceIdentifier": "{{DbInstanceIdentifier}}-new-{{automation:EXECUTION_ID}}",
+        "SourceDBInstanceIdentifier": "{{DbInstanceIdentifier}}"
+      },
+      "outputs": [
+        {
+          "Name": "ReplicaId",
+          "Selector": "$.DBInstance.DBInstanceIdentifier",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitForCreateReadReplica",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 900,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{DbInstanceIdentifier}}-new-{{automation:EXECUTION_ID}}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "ReplicaIdParameter",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "ReplicaId",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  return events['DryrunReplicaId'] if events['Dryrun'] else events['WetrunReplicaId']",
+        "InputPayload": {
+          "Dryrun": "{{Dryrun}}",
+          "WetrunReplicaId": "{{FetchFirstReadReplicaName.ReplicaId}}",
+          "DryrunReplicaId": "{{CreateReadReplica.ReplicaId}}"
+        }
+      }
+    },
+    {
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  from datetime import datetime, timezone\n  return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "PromoteReadReplica",
+      "action": "aws:executeAwsApi",
+      "description": "Promote a read replica to standalone instance",
+      "inputs": {
+        "Service": "rds",
+        "Api": "PromoteReadReplica",
+        "DBInstanceIdentifier": "{{ReplicaIdParameter.ReplicaId}}"
+      }
+    },
+    {
+      "name": "WaitForPromotionToStart",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT30S"
+      }
+    },
+    {
+      "name": "WaitForPromoteReadReplica",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 900,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ReplicaIdParameter.ReplicaId}}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "RenameParameters",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "MasterSourceId",
+          "Selector": "$.Payload.MasterSourceId",
+          "Type": "String"
+        },
+        {
+          "Name": "MasterTargetId",
+          "Selector": "$.Payload.MasterTargetId",
+          "Type": "String"
+        },
+        {
+          "Name": "PromotedSourceId",
+          "Selector": "$.Payload.PromotedSourceId",
+          "Type": "String"
+        },
+        {
+          "Name": "PromotedTargetId",
+          "Selector": "$.Payload.PromotedTargetId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  master_id = events['MasterId']\n  wetrun_replica_id = events['WetrunReplicaId']\n  dryrun_replica_id = events['DryrunReplicaId']\n  dryrun = events['Dryrun']\n  automation_id = events['AutomationId']\n  return {\n    'MasterSourceId' : dryrun_replica_id  if dryrun else master_id,\n    'MasterTargetId' : dryrun_replica_id + '-1' if dryrun else master_id + '-old-' + automation_id,\n    'PromotedSourceId' : dryrun_replica_id + '-1' if dryrun else wetrun_replica_id,\n    'PromotedTargetId' : dryrun_replica_id + '-2' if dryrun else master_id\n  }",
+        "InputPayload": {
+          "Dryrun": "{{Dryrun}}",
+          "MasterId": "{{DbInstanceIdentifier}}",
+          "WetrunReplicaId": "{{FetchFirstReadReplicaName.ReplicaId}}",
+          "DryrunReplicaId": "{{CreateReadReplica.ReplicaId}}",
+          "AutomationId": "{{automation:EXECUTION_ID}}"
+        }
+      }
+    },
+    {
+      "name": "WaitPreviousDatabaseAvailable",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 900,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{RenameParameters.MasterSourceId}}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "RenamePreviousDatabaseToOld",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "rds",
+        "Api": "ModifyDBInstance",
+        "DBInstanceIdentifier": "{{RenameParameters.MasterSourceId}}",
+        "NewDBInstanceIdentifier": "{{RenameParameters.MasterTargetId}}",
+        "ApplyImmediately": true
+      }
+    },
+    {
+      "name": "WaitForMasterToBeRenamedToOld",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  import boto3, time\n  rds = boto3.client('rds')\n  while True:\n    try:\n      if rds.describe_db_instances(DBInstanceIdentifier=events[\"DBInstanceIdentifier\"])[\"DBInstances\"][0][\"DBInstanceStatus\"] == \"available\":\n        return \"Instance successfully renamed to %s\" % (events[\"DBInstanceIdentifier\"])\n    except rds.exceptions.DBInstanceNotFoundFault:\n      pass\n    finally:\n      time.sleep(30)",
+        "InputPayload": {
+          "DBInstanceIdentifier": "{{RenameParameters.MasterTargetId}}"
+        }
+      }
+    },
+    {
+      "name": "RenameNewDatabaseToNoSuffix",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "rds",
+        "Api": "ModifyDBInstance",
+        "DBInstanceIdentifier": "{{RenameParameters.PromotedSourceId}}",
+        "NewDBInstanceIdentifier": "{{RenameParameters.PromotedTargetId}}",
+        "ApplyImmediately": true
+      }
+    },
+    {
+      "name": "WaitForNewToBeRenamedToMaster",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  import boto3, time\n  rds = boto3.client('rds')\n  while True:\n    try:\n      if rds.describe_db_instances(DBInstanceIdentifier=events[\"DBInstanceIdentifier\"])[\"DBInstances\"][0][\"DBInstanceStatus\"] == \"available\":\n        return \"Instance successfully renamed to %s\" % (events[\"DBInstanceIdentifier\"])\n    except rds.exceptions.DBInstanceNotFoundFault:\n      pass\n    finally:\n      time.sleep(30)",
+        "InputPayload": {
+          "DBInstanceIdentifier": "{{RenameParameters.PromotedTargetId}}"
+        }
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  from datetime import datetime, timezone\n  from dateutil import parser\n  return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{RecordStartTime.StartTime}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "Dryrun_EndBranch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EmptyStepForWetrunEnd",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "DeletePromotedInstance",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "EmptyStepForWetrunEnd",
+      "action": "aws:sleep",
+      "isEnd": true,
+      "inputs": {
+        "Duration": "PT1S"
+      }
+    },
+    {
+      "name": "DeletePromotedInstance",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DeleteDBInstance",
+        "DBInstanceIdentifier": "{{CreateReadReplica.ReplicaId}}-2",
+        "SkipFinalSnapshot": true,
+        "DeleteAutomatedBackups": true
+      }
+    }
+  ]
+}

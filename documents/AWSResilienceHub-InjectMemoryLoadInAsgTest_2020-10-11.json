@@ -1,0 +1,289 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## Intent\n'Test app performance and alarm under high memory load.'\n\n## Type\nTest\n\n## Risk\nHigh\n\n## Requirements\n  * ASG has more than 1 instances\n  * Only AmazonLinux instances are supported\n  * Memory Utilization Alarm is setup for ASG\n\n## Permissions required for AutomationAssumeRole\n  * ssm:GetParameters\n  * ssm:DescribeInstanceInformation\n  * ssm:SendCommand\n  * ssm:ListCommands\n  * ssm:ListCommandInvocations\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * cloudwatch:DescribeAlarms\n  * cloudwatch:GetMetricStatistics\n  * cloudwatch:DescribeAlarmHistory\n  * autoscaling:DescribeAutoScalingGroups\n  * iam:PassRole (restricted to same role)\n\n## Supports Rollback\n  Yes.\n\n## Cancellation behavior\n  Trigger rollback for previous execution.\n\n## Inputs\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf\n\n### (Required) AutoScalingGroupName:\n  * type: String\n  * description: (Required) Name of auto scaling group\n\n### (Required) MemoryUtilizationAlarmName:\n  * type: String\n  * description: (Required) ASG MemoryUtilization alarm which should be green after test\n\n### (Optional) DurationSeconds:\n  * type: String\n  * description: (Optional) The duration - in seconds - of the Memory stress.\n  * default: '300'\n\n### (Optional) Workers:\n  * type: String\n  * description: (Optional) The number of virtual memory stressors (default: 1)\n  * default: \"1\"\n\n### (Optional) LoadPercent:\n  * type: String\n  * description: (Optional) Specify the target memory load percentage. Valid values are between 0 (no load) and 100 (full load) (default - 100)\n  * default: \"100\"\n  * allowedPattern: \"^(100|[1-9]?[0-9])$\"\n\n### (Optional) PercentageOfInstances:\n  * type: Integer\n  * description: (Optional) Percentage of ASG EC2 instances to be impacted\n  * default: 1\n\n### (Optional) ExpectedRecoveryTime:\n  * type: String\n  * description: (Optional) Expected ASG EC2 instances recovery time in seconds\n  * default: '1'\n\n### (Optional) IsRollback:\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.\n  * default: 'false'\n\n### (Optional) PreviousExecutionId:\n  * type: String\n  * description: (Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.\n  * default: ''\n\n## Details\n  * Get healthy ASG EC2 instance ids.\n  * Get list of ASG EC2 instance ids which size is based on given percentage of instances should be stressed.\n  * Run Memory stress on chosen instances based on previous step for given time duration.\n  * Verify memory utilization alarm is in state 'Alarm' during memory stress test.\n  * Wait for given expected recovery time duration.\n  * Verify memory utilization alarm is in state 'OK' after recovery.\n  * Verify stress testing actually happened, by checking EC2 corresponding metric data points.\n  * In case of rollback stress testing will be terminated on EC2 machines.\n\n## Steps executed in normal flow\n  * SelectExecutionMode\n  * AssertAlarmToBeGreenBeforeTest\n  * GetAsgInstanceIds\n  * GetInstancesByPercentage\n  * RunMemoryStress\n  * AssertAlarmToBeRed\n  * WaitExpectedRecoveryTime\n  * AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n  * SelectExecutionMode\n  * GetInputsFromPreviousExecution\n  * AssertAutoScalingGroupName\n  * GetPreviousExecutionDetails\n  * KillStressCommandOnRollback\n\n## Outputs\nNone",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    },
+    "AutoScalingGroupName": {
+      "type": "String",
+      "description": "(Required) Name of AutoScalingGroup"
+    },
+    "MemoryUtilizationAlarmName": {
+      "type": "String",
+      "description": "(Required) ASG MemoryUtilization alarm which should be green after test"
+    },
+    "DurationSeconds": {
+      "type": "String",
+      "description": "(Optional) The duration of the attack in seconds (default/recommended 300)",
+      "default": "300"
+    },
+    "Workers": {
+      "type": "String",
+      "description": "(Optional) The number of virtual memory stressors (default: 1)",
+      "default": "1"
+    },
+    "LoadPercent": {
+      "type": "String",
+      "description": "(Optional) Specify the target memory load percentage. Valid values are between 0 (no load) and 100 (full load) (default - 100)",
+      "default": "100",
+      "allowedPattern": "^(100|[1-9]?[0-9])$"
+    },
+    "PercentageOfInstances": {
+      "type": "Integer",
+      "description": "(Optional) Percentage of ASG EC2 instances to be impacted (default 1)",
+      "default": 1
+    },
+    "ExpectedRecoveryTime": {
+      "type": "String",
+      "description": "(Optional) Expected ASG EC2 instances recovery time in seconds (default 1)",
+      "default": "1"
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "SelectExecutionMode",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AssertAlarmToBeGreenBeforeTest",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "false"
+          }
+        ],
+        "Default": "GetInputsFromPreviousExecution"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{MemoryUtilizationAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "GetAsgInstanceIds",
+      "description": "Get all healthy instances in ASG.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceIds",
+          "Selector": "$.Payload.InstanceIds",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_healthy_instance_ids_in_asg",
+        "InputPayload": {
+          "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+        },
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_healthy_instance_ids_in_asg(events, context):\n    if 'AutoScalingGroupName' not in events:\n        raise KeyError('Requires AutoScalingGroupName in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    autoscaling = boto3.client('autoscaling', config=config)\n\n    auto_scaling_groups = autoscaling.describe_auto_scaling_groups(\n        AutoScalingGroupNames=[\n            events['AutoScalingGroupName']\n        ]\n    )\n\n    # Take all healthy ASG EC2 instances\n    asg_healthy_instances = []\n    for instance in auto_scaling_groups['AutoScalingGroups'][0]['Instances']:\n        if instance['HealthStatus'] == 'Healthy' and instance['LifecycleState'] == 'InService':\n            asg_healthy_instances.append(instance['InstanceId'])\n\n    output = {}\n    output['InstanceIds'] = asg_healthy_instances\n    return output"
+      }
+    },
+    {
+      "name": "GetInstancesByPercentage",
+      "description": "Get instances based on input parameters on which memory load will be injected.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceIds",
+          "Selector": "$.Payload.InstanceIds",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_instance_ids_by_percentage",
+        "InputPayload": {
+          "InstanceIds": "{{GetAsgInstanceIds.InstanceIds}}",
+          "Percentage": "{{PercentageOfInstances}}"
+        },
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_instance_ids_by_percentage(events, context):\n    if 'InstanceIds' not in events or 'Percentage' not in events:\n        raise KeyError('Requires InstanceIds and Percentage in events')\n    instanceIds = events['InstanceIds']\n    percentage = events['Percentage']\n    instance_count = len(instanceIds)\n    output = {}\n    output['InstanceIds'] = []\n    if instance_count < 1:\n        raise Exception('No given EC2 instances')\n    if percentage < 1:\n        raise Exception('Given percentage should not be lower than 1%')\n    instance_count = ceil(instance_count / 100 * percentage)\n    for i in range(instance_count):\n        output['InstanceIds'].append(instanceIds[i])\n    return output"
+      }
+    },
+    {
+      "name": "RunMemoryStress",
+      "description": "Run FIS command document to inject memory stress.",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "DocumentName": "AWSFIS-Run-Memory-Stress",
+        "InstanceIds": [
+          "{{GetInstancesByPercentage.InstanceIds}}"
+        ],
+        "Parameters": {
+          "Percent": "{{LoadPercent}}",
+          "Workers": "{{Workers}}",
+          "DurationSeconds": "{{DurationSeconds}}"
+        }
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for alarm to be red after memory injection.",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "verify_alarm_triggered",
+        "InputPayload": {
+          "AlarmName": "{{MemoryUtilizationAlarmName}}",
+          "DurationInSeconds": "{{DurationSeconds}}"
+        },
+        "Script": "import boto3\nimport logging\nimport time\nfrom botocore.config import Config\nfrom datetime import datetime, timedelta\nfrom typing import Any, Callable, Iterator, List\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n\nPUT_METRIC_ALARM_PARAMS = ['AlarmName', 'AlarmDescription', 'ActionsEnabled', 'OKActions',\n                           'AlarmActions', 'InsufficientDataActions', 'MetricName', 'Namespace', 'Statistic',\n                           'ExtendedStatistic',\n                           'Dimensions', 'Period', 'Unit', 'EvaluationPeriods', 'DatapointsToAlarm',\n                           'Threshold', 'ComparisonOperator', 'TreatMissingData', 'EvaluateLowSampleCountPercentile',\n                           'Metrics', 'Tags', 'ThresholdMetricId']\n\n\n\n\ndef verify_alarm_triggered(events, context):\n    \"\"\"\n    Verify if alarm triggered\n    \"\"\"\n    if 'AlarmName' not in events or ('DurationInMinutes' not in events and 'DurationInSeconds' not in events):\n        raise KeyError('Requires AlarmName and either DurationInMinutes or DurationInSeconds in events')\n\n    cw = boto3.client('cloudwatch', config=boto3_config)\n\n    if 'DurationInMinutes' in events:\n        start_date = datetime.now() - timedelta(minutes=int(events['DurationInMinutes']))\n    else:\n        start_date = datetime.now() - timedelta(seconds=int(events['DurationInSeconds']))\n\n    response = cw.describe_alarm_history(\n        AlarmName=events['AlarmName'],\n        HistoryItemType='StateUpdate',\n        MaxRecords=5,\n        ScanBy='TimestampDescending',\n        StartDate=start_date)\n\n    for alarm_history_item in response['AlarmHistoryItems']:\n        if alarm_history_item['HistorySummary'] == \"Alarm updated from OK to ALARM\":\n            return\n\n    raise Exception('Alarm was not triggered')"
+      }
+    },
+    {
+      "name": "WaitExpectedRecoveryTime",
+      "description": "Wait for expected recovery time.",
+      "action": "aws:sleep",
+      "onFailure": "Abort",
+      "inputs": {
+        "Duration": "PT{{ExpectedRecoveryTime}}S"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete.",
+      "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{MemoryUtilizationAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "AutoScalingGroupName",
+          "Selector": "$.Payload.AutoScalingGroupName[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertAutoScalingGroupName",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetPreviousExecutionDetails",
+            "Variable": "{{ GetInputsFromPreviousExecution.AutoScalingGroupName }}",
+            "StringEquals": "{{ AutoScalingGroupName }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetPreviousExecutionDetails",
+      "description": "Get instance ids from previous execution details for rollback.",
+      "action": "aws:executeScript",
+      "maxAttempts": 2,
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceIds",
+          "Selector": "$.Payload.InstanceIds[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "GetAsgInstanceIds",
+          "ResponseField": "InstanceIds"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "KillStressCommandOnRollback",
+      "description": "Kill stress ng command running on ec2 instances during rollback to stop memory injection.",
+      "action": "aws:executeAutomation",
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWSResilienceHub-KillStressOnHealthyInstances_2020-07-28",
+        "RuntimeParameters": {
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}",
+          "AutoScalingGroupName": "{{AutoScalingGroupName}}",
+          "InstanceIds": "{{GetPreviousExecutionDetails.InstanceIds}}"
+        }
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress and starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

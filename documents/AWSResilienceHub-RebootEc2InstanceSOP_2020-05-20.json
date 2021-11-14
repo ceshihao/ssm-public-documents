@@ -1,0 +1,100 @@
+{
+  "description": "Reboots the ec2 instance",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "parameters": {
+    "EC2InstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) EC2InstanceIdentifier"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "AssertInstanceInAvailableState",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses..InstanceState.Name",
+        "DesiredValues": [
+          "running"
+        ]
+      }
+    },
+    {
+      "name": "RebootEC2Instance",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "rebootInstances",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ]
+      }
+    },
+    {
+      "name": "ValidateInstanceIsAvailable",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 900,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ EC2InstanceIdentifier }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses..InstanceState.Name",
+        "DesiredValues": [
+          "running"
+        ]
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

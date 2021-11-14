@@ -1,0 +1,165 @@
+{
+  "description": "## Id\nAWSResilienceHub-ChangeRestApiGwQuotaLimitSOP_2020-10-26\n\n## Intent\nChange quota limit and period of the REST API Gateway\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * REST API Gateway\n\n## Permissions required for AutomationAssumeRole\n  * apigateway:GET\n  * apigateway:POST\n  * apigateway:PATCH\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) RestApiGwUsagePlanId\n  * type: String\n  * description: The Id of the usage plan to be modified\n\n### (Required) RestApiGwQuotaLimit\n  * type: Integer\n  * description: New limit in requests/period\n\n### (Required) RestApiGwQuotaPeriod\n  * type: String\n  * description: Period for quota limit. DAY/WEEK/MONTH\n\n### (Required) ForceExecution\n  * type: String\n  * description: By default the document raises error if the quota limit is changed by more than 50%. If this option is True, skips this check. True of False.\n\n## Details\nThe document changes quota limit and period of the REST API Gateway. It also validates the requested values\nand raises error if quota limit is going to be increased/decreased by more than 50%. Users have an option\nto skip this validation using `ForceExecution` parameter or execute the current SOP several times with\nsmaller increments.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * CheckIfForceExecutionIsSet\n  * ValidateInputs\n  * SetQuotaConfiguration\n  * OutputRecoveryTime\n\n## Outputs\n### SetQuotaConfiguration.RestApiGwQuotaLimitNewValue\n  * type: Integer\n  * description: Quota limit value after update\n\n### SetQuotaConfiguration.RestApiGwQuotaPeriodNewValue\n  * type: String\n  * description: Quota limit period after update. DAY/WEEK/MONTH\n\n### ValidateInputs.RestApiGwQuotaLimitOriginalValue\n  * type: Integer\n  * description: Quota limit value before update\n\n### ValidateInputs.RestApiGwQuotaPeriodOriginalValue\n  * type: String\n  * description: Quota limit period before update. DAY/WEEK/MONTH\n\n### ValidateInputs.RestApiGwQuotaLimit\n  * type: Integer\n  * description: Requested new quota limit value\n\n### ValidateInputs.RestApiGwQuotaPeriod\n  * type: Integer\n  * description: Requested new quota limit period. DAY/WEEK/MONTH\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "RestApiGwUsagePlanId": {
+      "type": "String",
+      "description": "(Required) The Id of the usage plan to be modified."
+    },
+    "RestApiGwQuotaLimit": {
+      "type": "Integer",
+      "description": "(Required) New limit in requests/period"
+    },
+    "RestApiGwQuotaPeriod": {
+      "type": "String",
+      "description": "(Required) DAY/WEEK/MONTH"
+    },
+    "ForceExecution": {
+      "type": "String",
+      "description": "(Required) True/False"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "SetQuotaConfiguration.RestApiGwQuotaLimitNewValue",
+    "SetQuotaConfiguration.RestApiGwQuotaPeriodNewValue",
+    "ValidateInputs.RestApiGwQuotaLimitOriginalValue",
+    "ValidateInputs.RestApiGwQuotaPeriodOriginalValue",
+    "ValidateInputs.RestApiGwQuotaLimit",
+    "ValidateInputs.RestApiGwQuotaPeriod",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "CheckIfForceExecutionIsSet",
+      "description": "Check if `ForceExecution` option is true and changes by more than 50% are allowed",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "SetQuotaConfiguration",
+            "Variable": "{{ForceExecution}}",
+            "StringEquals": "True"
+          },
+          {
+            "NextStep": "ValidateInputs",
+            "Variable": "{{ForceExecution}}",
+            "StringEquals": "False"
+          }
+        ],
+        "Default": "SetQuotaConfiguration"
+      }
+    },
+    {
+      "name": "ValidateInputs",
+      "description": "Get current quota limits for given Usage Plan of REST API GW and raise error if requested increase/decrease is by\nmore than 50% of original values",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Payload.Result",
+          "Type": "String"
+        },
+        {
+          "Name": "RestApiGwQuotaLimitOriginalValue",
+          "Selector": "$.Payload.OriginalLimit",
+          "Type": "Integer"
+        },
+        {
+          "Name": "RestApiGwQuotaPeriodOriginalValue",
+          "Selector": "$.Payload.OriginalPeriod",
+          "Type": "String"
+        },
+        {
+          "Name": "RestApiGwQuotaLimit",
+          "Selector": "$.Payload.NewLimit",
+          "Type": "Integer"
+        },
+        {
+          "Name": "RestApiGwQuotaPeriod",
+          "Selector": "$.Payload.NewPeriod",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "check_limit_and_period",
+        "InputPayload": {
+          "RestApiGwUsagePlanId": "{{ RestApiGwUsagePlanId }}",
+          "RestApiGwQuotaLimit": "{{ RestApiGwQuotaLimit }}",
+          "RestApiGwQuotaPeriod": "{{ RestApiGwQuotaPeriod }}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom random import uniform\nfrom typing import Any, Callable\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlog = logging.getLogger()\nlog.setLevel(logging.INFO)\n\n\n\ndef check_limit_and_period(events, context):\n    \"\"\"\n    Check if new values do not change usage plan by more than 50%\n    :return: Evaluation result, old and new limits and periods\n    \"\"\"\n    if 'RestApiGwUsagePlanId' not in events:\n        raise KeyError('Requires RestApiGwUsagePlanId  in events')\n    if 'RestApiGwQuotaLimit' not in events:\n        raise KeyError('Requires RestApiGwQuotaLimit  in events')\n    if 'RestApiGwQuotaPeriod' not in events:\n        raise KeyError('Requires RestApiGwQuotaPeriod  in events')\n\n    usage_plan_id = events['RestApiGwUsagePlanId']\n    new_usage_plan_limit = events['RestApiGwQuotaLimit']\n    new_usage_plan_period = events['RestApiGwQuotaPeriod']\n\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    apigw_client = boto3.client('apigateway', config=config)\n\n    log.debug(f'Getting limit and period from Plan {usage_plan_id} ...')\n    apigw_usage_plan = apigw_client.get_usage_plan(usagePlanId=usage_plan_id)\n    if apigw_usage_plan['ResponseMetadata']['HTTPStatusCode'] != 200:\n        log.error(f'Failed to get usage plan with id {usage_plan_id}, response is {apigw_usage_plan}')\n        raise ValueError('Failed to get usage plan limit and period')\n\n    current_usage_plan_limit = apigw_usage_plan[\"quota\"][\"limit\"]\n    current_usage_plan_period = apigw_usage_plan[\"quota\"][\"period\"]\n    log.debug(f'The converted period is {current_usage_plan_period}')\n    choices = {'DAY': 1, 'WEEK': 7, 'MONTH': 30}\n    divider_current = choices[current_usage_plan_period]\n    divider_new = choices[new_usage_plan_period]\n\n    converted_current_limit = int(apigw_usage_plan[\"quota\"][\"limit\"]) / divider_current\n    converted_new_limit = int(new_usage_plan_limit) / divider_new\n\n    evaluation_message = \"The converted current/new limits are \" + str(converted_current_limit) + \"\"\"/\n                         \"\"\" + str(converted_new_limit)\n\n    log.debug(evaluation_message)\n\n    if abs(converted_current_limit - converted_new_limit) > converted_current_limit * 0.5:\n        result = 'warning'\n        exception = \"\"\"Warning: The quota is going to be increased on more than 50%.\n                    Please use smaller increments or use ForceExecution=True\n                    parameter to disable validation. \"\"\" + evaluation_message\n        raise AssertionError(exception)\n    else:\n        log.debug('Info: The quota is going to be increased not more than 50%')\n        result = 'ok'\n\n    return {\"Result\": result,\n            \"OriginalLimit\": current_usage_plan_limit,\n            \"OriginalPeriod\": current_usage_plan_period,\n            \"NewLimit\": new_usage_plan_limit,\n            \"NewPeriod\": new_usage_plan_period}"
+      },
+      "nextStep": "SetQuotaConfiguration"
+    },
+    {
+      "name": "SetQuotaConfiguration",
+      "description": "Update quota limits for given Usage Plan of REST API GW",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RestApiGwQuotaLimitNewValue",
+          "Selector": "$.Payload.Limit",
+          "Type": "Integer"
+        },
+        {
+          "Name": "RestApiGwQuotaPeriodNewValue",
+          "Selector": "$.Payload.Period",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "set_limit_and_period",
+        "InputPayload": {
+          "RestApiGwUsagePlanId": "{{ RestApiGwUsagePlanId }}",
+          "RestApiGwQuotaLimit": "{{ RestApiGwQuotaLimit }}",
+          "RestApiGwQuotaPeriod": "{{ RestApiGwQuotaPeriod }}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom random import uniform\nfrom typing import Any, Callable\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlog = logging.getLogger()\nlog.setLevel(logging.INFO)\n\n\n\ndef assert_https_status_code_200(response: dict, error_message: str) -> None:\n    if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n        raise ValueError(f'{error_message} Response is: {response}')\n\n\n\ndef get_throttling_config(events: dict, context: dict) -> dict:\n    if 'RestApiGwUsagePlanId' not in events:\n        raise KeyError('Requires RestApiGwUsagePlanId in events')\n\n    if 'RestApiGwStageName' in events and events['RestApiGwStageName']:\n        if 'RestApiGwId' not in events:\n            raise KeyError('Requires RestApiGwId in events')\n        if not events['RestApiGwId']:\n            raise KeyError('RestApiGwId should not be empty')\n\n    usage_plan_id: str = events['RestApiGwUsagePlanId']\n    gateway_id: str = events.get('RestApiGwId')\n    stage_name: str = events.get('RestApiGwStageName')\n    resource_path: str = events.get('RestApiGwResourcePath', '*')\n    http_method: str = events.get('RestApiGwHttpMethod', '*')\n\n    # Need to have it here for rollback case to overcame issue DIG-853 with get_inputs_from_ssm_execution\n    if (stage_name and stage_name.startswith('{{')) and (gateway_id and gateway_id.startswith('{{')):\n        gateway_id = stage_name = None\n    resource_path = '*' if resource_path.startswith('{{') else resource_path\n    http_method = '*' if http_method.startswith('{{') else http_method\n\n    config: object = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    client = boto3.client('apigateway', config=config)\n    usage_plan = client.get_usage_plan(usagePlanId=usage_plan_id)\n    assert_https_status_code_200(usage_plan, f'Failed to get usage plan with id {usage_plan_id}')\n\n    if stage_name:\n        stage_found = False\n        for stage in usage_plan['apiStages']:\n            if stage['apiId'] == gateway_id and stage['stage'] == stage_name:\n                stage_found = True\n                if 'throttle' in stage and f'{resource_path}/{http_method}' in stage['throttle']:\n                    rate_limit: float = stage['throttle'][f'{resource_path}/{http_method}']['rateLimit']\n                    burst_limit: int = stage['throttle'][f'{resource_path}/{http_method}']['burstLimit']\n                else:\n                    rate_limit: float = usage_plan['throttle']['rateLimit']\n                    burst_limit: int = usage_plan['throttle']['burstLimit']\n        if not stage_found:\n            raise KeyError(f'Stage name {stage_name} not found in get_usage_plan response: {usage_plan}')\n    else:\n        rate_limit: float = usage_plan['throttle']['rateLimit']\n        burst_limit: int = usage_plan['throttle']['burstLimit']\n\n    return {'RateLimit': int(rate_limit),\n            'BurstLimit': burst_limit,\n            'QuotaLimit': usage_plan['quota']['limit'],\n            'QuotaPeriod': usage_plan['quota']['period']}\n\n\n\ndef wait_limit_and_period_updated(events, context):\n    expected_quota_limit: int = int(events['RestApiGwQuotaLimit'])\n    expected_quota_period: str = events['RestApiGwQuotaPeriod']\n    max_retries: int = events.get('MaxRetries', 40)\n    timeout: int = events.get('Timeout', 15)\n    max_timeout = max_retries * timeout\n    while max_retries > 0:\n        actual_throttling_config = get_throttling_config(events, None)\n        actual_quota_limit = actual_throttling_config['QuotaLimit']\n        actual_quota_period = actual_throttling_config['QuotaPeriod']\n        if actual_quota_limit == expected_quota_limit and actual_quota_period == expected_quota_period:\n            log.info('Quota limit and period updated')\n            return\n        log.info(f'Waiting for expected values: '\n                 f'[QuotaLimit: {expected_quota_limit}, QuotaPeriod: {expected_quota_period}], '\n                 f'actual values: [QuotaLimit: {actual_quota_limit}, QuotaPeriod: {actual_quota_period}]')\n        max_retries -= 1\n        time.sleep(timeout)\n\n    raise TimeoutError(f'Error to wait for updated values of QuotaLimit and QuotaPeriod. '\n                       f'Expected values: [QuotaLimit: {expected_quota_limit}, QuotaPeriod: {expected_quota_period}]. '\n                       f'Actual values: [QuotaLimit: {actual_quota_limit}, QuotaPeriod: {actual_quota_period}] '\n                       f'Maximum timeout {max_timeout} seconds exceeded!')\n\n\n\ndef set_limit_and_period(events, context):\n    \"\"\"\n    Set usage plan limit and period\n    :return: New limit and period\n    \"\"\"\n    if 'RestApiGwUsagePlanId' not in events:\n        raise KeyError('Requires RestApiGwUsagePlanId  in events')\n    if 'RestApiGwQuotaLimit' not in events:\n        raise KeyError('Requires RestApiGwQuotaLimit  in events')\n    if 'RestApiGwQuotaPeriod' not in events:\n        raise KeyError('Requires RestApiGwQuotaPeriod  in events')\n\n    usage_plan_id = events['RestApiGwUsagePlanId']\n    new_usage_plan_limit = events['RestApiGwQuotaLimit']\n    new_usage_plan_period = events['RestApiGwQuotaPeriod']\n\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    apigw_client = boto3.client('apigateway', config=config)\n\n    apigw_usage_plan = apigw_client.update_usage_plan(\n        usagePlanId=usage_plan_id,\n        patchOperations=[\n            {\n                'op': 'replace',\n                'path': '/quota/limit',\n                'value': str(new_usage_plan_limit)\n            },\n            {\n                'op': 'replace',\n                'path': '/quota/period',\n                'value': new_usage_plan_period\n            }\n        ])\n    log.debug(f'The response from the API : {apigw_usage_plan}')\n    if apigw_usage_plan['ResponseMetadata']['HTTPStatusCode'] != 200:\n        log.error(f'Failed to update usage plan with id {usage_plan_id}, response is {apigw_usage_plan}')\n        raise ValueError('Failed to update usage plan limit and period')\n\n    wait_limit_and_period_updated(events, None)\n\n    return {\"Limit\": apigw_usage_plan[\"quota\"][\"limit\"],\n            \"Period\": apigw_usage_plan[\"quota\"][\"period\"]}"
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

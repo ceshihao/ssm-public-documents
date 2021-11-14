@@ -1,0 +1,118 @@
+{
+  "description": "## Id\nAWSResilienceHub-UpdateRestApiGwVersionSOP_2020-10-26\n\n## Intent\nUpdate REST API Gateway Stage deployment version\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * REST API Gateway\n\n## Permissions required for AutomationAssumeRole\n  * apigateway:GET\n  * apigateway:PATCH\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) RestApiGwId\n  * type: String\n  * description: The ID of the REST API Gateway\n\n### (Required) RestStageName\n  * type: String\n  * description: The stage name of the REST API Gateway\n\n### (Optional) RestDeploymentId\n  * type: String\n  * description: The ID of deployment that should be applied on the given stage\n  * default: ''\n\n## Details\nThe document validates that auto deployment is turned off for the specified stage and applies the previous\ndeployment (by creation date) or the specified deployment on the REST API Gateway stage.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * FindDeploymentIdForUpdate\n  * UpdateDeployment\n  * OutputRecoveryTime\n\n## Outputs\n### FindDeploymentIdForUpdate.RestDeploymentIdOriginalValue\n  * type: String\n  * description: Deployment Id before update\n\n### FindDeploymentIdForUpdate.RestDeploymentIdToApply\n  * type: String\n  * description: Previous deployment Id selected to apply if Id is not specified\n\n### UpdateDeployment.RestDeploymentIdNewValue\n  * type: String\n  * description: Deployment Id after update\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "RestApiGwId": {
+      "type": "String",
+      "description": "(Required) The ID of the REST API Gateway."
+    },
+    "RestStageName": {
+      "type": "String",
+      "description": "(Required) The stage name of the REST API Gateway."
+    },
+    "RestDeploymentId": {
+      "type": "String",
+      "description": "(Optional) The ID of deployment that should be applied on the give stage",
+      "default": ""
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "FindDeploymentIdForUpdate.RestDeploymentIdOriginalValue",
+    "FindDeploymentIdForUpdate.RestDeploymentIdToApply",
+    "UpdateDeployment.RestDeploymentIdNewValue",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "FindDeploymentIdForUpdate",
+      "description": "Find previous deployment by creation date if `RestDeploymentId` not specified",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RestDeploymentIdOriginalValue",
+          "Selector": "$.Payload.OriginalDeploymentId",
+          "Type": "String"
+        },
+        {
+          "Name": "RestDeploymentIdToApply",
+          "Selector": "$.Payload.DeploymentIdToApply",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "find_deployment_id_for_update",
+        "InputPayload": {
+          "RestApiGwId": "{{ RestApiGwId }}",
+          "RestStageName": "{{ RestStageName }}",
+          "RestDeploymentId": "{{ RestDeploymentId }}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom random import uniform\nfrom typing import Any, Callable\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlog = logging.getLogger()\nlog.setLevel(logging.INFO)\n\n\n\ndef get_stage(config: object, gateway_id: str, stage_name: str) -> dict:\n    client = boto3.client('apigateway', config=config)\n    response = client.get_stage(restApiId=gateway_id, stageName=stage_name)\n    assert_https_status_code_200(response, f'Failed to perform get_stage with '\n                                           f'restApiId: {gateway_id} and stageName: {stage_name}')\n    return response\n\n\n\ndef get_deployment(config: object, gateway_id: str, deployment_id: str) -> dict:\n    client = boto3.client('apigateway', config=config)\n    response = client.get_deployment(restApiId=gateway_id, deploymentId=deployment_id)\n    assert_https_status_code_200(response, f'Failed to perform get_deployment with '\n                                           f'restApiId: {gateway_id} and deploymentId: {deployment_id}')\n    return response\n\n\n\ndef get_deployments(config: object, gateway_id: str, limit: int = 25) -> dict:\n    client = boto3.client('apigateway', config=config)\n    response = client.get_deployments(restApiId=gateway_id, limit=limit)\n    assert_https_status_code_200(response, f'Failed to perform get_deployments with restApiId: {gateway_id}')\n    return response\n\n\n\ndef assert_https_status_code_200(response: dict, error_message: str) -> None:\n    if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n        raise ValueError(f'{error_message} Response is: {response}')\n\n\n\ndef find_deployment_id_for_update(events: dict, context: dict) -> dict:\n    \"\"\"\n    Find deployment id for update\n    \"\"\"\n    if 'RestApiGwId' not in events:\n        raise KeyError('Requires RestApiGwId in events')\n\n    if 'RestStageName' not in events:\n        raise KeyError('Requires RestStageName in events')\n\n    output: dict = {}\n    gateway_id: str = events['RestApiGwId']\n    stage_name: str = events['RestStageName']\n    provided_deployment_id: str = events.get('RestDeploymentId', '')\n\n    boto3_config: object = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    current_deployment_id = get_stage(boto3_config, gateway_id, stage_name)['deploymentId']\n    output['OriginalDeploymentId'] = current_deployment_id\n\n    if provided_deployment_id and provided_deployment_id == current_deployment_id:\n        raise ValueError('Provided deployment ID and current deployment ID should not be the same')\n\n    if provided_deployment_id:\n        output['DeploymentIdToApply'] = get_deployment(boto3_config, gateway_id, provided_deployment_id)['id']\n        return output\n\n    deployment_items = get_deployments(boto3_config, gateway_id, 500)['items']\n    if len(deployment_items) == 1 and deployment_items[0]['id'] == current_deployment_id:\n        raise ValueError(f'There are no deployments found to apply in RestApiGateway ID: {gateway_id}, '\n                         f'except current deployment ID: {current_deployment_id}')\n\n    current_deployment_creation_date = get_deployment(boto3_config, gateway_id, current_deployment_id)['createdDate']\n    deployment_items.sort(key=lambda x: x['createdDate'], reverse=True)\n\n    for item in deployment_items:\n        if item['createdDate'] < current_deployment_creation_date and item['id'] != current_deployment_id:\n            output['DeploymentIdToApply'] = item['id']\n            return output\n\n    raise ValueError(f'Could not find any existing deployment which has createdDate less than current deployment ID: '\n                     f'{current_deployment_id}, with createdDate: {current_deployment_creation_date}')"
+      }
+    },
+    {
+      "name": "UpdateDeployment",
+      "description": "Apply the specified or previous deployment to stage",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RestDeploymentIdNewValue",
+          "Selector": "$.Payload.DeploymentIdNewValue",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "update_deployment",
+        "InputPayload": {
+          "RestApiGwId": "{{ RestApiGwId }}",
+          "RestStageName": "{{ RestStageName }}",
+          "RestDeploymentId": "{{ FindDeploymentIdForUpdate.RestDeploymentIdToApply }}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom random import uniform\nfrom typing import Any, Callable\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlog = logging.getLogger()\nlog.setLevel(logging.INFO)\n\n\n\ndef assert_https_status_code_200(response: dict, error_message: str) -> None:\n    if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n        raise ValueError(f'{error_message} Response is: {response}')\n\n\n\ndef update_deployment(events: dict, context: dict) -> dict:\n    \"\"\"\n    Apply RestDeploymentId to provided RestStageName\n    \"\"\"\n    if 'RestApiGwId' not in events:\n        raise KeyError('Requires RestApiGwId in events')\n\n    if 'RestStageName' not in events:\n        raise KeyError('Requires RestStageName in events')\n\n    if 'RestDeploymentId' not in events:\n        raise KeyError('Requires RestDeploymentId in events')\n\n    gateway_id: str = events['RestApiGwId']\n    stage_name: str = events['RestStageName']\n    deployment_id: str = events['RestDeploymentId']\n\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    client = boto3.client('apigateway', config=config)\n    response = client.update_stage(\n        restApiId=gateway_id,\n        stageName=stage_name,\n        patchOperations=[\n            {\n                'op': 'replace',\n                'path': '/deploymentId',\n                'value': deployment_id,\n            },\n        ]\n    )\n    assert_https_status_code_200(response, f'Failed to perform update_stage with restApiId: {gateway_id},'\n                                           f' stageName: {stage_name} and deploymentId: {deployment_id}')\n\n    return {'DeploymentIdNewValue': response['deploymentId'],\n            'StageName': response['stageName']}"
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

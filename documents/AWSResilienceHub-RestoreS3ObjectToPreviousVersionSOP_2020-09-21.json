@@ -1,0 +1,95 @@
+{
+  "description": "## Id\nAWSResilienceHub-RestoreS3ObjectToPreviousVersionSOP_2020-09-21\n\n## Intent\nrestore an S3 object into a previous version\n\n## Type\nSOP\n\n## Risk\nSmall\n\n## Requirements\n  * S3 bucket with versioning enabled\n\n## Permissions required for AutomationAssumeRole\n  * s3:PutObject\n  * s3:GetObject\n  * s3:GetObject*\n  * s3:ListBucket\n  * s3:ListBucketVersions\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) S3BucketName\n  * type: String\n  * description: The S3 Bucket Name\n\n### (Required) S3BucketObjectKey\n  * type: String\n  * description: The S3 Bucket Object Key\n\n## Details\nThe document checks if the specified object has previous versions, gets latest previous version and uses it\nto replace the object.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * RestoreToThePreviousVersion\n  * OutputRecoveryTime\n\n## Outputs\n### RestoreToThePreviousVersion.RestoreTimeSeconds\n  * type: String\n  * description: Time in seconds taken by script execution\n\n### RestoreToThePreviousVersion.ActualVersion\n  * type: String\n  * description: Key of the actual object version after restore\n\n### RestoreToThePreviousVersion.OldVersion\n  * type: String\n  * description: Key of the object version before restore\n\n### OutputRecoveryTime.RecoveryTime\n  * type: String\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "S3BucketName": {
+      "type": "String",
+      "description": "(Required) The S3 Bucket Name."
+    },
+    "S3BucketObjectKey": {
+      "type": "String",
+      "description": "(Required) The S3 Bucket Object Key."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime",
+    "RestoreToThePreviousVersion.RestoreTimeSeconds",
+    "RestoreToThePreviousVersion.ActualVersion",
+    "RestoreToThePreviousVersion.OldVersion"
+  ],
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "RestoreToThePreviousVersion",
+      "description": "Execute script that checks if object has previous versions and replaces object with the latest of the previous versions",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RestoreTimeSeconds",
+          "Selector": "$.Payload.RestoreTimeSeconds",
+          "Type": "String"
+        },
+        {
+          "Name": "ActualVersion",
+          "Selector": "$.Payload.ActualVersion",
+          "Type": "String"
+        },
+        {
+          "Name": "OldVersion",
+          "Selector": "$.Payload.OldVersion",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "restore_to_the_previous_version",
+        "InputPayload": {
+          "S3BucketName": "{{S3BucketName}}",
+          "S3BucketObjectKey": "{{S3BucketObjectKey}}"
+        },
+        "Script": "import boto3\nfrom datetime import datetime\nfrom botocore.config import Config\n\n\n\n\ndef restore_to_the_previous_version(events, context):\n    \"\"\"\n    Restore to the previous version the object\n    :return: Restore time, actual version, old version\n    \"\"\"\n    if 'S3BucketObjectKey' not in events or 'S3BucketName' not in events:\n        raise KeyError('Requires S3BucketObjectKey and S3BucketName in events')\n\n    start = datetime.utcnow()\n\n    s3_bucket_name = events['S3BucketName']\n    s3_bucket_object_key = events['S3BucketObjectKey']\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    s3_client = boto3.client('s3', config=config)\n    list_object_versions_response = s3_client.list_object_versions(Bucket=s3_bucket_name,\n                                                                   Prefix=s3_bucket_object_key,\n                                                                   MaxKeys=2)\n    if \"Versions\" in list_object_versions_response:\n        if len(list_object_versions_response[\"Versions\"]) < 2:\n            raise AssertionError(f'The file {s3_bucket_object_key} has less than 2 versions: '\n                                 f'{list_object_versions_response[\"Versions\"]}. Can not restore to the previous one.')\n\n        latest_version = list_object_versions_response[\"Versions\"][0]['VersionId']\n        previous_version = list_object_versions_response[\"Versions\"][1]['VersionId']\n\n        print(f'Restore {s3_bucket_object_key} file from the latest {latest_version} '\n              f'version to the previous {previous_version} version'\n              f'in the bucket {s3_bucket_object_key}...')\n        copy_source = {\n            'Bucket': s3_bucket_name,\n            'Key': s3_bucket_object_key,\n            'VersionId': previous_version,\n        }\n        s3_client.copy(copy_source, s3_bucket_name, s3_bucket_object_key)\n        print(f'The file {s3_bucket_object_key} file was successfully restored from the latest'\n              f' {latest_version} '\n              f'version to the previous {previous_version} version')\n\n        return {'RestoreTimeSeconds': str((datetime.utcnow() - start).total_seconds()),\n                'ActualVersion': previous_version,\n                'OldVersion': latest_version}\n    else:\n        raise AssertionError(f'The bucket {s3_bucket_name} is not versioning but it has to be')"
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

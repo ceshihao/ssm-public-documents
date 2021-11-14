@@ -1,0 +1,317 @@
+{
+  "description": "## Id\nAWSResilienceHub-SimulateNatGwInternetUnavailableTest_2020-09-21\n\n## Intent\nTest alarm can detect internet unavailable on network gateway\n\n## Type\nTEST\n\n## Risk\nHigh\n\n## Requirements\n  * NAT Gateway\n  * Internet Gateway\n  * VPC\n  * Public Subnet\n  * Route with NAT Gateway target\n  * Alarm for metric [BytesOutToSource](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway-cloudwatch.html) setup for the NAT Gateway\n  * There is outbound traffic from the application through the NAT Gateway\n\n## Permissions required for AutomationAssumeRole\n  * ec2:DescribeRouteTables\n  * ec2:DeleteRoute\n  * ec2:CreateRoute\n  * ec2:DescribeSubnets\n  * cloudwatch:DescribeAlarms\n  * ssm:StartAutomationExecution\n  * ssm:GetAutomationExecution\n  * ssm:GetParameters\n  * iam:PassRole\n\n## Supports Rollback\nYes. Restores deleted routes to NAT Gateway\n\n## Cancellation behavior\nRestores deleted routes to NAT Gateway\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) NatGatewayId\n  * type: String\n  * description: The NAT Gateway ID\n\n### (Required) BytesOutToSourceAlarmName\n  * type: String\n  * description: Alarm for metric [BytesOutToSource]https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway-cloudwatch.html) setup for the NAT Gateway\n\n### (Optional) PrivateSubnetId\n  * type: String\n  * description: The Private Subnet ID to filter routes\n\n### (Optional) IsRollback\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n  * default: false\n\n### (Optional) PreviousExecutionId\n  * type: String\n  * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nThe document filters route table for the list of routes that target the specified NAT Gateway and deletes\nthem to simulate network failure. If private subnet is specified, deletes only routes from that subnet.\nIn case of issues user may need to restore deleted routes from `Backup` SSM step's output.\n\n## Steps executed in normal flow\n  * CheckIsRollback\n  * Backup\n  * AssertAlarmToBeGreenBeforeTest\n  * DeleteRoute\n  * AssertAlarmToBeRed\n  * RollbackCurrent\n  * AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n  * CheckIsRollback\n  * GetPreviousExecutionInputsNatGw\n  * AssertNatGatewayId\n  * GetPreviousExecutionInputsSubnet\n  * AssertPrivateSubnetId\n  * GetPreviousExecutionBackupOutputs\n  * RollbackPreviousExecution\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "NatGatewayId": {
+      "type": "String",
+      "description": "(Required) The NAT Gateway ID"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "BytesOutToSourceAlarmName": {
+      "type": "String",
+      "description": "(Required) Alarm for metric `BytesOutToSource` setup for the NAT Gateway"
+    },
+    "PrivateSubnetId": {
+      "type": "String",
+      "description": "(Optional) The Private Subnet ID.",
+      "default": ""
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`)",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetPreviousExecutionInputsNatGw",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "Backup"
+      }
+    },
+    {
+      "name": "GetPreviousExecutionInputsNatGw",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "NatGatewayId",
+          "Selector": "$.Payload.NatGatewayId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_inputs_from_input_payload_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "Backup",
+          "InputPayloadField": "NatGatewayId"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                step_output = step['Inputs'][response_field]\n                output[response_field] = json.loads(step_output)\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])\n\n\n\ndef get_inputs_from_input_payload_ssm_step_execution(events, context):\n    if 'ExecutionId' not in events or 'StepName' not in events or 'InputPayloadField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and InputPayloadField in events')\n    events['ResponseField'] = 'InputPayload'\n    payload = get_inputs_from_ssm_step_execution(events=events,\n                                                 context=context)\n    field = events['InputPayloadField']\n    return {\n        field: payload['InputPayload'][field]\n    }"
+      }
+    },
+    {
+      "name": "AssertNatGatewayId",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetPreviousExecutionInputsSubnet",
+            "Variable": "{{ GetPreviousExecutionInputsNatGw.NatGatewayId }}",
+            "StringEquals": "{{ NatGatewayId }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetPreviousExecutionInputsSubnet",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "PrivateSubnetId",
+          "Selector": "$.Payload.PrivateSubnetId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_inputs_from_input_payload_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "Backup",
+          "InputPayloadField": "PrivateSubnetId"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                step_output = step['Inputs'][response_field]\n                output[response_field] = json.loads(step_output)\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])\n\n\n\ndef get_inputs_from_input_payload_ssm_step_execution(events, context):\n    if 'ExecutionId' not in events or 'StepName' not in events or 'InputPayloadField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and InputPayloadField in events')\n    events['ResponseField'] = 'InputPayload'\n    payload = get_inputs_from_ssm_step_execution(events=events,\n                                                 context=context)\n    field = events['InputPayloadField']\n    return {\n        field: payload['InputPayload'][field]\n    }"
+      }
+    },
+    {
+      "name": "AssertPrivateSubnetId",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetPreviousExecutionBackupOutputs",
+            "Variable": "{{ GetPreviousExecutionInputsSubnet.PrivateSubnetId }}",
+            "StringEquals": "{{ PrivateSubnetId }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetPreviousExecutionBackupOutputs",
+      "description": "Get original route from backup",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RoutesOriginalValue",
+          "Selector": "$.Payload.RoutesOriginalValue[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "Backup",
+          "ResponseField": "RoutesOriginalValue"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "RollbackPreviousExecution",
+      "description": "Restore original routes from backup",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RestoredValue",
+          "Selector": "$.Payload.Response",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "create_nat_gw_routes",
+        "InputPayload": {
+          "OriginalValue": "{{GetPreviousExecutionBackupOutputs.RoutesOriginalValue}}",
+          "NatGatewayId": "{{NatGatewayId}}",
+          "PrivateSubnetId": "{{PrivateSubnetId}}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nINTERNET_DESTINATION = '0.0.0.0/0'\n\n\n\n\ndef _get_nat_routes_filter(nat_gw_id: str,\n                           private_subnet_id: str = None,\n                           destination_ipv4_cidr_block: str = None) -> List[str]:\n    filters = [{'Name': 'route.nat-gateway-id', 'Values': [nat_gw_id]}]\n    if private_subnet_id:\n        filters.append({'Name': 'association.subnet-id', 'Values': [private_subnet_id]})\n    if destination_ipv4_cidr_block:\n        filters.append({'Name': 'route.destination-cidr-block', 'Values': [destination_ipv4_cidr_block]})\n\n    return filters\n\n\n\ndef _get_ipv4_routes_to_nat(boto3_ec2_client,\n                            nat_gw_id: str,\n                            private_subnet_id: str = None,\n                            destination_ipv4_cidr_block=None) -> dict:\n    describe_route_filters = _get_nat_routes_filter(nat_gw_id=nat_gw_id,\n                                                    private_subnet_id=private_subnet_id,\n                                                    destination_ipv4_cidr_block=destination_ipv4_cidr_block)\n    print(f'filter: {describe_route_filters}')\n\n    route_tables_response = boto3_ec2_client.describe_route_tables(Filters=describe_route_filters)\n    if not route_tables_response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        print(route_tables_response)\n        raise ValueError('Failed to get route tables')\n\n    return [{'RouteTableId': rt['RouteTableId'],\n             'Routes':[{'DestinationCidrBlock': route['DestinationCidrBlock']}\n            for route in filter(lambda x: x.get('NatGatewayId', '') == nat_gw_id, rt['Routes'])]}\n            for rt in route_tables_response['RouteTables']]\n\n\n\ndef _check_if_route_already_exists(route_table_id: str, cidr_ipv4: str, current_routes: dict) -> bool:\n    \"\"\"\n    Checks whether or not route already exist\n    :param route_table_id: The ID of the route table\n    :param cidr_ipv4: The IPv4 CIDR\n    :param current_routes: The current routes\n    \"\"\"\n    existing_rts = [rt for rt in current_routes\n                    if rt.get('RouteTableId', '') == route_table_id]\n    if existing_rts:\n        routes = existing_rts[0].get('Routes', [])\n        existing_routes = [r for r in routes\n                           if r.get('DestinationCidrBlock', '') == cidr_ipv4]\n        if existing_routes:\n            return True\n\n    return False\n\n\n\ndef _create_route(boto3_ec2_client, route_table_id: str,\n                  destination_ipv4_cidr_block: str,\n                  nat_gw_id: str) -> dict:\n    create_route_response = boto3_ec2_client.create_route(RouteTableId=route_table_id,\n                                                          DestinationCidrBlock=destination_ipv4_cidr_block,\n                                                          NatGatewayId=nat_gw_id)\n    if not create_route_response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        print(create_route_response)\n        raise ValueError('Failed to delete route')\n\n    return create_route_response\n\n\n\ndef _create_route_and_wait(boto3_ec2_client, route_table_id: str,\n                           destination_ipv4_cidr_block: str,\n                           nat_gw_id: str,\n                           wait_timeout_seconds: int = 30) -> dict:\n\n    route = _create_route(boto3_ec2_client=boto3_ec2_client,\n                          route_table_id=route_table_id,\n                          destination_ipv4_cidr_block=destination_ipv4_cidr_block,\n                          nat_gw_id=nat_gw_id)\n\n    start = time.time()\n    elapsed = 0\n    while elapsed <= wait_timeout_seconds:\n        ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=boto3_ec2_client,\n                                              nat_gw_id=nat_gw_id,\n                                              private_subnet_id=None,\n                                              destination_ipv4_cidr_block=destination_ipv4_cidr_block)\n        if ipv4_rt_nat:\n            return route\n\n        end = time.time()\n        logging.debug(f'time elapsed {elapsed} seconds. The last result:{ipv4_rt_nat}')\n        time.sleep(10)\n        elapsed = end - start\n\n    raise TimeoutError(f'After {elapsed} route [{route}] hasn\\'t been found in route table [{route_table_id}].')\n\n\n\ndef create_nat_gw_routes(events, context):\n    print('Creating ec2 client')\n    print(events)\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ec2 = boto3.client('ec2', config=config)\n\n    if 'NatGatewayId' not in events:\n        raise KeyError('Requires NatGatewayId')\n    if 'OriginalValue' not in events:\n        raise KeyError('Requires OriginalValue')\n\n    nat_gw_id = events['NatGatewayId']\n    private_subnet_id = events['PrivateSubnetId'] if 'PrivateSubnetId' in events else None\n    original_value = json.loads(events['OriginalValue'])\n\n    ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=ec2,\n                                          nat_gw_id=nat_gw_id,\n                                          private_subnet_id=private_subnet_id)\n    for route_table in original_value:\n        route_table_id = route_table['RouteTableId']\n        for route in route_table['Routes']:\n            cidr = route['DestinationCidrBlock']\n            exists = _check_if_route_already_exists(route_table_id=route_table_id,\n                                                    cidr_ipv4=cidr,\n                                                    current_routes=ipv4_rt_nat)\n            if exists:\n                print(f'The route to {cidr} already exists. Route tables is {route_table_id}')\n                continue\n            _create_route_and_wait(boto3_ec2_client=ec2,\n                                   route_table_id=route_table_id,\n                                   destination_ipv4_cidr_block=cidr,\n                                   nat_gw_id=nat_gw_id)\n\n    ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=ec2,\n                                          nat_gw_id=nat_gw_id,\n                                          private_subnet_id=private_subnet_id)\n\n    return {\n        'Response': json.dumps(ipv4_rt_nat)\n    }"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "Backup",
+      "description": "Backup original routes targeting the NAT Gateway for rollback",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RoutesOriginalValue",
+          "Selector": "$.Payload.Response",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_nat_gw_routes",
+        "InputPayload": {
+          "NatGatewayId": "{{NatGatewayId}}",
+          "PrivateSubnetId": "{{PrivateSubnetId}}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nINTERNET_DESTINATION = '0.0.0.0/0'\n\n\n\n\ndef _get_nat_routes_filter(nat_gw_id: str,\n                           private_subnet_id: str = None,\n                           destination_ipv4_cidr_block: str = None) -> List[str]:\n    filters = [{'Name': 'route.nat-gateway-id', 'Values': [nat_gw_id]}]\n    if private_subnet_id:\n        filters.append({'Name': 'association.subnet-id', 'Values': [private_subnet_id]})\n    if destination_ipv4_cidr_block:\n        filters.append({'Name': 'route.destination-cidr-block', 'Values': [destination_ipv4_cidr_block]})\n\n    return filters\n\n\n\ndef _get_ipv4_routes_to_nat(boto3_ec2_client,\n                            nat_gw_id: str,\n                            private_subnet_id: str = None,\n                            destination_ipv4_cidr_block=None) -> dict:\n    describe_route_filters = _get_nat_routes_filter(nat_gw_id=nat_gw_id,\n                                                    private_subnet_id=private_subnet_id,\n                                                    destination_ipv4_cidr_block=destination_ipv4_cidr_block)\n    print(f'filter: {describe_route_filters}')\n\n    route_tables_response = boto3_ec2_client.describe_route_tables(Filters=describe_route_filters)\n    if not route_tables_response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        print(route_tables_response)\n        raise ValueError('Failed to get route tables')\n\n    return [{'RouteTableId': rt['RouteTableId'],\n             'Routes':[{'DestinationCidrBlock': route['DestinationCidrBlock']}\n            for route in filter(lambda x: x.get('NatGatewayId', '') == nat_gw_id, rt['Routes'])]}\n            for rt in route_tables_response['RouteTables']]\n\n\n\ndef get_nat_gw_routes(events, context):\n    print('Creating ec2 client')\n    print(events)\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ec2 = boto3.client('ec2', config=config)\n\n    if 'NatGatewayId' not in events:\n        raise KeyError('Requires NatGatewayId')\n\n    nat_gw_id = events['NatGatewayId']\n    private_subnet_id = events['PrivateSubnetId'] if 'PrivateSubnetId' in events else None\n    ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=ec2,\n                                          nat_gw_id=nat_gw_id,\n                                          private_subnet_id=private_subnet_id)\n\n    if not ipv4_rt_nat:\n        raise ValueError(f'Route tables and routes not found: nat={nat_gw_id}, subnet={private_subnet_id}')\n\n    return {\n        'Response': json.dumps(ipv4_rt_nat)\n    }"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{BytesOutToSourceAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "DeleteRoute",
+      "description": "Insert failure by deleting routes that target the NAT Gateway",
+      "action": "aws:executeScript",
+      "onFailure": "step:RollbackCurrent",
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "UpdatedValue",
+          "Selector": "$.Payload.Response",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "delete_nat_gw_routes",
+        "InputPayload": {
+          "OriginalValue": "{{Backup.RoutesOriginalValue}}",
+          "NatGatewayId": "{{NatGatewayId}}",
+          "PrivateSubnetId": "{{PrivateSubnetId}}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nINTERNET_DESTINATION = '0.0.0.0/0'\n\n\n\n\ndef _get_nat_routes_filter(nat_gw_id: str,\n                           private_subnet_id: str = None,\n                           destination_ipv4_cidr_block: str = None) -> List[str]:\n    filters = [{'Name': 'route.nat-gateway-id', 'Values': [nat_gw_id]}]\n    if private_subnet_id:\n        filters.append({'Name': 'association.subnet-id', 'Values': [private_subnet_id]})\n    if destination_ipv4_cidr_block:\n        filters.append({'Name': 'route.destination-cidr-block', 'Values': [destination_ipv4_cidr_block]})\n\n    return filters\n\n\n\ndef _get_ipv4_routes_to_nat(boto3_ec2_client,\n                            nat_gw_id: str,\n                            private_subnet_id: str = None,\n                            destination_ipv4_cidr_block=None) -> dict:\n    describe_route_filters = _get_nat_routes_filter(nat_gw_id=nat_gw_id,\n                                                    private_subnet_id=private_subnet_id,\n                                                    destination_ipv4_cidr_block=destination_ipv4_cidr_block)\n    print(f'filter: {describe_route_filters}')\n\n    route_tables_response = boto3_ec2_client.describe_route_tables(Filters=describe_route_filters)\n    if not route_tables_response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        print(route_tables_response)\n        raise ValueError('Failed to get route tables')\n\n    return [{'RouteTableId': rt['RouteTableId'],\n             'Routes':[{'DestinationCidrBlock': route['DestinationCidrBlock']}\n            for route in filter(lambda x: x.get('NatGatewayId', '') == nat_gw_id, rt['Routes'])]}\n            for rt in route_tables_response['RouteTables']]\n\n\n\ndef _delete_route(boto3_ec2_client, route_table_id: str, destination_ipv4_cidr_block: str) -> dict:\n    delete_route_response = boto3_ec2_client.delete_route(RouteTableId=route_table_id,\n                                                          DestinationCidrBlock=destination_ipv4_cidr_block)\n    if not delete_route_response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        print(delete_route_response)\n        raise ValueError('Failed to delete route')\n\n\n\ndef delete_nat_gw_routes(events, context):\n    print('Creating ec2 client')\n    print(events)\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ec2 = boto3.client('ec2', config=config)\n\n    if 'NatGatewayId' not in events:\n        raise KeyError('Requires NatGatewayId')\n    if 'OriginalValue' not in events:\n        raise KeyError('Requires OriginalValue')\n\n    nat_gw_id = events['NatGatewayId']\n    private_subnet_id = events['PrivateSubnetId'] if 'PrivateSubnetId' in events else None\n    original_value = json.loads(events['OriginalValue'])\n    for route_table in original_value:\n        route_table_id = route_table['RouteTableId']\n        for route in route_table['Routes']:\n            cidr = route['DestinationCidrBlock']\n            _delete_route(boto3_ec2_client=ec2,\n                          route_table_id=route_table_id,\n                          destination_ipv4_cidr_block=cidr)\n\n    ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=ec2,\n                                          nat_gw_id=nat_gw_id,\n                                          private_subnet_id=private_subnet_id)\n\n    return {\n        'Response': json.dumps(ipv4_rt_nat)\n    }"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for expected alarm to be red after failure is injected",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "onFailure": "step:RollbackCurrent",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{BytesOutToSourceAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "RollbackCurrent",
+      "description": "Restore routes from backup",
+      "action": "aws:executeScript",
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "RestoredValue",
+          "Selector": "$.Payload.Response",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "create_nat_gw_routes",
+        "InputPayload": {
+          "OriginalValue": "{{Backup.RoutesOriginalValue}}",
+          "NatGatewayId": "{{NatGatewayId}}",
+          "PrivateSubnetId": "{{PrivateSubnetId}}"
+        },
+        "Script": "import json\nimport logging\nimport time\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nINTERNET_DESTINATION = '0.0.0.0/0'\n\n\n\n\ndef _get_nat_routes_filter(nat_gw_id: str,\n                           private_subnet_id: str = None,\n                           destination_ipv4_cidr_block: str = None) -> List[str]:\n    filters = [{'Name': 'route.nat-gateway-id', 'Values': [nat_gw_id]}]\n    if private_subnet_id:\n        filters.append({'Name': 'association.subnet-id', 'Values': [private_subnet_id]})\n    if destination_ipv4_cidr_block:\n        filters.append({'Name': 'route.destination-cidr-block', 'Values': [destination_ipv4_cidr_block]})\n\n    return filters\n\n\n\ndef _get_ipv4_routes_to_nat(boto3_ec2_client,\n                            nat_gw_id: str,\n                            private_subnet_id: str = None,\n                            destination_ipv4_cidr_block=None) -> dict:\n    describe_route_filters = _get_nat_routes_filter(nat_gw_id=nat_gw_id,\n                                                    private_subnet_id=private_subnet_id,\n                                                    destination_ipv4_cidr_block=destination_ipv4_cidr_block)\n    print(f'filter: {describe_route_filters}')\n\n    route_tables_response = boto3_ec2_client.describe_route_tables(Filters=describe_route_filters)\n    if not route_tables_response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        print(route_tables_response)\n        raise ValueError('Failed to get route tables')\n\n    return [{'RouteTableId': rt['RouteTableId'],\n             'Routes':[{'DestinationCidrBlock': route['DestinationCidrBlock']}\n            for route in filter(lambda x: x.get('NatGatewayId', '') == nat_gw_id, rt['Routes'])]}\n            for rt in route_tables_response['RouteTables']]\n\n\n\ndef _check_if_route_already_exists(route_table_id: str, cidr_ipv4: str, current_routes: dict) -> bool:\n    \"\"\"\n    Checks whether or not route already exist\n    :param route_table_id: The ID of the route table\n    :param cidr_ipv4: The IPv4 CIDR\n    :param current_routes: The current routes\n    \"\"\"\n    existing_rts = [rt for rt in current_routes\n                    if rt.get('RouteTableId', '') == route_table_id]\n    if existing_rts:\n        routes = existing_rts[0].get('Routes', [])\n        existing_routes = [r for r in routes\n                           if r.get('DestinationCidrBlock', '') == cidr_ipv4]\n        if existing_routes:\n            return True\n\n    return False\n\n\n\ndef _create_route(boto3_ec2_client, route_table_id: str,\n                  destination_ipv4_cidr_block: str,\n                  nat_gw_id: str) -> dict:\n    create_route_response = boto3_ec2_client.create_route(RouteTableId=route_table_id,\n                                                          DestinationCidrBlock=destination_ipv4_cidr_block,\n                                                          NatGatewayId=nat_gw_id)\n    if not create_route_response['ResponseMetadata']['HTTPStatusCode'] == 200:\n        print(create_route_response)\n        raise ValueError('Failed to delete route')\n\n    return create_route_response\n\n\n\ndef _create_route_and_wait(boto3_ec2_client, route_table_id: str,\n                           destination_ipv4_cidr_block: str,\n                           nat_gw_id: str,\n                           wait_timeout_seconds: int = 30) -> dict:\n\n    route = _create_route(boto3_ec2_client=boto3_ec2_client,\n                          route_table_id=route_table_id,\n                          destination_ipv4_cidr_block=destination_ipv4_cidr_block,\n                          nat_gw_id=nat_gw_id)\n\n    start = time.time()\n    elapsed = 0\n    while elapsed <= wait_timeout_seconds:\n        ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=boto3_ec2_client,\n                                              nat_gw_id=nat_gw_id,\n                                              private_subnet_id=None,\n                                              destination_ipv4_cidr_block=destination_ipv4_cidr_block)\n        if ipv4_rt_nat:\n            return route\n\n        end = time.time()\n        logging.debug(f'time elapsed {elapsed} seconds. The last result:{ipv4_rt_nat}')\n        time.sleep(10)\n        elapsed = end - start\n\n    raise TimeoutError(f'After {elapsed} route [{route}] hasn\\'t been found in route table [{route_table_id}].')\n\n\n\ndef create_nat_gw_routes(events, context):\n    print('Creating ec2 client')\n    print(events)\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ec2 = boto3.client('ec2', config=config)\n\n    if 'NatGatewayId' not in events:\n        raise KeyError('Requires NatGatewayId')\n    if 'OriginalValue' not in events:\n        raise KeyError('Requires OriginalValue')\n\n    nat_gw_id = events['NatGatewayId']\n    private_subnet_id = events['PrivateSubnetId'] if 'PrivateSubnetId' in events else None\n    original_value = json.loads(events['OriginalValue'])\n\n    ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=ec2,\n                                          nat_gw_id=nat_gw_id,\n                                          private_subnet_id=private_subnet_id)\n    for route_table in original_value:\n        route_table_id = route_table['RouteTableId']\n        for route in route_table['Routes']:\n            cidr = route['DestinationCidrBlock']\n            exists = _check_if_route_already_exists(route_table_id=route_table_id,\n                                                    cidr_ipv4=cidr,\n                                                    current_routes=ipv4_rt_nat)\n            if exists:\n                print(f'The route to {cidr} already exists. Route tables is {route_table_id}')\n                continue\n            _create_route_and_wait(boto3_ec2_client=ec2,\n                                   route_table_id=route_table_id,\n                                   destination_ipv4_cidr_block=cidr,\n                                   nat_gw_id=nat_gw_id)\n\n    ipv4_rt_nat = _get_ipv4_routes_to_nat(boto3_ec2_client=ec2,\n                                          nat_gw_id=nat_gw_id,\n                                          private_subnet_id=private_subnet_id)\n\n    return {\n        'Response': json.dumps(ipv4_rt_nat)\n    }"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{BytesOutToSourceAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress. This step starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

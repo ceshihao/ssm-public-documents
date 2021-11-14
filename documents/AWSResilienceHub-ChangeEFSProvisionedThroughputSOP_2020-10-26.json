@@ -1,0 +1,107 @@
+{
+  "description": "## Id\nAWSResilienceHub-ChangeEFSProvisionedThroughputSOP_2020-10-26\n\n## Intent\nChange EFS file system's provisioned throughput\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * EFS file system with [provisioned](https://docs.aws.amazon.com/efs/latest/ug/performance.html) Throughput Mode\n\n## Permissions required for AutomationAssumeRole\n  * elasticfilesystem:DescribeFileSystems\n  * elasticfilesystem:UpdateFileSystem\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) FileSystemID\n  * type: String\n  * description: ID of the EFS file system\n\n### (Required) ProvisionedThroughput\n  * type: Integer\n  * description: New provisioned throughput value in Mibps to use for EFS file system. Valid values are 1-1024\n\n## Details\nThe document updates Provisioned Throughput value of the specified EFS file system and waits for the file\nsystem to become available.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * UpdateEFSProvisionedThroughput\n  * WaitForEFSToBeAvailable\n  * GetUpdatedProvisionedThroughput\n  * OutputRecoveryTime\n\n## Outputs\n### GetUpdatedProvisionedThroughput.ProvisionedThroughputInMibps\n  * type: Integer\n  * description: Provisioned Throughput value in Mibps after update\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "GetUpdatedProvisionedThroughput.ProvisionedThroughputInMibps",
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "parameters": {
+    "FileSystemID": {
+      "type": "String",
+      "description": "(Required) ID of the EFS file system"
+    },
+    "ProvisionedThroughput": {
+      "type": "Integer",
+      "description": "(Required) New provisioned throughput value in Mibps to use for EFS file system. Valid values are 1-1024"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "UpdateEFSProvisionedThroughput",
+      "description": "Update the Provisioned Throughput value for the specified file system",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "efs",
+        "Api": "UpdateFileSystem",
+        "FileSystemId": "{{ FileSystemID }}",
+        "ProvisionedThroughputInMibps": "{{ ProvisionedThroughput }}"
+      }
+    },
+    {
+      "name": "WaitForEFSToBeAvailable",
+      "description": "Wait for the file system to become available after update",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "efs",
+        "Api": "DescribeFileSystems",
+        "FileSystemId": "{{ FileSystemID }}",
+        "PropertySelector": "$.FileSystems[0].LifeCycleState",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "GetUpdatedProvisionedThroughput",
+      "description": "Get updated Provisioned Throughput value",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "efs",
+        "Api": "DescribeFileSystems",
+        "FileSystemId": "{{ FileSystemID }}"
+      },
+      "outputs": [
+        {
+          "Name": "ProvisionedThroughputInMibps",
+          "Selector": "$.FileSystems[0].ProvisionedThroughputInMibps",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

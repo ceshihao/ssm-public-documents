@@ -1,0 +1,188 @@
+{
+  "description": "SOP By Digito: Digito_EBSRestoreFromBackup_2020_05_26",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "SizeGib": {
+      "type": "Integer",
+      "description": "(Required) The target size to increase the volume to (in GiB)"
+    },
+    "InstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) The identifier of the instance requiring increase of volume size"
+    },
+    "DeviceName": {
+      "type": "String",
+      "description": "(Required) The device name (such as /dev/sdh) is to be increased"
+    },
+    "Partition": {
+      "type": "String",
+      "description": "(Required) The partition which is to be increased"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "description": "Start the timer when SOP starts",
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "from datetime import datetime, timezone\n\ndef script_handler(params: dict, context):\n    return get_current_time().isoformat()\n\ndef get_current_time():\n    return datetime.now(timezone.utc)\n",
+        "InputPayload": {}
+      },
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Describe volumes by instance and device [DescribeVolumes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeVolumes.html)",
+      "name": "DescribeInstanceVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "Filters": [
+          {
+            "Name": "attachment.device",
+            "Values": [
+              "{{DeviceName}}"
+            ]
+          },
+          {
+            "Name": "attachment.instance-id",
+            "Values": [
+              "{{InstanceIdentifier}}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VolumeId",
+          "Selector": "$.Volumes[0].VolumeId",
+          "Type": "String"
+        },
+        {
+          "Name": "CurrentSizeGiB",
+          "Selector": "$.Volumes[0].Size",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "description": "Check if requested volume size is greater than current. If not, we know to skip to the end.",
+      "name": "CheckLargerVolume",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "\n\ndef script_handler(params: dict, context):\n    return params['CurrentSizeGiB'] >= params['SizeGib']\n",
+        "InputPayload": {
+          "SizeGib": "{{ SizeGib }}",
+          "CurrentSizeGiB": "{{ DescribeInstanceVolume.CurrentSizeGiB }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "VolumeAlreadyGreater",
+          "Selector": "$.Payload",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "SizeValidationBranch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "OutputRecoveryTime",
+            "Variable": "{{CheckLargerVolume.VolumeAlreadyGreater}}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "description": "Modify the Volume [ModifyVolume](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyVolume.html)",
+      "name": "ModifyVolume",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyVolume",
+        "VolumeId": "{{ DescribeInstanceVolume.VolumeId }}",
+        "Size": "{{ SizeGib }}"
+      }
+    },
+    {
+      "description": "Wait until volume is updated to new value.",
+      "name": "WaitForVolumeSize",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "from time import sleep\nimport boto3\n\ndef script_handler(params: dict, context):\n    ec2 = boto3.client('ec2')\n    while True:\n        response = ec2.describe_volumes(VolumeIds=[params['VolumeId']])\n        if response['Volumes'][0]['Size'] == params['SizeGib']:\n            return {}\n        print('Sleeping for 3 seconds because received response of ' + str(response['Volumes'][0]['Size']))\n        sleep(3)\n",
+        "InputPayload": {
+          "SizeGib": "{{ SizeGib }}",
+          "VolumeId": "{{ DescribeInstanceVolume.VolumeId }}"
+        }
+      }
+    },
+    {
+      "description": "Command Document: AWS_RunShellScript",
+      "name": "AWS_RunShellScript",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ InstanceIdentifier }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "originalsize=`df -h | grep {{ DeviceName }} | awk -F ' ' '{print $2}'`",
+            "echo \"Original volume size: ${originalsize}\"",
+            "sudo growpart {{ DeviceName }} {{ Partition }}",
+            "mntpt=`df -h | grep {{ DeviceName }} | grep -oE '[^ ]+$'`",
+            "sudo xfs_growfs -d ${mntpt} || sudo resize2fs {{ DeviceName }}{{ Partition }}",
+            "echo \"Resize completed\"",
+            "volsize=`df -h | grep {{ DeviceName }} | awk -F ' ' '{print $2}'`",
+            "echo \"New volume size: ${volsize}\"",
+            "[ -n \"${volsize}\" ] && [ ${volsize} != ${originalsize} ] 2>/dev/null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Record the runtime in seconds",
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "from datetime import datetime, timezone\nfrom dateutil import parser\n\ndef script_handler(params: dict, context):\n    return (get_current_time() - parser.parse(params['StartTime'])).seconds\n\ndef get_current_time():\n    return datetime.now(timezone.utc)\n",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ]
+    }
+  ]
+}

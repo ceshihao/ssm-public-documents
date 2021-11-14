@@ -1,0 +1,235 @@
+{
+  "description": "SOP By AWSResilienceHub. Scale-up ASG by modifying ASG to use larger instances. The SOP will not change from the instance type used, rather will use a larger version from the same type.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "parameters": {
+    "AutoScalingGroupName": {
+      "type": "String",
+      "description": "(Required) The Name of the ASG to scale-up"
+    },
+    "Dryrun": {
+      "type": "Boolean",
+      "default": true,
+      "description": "(Optional) Dryrun indicates a testing run, changes will be rolled back."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  from datetime import datetime, timezone\n  return datetime.now(timezone.utc).isoformat()"
+      },
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CurrentSetup",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "OriginalInstanceType",
+          "Selector": "$.Payload.OriginalInstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "LaunchTemplateVersion",
+          "Selector": "$.Payload.LaunchTemplateVersion",
+          "Type": "String"
+        },
+        {
+          "Name": "LaunchTemplateName",
+          "Selector": "$.Payload.LaunchTemplateName",
+          "Type": "String"
+        },
+        {
+          "Name": "LaunchConfigurationName",
+          "Selector": "$.Payload.LaunchConfigurationName",
+          "Type": "String"
+        },
+        {
+          "Name": "BiggerInstanceType",
+          "Selector": "$.Payload.BiggerInstanceType",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "get_instance_data",
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_instance_data(events, context):\n    asg = boto3.client('autoscaling')\n    ec2 = boto3.client('ec2')\n    describe_asg = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[events['AutoScalingGroupName']])\n    if 'MixedInstancesPolicy' in describe_asg['AutoScalingGroups'][0]:\n        raise Exception('Cannot run this SOP on ASG that has a MixedInstancesPolicy')\n    current_state = get_current_state(ec2, asg, describe_asg)\n    bigger_instance_type = get_bigger_instance(current_state['OriginalInstanceType'], ec2)\n    return {**current_state, **{'BiggerInstanceType': bigger_instance_type}}\n\n\n\ndef get_current_state(ec2, asg, describe_asg):\n    if 'LaunchTemplate' in describe_asg['AutoScalingGroups'][0]:\n        launch_template_version = describe_asg['AutoScalingGroups'][0]['LaunchTemplate']['Version']\n        launch_template_name = describe_asg['AutoScalingGroups'][0]['LaunchTemplate']['LaunchTemplateName']\n        describe_template = ec2.describe_launch_template_versions(\n            LaunchTemplateName=launch_template_name, Versions=[launch_template_version])\n        current_instance_type = describe_template['LaunchTemplateVersions'][0]['LaunchTemplateData']['InstanceType']\n        return {'OriginalInstanceType': current_instance_type, 'LaunchTemplateVersion': launch_template_version,\n                'LaunchTemplateName': launch_template_name, 'LaunchConfigurationName': ''}\n    else:\n        launch_config_name = describe_asg['AutoScalingGroups'][0]['LaunchConfigurationName']\n        launch_config = asg.describe_launch_configurations(LaunchConfigurationNames=[launch_config_name])\n        return {'OriginalInstanceType': launch_config['LaunchConfigurations'][0]['InstanceType'],\n                'LaunchTemplateVersion': '',\n                'LaunchTemplateName': '',\n                'LaunchConfigurationName': launch_config_name}\n\n\n\ndef get_bigger_instance(current_instance_type, ec2):\n    instance_type_size = current_instance_type.rsplit(\".\", 1)\n    instance_sizes = [\"nano\", \"micro\", \"small\", \"medium\", \"large\", \"xlarge\", \"2xlarge\", \"3xlarge\", \"4xlarge\",\n                      \"6xlarge\", \"8xlarge\", \"9xlarge\", \"10xlarge\", \"12xlarge\", \"16xlarge\", \"18xlarge\", \"24xlarge\",\n                      \"32xlarge\", \"56xlarge\", \"112xlarge\"]\n    bigger_size_start_idx = instance_sizes.index(instance_type_size[1]) + 1\n    possible_instance_types = []\n    for i in range(len(instance_sizes) - bigger_size_start_idx):\n        possible_instance_types.append(instance_type_size[0] + \".\" + instance_sizes[bigger_size_start_idx + i])\n    instance_types_response = ec2.describe_instance_type_offerings(\n        Filters=[{'Name': 'instance-type', \"Values\": [instance_type_size[0] + \".*\"]}])\n    all_instance_types = [offering['InstanceType'] for offering in instance_types_response['InstanceTypeOfferings']]\n    bigger_instances = [candidate for candidate in possible_instance_types if candidate in all_instance_types]\n    if bigger_instances:\n        return bigger_instances[0]\n    else:\n        raise Exception(\"Could not identify bigger instance type than current instance type: \" + current_instance_type)\n",
+        "InputPayload": {
+          "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+        }
+      },
+      "description": "Record current set up and gather the larger instance to which we will upgrade the ASG."
+    },
+    {
+      "name": "UpgradeInstanceType",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "update_asg",
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef update_asg(events, context):\n    asg = boto3.client('autoscaling')\n    ec2 = boto3.client('ec2')\n    new_instance_type = events['BiggerInstanceType']\n    if events['LaunchTemplateName']:\n        create_template_response = ec2.create_launch_template_version(\n            LaunchTemplateName=events['LaunchTemplateName'],\n            SourceVersion=events['LaunchTemplateVersion'],\n            LaunchTemplateData={'InstanceType': new_instance_type},\n            VersionDescription=\"Uses instance type \" + new_instance_type)\n        new_version = str(create_template_response['LaunchTemplateVersion']['VersionNumber'])\n        asg.update_auto_scaling_group(AutoScalingGroupName=events['AutoScalingGroupName'],\n                                      LaunchTemplate={'LaunchTemplateName': events['LaunchTemplateName'],\n                                                      'Version': new_version})\n        return {'LaunchConfigOrTemplate': events['LaunchTemplateName'] + ':' + new_version}\n    else:\n        describe_asg = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[events['AutoScalingGroupName']])\n        describe_launch_config = asg.describe_launch_configurations(\n            LaunchConfigurationNames=[describe_asg['AutoScalingGroups'][0]['LaunchConfigurationName']])\n        launch_config = describe_launch_config['LaunchConfigurations'][0]\n        launch_config.pop('LaunchConfigurationARN')\n        launch_config.pop('CreatedTime')\n        launch_config['InstanceType'] = new_instance_type\n        launch_config['LaunchConfigurationName'] = launch_config['LaunchConfigurationName'] + \\\n            \"-\" + str(random.randint(1000, 9999))\n        asg.create_launch_configuration(**{key: value for (key, value) in launch_config.items() if value != ''})\n        asg.update_auto_scaling_group(AutoScalingGroupName=events['AutoScalingGroupName'],\n                                      LaunchConfigurationName=launch_config['LaunchConfigurationName'])\n        return {'LaunchConfigOrTemplate': launch_config['LaunchConfigurationName']}",
+        "InputPayload": {
+          "AutoScalingGroupName": "{{ AutoScalingGroupName }}",
+          "LaunchTemplateName": "{{ CurrentSetup.LaunchTemplateName }}",
+          "LaunchTemplateVersion": "{{ CurrentSetup.LaunchTemplateVersion }}",
+          "BiggerInstanceType": "{{ CurrentSetup.BiggerInstanceType }}"
+        }
+      },
+      "outputs": [
+        {
+          "Selector": "$.Payload.LaunchConfigOrTemplate",
+          "Name": "LaunchConfigOrTemplate",
+          "Type": "String"
+        }
+      ],
+      "description": "Upgrade ASG to use the larger instance type. Depending on the configuration of the ASG, this will either upgrade the Launch Template or the Launch Configuration."
+    },
+    {
+      "name": "RefreshInstances",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "StartInstanceRefresh",
+        "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+      },
+      "outputs": [
+        {
+          "Selector": "$.InstanceRefreshId",
+          "Name": "InstanceRefreshId",
+          "Type": "String"
+        }
+      ],
+      "description": "Refresh instances to upgrade to new instance type"
+    },
+    {
+      "name": "WaitForRefresh",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "DescribeInstanceRefreshes",
+        "PropertySelector": "$.InstanceRefreshes[0].Status",
+        "DesiredValues": [
+          "Successful"
+        ],
+        "AutoScalingGroupName": "{{AutoScalingGroupName}}",
+        "InstanceRefreshIds": [
+          "{{RefreshInstances.InstanceRefreshId}}"
+        ]
+      },
+      "description": "Wait for RefreshInstances to complete"
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "def script_handler(events, context):\n  from datetime import datetime, timezone\n  from dateutil import parser\n  return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{RecordStartTime.StartTime}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "DryrunBranch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EmptyStepForEnd",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "RollBackScaleUpChange",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": true
+          }
+        ]
+      },
+      "description": "If this is NOT a dryrun, skip to the end. If it is a dryrun, proceed to rollback."
+    },
+    {
+      "name": "RollBackScaleUpChange",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "rollback_scaleup",
+        "Script": "import random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef rollback_scaleup(events, context):\n    asg = boto3.client('autoscaling')\n    ec2 = boto3.client('ec2')\n    if events['LaunchTemplateName']:\n        name_version = events['LaunchConfigOrTemplate'].rsplit(\":\", 1)\n        asg.update_auto_scaling_group(AutoScalingGroupName=events['AutoScalingGroupName'],\n                                      LaunchTemplate={'LaunchTemplateName': events['LaunchTemplateName'],\n                                                      'Version': events['LaunchTemplateVersion']})\n        ec2.delete_launch_template_versions(LaunchTemplateName=name_version[0], Versions=[name_version[1]])\n    else:\n        asg.update_auto_scaling_group(AutoScalingGroupName=events['AutoScalingGroupName'],\n                                      LaunchConfigurationName=events['LaunchConfigurationName'])\n        asg.delete_launch_configuration(LaunchConfigurationName=events['LaunchConfigOrTemplate'])\n",
+        "InputPayload": {
+          "AutoScalingGroupName": "{{ AutoScalingGroupName }}",
+          "LaunchTemplateName": "{{ CurrentSetup.LaunchTemplateName }}",
+          "LaunchTemplateVersion": "{{ CurrentSetup.LaunchTemplateVersion }}",
+          "LaunchConfigurationName": "{{ CurrentSetup.LaunchConfigurationName }}",
+          "LaunchConfigOrTemplate": "{{ UpgradeInstanceType.LaunchConfigOrTemplate }}"
+        }
+      },
+      "description": "Rollback by updating the ASG to use the previous Launch Template or Launch Configuration"
+    },
+    {
+      "name": "RefreshInstancesRollback",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "StartInstanceRefresh",
+        "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+      },
+      "outputs": [
+        {
+          "Name": "RollbackInstanceRefreshId",
+          "Selector": "$.InstanceRefreshId",
+          "Type": "String"
+        }
+      ],
+      "description": "Refresh instances to previous version (perform rollback)"
+    },
+    {
+      "name": "WaitForRollback",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "DescribeInstanceRefreshes",
+        "PropertySelector": "$.InstanceRefreshes[0].Status",
+        "DesiredValues": [
+          "Successful"
+        ],
+        "AutoScalingGroupName": "{{AutoScalingGroupName}}",
+        "InstanceRefreshIds": [
+          "{{RefreshInstancesRollback.RollbackInstanceRefreshId}}"
+        ]
+      },
+      "description": "Wait for rollback to complete"
+    },
+    {
+      "name": "EmptyStepForEnd",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT1S"
+      },
+      "description": "End"
+    }
+  ]
+}
