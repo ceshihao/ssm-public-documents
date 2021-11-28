@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Generates private and public keys for users to access instance through RDP protocol.",
+  "parameters": {
+    "Username": {
+      "type": "String",
+      "description": "The name of the user for whom a password is created or reset.",
+      "allowedPattern": "^[^\"'\\/\\\\\\[\\]:;|=,+*?<>@\\r\\n]+$",
+      "maxChars": 32
+    },
+    "RsaParameters": {
+      "type": "String",
+      "description": "A Modulus and Exponent that can be used to generate an RSA public key.",
+      "allowedPattern": "^([0-9,a-z.]{6})([A-Za-z0-9-_\\/+]{4})*([A-Za-z0-9-_\\/+]{4}|[A-Za-z0-9-_\\/+]{3}=|[A-Za-z0-9-_\\/+]{2}==)$"
+    },
+    "PerformAction": {
+      "type": "String",
+      "description": "(Optional) Set this to 'Yes' to perform the action.",
+      "default": "No",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "action": "aws:runPowerShellScript",
+      "name": "InvokeWindowsScript",
+      "inputs": {
+        "runCommand": [
+          "$ErrorActionPreference = 'Stop'\n\nFunction ParseInputParameter {\n    param (\n        [string]$Name,\n        [string]$Value,\n        [string]$Regex\n    )\n\n    $ValidParameterRegex = '^--%[ +{|{].*}( +)?$'\n    if ($Value -notmatch $ValidParameterRegex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\" -PrintJson\n    }\n    $parameterValue = $Value.Substring(3)\n\n    $trimmedParameterValue = $parameterValue.TrimStart().TrimEnd()\n    $trimmedParameterValue = $trimmedParameterValue.Substring(1)\n    $trimmedParameterValue = $trimmedParameterValue.Substring(0, $trimmedParameterValue.Length - 1)\n\n    if ($Regex -and $trimmedParameterValue -notmatch $Regex) {\n        ExitWithFailureMessage -Message \"Invalid syntax for the parameter $Name\" -PrintJson\n    } else {\n        $trimmedParameterValue\n    }\n}\n\nfunction ExitWithFailureMessage {\n    param (\n        [string]$Message,\n        [string]$ExceptionMessage,\n        [Switch]$PrintJson,\n        [int]$ExitCode = 1\n    )\n    if ([string]::IsNullOrWhitespace($ExceptionMessage)) {\n        $errorMessage = $Message\n    } else {\n        $errorMessage = '{0} {1}' -f $Message, $ExceptionMessage\n    }\n    if ($PrintJson) { ConvertTo-Json -InputObject @{error = $errorMessage } -Compress }\n    WriteStandardError -Message $errorMessage\n    [System.Environment]::Exit($ExitCode)\n}\n\nfunction WriteStandardError {\n    param (\n        [string]$Message\n    )\n    $Host.UI.WriteErrorLine($Message)\n}\n\nfunction TestPerformAction {\n    param ( [string]$PerformAction )\n    if ($PerformAction -ne 'Yes') {\n        ExitWithFailureMessage -Message \"No action was taken because the PerformAction parameter is set to $PerformAction. To make the desired change, set this parameter to Yes.\" -PrintJson\n    }\n}\n\n$Username = Write-Output --%{{{ Username }}}\n$Username = ParseInputParameter -Name 'Username' -Value $Username\n\n$RsaParameters = Write-Output --%{{{ RsaParameters }}}\n$RsaParameters = ParseInputParameter -Name 'RsaParameters' -Value $RsaParameters\n\n$PerformAction = Write-Output --%{{{ PerformAction }}}\n$PerformAction = ParseInputParameter -Name 'PerformAction' -Value $PerformAction -Regex '(Yes|No)'\nTestPerformAction -PerformAction $PerformAction\n\n# Fail if the current system is a domain controller.\n$domainRole = (Get-WmiObject -Class 'Win32_ComputerSystem' -Property 'DomainRole').DomainRole\nif ($domainRole -ge 4) {\n    ExitWithFailureMessage -Message 'The SSO functionality is not supported on domain controllers. You can only connect with the username/password method.' -PrintJson\n}\n\n# The RsaParameters parameter is serialized in the format '[Exponent].[Modulus]'. We need to deserialize it into an\n# RSAParameters object.\n$keyParts = $RsaParameters.Split('.')\n$par = New-Object -TypeName 'System.Security.Cryptography.RSAParameters'\n$par.Exponent = $keyParts[0].Split(',') | ForEach-Object { [Byte]$_ }\n$par.Modulus = [Convert]::FromBase64String($keyParts[1])\n\n# Create the encryptor\n$rsa = [System.Security.Cryptography.RSA]::Create($par)\n\n# Generate a 14 character password (the maximum allowed length before a warning prompt appears). Use a mix of upper\n# and lower case characters, special characters, and numbers.\n$random = New-Object -TypeName 'Random'\n\n# The use of a HashSet ensures that all randomly selected characters are unique.\n$pool = New-Object -TypeName 'System.Collections.Generic.HashSet[char]'\n1..4 | ForEach-Object {\n    # Upper case letters\n    do {\n        $added = $pool.Add([char]$random.Next(65, 90))\n    } until ($added)\n    # Lower case letters\n    do {\n        $added = $pool.Add([char]$random.Next(97, 122))\n    } until ($added)\n}\n$chars = '!@$^&*(),.?<>;:+-_=|'.ToCharArray()\n1..3 | ForEach-Object {\n    # Numbers\n    do {\n        $added = $pool.Add([char]$random.Next(48, 57))\n    } until ($added)\n    # Special characters\n    do {\n        $added = $pool.Add($chars[$random.Next(0, $chars.Length - 1)])\n    } until ($added)\n}\n\n# Create a string using the pool of characters in a randomized order.\n$passwd = ($pool | Get-Random -Count 14) -join ''\n\n# Convert the password to a byte array\n$passwdBytes = [Text.Encoding]::UTF8.GetBytes($passwd)\n\n# Determine the padding mode. We default to OaepSHA1 since it is best. Older Operating Systems do not support\n# OaepSHA1, so we may need to fall back to Pkcs. To accommodate this, we also cannot reference the OaepSHA1 class\n# directly, as the script would fail to parse (due to the missing class). To work around this, we use\n# Invoke-Expression to initialize it instead. This is wrapped in a try/catch so we can fall back to Pkcs1.\ntry {\n    $paddingMode = Invoke-Expression -Command '[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1'\n} catch {\n    $paddingMode = [System.Security.Cryptography.RSAEncryptionPadding]::Pkcs1\n}\n\n# Encrypt the bytes using the RSA public key\n$cipherBytes = $rsa.Encrypt($passwdBytes, $paddingMode)\n$cipherText = [Convert]::ToBase64String($cipherBytes)\n\n# Generate the encrypted password for stdout. We'll enclose the output between two '###' strings to make it easier\n# to extract, since the output may also contain status messages. We will prefix the output with the padding mode\n# that was used, so the caller can tell which padding mode was used. For example:\n# '###{0}:{1}###' -f $paddingMode,$cipherText\n$results = @{\n    paddingMode = [string]$paddingMode\n    cipherText  = $cipherText\n}\n\n# Try to create the user\n$null = & net user $Username $passwd /ADD\n\n# If the user already exists, the exit code will be '2'. If that's the case we need to reset the password.\nif ($lastexitcode -eq 2) {\n    # Reset the user password\n    $null = & net user $Username $passwd\n    if ($lastexitcode -ne 0) {\n        ExitWithFailureMessage -Message \"Failed to reset the SSO user's password\" -ExitCode $lastexitcode -PrintJson\n    }\n\n    # Enable the account\n    $null = & net user $Username /ACTIVE:YES\n    if ($lastexitcode -ne 0) {\n        ExitWithFailureMessage -Message \"Failed to enable the SSO user\" -PrintJson\n    }\n} elseif ($lastexitcode -ne 0){\n    ExitWithFailureMessage -Message \"Failed to create the SSO user\" -PrintJson\n}\n\n# Add the user to local Administrators group\n$null = & net localgroup Administrators $Username /ADD\n\n# If the user is already a member of the group, the exit code is '2'.\nif ($lastexitcode -eq 0 -or $lastexitcode -eq 2) {\n    ConvertTo-Json -InputObject $results -Compress\n} else {\n    ExitWithFailureMessage -Message \"Failed to set SSO user as an Administrator\" -PrintJson\n}\n"
+        ]
+      }
+    }
+  ]
+}
