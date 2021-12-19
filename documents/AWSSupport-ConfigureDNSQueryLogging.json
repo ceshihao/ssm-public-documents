@@ -1,0 +1,129 @@
+{
+  "description": "The AWSSupport-ConfigureDNSQueryLogging runbook allows you to automate DNS Query Logs configuration.  Query Log data is published to the Amazon CloudWatch Logs, Amazon Simple Storage Service (Amazon S3) or Amazon Kinesis stream you choose. After you've created a DNS Query Log, you can retrieve and view its data in the chosen destination. For more information, see [Public DNS Query Logs](https://docs.aws.amazon.com/Route53/latestDeveloperGuide/query-logs.html) and [Resolver DNS Query Logs](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver-query-logs.html).\n\n### Additional Information\nDNS Query Logs configuration is a feature that enables you to capture DNS Queries traffic flow generated from your VPCs or Route53 hosted zones. The data can be used for investigating and troubleshooting connectivity issues.\n### Important\nPlease note that your account will be charged for the costs associated with the storage fees for the AWS Service you want to forward the logs to: CloudWatch Logs, S3, or Amazon Kinesis Firehose. For more information see  [Public DNS Query Logs](https://docs.aws.amazon.com/Route53/latestDeveloperGuide/query-logs.html) and [Resolver DNS Query Logs](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver-query-logs.html)\n\n``Note: If you don’t specify a value for LogDestinationArn, the runbook tries to create a new CloudWatch Log Group with the name ‘AWSSupport-ConfigureDNSQueryLogging-<automation:EXECUTION_ID>’. When the automation creates the new Log Group, it sets the number of days to retain the log data to 14 days. Public DNS Query Logs only support CloudWatch Log group as LogDestinationArn.``\n\n[Run this Automation (console)](https://console.aws.amazon.com/systems-manager/automation/execute/AWSSupport-ConfigureDNSQueryLogging)",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "CreateDNSLogConfig.message"
+  ],
+  "parameters": {
+    "ResourceId": {
+      "type": "String",
+      "allowedPattern": "(^Z[A-Z0-9_]{4,32}$|^vpc-[a-z0-9]{8,17}$)",
+      "description": "(Required) The resource Id for which the DNS logging is created. If you specify 'Public' in *QueryLogType*, the resource needs to be the Hosted Zone ID (ex. Z111111QQQQQQQ). If you specify 'Resolver/Private', the resouce needs to be the VPC Id (ex. vpc-1a2b3c4d)"
+    },
+    "QueryLogType": {
+      "type": "String",
+      "default": "Public",
+      "description": "(Optional) Type of configuration for the DNS logging. The allowed types are Public or Resolver/Private",
+      "allowedValues": [
+        "Public",
+        "Resolver/Private"
+      ]
+    },
+    "LogDestinationArn": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) CloudWatch Log group, Amazon S3 bucket or a Kinesis stream ARN for the Creation of the Resolver DNS log config. Route53 Public DNS query Logging only supports CloudWatch Log Groups. *Note:* `if nothing is specified, the automation will create a CloudWatch Log Group, stream and the IAM Resource policy to put data in it on behalf of Route53.`",
+      "allowedPattern": "(^arn:(aws[a-zA-Z-]*)?:(logs|s3|kinesis):([\\w+-]+)?:(\\d{12})?:[\\w+-]+(:|\\/)?[\\w+=,.@\\-:\\/*]+$)?"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) The ARN of the role that allows the Automation runbook to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your current IAM user permissions context to execute this runbook.",
+      "allowedPattern": "(^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$)?"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateResourceId",
+      "description": "Validates the Resource existence and checks if it's the correct Resource type for the *QueryLogType* (Public or Resolver/Private).",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "Script": "#\n# Copyright 2010-2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n#\n# Permission is hereby granted, free of charge, to any person obtaining a copy of this\n# software and associated documentation files (the \"Software\"), to deal in the Software\n# without restriction, including without limitation the rights to use, copy, modify,\n# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to\n# permit persons to whom the Software is furnished to do so.\n#\n# THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,\n# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A\n# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT\n# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\n# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE\n# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n#\n\nimport boto3\nimport re\n\ndef script_handler(events, context):\n\n    ACCOUNT_ID = context[\"global:ACCOUNT_ID\"]\n    region = context[\"global:REGION\"]\n    ExecutionId = context[\"automation:EXECUTION_ID\"]\n    # @Parameters\n    ResourceId = events[\"ResourceId\"]\n    QueryLogType = events[\"QueryLogType\"]\n\n    ec2 = boto3.client('ec2')\n    route53 = boto3.client('route53')\n\n    vpc_pattern = re.compile('^vpc-[a-z0-9]{8,17}$')\n    host_id_pattern = re.compile('^Z[A-Z0-9_]{4,32}$')\n\n    if QueryLogType == 'Public':\n        if (host_id_pattern.match(ResourceId)):\n            response = route53.get_hosted_zone(\n                Id = ResourceId\n            )\n            if ResourceId in response['HostedZone']['Id']:\n                return\n            else:\n                raise Exception(\"Resource Id not found in Route53\")\n        else:\n            raise Exception(\"Resource Id Type is not correct\")\n    elif QueryLogType == 'Resolver/Private':\n        if (vpc_pattern.match(ResourceId)):\n            response = ec2.describe_vpcs(\n                VpcIds=[ResourceId]\n            )\n            if len(response['Vpcs']) > 0:\n                return\n            else:\n                raise Exception(\"Resource Id not found in VPCs\")\n        else:\n            raise Exception(\"Resource Id Type is not correct\")\n",
+        "InputPayload": {
+          "ResourceId": "{{ResourceId}}",
+          "QueryLogType": "{{QueryLogType}}",
+          "LogDestinationArn": "{{LogDestinationArn}}"
+        }
+      },
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "nextStep": "CheckDestinationARN",
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "CheckDestinationARN",
+      "action": "aws:executeScript",
+      "description": "Checks if *LogDestinationArn* parameter it's the correct Destination type (s3, cloudwatch log, or kinesis stream) for the *QueryLogType* (Public or Resolver/Private).",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "Script": "#\n# Copyright 2010-2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n#\n# Permission is hereby granted, free of charge, to any person obtaining a copy of this\n# software and associated documentation files (the \"Software\"), to deal in the Software\n# without restriction, including without limitation the rights to use, copy, modify,\n# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to\n# permit persons to whom the Software is furnished to do so.\n#\n# THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,\n# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A\n# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT\n# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\n# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE\n# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n#\n\nimport boto3\nimport time\nimport re\n\ndef script_handler(events, context):\n    RETENTION_DAYS = 14\n    ACCOUNT_ID = context[\"global:ACCOUNT_ID\"]\n    region = context[\"global:REGION\"]\n    ExecutionId = context[\"automation:EXECUTION_ID\"]\n    # @Parameters\n    ResourceId = events[\"ResourceId\"]\n    QueryLogType = events[\"QueryLogType\"]\n    LogDestinationArn = events[\"LogDestinationArn\"]\n\n    cwlog_pattern = re.compile('(^arn:(aws[a-zA-Z-]*)?:logs:([\\w+-]+)?:(\\d{12})?:[\\w+-]+(:|\\/)?[\\w+=,.@\\-:\\/*]+$)?')\n    s3_firehose_pattern = re.compile('(^arn:(aws[a-zA-Z-]*)?:(logs|s3|firehose):([\\w+-]+)?:(\\d{12})?:[\\w+-]+(:|\\/)?[\\w+=,.@\\-:\\/*]+$)?')\n\n\n    if QueryLogType == 'Public':\n        if LogDestinationArn == '':\n            LogDestinationArn = create_log_group_with_retention('us-east-1', ACCOUNT_ID, RETENTION_DAYS, ExecutionId)\n            return LogDestinationArn\n        elif (cwlog_pattern.match(LogDestinationArn)):\n            logGroupNamePrefix = re.sub('arn:aws:logs:([\\w+-]+)?:(\\d{12})?:log-group:', '', LogDestinationArn)\n            logGroupNamePrefix = re.sub('(:\\*)?$', '', logGroupNamePrefix)\n            # Logs must be in us-east-1 as Route53 is global therefore the default region is N. Virginia\n            logs = boto3.client('logs', region_name='us-east-1')\n            response = logs.describe_log_groups(\n                logGroupNamePrefix=logGroupNamePrefix,\n                limit=1\n            )\n            if LogDestinationArn in response['logGroups'][0]['arn']:\n                return LogDestinationArn\n            else:\n                raise Exception(\"Destination ARN not found\")\n        else:\n            raise Exception(\"Destination Type is not correct\")\n    elif QueryLogType == 'Resolver/Private':\n        if LogDestinationArn == '':\n            LogDestinationArn = create_log_group_with_retention(region, ACCOUNT_ID, RETENTION_DAYS, ExecutionId)\n            return LogDestinationArn\n        elif (s3_firehose_pattern.match(LogDestinationArn)):\n            return LogDestinationArn\n        else:\n            raise Exception(\"Destination Type is not correct\")\n\n\ndef create_log_group_with_retention (region, ACCOUNT_ID, RETENTION_DAYS, ExecutionId):\n\n    logs = boto3.client('logs', region_name=region)\n    \n    try:\n        response = logs.create_log_group(\n            logGroupName='AWSSupport-ConfigureDNSQueryLogging-'+ExecutionId,\n            tags={\n                'Author': 'Created by AWSSupport-ConfigureDNSQueryLogging automation'\n            }\n        )\n        if response['ResponseMetadata'][\"HTTPStatusCode\"] == 200:\n            time.sleep(3)\n            response = logs.put_retention_policy(\n                logGroupName='AWSSupport-ConfigureDNSQueryLogging-'+ExecutionId,\n                retentionInDays=RETENTION_DAYS\n            )\n            return 'arn:aws:logs:'+region+':'+ACCOUNT_ID+':log-group:AWSSupport-ConfigureDNSQueryLogging-'+ExecutionId+':*'\n    except Exception as e:\n        if \"ResourceAlreadyExistsException\" in str(e):\n            return 'arn:aws:logs:'+region+':'+ACCOUNT_ID+':log-group:AWSSupport-ConfigureDNSQueryLogging-'+ExecutionId+':*'\n        else:\n            raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n",
+        "InputPayload": {
+          "ResourceId": "{{ResourceId}}",
+          "QueryLogType": "{{QueryLogType}}",
+          "LogDestinationArn": "{{LogDestinationArn}}"
+        }
+      },
+      "nextStep": "CheckResourcePolicy",
+      "timeoutSeconds": 120,
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "outputs": [
+        {
+          "Name": "message",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckResourcePolicy",
+      "description": "Checks the permission for Route53 to put logs into the CloudWatch log group, and creates the resource policy if it doesn't exist",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "Script": "#\n# Copyright 2010-2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n#\n# Permission is hereby granted, free of charge, to any person obtaining a copy of this\n# software and associated documentation files (the \"Software\"), to deal in the Software\n# without restriction, including without limitation the rights to use, copy, modify,\n# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to\n# permit persons to whom the Software is furnished to do so.\n#\n# THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,\n# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A\n# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT\n# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\n# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE\n# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n#\n\nimport boto3\nimport json\nimport time\nimport re\n\ndef script_handler(events, context):\n\n    RETENTION_DAYS = 14\n    ACCOUNT_ID = context[\"global:ACCOUNT_ID\"]\n    region = context[\"global:REGION\"]\n    ExecutionId = context[\"automation:EXECUTION_ID\"]\n    # @Parameters\n    ResourceId = events[\"ResourceId\"]\n    QueryLogType = events[\"QueryLogType\"]\n    LogDestinationArn = events[\"LogDestinationArn\"]\n\n    logs = boto3.client('logs', region_name='us-east-1')\n\n    if QueryLogType == 'Public':\n        paginator = logs.get_paginator('describe_resource_policies')\n        response = paginator.paginate().build_full_result()\n        resource_policy = filter(\n            lambda policy : \n                policy[\"policyName\"] == 'AWSServiceRoleForRoute53',\n            response[\"resourcePolicies\"])\n        resource_policy = list(filter(policy_filter, resource_policy))\n        if len(resource_policy) > 0:\n            return\n        else:\n            create_logs_resource_policy(ACCOUNT_ID, LogDestinationArn)\n   \ndef create_logs_resource_policy(ACCOUNT_ID, LogDestinationArn):\n\n    policyDocument = '{ \\\"Version\\\": \\\"2012-10-17\\\", \\\"Statement\\\": [ { \\\"Sid\\\": \\\"Route53LogsToCloudWatchLogs\\\", \\\"Effect\\\": \\\"Allow\\\", \\\"Principal\\\": { \\\"Service\\\": \\\"route53.amazonaws.com\\\" }, \\\"Action\\\": [ \\\"logs:CreateLogStream\\\", \\\"logs:PutLogEvents\\\" ], \\\"Resource\\\": \\\"' + LogDestinationArn + '\\\" } ] }'\n    logs = boto3.client('logs', region_name='us-east-1')\n    try:\n        response = logs.put_resource_policy(\n            policyName=\"AWSServiceRoleForRoute53\",\n            policyDocument=policyDocument\n        )\n        if response[\"resourcePolicy\"][\"policyName\"] == \"AWSServiceRoleForRoute53\":\n            return\n    except Exception as e:\n        raise Exception(\"Something went wrong, please check: \"+\"\\n\"+str(e))\n\ndef policy_filter(policy):\n    policy_doc = json.loads(policy[\"policyDocument\"])\n    return policy_doc[\"Statement\"][0][\"Effect\"] == \"Allow\" and policy_doc[\"Statement\"][0][\"Principal\"][\"Service\"] == \"route53.amazonaws.com\" and any('logs:CreateLogStream' in a for a in policy_doc[\"Statement\"][0][\"Action\"]) and any('logs:PutLogEvents' in a for a in policy_doc[\"Statement\"][0][\"Action\"])\n",
+        "InputPayload": {
+          "ResourceId": "{{ResourceId}}",
+          "QueryLogType": "{{QueryLogType}}",
+          "LogDestinationArn": "{{LogDestinationArn}}"
+        }
+      },
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "timeoutSeconds": 120,
+      "nextStep": "CreateDNSLogConfig"
+    },
+    {
+      "name": "CreateDNSLogConfig",
+      "description": "Creates the DNS query logging on the selected destination, based on the Resource Id.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "Script": "#\n# Copyright 2010-2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n#\n# Permission is hereby granted, free of charge, to any person obtaining a copy of this\n# software and associated documentation files (the \"Software\"), to deal in the Software\n# without restriction, including without limitation the rights to use, copy, modify,\n# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to\n# permit persons to whom the Software is furnished to do so.\n#\n# THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,\n# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A\n# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT\n# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\n# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE\n# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n#\n\nimport boto3\nimport time\nimport re\nimport uuid\n\ndef script_handler(events, context):\n    \n    ACCOUNT_ID = context[\"global:ACCOUNT_ID\"]\n    region = context[\"global:REGION\"]\n    ExecutionId = context[\"automation:EXECUTION_ID\"]\n    # @Parameters\n    ResourceId = events[\"ResourceId\"]\n    QueryLogType = events[\"QueryLogType\"]\n    LogDestinationArn = events[\"LogDestinationArn\"]\n\n    # @ Input Validation\n    \n    if QueryLogType == 'Public':\n        if LogDestinationArn == '':\n            LogDestinationArn='arn:aws:logs:us-east-1:'+ACCOUNT_ID+':log-group:AWSSupport-ConfigureDNSQueryLogging-'+ExecutionId\n        route53 = boto3.client('route53')\n        try:\n            response = route53.create_query_logging_config(\n                HostedZoneId=ResourceId,\n                CloudWatchLogsLogGroupArn=LogDestinationArn\n            )\n            if response[\"QueryLoggingConfig\"][\"HostedZoneId\"] == ResourceId:\n                return response\n            else:\n                rollback(None, LogDestinationArn, 'us-east-1', ExecutionId)\n                raise Exception('Error creating the Route53 association' + str(response))\n        except Exception as e:\n            raise Exception(\"Something went wrong on the DNS query log creation, please check: \"+\"\\n\"+str(e))\n    elif QueryLogType == 'Resolver/Private':\n        if LogDestinationArn == '':\n            LogDestinationArn='arn:aws:logs:'+region+':'+ACCOUNT_ID+':log-group:AWSSupport-ConfigureDNSQueryLogging-'+ExecutionId\n        response = None\n        try:\n            route53resolver = boto3.client('route53resolver')\n            response = route53resolver.create_resolver_query_log_config(\n                Name='ConfigureDNSQueryLogging-'+ExecutionId,\n                DestinationArn=LogDestinationArn,\n                CreatorRequestId=str(uuid.uuid4()),\n                Tags=[\n                    {\n                        'Key':'Author',\n                        'Value':'Created by the SSM AWSSupport-ConfigureDNSQueryLogging automation'\n                    }\n                ]\n            )\n            config_id = response[\"ResolverQueryLogConfig\"][\"Id\"]\n            if response[\"ResolverQueryLogConfig\"][\"DestinationArn\"] in LogDestinationArn and response[\"ResolverQueryLogConfig\"][\"Id\"] != None:\n                response = route53resolver.associate_resolver_query_log_config(\n                    ResolverQueryLogConfigId=config_id,\n                    ResourceId=ResourceId\n                )\n                if response[\"ResolverQueryLogConfigAssociation\"][\"ResourceId\"] == ResourceId:\n                    return response;\n                else:\n                    rollback(config_id, LogDestinationArn, region, ExecutionId)\n                    raise Exception('Error creating the Resolver association' + str(response))\n            else:\n                rollback(None, LogDestinationArn, region, ExecutionId)\n                raise Exception('Error creating the Resolver log configuration.' +  str(response))\n        except Exception as e:\n            rollback(config_id, LogDestinationArn, region, ExecutionId)\n            raise Exception('Something went wrong on the Resolver DNS query log creation, please check: \\n'+str(e))\n\ndef rollback(config_id, LogDestinationArn, region, ExecutionId):\n\n    route53resolver = boto3.client('route53resolver')\n    logs = boto3.client('logs', region_name=region)\n    \n    if config_id != None:\n        response = route53resolver.delete_resolver_query_log_config(\n            ResolverQueryLogConfigId=config_id\n        )\n        if response[\"ResolverQueryLogConfig\"][\"Id\"] != config_id:\n            raise Exception('[Rollback] Error deleting the Resolver configuration Id: '+ config_id +'\\n'+ str(response))\n    if 'AWSSupport-ConfigureDNSQueryLogging' in LogDestinationArn:\n        try:\n            response = logs.delete_log_group(\n                logGroupName='AWSSupport-ConfigureDNSQueryLogging-'+ExecutionId\n            )\n            time.sleep(3)\n        except Exception as e:\n            raise Exception('[Rollback] Something went wrong on the Log group deletion, please check: \\n'+str(e))\n    \n    return\n",
+        "InputPayload": {
+          "ResourceId": "{{ResourceId}}",
+          "QueryLogType": "{{QueryLogType}}",
+          "LogDestinationArn": "{{LogDestinationArn}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "message",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "isEnd": true
+    }
+  ]
+}
