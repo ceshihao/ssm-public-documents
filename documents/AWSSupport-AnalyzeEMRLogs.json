@@ -1,0 +1,886 @@
+{
+  "description": "This is a SSM Automation Document which tries to detect an error (if there is any) while you are running an EMR job on a Cluster. It provides you 3 options: \"To run automation once\", \"Schedule automation to run at a specific time interval\", \"Remove schedule created via automation\".\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "GetClusterInformation.ClusterName",
+    "GetClusterInformation.ClusterState",
+    "ListingClusterInstances.InstanceIDs",
+    "CreatingScheduleCloudFormationStack.StackStatus",
+    "RemovingScheduleByDeletingScheduleCloudFormationStack.StackStatus",
+    "CheckIfLogGroupExists.output",
+    "FindLogPatternOnEMRNode.CommandId"
+  ],
+  "parameters": {
+    "ClusterID": {
+      "type": "String",
+      "description": "This is the cluster ID of the cluster whose nodes logs will be monitored.",
+      "allowedPattern": "^j-[A-Z0-9]{1,13}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "Operation": {
+      "type": "String",
+      "description": "Operation to perform on the cluster.",
+      "allowedValues": [
+        "Schedule",
+        "Run Once",
+        "Remove Schedule"
+      ]
+    },
+    "IntervalTime": {
+      "type": "String",
+      "description": "The Interval time represent the duration after which the execution of this automation document will be triggered regularly. Only applicable if you select 'Schedule' as 'Operation'",
+      "allowedValues": [
+        "5 minutes",
+        "10 minutes",
+        "15 minutes",
+        "None"
+      ],
+      "default": "5 minutes"
+    },
+    "LogToCloudWatchLogs": {
+      "type": "String",
+      "description": "This will create a cloudwatch log group with the name specified in parameter \"CloudWatchLogGroup\" to store any matched log lines.",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ],
+      "default": "No"
+    },
+    "CloudWatchLogGroup": {
+      "type": "String",
+      "description": "Cloudwatch log group name to store any matched log lines. Only applicable if you select \"Yes\" in \"LogToCloudWatchLogs\" parameter.",
+      "default": "AWSSupport-AnalyzeEMRLogs",
+      "allowedPattern": "^[0-9A-Za-z\\-\\_]{1,512}$"
+    },
+    "CreateLogInsightsDashboard": {
+      "type": "String",
+      "description": "If you choose option \"Yes\", logs will be pushed to the log group with name as mentioned in  parameter \"CloudWatchLogGroup\" and a cloudwatch Dashboard will also be created if it does not exists already. Choosing option \"No\" will simply push the log in the log group with name as mentioned in  parameter \"CloudWatchLogGroup\". Only applicable if you select \"Yes\" in \"LogToCloudWatchLogs\" parameter.",
+      "default": "No",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ]
+    },
+    "CreateMetricFilters": {
+      "type": "String",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ],
+      "description": "Yes, if you want to create metric filters. Only applicable if you select \"Yes\" in \"LogToCloudWatchLogs\" parameter.",
+      "default": "No"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetClusterInformation",
+      "nextStep": "BranchForRemoveSchedule",
+      "action": "aws:executeAwsApi",
+      "outputs": [
+        {
+          "Name": "ClusterName",
+          "Selector": "$.Cluster.Name",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterState",
+          "Selector": "$.Cluster.Status.State",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Service": "emr",
+        "Api": "DescribeCluster",
+        "ClusterId": "{{ ClusterID }}"
+      },
+      "description": "This step execute an AWS API call which describes the cluster if provided with the cluster ID. \nThis step also fetch the name of the cluster and show that in output."
+    },
+    {
+      "name": "CheckingIfClusterExists",
+      "nextStep": "ListingClusterInstances",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "emr",
+        "Api": "DescribeCluster",
+        "ClusterId": "{{ ClusterID }}",
+        "PropertySelector": "$.Cluster.Status.State",
+        "DesiredValues": [
+          "RUNNING",
+          "WAITING"
+        ]
+      },
+      "description": "This step checks if cluster is in desired state."
+    },
+    {
+      "name": "ListingClusterInstances",
+      "nextStep": "CheckingIfInstancesAreManagedBySSM",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "emr",
+        "Api": "ListInstances",
+        "InstanceStates": [
+          "RUNNING"
+        ],
+        "ClusterId": "{{ ClusterID }}"
+      },
+      "description": "In this step, an AWS API call will fetch the instance ID's of all running nodes in EMR cluster.",
+      "outputs": [
+        {
+          "Name": "InstanceIDs",
+          "Selector": "$.Instances..Ec2InstanceId",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "BranchForRemoveSchedule",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckingIfStackExists",
+            "Variable": "{{Operation}}",
+            "StringEquals": "Remove Schedule"
+          }
+        ],
+        "Default": "CheckingIfClusterExists"
+      },
+      "description": "Branch to Remove Schedule"
+    },
+    {
+      "name": "CheckingIfInstancesAreManagedBySSM",
+      "nextStep": "BranchOnOperation",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ],
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ ListingClusterInstances.InstanceIDs }}"
+            ]
+          }
+        ]
+      },
+      "description": "Check if the SSM agent is running on nodes or not."
+    },
+    {
+      "name": "BranchOnOperation",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnLogToCloudWatchLogsChoice",
+            "Variable": "{{Operation}}",
+            "StringEquals": "Run Once"
+          },
+          {
+            "NextStep": "CreatingScheduleCloudFormationStack",
+            "Variable": "{{Operation}}",
+            "StringEquals": "Schedule"
+          }
+        ]
+      },
+      "description": "Branch to Check to Run this automation document once or on schedule"
+    },
+    {
+      "name": "BranchOnLogToCloudWatchLogsChoice",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckIfLogGroupExists",
+            "Variable": "{{LogToCloudWatchLogs}}",
+            "StringEquals": "Yes"
+          },
+          {
+            "NextStep": "FindLogPatternOnEMRNode",
+            "Variable": "{{LogToCloudWatchLogs}}",
+            "StringEquals": "No"
+          }
+        ]
+      },
+      "description": "It is a branch step to branch the step based on the input selected in LogToCloudWatchLogs parameter."
+    },
+    {
+      "name": "CheckingIfStackExists",
+      "nextStep": "RemovingScheduleByDeletingScheduleCloudFormationStack",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Api": "DescribeStacks",
+        "Service": "cloudformation",
+        "StackName": "AWSSupport-AnalyzeEMRLogs-{{ClusterID}}"
+      },
+      "outputs": [
+        {
+          "Name": "StackId",
+          "Selector": "$.Stacks[0].StackId",
+          "Type": "String"
+        },
+        {
+          "Name": "StackName",
+          "Selector": "$.Stacks[0].StackName",
+          "Type": "String"
+        }
+      ],
+      "description": "This step DescribeStacks to check if one is already created by automation document for the the cluster mentioned as input."
+    },
+    {
+      "name": "RemovingScheduleByDeletingScheduleCloudFormationStack",
+      "action": "aws:deleteStack",
+      "inputs": {
+        "StackName": "AWSSupport-AnalyzeEMRLogs-{{ClusterID}}"
+      },
+      "description": "This will stop the scheduling by deleting the event rule and IAM role that triggered the event.",
+      "outputs": [
+        {
+          "Name": "StackStatus",
+          "Selector": "$",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "FindLogPatternOnEMRNode",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Parameters": {
+          "commands": [
+            "#!/usr/bin/env python3",
+            "",
+            "import ast, io, subprocess, re, sqlite3, hashlib, os, math, tempfile, multiprocessing, json, time, pip, importlib",
+            "from datetime import datetime",
+            "",
+            "logToCWL = \"{{LogToCloudWatchLogs}}\"",
+            "logGroup = \"{{CloudWatchLogGroup}}\"",
+            "#installing boto3 if required",
+            "try:",
+            "    importlib.import_module(\"boto3\")",
+            "except ImportError:",
+            "    install_cmd = \"python3 -m pip install boto3\"",
+            "    install_out = subprocess.Popen([install_cmd], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stderr.readlines()",
+            "    for line in install_out:",
+            "        line = str(line.decode(\"utf-8\").strip())",
+            "        if \"WARNING: Running pip install with root privileges is generally not a good idea\" not in line:",
+            "            print(install_out)",
+            "",
+            "",
+            "import boto3",
+            "",
+            "def post_logs_cwl(logGroup, logStream, eventtime, event):",
+            "",
+            "# we need to check if the log group exists and create it if thats not the case",
+            "# The names in use here should be unique enough that we don\"t need to test for exact matches, just for existence but we can discuss that.",
+            "",
+            "  #log(\"Started Post to CWL\")",
+            "  currentTimestamp = int(round(time.time() * 1000))",
+            "  client = boto3.client(\"logs\",region_name=\"{{global:REGION}}\")",
+            "  try:",
+            "    logGroupFinder = client.describe_log_groups(",
+            "        logGroupNamePrefix=logGroup,",
+            "        limit=10",
+            "    )",
+            "  except:",
+            "    log(\"Unable to describe Log Groups\")",
+            " ",
+            "  if len(logGroupFinder[\"logGroups\"]) == 0:",
+            "    try:",
+            "      createdLogGroup = client.create_log_group(",
+            "        logGroupName=logGroup",
+            "      )",
+            "    except:",
+            "      log(\"Unable to Create Log Group\")",
+            " ",
+            " ",
+            "  # Now, we need to check if there\"s a logstream for this instance",
+            " ",
+            "  try:",
+            "    logStreamFinder = client.describe_log_streams(",
+            "        logGroupName=logGroup,",
+            "        logStreamNamePrefix=logStream,",
+            "        orderBy=\"LogStreamName\",",
+            "        descending=True,",
+            "    )",
+            "  except:",
+            "    print(\"Unable to query logStreams\")",
+            "",
+            "  if len(logStreamFinder[\"logStreams\"]) == 0:",
+            "    try:",
+            "      createdLogStream = client.create_log_stream(",
+            "        logGroupName=logGroup,",
+            "        logStreamName=logStream",
+            "      )",
+            "    except:",
+            "      log(\"Unable to Create Log Stream\")",
+            "  # Since we just created the logStream, we can upload events without being concerned about sequence token.",
+            "    try:",
+            "      response = client.put_log_events(",
+            "          logGroupName=logGroup,",
+            "          logStreamName=logStream,",
+            "          logEvents=[",
+            "              {",
+            "                  \"timestamp\": currentTimestamp,",
+            "                  \"message\": event",
+            "              },",
+            "          ]",
+            "      )   ",
+            "    except:",
+            "      log(response)",
+            "",
+            "  if len(logStreamFinder[\"logStreams\"]) == 1:",
+            "    # We need to capture the sequence number for uploading the logs in this case",
+            "    print(logStreamFinder[\"logStreams\"])",
+            "    token=logStreamFinder[\"logStreams\"][0][\"uploadSequenceToken\"]",
+            "    try: ",
+            "      # The epoch time might come in as float, we need to cast as int to be able to upload the log entry",
+            "      response = client.put_log_events(",
+            "        logGroupName=logGroup,",
+            "        logStreamName=logStream,",
+            "        logEvents=[",
+            "            {",
+            "                \"timestamp\": currentTimestamp ,",
+            "                \"message\": event",
+            "            },",
+            "        ],",
+            "        sequenceToken=token",
+            "    )",
+            "    except:",
+            "      log(\"Unable to upload logs\")",
+            "    ",
+            " ",
+            "",
+            "",
+            "",
+            "def run_grep(filename_pattern, regex_type, search_string, grep_arg, post_cmd):",
+            "        if regex_type == \"\":",
+            "                dir_name = filename_pattern[0 : filename_pattern.rfind(\"/\") + 1]",
+            "                file_name = \"\\\"\" + filename_pattern[filename_pattern.rfind(\"/\") + 1 :] + \"\\\"\"",
+            "                cmd_str = \"find \" + dir_name + \" -name \" + file_name + \" -print0\"",
+            "        else:",
+            "                cmd_str = (\"find\" + filename_pattern + \" -regextype posix-extended -regex \" + regex_type + \" -print0\")",
+            "        if grep_arg == \"\":",
+            "                cmd_str = cmd_str + \" | xargs -0 -n1 -P2 zgrep \" + search_string + \" \" + post_cmd",
+            "        else:",
+            "                cmd_str = (cmd_str + \" | xargs -0 -n1 -P2 zgrep \" + grep_arg + \" \" + search_string + \" \" + post_cmd)",
+            "        #log(\"Running command: \" + cmd_str)",
+            "        cmd_output = subprocess.Popen([cmd_str], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.readlines()",
+            "        return cmd_output",
+            "",
+            "",
+            "",
+            "def run_cmd(cmd):",
+            "        #log(\"Running Command:\" + cmd)",
+            "        cmd_output = subprocess.Popen([cmd], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.readlines()",
+            "        return cmd_output",
+            "",
+            "",
+            "",
+            "def is_float(string_value):",
+            "       try:",
+            "              float(string_value)",
+            "              return True",
+            "       except ValueError:",
+            "              return False",
+            "",
+            "",
+            "",
+            "def output_events(id_to_fetch):",
+            "        c.execute(\"SELECT metricdata FROM events WHERE id = ?\", (id_to_fetch,),)",
+            "        event_data = \"\"",
+            "        results = c.fetchall()",
+            "        if len(results) > 0:",
+            "                 for line in results:",
+            "                         event_data = event_data + line[0] + \"\\n\"",
+            "                         print(event_data)",
+            "",
+            "",
+            "",
+            "def create_postcommand(check_name, log_file, log_sig):",
+            "        if(check_name == \"node_state_change\"):",
+            "                post_cmd = (\"| tr \\\"\\\\n\\\" \\\" \\\" | sed \\\"s/slaveRecords/\\\\nslaveRecords/g\\\" | grep \\\"slaveRecords\\\" | grep -v \\\"state: RUNNING\\\"\")",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"-A7\", post_cmd)",
+            "        elif (check_name == \"step_failure\"):",
+            "                post_cmd = (\"| tr \\\"\\\\n\\\" \\\" \\\" | sed \\\"s/stepRecord/\\\\nstepRecord/g\\\" | grep \\\"state: FAILED\\\" | grep -v \\\"state: RUNNING\\\"\")",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"-A9\", post_cmd)",
+            "        elif (check_name == \"no_core_nodes_running\"):",
+            "                post_cmd = (\"| tr \\\"\\\\n\\\" \\\" \\\" | sed \\\"s/--/\\\\n/g\\\" | grep \\\"Present Capacity: 0\\\" | tail -n1\")",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"-A8\", post_cmd)",
+            "        elif (check_name == \"hdfs_missing_blocks\"):",
+            "                post_cmd = (\"| grep -v \\\"Failed to update HDFS app monitor \\\" | grep -v \\\"Return code of \\\" | tr \\\"\\\\n\\\" \\\" \\\" | sed \\\"s/--/\\\\n/g\\\" | grep -v \\\"Missing blocks: 0\\\" | tail -n1\")",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"-A8\", post_cmd)",
+            "        elif (check_name == \"hdfs_high_util\"):",
+            "                post_cmd = (\"| tr \\\"\\\\n\\\" \\\" \\\" | sed \\\"s/--/\\\\n/g\\\" | grep -e \\\"DFS Used%: 9[0-9]\\.\\\" | tail -n1\")",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"-A8\", post_cmd)",
+            "        elif (check_name == \"instance_controller_restart\"):",
+            "                post_cmd = (\"| tail -n1\")",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"\", post_cmd)",
+            "        elif (check_name == \"instance_controller_restart_legacy\"):",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"\", \"\")",
+            "                if (len(cur_result) > 1):",
+            "                        cur_result = [cur_result[len(cur_result)-1]]",
+            "        elif (check_name == \"high_load\"):",
+            "                cmd = (\"cat \" + log_file + \" | cut -d\\\" \\\" -f1\")",
+            "                load_avg = run_cmd(cmd)[0]",
+            "                if is_float(load_avg):",
+            "                        load_avg = float(load_avg)",
+            "                        num_vcores = multiprocessing.cpu_count()",
+            "                        cpu_util = math.ceil(load_avg / float(num_vcores) * 100)",
+            "                        if (float(cpu_util) > 95.0):",
+            "                                cur_result = [(datetime.now().isoformat(\" \") + \" 5-Minute Load Average: \" + str(load_avg) + \", Num vCores: \" + str(num_vcores) + \", Effective CPU Utilization: \" + str(cpu_util) + \"%\")]",
+            "                        else:",
+            "                                cur_result = []",
+            "                else:",
+            "                        cur_result = []",
+            "        else:",
+            "                cur_result = run_grep(log_file, \"\", log_sig, \"\", \"\")",
+            "        return cur_result",
+            "",
+            "",
+            "",
+            "def get_node_info():",
+            "        instance_id = \"\"",
+            "        jobflow_id = \"\"",
+            "        try:",
+            "                instance_id = subprocess.Popen([\"curl http://169.254.169.254/latest/meta-data/instance-id\"],shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.readlines()[0]",
+            "                instance_id = str(instance_id.decode(\"utf-8\").strip())",
+            "        except IndexError:",
+            "                log(\"Error\\tCould not obtain instance ID\")",
+            "        try:",
+            "                jobflow_json = read_file(\"/emr/instance-controller/lib/info/job-flow.json\")",
+            "                jobflow_id = jobflow_json[\"jobFlowId\"]",
+            "        except FileNotFoundError:",
+            "                log(\"Error\\tCould not obtain jobflow ID\")",
+            "        return instance_id, jobflow_id",
+            "",
+            "",
+            "",
+            "def read_file(filename):",
+            "        with io.open(filename, \"r\",encoding=\"utf-8\") as file_obj:",
+            "                file_data=ast.literal_eval(file_obj.read())",
+            "        return file_data",
+            "",
+            "",
+            "def log(message):",
+            "        timestamp = datetime.now().isoformat(\" \")",
+            "        print(str(timestamp) + \"\\t\" + message)",
+            "",
+            "if __name__ == \"__main__\":",
+            "        #print(\"Start\")",
+            "",
+            "        run_start_time = datetime.now()",
+            "",
+            "        #log(\"1. Starting log monitoring now\")",
+            "        cwd = os.path.dirname(os.path.abspath(__file__))",
+            "        pwd = \"/mnt\" +cwd",
+            "        bisect=\"orchestration\"",
+            "        db_path=pwd.partition(bisect)[0]",
+            "",
+            "        #print(pwd)",
+            "        #print(db_path)",
+            "",
+            "        log_defs= {\"log_items\":[{\"name\":\"container_out_of_memory\",\"location\":\"/var/log/hadoop-yarn/*-yarn-nodemanager-*.log\",\"signature\":\"-e \\\"is running beyond physical memory limits\\\" -e \\\"Exit code from container .* is : 137$\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"YARN container ran out of memory, running job may fail\",\"kb_link\":\"https://aws.amazon.com/premiumsupport/knowledge-center/emr-spark-yarn-memory-limit/\"},{\"name\":\"yarn_nodemanager_health\",\"location\":\"/var/log/hadoop-yarn/*-yarn-nodemanager-*.log\",\"signature\":\"\\\"Most of the disks failed\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"CORE or TASK node is running low on disk space and will not be able to run tasks\",\"kb_link\":\"https://aws.amazon.com/premiumsupport/knowledge-center/core-node-emr-cluster-disk-space/\"},{\"name\":\"node_state_change\",\"location\":\"/emr/instance-controller/lib/info/job-flow-state.txt\",\"signature\":\"\\\"slaveRecords\\\"\",\"timestamp_format\":\"lastStateChangeTime: (\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d)\",\"description\":\"CORE or TASK node is unreachable by the MASTER node\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-troubleshoot-error-resource.html\"},{\"name\":\"step_failure\",\"location\":\"/emr/instance-controller/lib/info/job-flow-state.txt\",\"signature\":\"\\\"stepRecord\\\"\",\"timestamp_format\":\"endInstant: (\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d\\\\d)\",\"description\":\"An EMR Step has failed\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-troubleshoot-failed-4.html\"},{\"name\":\"no_core_nodes_running\",\"location\":\"/emr/instance-controller/log/instance-controller.log\",\"signature\":\"\\\"hdfs dfsadmin -report\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"No CORE nodes are currently running, cluster is unhealthy\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-cluster-NO_SLAVE_LEFT-FAILED_BY_MASTER.html\"},{\"name\":\"hdfs_missing_blocks\",\"location\":\"/emr/instance-controller/log/instance-controller.log\",\"signature\":\"\\\"hdfs dfsadmin -report\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"There are missing HDFS blocks which could lead to dataloss\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/enough-hdfs-space.html\"},{\"name\":\"hdfs_high_util\",\"location\":\"/emr/instance-controller/log/instance-controller.log\",\"signature\":\"\\\"hdfs dfsadmin -report\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"HDFS Utilization is high, which may affect jobs and cluster health\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-troubleshoot-error-resource-2.html\"},{\"name\":\"instance_controller_restart\",\"location\":\"/emr/instance-controller/log/monitor.log\",\"signature\":\"\\\"MonitorReactionExecutor failed\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"Instance-Controller process has restarted. This process is essential for cluster health\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-process-restart-stop-view.html\"},{\"name\":\"instance_controller_restart_legacy\",\"location\":\"/emr/service-nanny/log/service-nanny-*\",\"signature\":\"\\\"starting instance-controller\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\s\",\"description\":\"Instance-Controller process has restarted. This process is essential for cluster health\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-process-restart-stop-view.html\"},{\"name\":\"high_load\",\"location\":\"/proc/loadavg\",\"signature\":\"\\\"\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\",\"description\":\"High Load Average detected, may affect node health reporting or result in timeouts or slowdowns\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-troubleshoot-slow-4.html\"},{\"name\":\"yarn_node_blacklisted\",\"location\":\"/var/log/hadoop-yarn/*-yarn-resourcemanager-*.log\",\"signature\":\"\\\"blacklist are updated in Scheduler.blacklistAdditions\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"CORE or TASK node has been blacklisted by YARN from running tasks\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-process-restart-stop-view.html\"},{\"name\":\"yarn_node_lost\",\"location\":\"/var/log/hadoop-yarn/*-yarn-resourcemanager-*.log\",\"signature\":\"\\\"Node Transitioned from RUNNING to LOST\\\"\",\"timestamp_format\":\"(\\\\d\\\\d\\\\d\\\\d\\\\-\\\\d\\\\d\\\\-\\\\d\\\\d\\\\s\\\\d\\\\d\\\\:\\\\d\\\\d\\\\:\\\\d\\\\d)\\\\,\\\\d\\\\d\\\\d\",\"description\":\"CORE or TASK node has been marked as LOST by YARN, possible connectivity issues\",\"kb_link\":\"https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-process-restart-stop-view.html\"}]}",
+            "        conn = sqlite3.connect(db_path + \"metric_records.db\")",
+            "        c = conn.cursor()",
+            "        c.execute(\"CREATE TABLE IF NOT EXISTS events (id text PRIMARY KEY, metricdata text)\")",
+            "",
+            "",
+            "        #log(\"4. Getting log info\")",
+            "        instance_id, jobflow_id = get_node_info()",
+            "",
+            "",
+            "        result_lines = []",
+            "        counter=0",
+            "        #log(\"5. Parsing log definitions\")",
+            "        for log_item in log_defs[\"log_items\"]:",
+            "                check_name = log_item[\"name\"]",
+            "                log_file = log_item[\"location\"]",
+            "                log_sig = log_item[\"signature\"]",
+            "                description = log_item[\"description\"]",
+            "                kb_link = log_item[\"kb_link\"]",
+            "                timestamp_format = log_item[\"timestamp_format\"]",
+            "",
+            "",
+            "                timestamp_regx = re.compile(timestamp_format)",
+            "                #log(\"\\t5.1 Checking for \" + check_name + \" messages\")",
+            "                cmd_result = create_postcommand(check_name, log_file, log_sig)",
+            "",
+            "                #log (\"\\t\\t5.2 Trying to find an error\")",
+            "                if (len(cmd_result)>0):",
+            "                        for line in cmd_result:",
+            "                                result_line = \"\"",
+            "                                if isinstance(line, bytes):",
+            "                                        line = str(line.decode(\"utf-8\").strip())",
+            "                                        #log(\"\\t\\t\\tFound: \" + line)",
+            "                                timestamp_match = timestamp_regx.search(line)",
+            "                                if timestamp_match:",
+            "                                        if (check_name == \"node_state_change\") or (check_name == \"step_failure\"):",
+            "                                                epoch_seconds = int(timestamp_match.group(1)) / 1000",
+            "                                                parsed_timestamp = datetime.fromtimestamp(epoch_seconds).strftime(\"%Y-%m-%d %H:%M:%S\")",
+            "                                        else:",
+            "                                              parsed_timestamp = timestamp_match.group(1)",
+            "                                        result_line = (parsed_timestamp + \"\\t\" + jobflow_id + \"\\t\" + instance_id + \"\\t\" + check_name + \"\\t[\" + description + \"]\\t\" + kb_link + \"\\t\" + line)",
+            "                                        result_lines.append(result_line)",
+            "                                        #log(str(result_lines))",
+            "                                        # create a unique event id based on the log entry",
+            "                                        logline_id = hashlib.md5(str(result_line).encode()).hexdigest()",
+            "                                        #print(logline_id)",
+            "                                #write event to sqlite",
+            "                                uni = str(logline_id)",
+            "                                already_exists=c.execute(\"SELECT id FROM events WHERE id = ?\", (uni,),).fetchall()",
+            "                                if len(already_exists) == 0:",
+            "                                        counter+=1",
+            "                                        c.execute(\"INSERT OR IGNORE INTO events values (?, ?)\", (uni, str(result_line)))",
+            "                                        output_events(uni)",
+            "                                        if \"{{LogToCloudWatchLogs}}\" == \"Yes\":",
+            "                                          post_logs_cwl(logGroup,instance_id,parsed_timestamp,result_line)",
+            "",
+            "                                #log(\"5.2.1 Event found: while checking for \" + check_name + \" messages \" + str(result_line) + \"\\n\")",
+            "                                #counter+=1",
+            "",
+            "",
+            "        #log(\"6. Sending events to the console\")",
+            "        conn.commit()",
+            "        c.close()",
+            "        conn.close()",
+            "        #os.remove(logdef)",
+            "",
+            "",
+            "        log(\"Number of error/s found: \" + str(counter) + \"\\n\")",
+            "        #print(\"End\")",
+            " "
+          ]
+        },
+        "InstanceIds": "{{ ListingClusterInstances.InstanceIDs }}"
+      },
+      "description": "This steps finds LogPattern On each EMR Node",
+      "timeoutSeconds": 120,
+      "isEnd": true
+    },
+    {
+      "name": "CreatingScheduleCloudFormationStack",
+      "action": "aws:createStack",
+      "inputs": {
+        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nParameters:\n  IntervalTime:\n    Type: String\n    Description: \"Interval in at which the doc will be triggered\" \nResources:\n  EMRSchedulingRuleCreatedbySSM: \n    Type: AWS::Events::Rule\n    Properties: \n      Description: \"Scheduling rule for AWSSupport-AnalyzeEMRLogs\"\n      ScheduleExpression: !Sub 'rate(${IntervalTime})'\n      Targets: \n        - Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/AWSSupport-AnalyzeEMRLogs:$DEFAULT'\n          Id: \"AWSSupport-AnalyzeEMRLogs-{{ClusterID}}-Rule\"\n          RoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${RoletoTriggerAWSSupportAnalyzeEMRLogs}'\n          Input: !Sub \" {\\\"ClusterID\\\":[\\\"{{ClusterID}}\\\"],\\\"AutomationAssumeRole\\\":[\\\"{{AutomationAssumeRole}}\\\"],\\\"Operation\\\":[\\\"Run Once\\\"],\\\"IntervalTime\\\":[\\\"{{IntervalTime}}\\\"],\\\"LogToCloudWatchLogs\\\":[\\\"{{LogToCloudWatchLogs}}\\\"],\\\"CreateLogInsightsDashboard\\\":[\\\"{{CreateLogInsightsDashboard}}\\\"],\\\"CreateMetricFilters\\\":[\\\"{{CreateMetricFilters}}\\\"],\\\"CloudWatchLogGroup\\\":[\\\"{{CloudWatchLogGroup}}\\\"]}\"\n  RoletoTriggerAWSSupportAnalyzeEMRLogs:\n   Type: AWS::IAM::Role\n   Properties:\n     AssumeRolePolicyDocument:\n       Version: 2012-10-17\n       Statement:\n         - Effect: Allow\n           Principal:\n             Service:\n               - events.amazonaws.com\n           Action:\n             - sts:AssumeRole\n     Path: /\n     Policies:\n       - PolicyName: \"StartAutomationAndPassRole\"\n         PolicyDocument:\n           Version: '2012-10-17'\n           Statement:\n             - Effect: Allow\n               Action: ssm:StartAutomationExecution\n               Resource:\n                 - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/AWSSupport-AnalyzeEMRLogs:$DEFAULT'\n             - Effect: Allow\n               Action: \n                 - iam:PassRole\n               Resource: !Sub '{{AutomationAssumeRole}}'\n               Condition:\n                 StringLikeIfExists: \n                   iam:PassedToService: 'ssm.amazonaws.com'\n",
+        "StackName": "AWSSupport-AnalyzeEMRLogs-{{ClusterID}}",
+        "Capabilities": [
+          "CAPABILITY_IAM"
+        ],
+        "TimeoutInMinutes": 10,
+        "Parameters": [
+          {
+            "ParameterKey": "IntervalTime",
+            "ParameterValue": "{{IntervalTime }}"
+          }
+        ]
+      },
+      "description": "In this step, an event bridge event is created with target as this automation document and a role is also created to trigger that event. This step take time interval parameter as an input.",
+      "timeoutSeconds": 180,
+      "isEnd": true
+    },
+    {
+      "name": "CheckIfLogGroupExists",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnMetricFilterChoice",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "Script": "import json\nimport boto3\nimport botocore\n\ndef script_handler(events, context):\n\n    logGroup = events['CloudWatchLogGroup']\n    cwLog = boto3.client('logs')\n\n    try:   \n        createLogGroup = cwLog.create_log_group(logGroupName=logGroup)\n        Results=\"Log group successfully created with name: \" + logGroup + \"\\nPlease check log group \" + logGroup + \" for details. Please note, logs will only exists if any errors/patterns are found in step 'FindLogPatternOnEMRNode'.\"\n        return {'output': Results}\n        \n    except botocore.exceptions.ClientError as err:\n        if (err.response['Error']['Message'].find('specified log group already exists')!= -1):\n            Results=\"Log group already exists with name: \" + logGroup + \"\\nPlease check log group \" + logGroup + \" for details.  Please note, logs will only exists if any errors/patterns are found in step 'FindLogPatternOnEMRNode'.\"\n            return {'output': Results}\n",
+        "InputPayload": {
+          "CloudWatchLogGroup": "{{CloudWatchLogGroup}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort",
+      "description": "This will check if a cloudwatch log group with the name specified in parameter CloudWatchLogGroup already exists. If not, it creates with the same name."
+    },
+    {
+      "name": "BranchOnMetricFilterChoice",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PutMetricFilterHighLoad",
+            "Variable": "{{CreateMetricFilters}}",
+            "StringEquals": "Yes"
+          },
+          {
+            "NextStep": "Branch_CreatCloudWatchLogInsightsOrNot",
+            "Variable": "{{CreateMetricFilters}}",
+            "StringEquals": "No"
+          }
+        ]
+      },
+      "description": "Branch step to branch the step based on the input selected in CreateMetricFilters."
+    },
+    {
+      "name": "PutMetricFilterHighLoad",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "filterName": "HighLoad",
+        "filterPattern": "high_load",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "HighLoad",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ]
+      },
+      "description": "In this step metric HighLoad filter is created in the log group selected by user.",
+      "timeoutSeconds": 15
+    },
+    {
+      "name": "PutMetricFilterContainerOutofMemory",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Api": "PutMetricFilter",
+        "Service": "logs",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "ContainerOutofMemory",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "ContainerOutofMemory",
+        "filterPattern": "container_out_of_memory"
+      },
+      "description": "In this step ContainerOutofMemory metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterYarnNodeManagerHealth",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "YarnNodeManagerHealth",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "YarnNodeManagerHealth",
+        "filterPattern": "yarn_nodemanager_health"
+      },
+      "description": "In this step YarnNodeManagerHealth metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterNodeStateChange",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "NodeStateChange",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "NodeStateChange",
+        "filterPattern": "node_state_change"
+      },
+      "description": "In this step NodeStateChange metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterStepFailure",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "StepFailure",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "StepFailure",
+        "filterPattern": "step_failure"
+      },
+      "description": "In this step StepFailure metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterNoCoreNodesRunning",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "NoCoreNodesRunning",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "NoCoreNodesRunning",
+        "filterPattern": "no_core_nodes_running"
+      },
+      "description": "In this step NoCoreNodesRunning metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterHDFSMissingBlocks",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs ",
+        "Api": "PutMetricFilter",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "HDFSMissingBlocks",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "HDFSMissingBlocks",
+        "filterPattern": "hdfs_missing_blocks"
+      },
+      "description": "In this step HDFSMissingBlocks metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterHDFSHighUtilization",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "HDFSHighUtilization",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "HDFSHighUtilization",
+        "filterPattern": "hdfs_high_util"
+      },
+      "description": "In this step HDFSHighUtilization metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterInstanceControllerRestart",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "InstanceControllerRestart",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ],
+        "filterName": "InstanceControllerRestart",
+        "filterPattern": "instance_controller_restart"
+      },
+      "description": "In this step InstanceControllerRestart metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterYarnNodeBlackListed",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "filterName": "YarnNodeBlackListed",
+        "filterPattern": "yarn_node_blacklisted",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "YarnNodeBlackListed",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ]
+      },
+      "description": "In this step YarnNodeBlackListed metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "PutMetricFilterYarnNodeLost",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "logs",
+        "Api": "PutMetricFilter",
+        "filterName": "YarnNodeLost",
+        "filterPattern": "yarn_node_lost",
+        "logGroupName": "{{CloudWatchLogGroup}}",
+        "metricTransformations": [
+          {
+            "metricName": "YarnNodeLost",
+            "metricNamespace": "EMR",
+            "metricValue": "1",
+            "defaultValue": 0
+          }
+        ]
+      },
+      "description": "In this step YarnNodeLost metric filter is created in the log group selected by user."
+    },
+    {
+      "name": "Branch_CreatCloudWatchLogInsightsOrNot",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PutDashboard",
+            "Variable": "{{CreateLogInsightsDashboard}}",
+            "StringEquals": "Yes"
+          },
+          {
+            "NextStep": "FindLogPatternOnEMRNode",
+            "Variable": "{{CreateLogInsightsDashboard}}",
+            "StringEquals": "No"
+          }
+        ]
+      },
+      "description": "It is a branch step to branch the step based on the input selected in CreateLogInsightsDashboard parameter."
+    },
+    {
+      "name": "PutDashboard",
+      "action": "aws:executeAwsApi",
+      "nextStep": "FindLogPatternOnEMRNode",
+      "inputs": {
+        "Api": "PutDashboard",
+        "Service": "cloudwatch",
+        "DashboardName": "{{CloudWatchLogGroup}}",
+        "DashboardBody": "{ \"widgets\": [ { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"us-east-1\", \"title\": \"us-east-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"us-east-2\", \"title\": \"us-east-2 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"us-west-1\", \"title\": \"us-west-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"us-west-2\", \"title\": \"us-west-2 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"af-south-1\", \"title\": \"af-south-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"ap-east-1\", \"title\": \"ap-east-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"ap-south-1\", \"title\": \"ap-south-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"ap-northeast-3\", \"title\": \"ap-northeast-3 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"ap-northeast-2\", \"title\": \"ap-northeast-2 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"ap-northeast-1\", \"title\": \"ap-northeast-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"ap-southeast-1\", \"title\": \"ap-southeast-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"ap-southeast-2\", \"title\": \"ap-southeast-2 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"eu-west-1\", \"title\": \"eu-west-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"eu-west-2\", \"title\": \"eu-west-2 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"eu-south-1\", \"title\": \"eu-south-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"eu-west-3\", \"title\": \"eu-west-3 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"eu-north-1\", \"title\": \"eu-north-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"me-south-1\", \"title\": \"me-south-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"sa-east-1\", \"title\": \"sa-east-1 EMRMonolog Events\", \"view\": \"table\" } }, { \"height\": 5, \"width\": 24, \"y\": 0, \"x\": 0, \"type\": \"log\", \"properties\": { \"query\": \"SOURCE \\\"{{CloudWatchLogGroup}}\\\" | parse @message \\\"* *\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\\t*\\\" as EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link, log_message | DISPLAY  EventDate, event_time, cluster_id, instance_id, issue_name, issue_description, issue_link\", \"region\": \"eu-central-1\", \"title\": \"eu-central-1 EMRMonolog Events\", \"view\": \"table\" } } ] }"
+      },
+      "description": "This step will create CW Dashboard with name as mentioned in parameter \"CloudWatchLogGroup\", if it does not exist already."
+    }
+  ]
+}
