@@ -1,0 +1,719 @@
+{
+  "schemaVersion": "1.0",
+  "description": "This AWS CloudFormation template demonstrates one way to configure Windows workloads in Auto Scaling groups on the AWS Cloud. It installs and configures IIS to display a simple static page, with Amazon CloudWatch collecting metrics and compiling logs and AWS Systems Manager configuring the instances. Scenario 1 launches a scalable IIS environment based on a launch template, Application Load Balancer, and Auto Scaling group. Configuration while scaling is handled by lifecycle hooks, Amazon EventBridge, and AWS System Manager automation. (qs-1r91fg4hm)",
+  "templateBody": {
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "This AWS CloudFormation template demonstrates one way to configure Windows workloads in Auto Scaling groups on the AWS Cloud. It installs and configures IIS to display a simple static page, with Amazon CloudWatch collecting metrics and compiling logs and AWS Systems Manager configuring the instances. Scenario 1 launches a scalable IIS environment based on a launch template, Application Load Balancer, and Auto Scaling group. Configuration while scaling is handled by lifecycle hooks, Amazon EventBridge, and AWS System Manager automation. (qs-1r91fg4hm)",
+    "Metadata": {
+      "QuickStartDocumentation": {
+        "EntrypointName": "Deploy into an existing VPC",
+        "Order": "2"
+      },
+      "AWS::CloudFormation::Interface": {
+        "ParameterGroups": [
+          {
+            "Label": {
+              "default": "Deployment Type"
+            },
+            "Parameters": [
+              "DeploymentType",
+              "ECSImage"
+            ]
+          },
+          {
+            "Label": {
+              "default": "Active Directory information"
+            },
+            "Parameters": [
+              "DomainDNSName",
+              "DomainNetBIOSName",
+              "DomainAdminUser",
+              "DomainAdminPassword"
+            ]
+          },
+          {
+            "Label": {
+              "default": "Auto Scaling group / Application Load Balancer configuration"
+            },
+            "Parameters": [
+              "ASGDesiredCapacity",
+              "ASGMaxSize",
+              "ASGMinSize",
+              "ELBSchemeParameter",
+              "IISServerInstanceType",
+              "WebAccessCIDR"
+            ]
+          },
+          {
+            "Label": {
+              "default": "IIS Webpage"
+            },
+            "Parameters": [
+              "WebBucketName",
+              "WebBucketKey"
+            ]
+          },
+          {
+            "Label": {
+              "default": "Network configuration"
+            },
+            "Parameters": [
+              "VPCID",
+              "DomainMemberSecurityGroup",
+              "PrivateSubnet1ID",
+              "PrivateSubnet2ID",
+              "ELBSubnet1ID",
+              "ELBSubnet2ID"
+            ]
+          },
+          {
+            "Label": {
+              "default": "AWS Quick Start configuration"
+            },
+            "Parameters": [
+              "QSS3BucketName",
+              "QSS3KeyPrefix"
+            ]
+          }
+        ],
+        "ParameterLabels": {
+          "ASGDesiredCapacity": {
+            "default": "Auto Scaling group desired capacity"
+          },
+          "ASGMaxSize": {
+            "default": "Auto Scaling group maximum size"
+          },
+          "ASGMinSize": {
+            "default": "Auto Scaling group minimum size"
+          },
+          "DeploymentType": {
+            "default": "Deployment type for IIS"
+          },
+          "DomainDNSName": {
+            "default": "Domain DNS name"
+          },
+          "DomainNetBIOSName": {
+            "default": "Domain NetBIOS name"
+          },
+          "DomainAdminUser": {
+            "default": "Domain administrator name"
+          },
+          "DomainAdminPassword": {
+            "default": "Domain administrator password"
+          },
+          "DomainMemberSecurityGroup": {
+            "default": "Security group with access to domain"
+          },
+          "ECSImage": {
+            "default": "ECS Container Image"
+          },
+          "ELBSchemeParameter": {
+            "default": "Elastic Load Balancing scheme"
+          },
+          "ELBSubnet1ID": {
+            "default": "Elastic Load Balancer subnet"
+          },
+          "ELBSubnet2ID": {
+            "default": "Elastic Load Balancer subnet"
+          },
+          "IISServerInstanceType": {
+            "default": "IIS server instance type"
+          },
+          "PrivateSubnet1ID": {
+            "default": "Private subnet"
+          },
+          "PrivateSubnet2ID": {
+            "default": "Private subnet"
+          },
+          "QSS3BucketName": {
+            "default": "Quick Start S3 bucket name"
+          },
+          "QSS3KeyPrefix": {
+            "default": "Quick Start S3 key prefix"
+          },
+          "WebAccessCIDR": {
+            "default": "Elastic Load Balancer CIDR range"
+          },
+          "WebBucketName": {
+            "default": "S3 Bucket Webpage Location"
+          },
+          "WebBucketKey": {
+            "default": "S3 Key Webpage Location"
+          },
+          "VPCID": {
+            "default": "VPC ID for workload"
+          }
+        }
+      }
+    },
+    "Parameters": {
+      "ASGMinSize": {
+        "Type": "Number",
+        "Description": "Minimum instance size for the Auto Scaling group."
+      },
+      "ASGMaxSize": {
+        "Type": "Number",
+        "Description": "Maximum instance size for the Auto Scaling group."
+      },
+      "ASGDesiredCapacity": {
+        "Type": "Number",
+        "Description": "Desired capacity of the Auto Scaling group."
+      },
+      "DeploymentType": {
+        "Type": "String",
+        "Description": "Deploy IIS on EC2 Or ECS",
+        "Default": "ECS",
+        "AllowedValues": [
+          "EC2",
+          "ECS"
+        ]
+      },
+      "DomainAdminPassword": {
+        "AllowedPattern": "(?=^.{6,255}$)((?=.*\\d)(?=.*[A-Z])(?=.*[a-z])|(?=.*\\d)(?=.*[^A-Za-z0-9])(?=.*[a-z])|(?=.*[^A-Za-z0-9])(?=.*[A-Z])(?=.*[a-z])|(?=.*\\d)(?=.*[A-Z])(?=.*[^A-Za-z0-9]))^.*",
+        "Description": "Password for the domain administrator. It must be at least 8 characters and contain letters, numbers, and symbols.",
+        "MaxLength": "32",
+        "MinLength": "8",
+        "NoEcho": "true",
+        "Type": "String"
+      },
+      "DomainAdminUser": {
+        "AllowedPattern": "[a-zA-Z0-9]*",
+        "Default": "Admin",
+        "Description": "User name for the account that will be used as domain administrator. This is separate from the default Administrator account.",
+        "MaxLength": "25",
+        "MinLength": "5",
+        "Type": "String"
+      },
+      "DomainDNSName": {
+        "AllowedPattern": "[a-zA-Z0-9\\-]+\\..+",
+        "Default": "example.com",
+        "Description": "Fully qualified domain name (FQDN).",
+        "MaxLength": "255",
+        "MinLength": "2",
+        "Type": "String"
+      },
+      "DomainNetBIOSName": {
+        "AllowedPattern": "[a-zA-Z0-9\\-]+",
+        "Default": "EXAMPLE",
+        "Description": "NetBIOS name of the domain (up to 15 characters) for users of earlier versions of Windows.",
+        "MaxLength": "15",
+        "MinLength": "1",
+        "Type": "String"
+      },
+      "DomainMemberSecurityGroup": {
+        "Type": "AWS::EC2::SecurityGroup::Id",
+        "Description": "Choose the EC2 security group that allows for Active Directory communication."
+      },
+      "ECSImage": {
+        "Type": "String",
+        "Default": "microsoft/iis",
+        "Description": "ECS Container Image for Windows. Only needed if ECS deployment type is used"
+      },
+      "ELBSchemeParameter": {
+        "Type": "String",
+        "Default": "internet-facing",
+        "AllowedValues": [
+          "internet-facing",
+          "internal"
+        ],
+        "Description": "Choose whether the Elastic Load Balancer is public or private."
+      },
+      "ELBSubnet1ID": {
+        "Description": "ID of subnet 1 in Availability Zone 1 where the Application Load Balancer will reside (e.g., subnet-a0246dcd). If the Elastic Load Balancer faces the internet, choose a public subnet. Otherwise, choose a private subnet.",
+        "Type": "AWS::EC2::Subnet::Id"
+      },
+      "ELBSubnet2ID": {
+        "Description": "ID of subnet 2 in Availability Zone 2 where the Application Load Balancer will reside (e.g., subnet-a0246dcd). If the Elastic Load Balancer faces the internet, choose a public subnet. Otherwise, choose a private subnet.",
+        "Type": "AWS::EC2::Subnet::Id"
+      },
+      "IISServerInstanceType": {
+        "AllowedValues": [
+          "t2.micro",
+          "t2.small",
+          "t2.medium",
+          "t2.large",
+          "t2.xlarge",
+          "t2.2xlarge",
+          "t3.micro",
+          "t3.small",
+          "t3.medium",
+          "t3.large",
+          "t3.xlarge",
+          "t3.2xlarge",
+          "m4.large",
+          "m4.xlarge",
+          "m4.2xlarge",
+          "m4.4xlarge",
+          "m4.10xlarge",
+          "m5.large",
+          "m5.xlarge",
+          "m5.2xlarge",
+          "m5.4xlarge",
+          "m5.8xlarge",
+          "m5.12xlarge",
+          "m5.16xlarge",
+          "m5.24xlarge",
+          "c4.large",
+          "c4.xlarge",
+          "c4.2xlarge",
+          "c4.4xlarge",
+          "c4.8xlarge",
+          "c5.large",
+          "c5.xlarge",
+          "c5.2xlarge",
+          "c5.4xlarge",
+          "c5.9xlarge",
+          "c5.12xlarge",
+          "c5.18xlarge",
+          "c5.24xlarge",
+          "r4.large",
+          "r4.xlarge",
+          "r4.2xlarge",
+          "r4.4xlarge",
+          "r4.8xlarge",
+          "r5.large",
+          "r5.xlarge",
+          "r5.2xlarge",
+          "r5.4xlarge",
+          "r5.8xlarge",
+          "r5.12xlarge",
+          "r5.16xlarge",
+          "r5.24xlarge"
+        ],
+        "Default": "t3.2xlarge",
+        "Description": "Amazon EC2 instance type for the second Active Directory instance.",
+        "Type": "String"
+      },
+      "PrivateSubnet1ID": {
+        "Description": "ID of private subnet 1 in Availability Zone 1 for the EC2 target group (e.g., subnet-a0246dcd).",
+        "Type": "AWS::EC2::Subnet::Id"
+      },
+      "PrivateSubnet2ID": {
+        "Description": "ID of private subnet 2 in Availability Zone 2 for the EC2 target group (e.g., subnet-a0246dcd).",
+        "Type": "AWS::EC2::Subnet::Id"
+      },
+      "QSS3BucketName": {
+        "AllowedPattern": "^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$",
+        "ConstraintDescription": "Can include numbers, lowercase letters, uppercase letters, and hyphens (-). It cannot start or end with a hyphen (-).",
+        "Default": "aws-quickstart",
+        "Description": "S3 bucket name for the Quick Start assets. This name can include numbers, lowercase letters, uppercase letters, and hyphens (-). It cannot start or end with a hyphen (-).",
+        "Type": "String"
+      },
+      "QSS3KeyPrefix": {
+        "AllowedPattern": "^[0-9a-zA-Z-/]*$",
+        "ConstraintDescription": "Can include numbers, lowercase letters, uppercase letters, hyphens (-), and forward slashes (/).",
+        "Default": "quickstart-microsoft-iis/",
+        "Description": "S3 key prefix for the Quick Start assets. This prefix can include numbers, lowercase letters, uppercase letters, hyphens (-), and forward slashes (/).",
+        "Type": "String"
+      },
+      "WebAccessCIDR": {
+        "AllowedPattern": "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$",
+        "Description": "The CIDR IP range that is permitted to access the Elastic Load Balancers.",
+        "Type": "String"
+      },
+      "WebBucketName": {
+        "Type": "String",
+        "Description": "Bucket name where html file is located for iis. If left blank, a sample page will be used.",
+        "Default": ""
+      },
+      "WebBucketKey": {
+        "Type": "String",
+        "Description": "Bucket Key where html/htm file is located for iis. Only user if WebBucketName specified, otherwise leave default.",
+        "Default": "webfiles/index.html"
+      },
+      "VPCID": {
+        "Description": "ID of the VPC (e.g., vpc-0343606e).",
+        "Type": "AWS::EC2::VPC::Id"
+      }
+    },
+    "Conditions": {
+      "UseDefault": {
+        "Fn::Equals": [
+          {
+            "Ref": "WebBucketName"
+          },
+          ""
+        ]
+      },
+      "ECSDeploy": {
+        "Fn::Equals": [
+          {
+            "Ref": "DeploymentType"
+          },
+          "ECS"
+        ]
+      },
+      "EC2Deploy": {
+        "Fn::Equals": [
+          {
+            "Ref": "DeploymentType"
+          },
+          "EC2"
+        ]
+      }
+    },
+    "Resources": {
+      "ConfigBucket": {
+        "Type": "AWS::S3::Bucket",
+        "Properties": {
+          "LifecycleConfiguration": {
+            "Rules": [
+              {
+                "Id": "DeleteAfter30Days",
+                "ExpirationInDays": 30,
+                "Status": "Enabled",
+                "Prefix": "logs/"
+              }
+            ]
+          }
+        }
+      },
+      "DomainJoinSecrets": {
+        "Type": "AWS::SecretsManager::Secret",
+        "Properties": {
+          "Name": {
+            "Fn::Sub": "DomainJoinSecrets-${AWS::StackName}"
+          },
+          "Description": "Secrets to join AD domain",
+          "SecretString": {
+            "Fn::Sub": "{\"username\":\"${DomainNetBIOSName}\\\\${DomainAdminUser}\",\"password\":\"${DomainAdminPassword}\"}"
+          }
+        }
+      },
+      "SecurityStack": {
+        "Type": "AWS::CloudFormation::Stack",
+        "Properties": {
+          "TemplateURL": {
+            "Fn::Sub": "https://${QSS3BucketName}.s3.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/security.template.yaml"
+          },
+          "Parameters": {
+            "ConfigBucket": {
+              "Ref": "ConfigBucket"
+            },
+            "DomainJoinSecrets": {
+              "Ref": "DomainJoinSecrets"
+            },
+            "ECSClusterName": {
+              "Fn::If": [
+                "ECSDeploy",
+                {
+                  "Fn::Sub": "ECSCluster-${AWS::StackName}"
+                },
+                ""
+              ]
+            },
+            "RemoveConfigurationDocName": {
+              "Fn::Sub": "RemoveConfigurationDocName-${AWS::StackName}"
+            },
+            "SetupConfigurationDocName": {
+              "Fn::Sub": "SetupConfiguration-${AWS::StackName}"
+            },
+            "VPCID": {
+              "Ref": "VPCID"
+            },
+            "WebAccessCIDR": {
+              "Ref": "WebAccessCIDR"
+            },
+            "WebBucketKey": {
+              "Ref": "WebBucketKey"
+            },
+            "WebBucketName": {
+              "Fn::If": [
+                "UseDefault",
+                {
+                  "Ref": "ConfigBucket"
+                },
+                {
+                  "Ref": "WebBucketName"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "AutomationStack": {
+        "Type": "AWS::CloudFormation::Stack",
+        "Properties": {
+          "TemplateURL": {
+            "Fn::Sub": "https://${QSS3BucketName}.s3.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/automation-parts.template.yaml"
+          },
+          "Parameters": {
+            "ConfigBucket": {
+              "Ref": "ConfigBucket"
+            },
+            "DomainJoinSecrets": {
+              "Ref": "DomainJoinSecrets"
+            },
+            "ECSClusterName": {
+              "Fn::If": [
+                "ECSDeploy",
+                {
+                  "Fn::Sub": "ECSCluster-${AWS::StackName}"
+                },
+                ""
+              ]
+            },
+            "RemoveConfigurationDocName": {
+              "Fn::Sub": "RemoveConfigurationDocName-${AWS::StackName}"
+            },
+            "SetupConfigurationDocName": {
+              "Fn::Sub": "SetupConfiguration-${AWS::StackName}"
+            },
+            "WebBucketKey": {
+              "Ref": "WebBucketKey"
+            },
+            "WebBucketName": {
+              "Fn::If": [
+                "UseDefault",
+                {
+                  "Ref": "ConfigBucket"
+                },
+                {
+                  "Ref": "WebBucketName"
+                }
+              ]
+            },
+            "WriteS3LambdaRoleArn": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.WriteS3LambdaRoleArn"
+              ]
+            }
+          }
+        }
+      },
+      "EC2WebAutoScaleStack": {
+        "Condition": "EC2Deploy",
+        "Type": "AWS::CloudFormation::Stack",
+        "Properties": {
+          "TemplateURL": {
+            "Fn::Sub": "https://${QSS3BucketName}.s3.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/ec2-asg-lch.template.yaml"
+          },
+          "Parameters": {
+            "ALBListenersSecurityGroup": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ALBListenersSecurityGroup"
+              ]
+            },
+            "ALBSecurityGroup": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ALBSecurityGroup"
+              ]
+            },
+            "ASGDesiredCapacity": {
+              "Ref": "ASGDesiredCapacity"
+            },
+            "ASGMaxSize": {
+              "Ref": "ASGMaxSize"
+            },
+            "ASGMinSize": {
+              "Ref": "ASGMinSize"
+            },
+            "AutoScalingGroupName": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.AutoScalingGroupName"
+              ]
+            },
+            "ConfigBucket": {
+              "Ref": "ConfigBucket"
+            },
+            "DomainDNSName": {
+              "Ref": "DomainDNSName"
+            },
+            "DomainMemberSecurityGroup": {
+              "Ref": "DomainMemberSecurityGroup"
+            },
+            "ELBSchemeParameter": {
+              "Ref": "ELBSchemeParameter"
+            },
+            "ELBSubnet1ID": {
+              "Ref": "ELBSubnet1ID"
+            },
+            "ELBSubnet2ID": {
+              "Ref": "ELBSubnet2ID"
+            },
+            "EventBridgeSSMAutoRole": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.EventBridgeSSMAutoRole"
+              ]
+            },
+            "ExecutionResourceArn": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ExecutionResourceArn"
+              ]
+            },
+            "IISServerInstanceType": {
+              "Ref": "IISServerInstanceType"
+            },
+            "RemoveConfigurationDocName": {
+              "Fn::GetAtt": [
+                "AutomationStack",
+                "Outputs.RemoveConfigurationDocName"
+              ]
+            },
+            "SSMInstanceProfileName": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.SSMInstanceProfileName"
+              ]
+            },
+            "SetupConfigurationDocName": {
+              "Fn::GetAtt": [
+                "AutomationStack",
+                "Outputs.SetupConfigurationDocName"
+              ]
+            },
+            "VPCID": {
+              "Ref": "VPCID"
+            },
+            "WorkloadSubnet1ID": {
+              "Ref": "PrivateSubnet1ID"
+            },
+            "WorkloadSubnet2ID": {
+              "Ref": "PrivateSubnet2ID"
+            }
+          }
+        }
+      },
+      "ECSWinNodesStack": {
+        "Condition": "ECSDeploy",
+        "Type": "AWS::CloudFormation::Stack",
+        "Properties": {
+          "TemplateURL": {
+            "Fn::Sub": "https://${QSS3BucketName}.s3.${AWS::URLSuffix}/${QSS3KeyPrefix}templates/ecs-asg-lch.template.yaml"
+          },
+          "Parameters": {
+            "ALBListenersSecurityGroup": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ALBListenersSecurityGroup"
+              ]
+            },
+            "ALBSecurityGroup": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ALBSecurityGroup"
+              ]
+            },
+            "ASGDesiredCapacity": {
+              "Ref": "ASGDesiredCapacity"
+            },
+            "ASGMaxSize": {
+              "Ref": "ASGMaxSize"
+            },
+            "ASGMinSize": {
+              "Ref": "ASGMinSize"
+            },
+            "AutoScalingGroupName": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.AutoScalingGroupName"
+              ]
+            },
+            "AutoscalingRole": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.AutoscalingRole"
+              ]
+            },
+            "ConfigBucket": {
+              "Ref": "ConfigBucket"
+            },
+            "DomainDNSName": {
+              "Ref": "DomainDNSName"
+            },
+            "DomainMemberSecurityGroup": {
+              "Ref": "DomainMemberSecurityGroup"
+            },
+            "ECSClusterName": {
+              "Fn::Sub": "ECSCluster-${AWS::StackName}"
+            },
+            "ECSServiceRole": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ECSServiceRole"
+              ]
+            },
+            "ECSImage": {
+              "Ref": "ECSImage"
+            },
+            "ECSTaskRole": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ECSTaskRole"
+              ]
+            },
+            "ELBSchemeParameter": {
+              "Ref": "ELBSchemeParameter"
+            },
+            "ELBSubnet1ID": {
+              "Ref": "ELBSubnet1ID"
+            },
+            "ELBSubnet2ID": {
+              "Ref": "ELBSubnet2ID"
+            },
+            "EventBridgeSSMAutoRole": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.EventBridgeSSMAutoRole"
+              ]
+            },
+            "ExecutionResourceArn": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.ExecutionResourceArn"
+              ]
+            },
+            "IISServerInstanceType": {
+              "Ref": "IISServerInstanceType"
+            },
+            "RemoveConfigurationDocName": {
+              "Fn::GetAtt": [
+                "AutomationStack",
+                "Outputs.RemoveConfigurationDocName"
+              ]
+            },
+            "SSMInstanceProfileName": {
+              "Fn::GetAtt": [
+                "SecurityStack",
+                "Outputs.SSMInstanceProfileName"
+              ]
+            },
+            "SetupConfigurationDocName": {
+              "Fn::GetAtt": [
+                "AutomationStack",
+                "Outputs.SetupConfigurationDocName"
+              ]
+            },
+            "VPCID": {
+              "Ref": "VPCID"
+            },
+            "WorkloadSubnet1ID": {
+              "Ref": "PrivateSubnet1ID"
+            },
+            "WorkloadSubnet2ID": {
+              "Ref": "PrivateSubnet2ID"
+            }
+          }
+        }
+      }
+    },
+    "Outputs": {
+      "ConfigBucket": {
+        "Value": {
+          "Ref": "ConfigBucket"
+        }
+      },
+      "DomainJoinSecrets": {
+        "Value": {
+          "Ref": "DomainJoinSecrets"
+        }
+      }
+    }
+  }
+}
