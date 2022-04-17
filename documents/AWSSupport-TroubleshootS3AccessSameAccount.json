@@ -1,0 +1,687 @@
+{
+  "description": "The **AWSSupport-TroubleshootS3AccessSameAccount** runbook helps diagnose Amazon Simple Storage Service (Amazon S3) access denied issues on bucket or object operations by evaluating the access level granted to the requester (IAM user or role) on your S3 resource. The runbook evaluates all the relevant access policies, user policies, and resource-based policies (bucket policy, bucket ACL, object ACL) associated with the S3 resource and the IAM user or role specified in the input parameters.\n\n### Important\n> * You can only use this runbook to evaluate access denied issues if the requestor is in the same AWS account as the S3 bucket/object.\n\n> * Please make sure that your user or the 'AutomationAssumeRole' used to run this runbook has the necessary permissions to get/list the relevant resource policies and bucket/key metadata configuration.\n\n> * If there is a NotPrincipal element in the Resource Policy, the runbook will throw error on the step 'PolicyModifier'",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows the Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your user context IAM permissions to run this document.",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov):iam::\\d{12}:role\\/[\\w+=/,.@-]+$",
+      "default": ""
+    },
+    "S3ResourceArn": {
+      "type": "String",
+      "description": "(Required) The ARN of your Amazon S3 resource (bucket or key). For example: arn:aws:s3:::bucket_name, or arn:aws:s3:::bucket_name/key_name. Note: For PutObject, GetObject (and any other object operation), provide the ARN of the object. ",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov):s3:::[a-zA-Z0-9/\\.\\-_\\\\]{1,2048}$"
+    },
+    "S3Action": {
+      "type": "String",
+      "description": "(Required) The S3 Action for which you want the runbook to evaluate the access context for.",
+      "allowedValues": [
+        "AbortMultipartUpload",
+        "CompleteMultipartUpload",
+        "CreateBucket",
+        "CreateMultipartUpload",
+        "DeleteBucket",
+        "DeleteBucketAnalyticsConfiguration",
+        "DeleteBucketCors",
+        "DeleteBucketEncryption",
+        "DeleteBucketIntelligentTieringConfiguration",
+        "DeleteBucketInventoryConfiguration",
+        "DeleteBucketLifecycle",
+        "DeleteBucketMetricsConfiguration",
+        "DeleteBucketOwnershipControls",
+        "DeleteBucketPolicy",
+        "DeleteBucketReplication",
+        "DeleteBucketTagging",
+        "DeleteBucketWebsite",
+        "DeleteObject",
+        "DeleteObjects",
+        "DeleteObjectTagging",
+        "DeletePublicAccessBlock",
+        "GetBucketAccelerateConfiguration",
+        "GetBucketAcl",
+        "GetBucketAnalyticsConfiguration",
+        "GetBucketCors",
+        "GetBucketEncryption",
+        "GetBucketIntelligentTieringConfiguration",
+        "GetBucketInventoryConfiguration",
+        "GetBucketLifecycle",
+        "GetBucketLifecycleConfiguration",
+        "GetBucketLocation",
+        "GetBucketLogging",
+        "GetBucketMetricsConfiguration",
+        "GetBucketNotification",
+        "GetBucketNotificationConfiguration",
+        "GetBucketOwnershipControls",
+        "GetBucketPolicy",
+        "GetBucketPolicyStatus",
+        "GetBucketReplication",
+        "GetBucketRequestPayment",
+        "GetBucketTagging",
+        "GetBucketVersioning",
+        "GetBucketWebsite",
+        "GetObject",
+        "GetObjectAcl",
+        "GetObjectLegalHold",
+        "GetObjectLockConfiguration",
+        "GetObjectRetention",
+        "GetObjectTagging",
+        "GetObjectTorrent",
+        "GetPublicAccessBlock",
+        "HeadBucket",
+        "HeadObject",
+        "ListBucketAnalyticsConfigurations",
+        "ListBucketIntelligentTieringConfigurations",
+        "ListBucketInventoryConfigurations",
+        "ListBucketMetricsConfigurations",
+        "ListBuckets",
+        "ListMultipartUploads",
+        "ListObjects",
+        "ListObjectsV2",
+        "ListObjectVersions",
+        "ListParts",
+        "PutBucketAccelerateConfiguration",
+        "PutBucketAcl",
+        "PutBucketAnalyticsConfiguration",
+        "PutBucketCors",
+        "PutBucketEncryption",
+        "PutBucketIntelligentTieringConfiguration",
+        "PutBucketInventoryConfiguration",
+        "PutBucketLifecycle",
+        "PutBucketLifecycleConfiguration",
+        "PutBucketLogging",
+        "PutBucketMetricsConfiguration",
+        "PutBucketNotification",
+        "PutBucketNotificationConfiguration",
+        "PutBucketOwnershipControls",
+        "PutBucketPolicy",
+        "PutBucketReplication",
+        "PutBucketRequestPayment",
+        "PutBucketTagging",
+        "PutBucketVersioning",
+        "PutBucketWebsite",
+        "PutObject",
+        "PutObjectAcl",
+        "PutObjectLegalHold",
+        "PutObjectLockConfiguration",
+        "PutObjectRetention",
+        "PutObjectTagging",
+        "PutPublicAccessBlock",
+        "RestoreObject",
+        "SelectObjectContent",
+        "UploadPart"
+      ]
+    },
+    "RequesterArn": {
+      "type": "String",
+      "description": "(Required) The IAM Principal (user or role) ARN for which you want to find the access level on the specific S3 resource. For example: arn:aws:iam::123456789012:user/user_name or arn:aws:iam::123456789012:role/example-role.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov):(iam|sts)::\\d{12}:(role|user)\\/[\\w+/=,.@-]+$"
+    },
+    "RequesterRoleSessionName": {
+      "type": "String",
+      "description": "(Optional) The session name of the assumed role, in case the IAM ARN is a role and you want to provide a specific session name.",
+      "allowedPattern": "^$|^[\\w+/=,.@-]{1,255}$",
+      "default": ""
+    },
+    "S3ObjectVersionId": {
+      "type": "String",
+      "description": "(Optional) If the object has multiple versions, this parameter allows you to specify the specific version of the object you want to evaluate the access context.",
+      "default": "",
+      "allowedPattern": "^$|^[\\w+=,.@-]{1,1024}$"
+    },
+    "KmsKeyArn": {
+      "type": "String",
+      "description": "(Optional) The KMS Key ARN if it is relevant to the action, example: 'CompleteMultipartUpload','CopyObject','CreateMultipartUpload','PutObject', etc., and the type of resource (bucket or object) for which you want to evaluate the access context.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov):kms:[-a-z0-9]*:[0-9]*:key/[-a-z0-9]*$"
+    },
+    "VpcEndpointId": {
+      "type": "String",
+      "description": "(Optional) The virtual private cloud (VPC) endpoint ID related to the access evaluation. Amazon S3 bucket policies can control access to buckets from specific virtual private cloud (VPC) endpoints.",
+      "default": "",
+      "allowedPattern": "^$|^vpce-[0-9a-zA-Z]{17,17}$"
+    },
+    "ContextKeyList": {
+      "type": "MapList",
+      "description": "(Optional) Condition keys list and corresponding values with respect to the policy evaluation. For example: [{\"ContextKeyName\":\"aws:PrincipalArn\",\"ContextKeyValues\":[\"arn:aws:iam::123456789012:root\"],\"ContextKeyType\":\"string\"},{\"ContextKeyName\":\"aws:SourceIp\",\"ContextKeyValues\":[\"54.240.143.0/24\"],\"ContextKeyType\":\"ip\"}]\n(Please remove any new lines, tabs, or white spaces when you input a value)\nFor more information please see the context-entries parameter in https://docs.aws.amazon.com/cli/latest/reference/iam/simulate-principal-policy.html",
+      "default": [],
+      "allowedPattern": "\\{\\\"ContextKeyName\\\":\\\"[:a-zA-Z0-9]{5,256}\\\",\\\"ContextKeyValues\\\":\\[(\\\"[@*:_a-zA-Z0-9\\/\\.\\-_\\\\]{1,50}\\\",?){1,256}\\],\\\"ContextKeyType\\\":\\\"(string|stringList|numeric|numericList|boolean|booleanList|ip|ipList|binary|binaryList|date|dateList)\\\"\\}",
+      "maxItems": 5
+    },
+    "SCPPolicy": {
+      "type": "String",
+      "description": "(Optional) The AWS Organizations Service Control Policy (SCP) in case you want the runbook to evaluate the input against a particular SCP policy. This is not needed and ignored when you run this runbook from the organization's management account. (Please remove any new lines, tabs, or white spaces when you input a value).",
+      "default": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}",
+      "allowedPattern": "^$|\\{\\\"Version\\\":\\\"2012-10-17\\\",\\\"Statement\\\":\\[(\\{\\\"(Sid|Effect|NotAction|Action|Resource|Condition)\\\":([@*\",:_a-zA-Z0-9\\/\\.\\-\\\\\\[\\]\\{\\}]*)\\},?){0,10}]\\}"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "IAMCheckTypeset",
+      "action": "aws:executeScript",
+      "description": "Checks if the IAM user or role exists, and parses the ARN into its constituent parts.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "iam_typecheck_typeset.iam_typecheck_typeset",
+        "InputPayload": {
+          "IAMArn": "{{RequesterArn}}",
+          "RequesterRoleSessionName": "{{RequesterRoleSessionName}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "user_name",
+          "Selector": "$.Payload.user_name",
+          "Type": "String"
+        },
+        {
+          "Name": "account_number",
+          "Selector": "$.Payload.account_number",
+          "Type": "String"
+        },
+        {
+          "Name": "iam_type",
+          "Selector": "$.Payload.iam_type",
+          "Type": "String"
+        },
+        {
+          "Name": "iam_assumed_arn",
+          "Selector": "$.Payload.iam_assumed_arn",
+          "Type": "String"
+        },
+        {
+          "Name": "iam_root",
+          "Selector": "$.Payload.iam_root",
+          "Type": "String"
+        },
+        {
+          "Name": "iam_id",
+          "Selector": "$.Payload.iam_id",
+          "Type": "String"
+        },
+        {
+          "Name": "iam_assumed_id",
+          "Selector": "$.Payload.iam_assumed_id",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ResourceTypeCheck",
+      "action": "aws:executeScript",
+      "description": "Checks if the S3 resource (key or object) exist and return the bucket and key name.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "check_resource_type.check_resource_type",
+        "InputPayload": {
+          "S3BucketArn": "{{S3ResourceArn}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "bucket_name",
+          "Selector": "$.Payload.bucket_name",
+          "Type": "String"
+        },
+        {
+          "Name": "key_prefix",
+          "Selector": "$.Payload.key_prefix",
+          "Type": "String"
+        },
+        {
+          "Name": "resource_type",
+          "Selector": "$.Payload.resource_type",
+          "Type": "String"
+        },
+        {
+          "Name": "bucket_location",
+          "Selector": "$.Payload.bucket_location",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "UaBoOoAccountCheck",
+      "action": "aws:executeScript",
+      "description": "Checks the S3 bucket owner account and returns the S3 bucket owner Canonical user ID",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "ua_bo_oo_account_checks.ua_bo_oo_account_checks",
+        "InputPayload": {
+          "BucketName": "{{ResourceTypeCheck.bucket_name}}",
+          "AccountNumber": "{{IAMCheckTypeset.account_number}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "requestor_canonical_id",
+          "Selector": "$.Payload.requestor_canonical_id",
+          "Type": "String"
+        },
+        {
+          "Name": "bucket_ACL_string",
+          "Selector": "$.Payload.bucket_ACL_string",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "KeyDetailsChecker",
+      "action": "aws:executeScript",
+      "description": "Checks if the type of resource ARN matches with the type of action and extract key and permission details.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "key_details_checker.key_details_checker",
+        "InputPayload": {
+          "ResourceType": "{{ResourceTypeCheck.resource_type}}",
+          "BucketLocation": "{{ResourceTypeCheck.bucket_location}}",
+          "S3Action": "{{S3Action}}",
+          "BucketName": "{{ResourceTypeCheck.bucket_name}}",
+          "KeyPrefix": "{{ResourceTypeCheck.key_prefix}}",
+          "KeyVersion": "{{S3ObjectVersionId}}",
+          "KmsKeyArn": "{{KmsKeyArn}}",
+          "CanonicalID": "{{UaBoOoAccountCheck.requestor_canonical_id}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "perm_required",
+          "Selector": "$.Payload.perm_required",
+          "Type": "StringList"
+        },
+        {
+          "Name": "action_type",
+          "Selector": "$.Payload.action_type",
+          "Type": "String"
+        },
+        {
+          "Name": "kms",
+          "Selector": "$.Payload.kms",
+          "Type": "String"
+        },
+        {
+          "Name": "acl_allow_check",
+          "Selector": "$.Payload.acl_allow_check",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "ACLBucketCheck",
+      "action": "aws:executeScript",
+      "description": "Checks if the bucket ACL allows the S3 action.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "bucket_allow_acl_check.bucket_allow_acl_check",
+        "InputPayload": {
+          "PermsList": "{{KeyDetailsChecker.perm_required}}",
+          "BucketACL": "{{UaBoOoAccountCheck.bucket_ACL_string}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "bucket_allow_acl_check",
+          "Selector": "$.Payload.bucket_allow_acl_check",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "ConditionSetter",
+      "action": "aws:executeScript",
+      "description": "Pre-fill some of the condition keys from the input parameters",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "condition_setter.condition_setter",
+        "InputPayload": {
+          "IAMArn": "{{RequesterArn}}",
+          "IAMType": "{{IAMCheckTypeset.iam_type}}",
+          "IAMAssumedRoleArn": "{{IAMCheckTypeset.iam_assumed_arn}}",
+          "IAMUserName": "{{IAMCheckTypeset.user_name}}",
+          "IAMAccountNumber": "{{IAMCheckTypeset.account_number}}",
+          "RequesterRoleSessionName": "{{RequesterRoleSessionName}}",
+          "KeyPrefix": "{{ResourceTypeCheck.key_prefix}}",
+          "ContextKeyList": "{{ContextKeyList}}",
+          "KeyVersion": "{{S3ObjectVersionId}}",
+          "KMSKey": "{{KeyDetailsChecker.kms}}",
+          "VpcEndpointId": "{{VpcEndpointId}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "condition_list",
+          "Selector": "$.Payload.condition_list",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "FetchIAMPolicy",
+      "action": "aws:executeScript",
+      "description": "Fetches IAM Policy",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "iam_policy_fetch.iam_policy_fetch",
+        "InputPayload": {
+          "UserName": "{{IAMCheckTypeset.user_name}}",
+          "IAMType": "{{IAMCheckTypeset.iam_type}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "iam_policy",
+          "Selector": "$.Payload.iam_policy",
+          "Type": "String"
+        },
+        {
+          "Name": "perm_boundary_policy",
+          "Selector": "$.Payload.perm_boundary_policy",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "ACLCheckBranch",
+      "description": "If the ACL check fails, the runbook goes to last step",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EvaluatePolicy",
+            "Variable": "{{KeyDetailsChecker.acl_allow_check}}",
+            "NumericEquals": 0
+          },
+          {
+            "NextStep": "FetchBucketPolicy",
+            "Variable": "{{KeyDetailsChecker.acl_allow_check}}",
+            "NumericEquals": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "FetchBucketPolicy",
+      "action": "aws:executeScript",
+      "description": "Fetches Bucket Policy",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "bucket_policy_fetch.bucket_policy_fetch",
+        "InputPayload": {
+          "BucketName": "{{ResourceTypeCheck.bucket_name}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "bucket_policy_str",
+          "Selector": "$.Payload.bucket_policy_str",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "KMSCheckBranch",
+      "description": "If KMS key involved go to fetch KMS policy else fetch VPCe policy",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "VPCeCheckBranch",
+            "Variable": "{{KeyDetailsChecker.kms}}",
+            "StringEquals": "NONE"
+          }
+        ],
+        "Default": "FetchKMSPolicy"
+      }
+    },
+    {
+      "name": "FetchKMSPolicy",
+      "action": "aws:executeScript",
+      "description": "Fetch KMS policy and permissions required",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "kms_policy_fetch.kms_policy_fetch",
+        "InputPayload": {
+          "KmsArn": "{{KeyDetailsChecker.kms}}",
+          "S3Actions": "{{KeyDetailsChecker.perm_required}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "kms_policy",
+          "Selector": "$.Payload.kms_policy",
+          "Type": "String"
+        },
+        {
+          "Name": "kms_perms_list",
+          "Selector": "$.Payload.kms_perms_list",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VPCeCheckBranch",
+      "action": "aws:branch",
+      "description": "If VPCe involved, fetch VPCe policy else fetch SCP policy",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "FetchSCPPolicy",
+            "Variable": "{{VpcEndpointId}}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "FetchVPCePolicy"
+      }
+    },
+    {
+      "name": "FetchVPCePolicy",
+      "action": "aws:executeScript",
+      "description": "Fetch VPCe policy",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "vpce_policy_fetch.vpce_policy_fetch",
+        "InputPayload": {
+          "VpcEndpointId": "{{VpcEndpointId}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "vpce_policy",
+          "Selector": "$.Payload.vpce_policy",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "FetchSCPPolicy",
+      "action": "aws:executeScript",
+      "description": "Fetch SCP policy",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "scp_policy_fetch.scp_policy_fetch",
+        "InputPayload": {
+          "SCPPolicy": "{{SCPPolicy}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "scp_policy",
+          "Selector": "$.Payload.scp_policy",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "PolicyModifier",
+      "action": "aws:executeScript",
+      "description": "Modify the IAM role identity with dummy user identity to simulate policy, if needed",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "policy_modifier.policy_modifier",
+        "InputPayload": {
+          "IAMArn": "{{RequesterArn}}",
+          "IAMUserName": "{{IAMCheckTypeset.user_name}}",
+          "IAMType": "{{IAMCheckTypeset.iam_type}}",
+          "IAMRoot": "{{IAMCheckTypeset.iam_root}}",
+          "IAMID": "{{IAMCheckTypeset.iam_id}}",
+          "IAMAssumedRoleArn": "{{IAMCheckTypeset.iam_assumed_arn}}",
+          "IAMAssumedID": "{{IAMCheckTypeset.iam_assumed_id}}",
+          "IAMPolicy": "{{FetchIAMPolicy.iam_policy}}",
+          "BucketPolicy": "{{FetchBucketPolicy.bucket_policy_str}}",
+          "VpcEndpointId": "{{VpcEndpointId}}",
+          "VPCePolicy": "{{FetchVPCePolicy.vpce_policy}}",
+          "SCPPolicy": "{{FetchSCPPolicy.scp_policy}}",
+          "S3Actions": "{{KeyDetailsChecker.perm_required}}",
+          "S3BucketArn": "{{S3ResourceArn}}",
+          "KMSPolicy": "{{FetchKMSPolicy.kms_policy}}",
+          "KMSActions": "{{FetchKMSPolicy.kms_perms_list}}",
+          "KMSArn": "{{KeyDetailsChecker.kms}}",
+          "ContextKeyList": "{{ContextKeyList}}",
+          "RequesterRoleSessionName": "{{RequesterRoleSessionName}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "iam_policy_modified_s3",
+          "Selector": "$.Payload.iam_policy_modified_s3",
+          "Type": "String"
+        },
+        {
+          "Name": "bucket_policy_modified",
+          "Selector": "$.Payload.bucket_policy_modified",
+          "Type": "String"
+        },
+        {
+          "Name": "vpce_policy_modified",
+          "Selector": "$.Payload.vpce_policy_modified",
+          "Type": "String"
+        },
+        {
+          "Name": "scp_policy_modified_s3",
+          "Selector": "$.Payload.scp_policy_modified_s3",
+          "Type": "String"
+        },
+        {
+          "Name": "iam_policy_modified_kms",
+          "Selector": "$.Payload.iam_policy_modified_kms",
+          "Type": "String"
+        },
+        {
+          "Name": "kms_policy_modified",
+          "Selector": "$.Payload.kms_policy_modified",
+          "Type": "String"
+        },
+        {
+          "Name": "scp_policy_modified_kms",
+          "Selector": "$.Payload.scp_policy_modified_kms",
+          "Type": "String"
+        },
+        {
+          "Name": "iam_evaluating_user_arn",
+          "Selector": "$.Payload.iam_evaluating_user_arn",
+          "Type": "String"
+        },
+        {
+          "Name": "kms_root_check",
+          "Selector": "$.Payload.kms_root_check",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "EvaluatePolicy",
+      "action": "aws:executeScript",
+      "description": "Simulate policy",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Attachment": "attachment.zip",
+        "Handler": "evaluate_policy.evaluate_policy",
+        "InputPayload": {
+          "AclCheck": "{{KeyDetailsChecker.acl_allow_check}}",
+          "IAMPermBoundary": "{{FetchIAMPolicy.perm_boundary_policy}}",
+          "IAMEvaluatingArn": "{{PolicyModifier.iam_evaluating_user_arn}}",
+          "ContextKeyList": "{{ConditionSetter.condition_list}}",
+          "IAMPolicyS3": "{{PolicyModifier.iam_policy_modified_s3}}",
+          "BucketPolicy": "{{PolicyModifier.bucket_policy_modified}}",
+          "VPCePolicy": "{{PolicyModifier.vpce_policy_modified}}",
+          "SCPPolicyS3": "{{PolicyModifier.scp_policy_modified_s3}}",
+          "S3Actions": "{{KeyDetailsChecker.perm_required}}",
+          "S3BucketArn": "{{S3ResourceArn}}",
+          "IAMPolicyKMS": "{{PolicyModifier.iam_policy_modified_kms}}",
+          "SCPPolicyKMS": "{{PolicyModifier.scp_policy_modified_kms}}",
+          "KMSPolicy": "{{PolicyModifier.kms_policy_modified}}",
+          "KMSActions": "{{FetchKMSPolicy.kms_perms_list}}",
+          "KMSArn": "{{KeyDetailsChecker.kms}}",
+          "KMSRootCheck": "{{PolicyModifier.kms_root_check}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "final_decision",
+          "Selector": "$.Payload.final_decision",
+          "Type": "String"
+        },
+        {
+          "Name": "allowed_statements_array",
+          "Selector": "$.Payload.allowed_statements_array",
+          "Type": "MapList"
+        },
+        {
+          "Name": "denied_statements_array",
+          "Selector": "$.Payload.denied_statements_array",
+          "Type": "MapList"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "EvaluatePolicy.final_decision",
+    "EvaluatePolicy.allowed_statements_array",
+    "EvaluatePolicy.denied_statements_array"
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "sha256": "8d817ebee8925d1eb82fea5590c002e1b6259a428329f48219755ae3c54a17d2"
+      }
+    }
+  }
+}
