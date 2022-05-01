@@ -63,7 +63,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "get_inputs_from_ssm_execution",
         "InputPayload": {
           "ExecutionId": "{{ PreviousExecutionId }}"
@@ -88,14 +88,14 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "get_output_from_ssm_step_execution",
         "InputPayload": {
           "ExecutionId": "{{ PreviousExecutionId }}",
           "StepName": "BackupProvisionedThroughput",
           "ResponseField": "BackupReadCapacityUnits,BackupWriteCapacityUnits"
         },
-        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    # Sets values in string type regardless of what is the original value type. In order to set\n                    # values with original types please use 'get_typed_output_from_ssm_step_execution'.\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
       }
     },
     {
@@ -115,7 +115,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "convert_param_types",
         "InputPayload": {
           "Parameters": [
@@ -183,7 +183,7 @@
       "description": "Asserts that billing mode iS PROVISIONED",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "validate_billing_mode",
         "Script": "import logging\nimport random\nimport time\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nENABLED_INSIGHTS_STATUSES = ['ENABLING', 'ENABLED']\nGLOBAL_TABLE_ACTIVE_STATUSES = ['ACTIVE']\n\n\n\ndef _execute_boto3_dynamodb(delegate: Callable[[Any], dict]) -> dict:\n    \"\"\"\n    Executes the given delegate with dynamodb client parameter\n    :param delegate: The delegate to execute (with boto3 function)\n    :return: The output of the given function\n    \"\"\"\n    dynamo_db_client = boto3.client('dynamodb', config=boto3_config)\n    description = delegate(dynamo_db_client)\n    if not description['ResponseMetadata']['HTTPStatusCode'] == 200:\n        logging.error(description)\n        raise ValueError('Failed to execute request')\n    return description\n\n\n\ndef _describe_table(table_name: str) -> dict:\n    \"\"\"\n    Describes the given dynamodb table\n    :param table_name: The table name\n    :return: The dictionary of table description properties\n    \"\"\"\n    return _execute_boto3_dynamodb(\n        delegate=lambda x: x.describe_table(TableName=table_name))\n\n\n\ndef validate_billing_mode(events: dict, context: dict) -> None:\n    \"\"\"\n    Validate billing mode to be specific value.\n    :param events: The dictionary that supposed to have the following keys:\n    * `ExpectedValues` - The list of values the property expected to be\n    * `TableName` - The target table name\n    :return: The status of continuous backup\n    \"\"\"\n    if 'ExpectedValues' not in events:\n        raise KeyError('Requires ExpectedValues')\n    if 'TableName' not in events:\n        raise KeyError('Requires TableName')\n\n    table_name: str = events['TableName']\n    expected_values: List[str] = events['ExpectedValues']\n\n    description = _describe_table(table_name=table_name)\n    billing_mode = description.get('Table', {}).get('BillingModeSummary', {}).get('BillingMode', '')\n\n    # process empty property case\n    if not billing_mode and (not expected_values or '' in expected_values or None in expected_values):\n        return\n    else:\n        if billing_mode not in expected_values:\n            raise ValueError(\n                f'BillingMode is required to be one of the following values {expected_values}, '\n                'but was {match.value}')",
         "InputPayload": {
@@ -359,7 +359,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.6",
+        "Runtime": "python3.8",
         "Handler": "start_rollback_execution",
         "InputPayload": {
           "ExecutionId": "{{automation:EXECUTION_ID}}"

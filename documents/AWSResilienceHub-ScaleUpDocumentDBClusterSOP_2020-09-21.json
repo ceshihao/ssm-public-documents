@@ -39,7 +39,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "start_time",
         "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
       }
@@ -65,7 +65,7 @@
       "action": "aws:executeScript",
       "onFailure": "Abort",
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "verify_number_is_in_inclusive_range",
         "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events. Allow empty, None or 0 values.\n    \"\"\"\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef verify_number_is_in_inclusive_range(events, context):\n    \"\"\"\n    Check that NumberOfInstancesToCreate is within a defined range.\n    The range is inclusive: [RangeMin, RangeMax]\n    \"\"\"\n    required_params = ['NumberOfInstancesToCreate', 'RangeMin', 'RangeMax']\n    check_required_params(required_params, events)\n\n    try:\n        number = int(events['NumberOfInstancesToCreate'])\n        range_min = int(events['RangeMin'])\n        range_max = int(events['RangeMax'])\n    except Exception:\n        raise ValueError(\"Input parameters should be integers\")\n    else:\n        if range_min <= number <= range_max:\n            return True\n        else:\n            raise AssertionError(\n                f\"Number of desired instances should be within [{range_min}, {range_max}], but found {number}\")",
         "InputPayload": {
@@ -111,7 +111,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "get_current_db_instance_class",
         "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef get_current_db_instance_class(events, context):\n    \"\"\"\n    Determine the currently used instance class if not explicitly provided.\n    \"\"\"\n    required_params = ['DBClusterIdentifier', 'DBInstanceClass']\n    check_required_params(required_params, events)\n\n    if events['DBInstanceClass'] != 'current':\n        return {'DBInstanceClass': events['DBInstanceClass']}\n\n    docdb = boto3.client('docdb')\n    paginator = docdb.get_paginator('describe_db_instances')\n    page_iterator = paginator.paginate(\n        Filters=[{\"Name\": \"db-cluster-id\", \"Values\": [events['DBClusterIdentifier']]}]\n    )\n    filtered_iterator = page_iterator.search(\"sort_by(DBInstances, &to_string(InstanceCreateTime))[-1]\")\n    filtered_instances = list(filtered_iterator)\n    if not filtered_instances:\n        raise Exception(\n            f\"No instances found for cluster {events['DBClusterIdentifier']}\")\n    else:\n        return {'DBInstanceClass': filtered_instances[0]['DBInstanceClass']}",
         "InputPayload": {
@@ -132,7 +132,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "scale_up_cluster",
         "Script": "import logging\nimport random\nimport time\nimport uuid\nfrom concurrent.futures import ThreadPoolExecutor\nfrom datetime import datetime\nfrom operator import itemgetter\nfrom typing import List\n\nimport boto3\nfrom botocore.config import Config\n\nif len(logging.getLogger().handlers) > 0:\n    # The Lambda environment pre-configures a handler logging to stderr. If a handler is already configured,\n    # `.basicConfig` does not execute. Thus we set the level directly.\n    logging.getLogger().setLevel(logging.INFO)\nelse:\n    logging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef create_new_instance_random_az(instance_params):\n    \"\"\"\n    Create a new instance with provided Identifier, Engine and InstanceClass in specified cluster.\n    List of parameters doesn't include AZ.\n    \"\"\"\n    docdb = boto3.client('docdb')\n    response = docdb.create_db_instance(\n        DBInstanceIdentifier=instance_params['DBInstanceIdentifier'],\n        DBInstanceClass=instance_params['DBInstanceClass'],\n        Engine=instance_params['Engine'],\n        DBClusterIdentifier=instance_params['DBClusterIdentifier']\n    )\n    return response['DBInstance']['DBInstanceIdentifier']\n\n\n\ndef scale_up_cluster(events, context):\n    \"\"\"\n    Add new instances to the cluster.\n    The amount of instances to add == events['NumberOfInstancesToCreate'].\n    \"\"\"\n    required_params = [\n        'NumberOfInstancesToCreate',\n        'DBClusterIdentifier',\n        'DBInstanceClass',\n        'DBClusterEngine'\n    ]\n    check_required_params(required_params, events)\n\n    amount = int(events['NumberOfInstancesToCreate'])\n    identifiers = []\n    for _ in range(amount):\n        rnd = str(uuid.uuid4()).split('-')[-1]\n        identifier = f\"{events['DBClusterIdentifier']}-{rnd}\"\n        new_event = {\n            'DBClusterIdentifier': events['DBClusterIdentifier'],\n            'DBInstanceIdentifier': identifier,\n            'DBInstanceClass': events['DBInstanceClass'],\n            'Engine': events['DBClusterEngine'],\n        }\n        create_new_instance_random_az(new_event)\n        identifiers.append(identifier)\n\n    return {'DBInstancesIdentifiers': identifiers}",
         "InputPayload": {
@@ -185,7 +185,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "recovery_time",
         "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
         "InputPayload": {
