@@ -1,5 +1,5 @@
 {
-  "description": "## Intent\n'Test that the application can withstand az outage in ASG.'\n\n## Type\nTest\n\n## Requirements\n  * ASG has more than 1 instance\n  * There is a synthetic alarm setup for application\n  * Application should be scaled sufficiently to handle expected traffic with one az loss\n\n## Permissions required for AutomationAssumeRole\n  * autoscaling:DescribeAutoScalingGroups\n  * autoscaling:SuspendProcesses\n  * autoscaling:ResumeProcesses\n  * ec2:TerminateInstances\n  * ec2:DescribeInstanceStatus\n  * cloudwatch:DescribeAlarms\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * iam:PassRole (restricted to same role)\n\n## Supports Rollback\n  Yes. If executed in rollback mode, any previous suspended launch processes in ASG will be resumed.\n\n## Cancellation behavior\n  Suspended launch processes in ASG will be resumed.\n\n## Inputs\n### (Required) AutoScalingGroupName:\n  * type: String\n  * description: Name of AutoScalingGroup.\n\n### (Required) SyntheticAlarmName:\n  * type: String\n  * description: Synthetic Canary Alarm for the application which should stay green during this test.\n\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: The ARN of the role that allows Automation to perform the actions on your behalf.\n\n### (Optional) TestDurationInMinutes:\n  * type: String\n  * description: Test duration in minutes.\n  * default: \"10\"\n\n### (Optional) IsRollback:\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.\n  * default: 'false'\n\n### (Optional) PreviousExecutionId:\n  * type: String\n  * description: (Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.\n  * default: ''\n\n## Details\n  * Select AZ where majority of instances are in.\n  * Prevent new instances in AZ from turning on (use suspendLaunch API)\n  * Inject an error to all instances in AZ together (terminate all instances in az)\n  * Verify alarms alert in (alarms a)\n  * Verify that Synthetic monitor stays green / turns green within x minutes.\n\n## Steps executed in normal flow\n  * SelectExecutionMode\n  * AssertNoSuspendedProcesses\n  * AssertAlarmToBeGreenBeforeTest\n  * SuspendLaunchProcessInAsg\n  * GetInstancesInRandomAz\n  * TerminateInstances\n  * WaitForTestCompletion\n  * AssertAlarmToBeGreen\n  * ResumeLaunchProcessInAsg\n\n## Steps executed in rollback flow\n  * SelectExecutionMode\n  * GetInputsFromPreviousExecution\n  * AssertAutoScalingGroupName\n  * ResumeLaunchProcessInAsg\n\n## Outputs\nNone",
+  "description": "## Intent\n'Test that the application can withstand az outage in ASG.'\n\n## Type\nTest\n\n## Requirements\n  * ASG has more than 1 instance\n  * ASG has instances in more than 1 AZ\n  * There is a synthetic alarm setup for application\n  * Application should be scaled sufficiently to handle expected traffic with one az loss\n\n## Permissions required for AutomationAssumeRole\n  * autoscaling:DescribeAutoScalingGroups\n  * autoscaling:SuspendProcesses\n  * autoscaling:ResumeProcesses\n  * ec2:TerminateInstances\n  * ec2:DescribeInstanceStatus\n  * cloudwatch:DescribeAlarms\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * iam:PassRole (restricted to same role)\n\n## Supports Rollback\n  Yes. If executed in rollback mode, any previous suspended launch processes in ASG will be resumed.\n\n## Cancellation behavior\n  Suspended launch processes in ASG will be resumed.\n\n## Inputs\n### (Required) AutoScalingGroupName:\n  * type: String\n  * description: Name of AutoScalingGroup.\n\n### (Required) SyntheticAlarmName:\n  * type: String\n  * description: Synthetic Canary Alarm for the application which should stay green during this test.\n\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: The ARN of the role that allows Automation to perform the actions on your behalf.\n\n### (Optional) TestDurationInMinutes:\n  * type: String\n  * description: Test duration in minutes.\n  * default: \"10\"\n\n### (Optional) IsRollback:\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified.\n  * default: 'false'\n\n### (Optional) PreviousExecutionId:\n  * type: String\n  * description: (Optional) SSM execution ID of the previous execution of this document for which resources need to be cleaned up.\n  * default: ''\n\n## Details\n  * Select AZ where majority of instances are in.\n  * Prevent new instances in AZ from turning on (use suspendLaunch API)\n  * Inject an error to all instances in AZ together (terminate all instances in az)\n  * Verify alarms alert in (alarms a)\n  * Verify that Synthetic monitor stays green / turns green within x minutes.\n\n## Steps executed in normal flow\n  * SelectExecutionMode\n  * AssertNoSuspendedProcesses\n  * AssertAlarmToBeGreenBeforeTest\n  * SuspendLaunchProcessInAsg\n  * GetInstancesInRandomAz\n  * EnsureMultiAz\n  * TerminateInstances\n  * WaitForTestCompletion\n  * AssertAlarmToBeGreen\n  * ResumeLaunchProcessInAsg\n\n## Steps executed in rollback flow\n  * SelectExecutionMode\n  * GetInputsFromPreviousExecution\n  * AssertAutoScalingGroupName\n  * ResumeLaunchProcessInAsg\n\n## Outputs\nNone",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
@@ -105,6 +105,11 @@
           "Name": "InstanceIds",
           "Selector": "$.Payload.InstanceIds",
           "Type": "StringList"
+        },
+        {
+          "Name": "AzsWithInstances",
+          "Selector": "$.Payload.AzsWithInstances",
+          "Type": "Integer"
         }
       ],
       "inputs": {
@@ -113,7 +118,22 @@
         "InputPayload": {
           "AutoScalingGroupName": "{{AutoScalingGroupName}}"
         },
-        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef get_instance_ids_in_asg_random_az(events, context):\n    if 'AutoScalingGroupName' not in events:\n        raise KeyError('Requires AutoScalingGroupName in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    autoscaling = boto3.client('autoscaling', config=config)\n\n    auto_scaling_groups = autoscaling.describe_auto_scaling_groups(\n        AutoScalingGroupNames=[\n            events['AutoScalingGroupName']\n        ]\n    )\n\n    instances_by_az = {}\n    for instance in auto_scaling_groups['AutoScalingGroups'][0]['Instances']:\n        instances_by_az.setdefault(instance['AvailabilityZone'], []).append(instance['InstanceId'])\n\n    output = {}\n    output['InstanceIds'] = random.choice(list(instances_by_az.values()))\n    return output"
+        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef get_instance_ids_in_asg_random_az(events, context):\n    if 'AutoScalingGroupName' not in events:\n        raise KeyError('Requires AutoScalingGroupName in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    autoscaling = boto3.client('autoscaling', config=config)\n\n    auto_scaling_groups = autoscaling.describe_auto_scaling_groups(\n        AutoScalingGroupNames=[\n            events['AutoScalingGroupName']\n        ]\n    )\n\n    instances_by_az = {}\n    for instance in auto_scaling_groups['AutoScalingGroups'][0]['Instances']:\n        instances_by_az.setdefault(instance['AvailabilityZone'], []).append(instance['InstanceId'])\n\n    output = {}\n    output['InstanceIds'] = random.choice(list(instances_by_az.values()))\n    output['AzsWithInstances'] = len(instances_by_az)\n    return output"
+      }
+    },
+    {
+      "name": "EnsureMultiAz",
+      "description": "Only continue if there are multiple AZs with instances.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ResumeLaunchProcessInAsg",
+            "Variable": "{{GetInstancesInRandomAz.AzsWithInstances}}",
+            "NumericEquals": 1
+          }
+        ],
+        "Default": "TerminateInstances"
       }
     },
     {
