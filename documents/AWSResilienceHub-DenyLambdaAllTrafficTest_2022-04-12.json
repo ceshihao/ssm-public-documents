@@ -1,0 +1,360 @@
+{
+  "description": "## Id\nAWSResilienceHub-DenyLambdaAllTrafficTest_2022-04-12\n\n## Intent\nTest lambda function behavior after deny all lambda function all traffic by setting security group without allowed inbound/outbaound traffic.\n\n## Type\nTEST\n\n## Risk\nHigh\n\n## Requirements\n  * Lambda Function\n  * Lambda Function has VPC configuration\n  * Alarm for metric [Errors](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-metrics.html) setup for the Lambda function\n\n## Permissions required for AutomationAssumeRole\n  * ec2:CreateSecurityGroup\n  * ec2:DescribeSecurityGroups\n  * ec2:DescribeSubnets\n  * ec2:DescribeVpcs\n  * ec2:CreateTags (for `ec2:CreateAction` value \"CreateSecurityGroup\")\n  * cloudwatch:DescribeAlarms\n  * ssm:GetAutomationExecution\n  * ssm:StartAutomationExecution\n  * lambda:GetFunction\n  * lambda:UpdateFunctionConfiguration\n  * iam:PassRole\n\n##### Permissions for security groups with tag `ec2:ResourceTag/AWSResilienceHub` value \"lambda:test:deny_all_outbound_traffic\"\n  * ec2:DeleteSecurityGroup\n  * ec2:RevokeSecurityGroupEgress\n  * ec2:RevokeSecurityGroupIngress\n  * ec2:UpdateSecurityGroupRuleDescriptionsIngress\n\n## Supports Rollback\nYes. Revert security groups to the original list\n\n## Cancellation behavior\nRevert security groups to the original list\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) LambdaARN\n  * type: String\n  * description: The Lambda function ARN\n\n### (Required) LambdaErrorAlarmName\n  * type: String\n  * description: Alarm for metric `Errors` setup for the Lambda function\n\n### (Optional) SecurityGroupId\n  * type: String\n  * description: The identifier of the security group that allows communication between give Lambda function and another AWS Service (e.g. DynamoDB, RDS, and etc.) SSM document will try to remove this SG from Lambda\n  * default: ''\n\n### (Optional) IsRollback\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n  * default: false\n\n### (Optional) PreviousExecutionId\n  * type: String\n  * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nThe document injects failure by adding an empty security group (or replacing the specified security group)\nthat blocks all egress connections. In case of issues users should manually revert security groups to the\noriginal state from backup.\n\n## Steps executed in normal flow\n  * CheckIsRollback\n  * AssertAlarmToBeGreenBeforeTest\n  * AssertLambdaInVPCAndBackupLambdaSecurityGroups\n  * CreateEmptySecurityGroup\n  * RemoveSecurityGroupAssignment\n  * AssertAlarmToBeRed\n  * RollbackCurrentExecution\n  * AssertAlarmToBeGreen\n  * ClearEmptySecurityGroup\n\n## Steps executed in rollback flow\n  * CheckIsRollback\n  * GetInputsFromPreviousExecution\n  * GetSecurityGroupsFromPreviousExecution\n  * GetEmptySecurityGroupFromPreviousExecution\n  * AssertLambdaARN\n  * RollbackPreviousExecution\n  * ClearEmptySecurityGroupOnRollback\n\n## Outputs\n### AssertLambdaInVPCAndBackupLambdaSecurityGroups.SecurityGroupList\n  * type: StringList\n  * description: List of original security groups\n\n### RemoveSecurityGroupAssignment.SecurityGroupListUpdatedValue\n  * type: StringList\n  * description: Updated list of security groups\n\n### RollbackCurrentExecution.SecurityGroupListRestoredValue\n  * type: StringList\n  * description: List of security groups after recovery (should be equal to original)",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "LambdaARN": {
+      "type": "String",
+      "description": "(Required) The Lambda function ARN"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "LambdaErrorAlarmName": {
+      "type": "String",
+      "description": "(Required) Alarm which should be red after injection of the failure and green after the rollback process in the end of the test."
+    },
+    "SecurityGroupId": {
+      "type": "String",
+      "description": "(Optional) The identifier of the security group that allows communication between give Lambda function and another AWS Service (e.g. DynamoDB, RDS, and etc.) SSM document will try to remove this SG from Lambda",
+      "default": ""
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`). Can be either true or false.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "outputs": [
+    "AssertLambdaInVPCAndBackupLambdaSecurityGroups.SecurityGroupList",
+    "RemoveSecurityGroupAssignment.SecurityGroupListUpdatedValue",
+    "RollbackCurrentExecution.SecurityGroupListRestoredValue"
+  ],
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetInputsFromPreviousExecution",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "AssertAlarmToBeGreenBeforeTest"
+      }
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "LambdaARN",
+          "Selector": "$.Payload.LambdaARN[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "GetSecurityGroupsFromPreviousExecution",
+      "description": "Get list of original Lambda function's security groups for rollback",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "SecurityGroupList",
+          "Selector": "$.Payload.SecurityGroupList",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "AssertLambdaInVPCAndBackupLambdaSecurityGroups",
+          "ResponseField": "SecurityGroupList"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    # Sets values in string type regardless of what is the original value type. In order to set\n                    # values with original types please use 'get_typed_output_from_ssm_step_execution'.\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "GetEmptySecurityGroupFromPreviousExecution",
+      "description": "Get empty security group for rollback",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "EmptySecurityGroupId",
+          "Selector": "$.Payload.EmptySecurityGroupId[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "CreateEmptySecurityGroup",
+          "ResponseField": "EmptySecurityGroupId"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    # Sets values in string type regardless of what is the original value type. In order to set\n                    # values with original types please use 'get_typed_output_from_ssm_step_execution'.\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "AssertLambdaARN",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RollbackPreviousExecution",
+            "Variable": "{{ GetInputsFromPreviousExecution.LambdaARN }}",
+            "StringEquals": "{{ LambdaARN }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "RollbackPreviousExecution",
+      "description": "Execute script that reverts Lambda function's security groups to original state",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "rollback_security_groups",
+        "InputPayload": {
+          "SecurityGroupList": "{{GetSecurityGroupsFromPreviousExecution.SecurityGroupList}}",
+          "LambdaARN": "{{GetInputsFromPreviousExecution.LambdaARN}}",
+          "ExecutionId": "{{PreviousExecutionId}}"
+        },
+        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\n\ndef rollback_security_groups(events: dict, context):\n    required_params = [\n        'LambdaARN',\n        'SecurityGroupList',\n        'ExecutionId'\n    ]\n    check_required_params(required_params, events)\n    lambda_client = boto3.client('lambda')\n    lambda_description = lambda_client.get_function(\n        FunctionName=events['LambdaARN']\n    )\n\n    subnet_ids = lambda_description['Configuration']['VpcConfig']['SubnetIds']\n\n    time_to_wait = 900\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = datetime.timestamp(datetime.now()) + int(time_to_wait)\n    while datetime.timestamp(datetime.now()) < timeout_timestamp:\n        try:\n            response = lambda_client.update_function_configuration(\n                FunctionName=events['LambdaARN'],\n                VpcConfig={\n                    'SecurityGroupIds': events['SecurityGroupList'],\n                    'SubnetIds': subnet_ids\n                }\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'ResourceConflictException':\n                logger.info(f'Function {events[\"LambdaARN\"]} is still updating, waiting...')\n            time.sleep(5)\n    return {'SecurityGroupListRestoredValue': events['SecurityGroupList']}"
+      }
+    },
+    {
+      "name": "ClearEmptySecurityGroupOnRollback",
+      "description": "Execute script that deletes emptry security group used in failure injection",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 900,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "remove_empty_security_group",
+        "InputPayload": {
+          "EmptySecurityGroupId": "{{GetEmptySecurityGroupFromPreviousExecution.EmptySecurityGroupId}}"
+        },
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef remove_empty_security_group(events, context):\n    required_params = [\n        'EmptySecurityGroupId'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    time_to_wait = 1800\n    ec2_client = boto3.client('ec2')\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = time.time() + int(time_to_wait)\n\n    while time.time() < timeout_timestamp:\n        try:\n            logger.info(f'Deleting empty security group: {events[\"EmptySecurityGroupId\"]}')\n            group_list = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-id',\n                        'Values': [\n                            events[\"EmptySecurityGroupId\"],\n                        ]\n                    },\n                ]\n            )\n            if not group_list['SecurityGroups']:\n                break\n            group_id = group_list['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {group_id}')\n            response = ec2_client.delete_security_group(\n                GroupId=group_id\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: {events['EmptySecurityGroupId']}\")\n                break\n            elif error.response['Error']['Code'] == 'DependencyViolation' \\\n                    or error.response['Error']['Code'] == 'RequestLimitExceeded':\n                time.sleep(5)\n                continue\n            else:\n                raise error\n\n    if datetime.timestamp(datetime.now()) > timeout_timestamp:\n        raise TimeoutError(f'Security group {events[\"EmptySecurityGroupId\"]} couldn\\'t '\n                           f'be deleted in {time_to_wait} seconds')"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{LambdaErrorAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "AssertLambdaInVPCAndBackupLambdaSecurityGroups",
+      "description": "Check that Lambda function has VPC configuration and store security groups for rollback",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "SecurityGroupList",
+          "Selector": "$.Payload.SecurityGroupIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Payload.VpcId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_lambda_in_vpc_and_backup_sg",
+        "InputPayload": {
+          "LambdaARN": "{{LambdaARN}}"
+        },
+        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\n\ndef assert_lambda_in_vpc_and_backup_sg(events: dict, context):\n    required_params = [\n        'LambdaARN'\n    ]\n    check_required_params(required_params, events)\n\n    lambda_client = boto3.client('lambda')\n    lambda_description = lambda_client.get_function(\n        FunctionName=events['LambdaARN']\n    )\n    result = {}\n    if 'VpcId' in lambda_description['Configuration']['VpcConfig']:\n        result['VpcId'] = lambda_description['Configuration']['VpcConfig']['VpcId']\n        result['SecurityGroupIds'] = lambda_description['Configuration']['VpcConfig']['SecurityGroupIds']\n    else:\n        raise AssertionError(f'Lambda function:{events[\"LambdaARN\"]} is not a member of any VPC')\n\n    return result"
+      }
+    },
+    {
+      "name": "CreateEmptySecurityGroup",
+      "description": "Create empty security group",
+      "action": "aws:executeScript",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "EmptySecurityGroupId",
+          "Selector": "$.Payload.EmptySecurityGroupId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "create_empty_security_group",
+        "InputPayload": {
+          "VpcId": "{{AssertLambdaInVPCAndBackupLambdaSecurityGroups.VpcId}}",
+          "Tag": "lambda:test:deny_all_traffic",
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef remove_empty_security_group(events, context):\n    required_params = [\n        'EmptySecurityGroupId'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    time_to_wait = 1800\n    ec2_client = boto3.client('ec2')\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = time.time() + int(time_to_wait)\n\n    while time.time() < timeout_timestamp:\n        try:\n            logger.info(f'Deleting empty security group: {events[\"EmptySecurityGroupId\"]}')\n            group_list = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-id',\n                        'Values': [\n                            events[\"EmptySecurityGroupId\"],\n                        ]\n                    },\n                ]\n            )\n            if not group_list['SecurityGroups']:\n                break\n            group_id = group_list['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {group_id}')\n            response = ec2_client.delete_security_group(\n                GroupId=group_id\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: {events['EmptySecurityGroupId']}\")\n                break\n            elif error.response['Error']['Code'] == 'DependencyViolation' \\\n                    or error.response['Error']['Code'] == 'RequestLimitExceeded':\n                time.sleep(5)\n                continue\n            else:\n                raise error\n\n    if datetime.timestamp(datetime.now()) > timeout_timestamp:\n        raise TimeoutError(f'Security group {events[\"EmptySecurityGroupId\"]} couldn\\'t '\n                           f'be deleted in {time_to_wait} seconds')\n\n\n\n\ndef create_empty_security_group(events: dict, context: dict) -> dict:\n    \"\"\"\n    Creates a empty security group in provided VPC\n    The name of this SG contains Execution Id of the SSM execution\n    :param events: The dictionary that supposed to have the following keys:\n        * `VpcId` - The vpc id to create SG into\n        * `ExecutionId` - The execution id of SSM\n        * `Tag` - a value of `AWSResilienceHub` tag to assign\n    :param context:\n    :return: Dict with two keys:\n        * EmptySecurityGroupId - string wih SG id, you can use it as String parameter in SSM\n        * EmptySecurityGroupId - one element list wih SG id, you can use it as StringList parameter in SSM\n    \"\"\"\n    required_params = [\n        'VpcId',\n        'ExecutionId',\n        'Tag'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    ec2_client = boto3.client('ec2')\n\n    group_id = ec2_client.create_security_group(\n        Description=f'Empty SG for executionID {events[\"ExecutionId\"]}',\n        GroupName=f'EmptySG-{events[\"ExecutionId\"]}',\n        VpcId=events['VpcId'],\n        TagSpecifications=[\n            {\n                'ResourceType': 'security-group',\n                'Tags': [\n                    {\n                        'Key': 'AWSResilienceHub',\n                        'Value': events['Tag']\n                    },\n                ]\n            }\n        ]\n    )['GroupId']\n\n    result = ec2_client.revoke_security_group_egress(\n        GroupId=group_id,\n        IpPermissions=[\n            {\n                \"IpProtocol\": \"-1\",\n                \"IpRanges\": [\n                    {\n                        \"CidrIp\": \"0.0.0.0/0\"\n                    }\n                ],\n                \"Ipv6Ranges\": [],\n                \"PrefixListIds\": [],\n                \"UserIdGroupPairs\": []\n            }\n        ]\n    )\n    if not result['Return']:\n        remove_empty_security_group({'EmptySecurityGroupId': group_id}, context)\n        raise ClientError(\n            error_response={\n                \"Error\":\n                {\n                    \"Code\": \"CouldNotRevoke\",\n                    \"Message\": f\"Could not revoke egress from sg: {group_id}\"\n                }\n            },\n            operation_name='RevokeSecurityGroupEgress'\n        )\n    return {'EmptySecurityGroupId': group_id, 'EmptySecurityGroupIdList': [group_id]}"
+      }
+    },
+    {
+      "name": "RemoveSecurityGroupAssignment",
+      "description": "Execute script that replaces the specified security group with the empty one or just adds empty security group",
+      "action": "aws:executeScript",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "SecurityGroupListUpdatedValue",
+          "Selector": "$.Payload.SecurityGroupListUpdatedValue",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "remove_sg_assignment",
+        "InputPayload": {
+          "SecurityGroupId": "{{SecurityGroupId}}",
+          "EmptySecurityGroupId": "{{CreateEmptySecurityGroup.EmptySecurityGroupId}}",
+          "LambdaARN": "{{LambdaARN}}",
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\n\ndef remove_sg_assignment(events: dict, context):\n    required_params = [\n        'LambdaARN',\n        'EmptySecurityGroupId',\n        'SecurityGroupId',\n        'ExecutionId'\n    ]\n    check_required_params(required_params, events)\n    lambda_client = boto3.client('lambda')\n    lambda_description = lambda_client.get_function(\n        FunctionName=events['LambdaARN']\n    )\n    security_group_list = lambda_description['Configuration']['VpcConfig']['SecurityGroupIds']\n    subnet_ids = lambda_description['Configuration']['VpcConfig']['SubnetIds']\n\n    logger.info(f'Emptying Security groups for lambda:{events[\"LambdaARN\"]}')\n\n    if events['SecurityGroupId']:\n        if events['SecurityGroupId'] not in security_group_list:\n            raise KeyError(f\"Security group {events['SecurityGroupId']} is not in security group list of Lambda: \"\n                           f\"{security_group_list}\")\n        security_group_list.remove(events['SecurityGroupId'])\n    else:\n        security_group_list = []\n    security_group_list.append(events['EmptySecurityGroupId'])\n\n    lambda_client.update_function_configuration(\n        FunctionName=events['LambdaARN'],\n        VpcConfig={\n            'SecurityGroupIds': security_group_list,\n            'SubnetIds': subnet_ids\n        }\n    )\n    return {'SecurityGroupListUpdatedValue': security_group_list}"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for expected alarm to be red after failure is injected",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{LambdaErrorAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "RollbackCurrentExecution",
+      "description": "Execute script that reverts Lambda function's security groups to original state",
+      "action": "aws:executeScript",
+      "maxAttempts": 5,
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "SecurityGroupListRestoredValue",
+          "Selector": "$.Payload.SecurityGroupListRestoredValue",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "rollback_security_groups",
+        "InputPayload": {
+          "SecurityGroupList": "{{AssertLambdaInVPCAndBackupLambdaSecurityGroups.SecurityGroupList}}",
+          "LambdaARN": "{{LambdaARN}}",
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\n\ndef rollback_security_groups(events: dict, context):\n    required_params = [\n        'LambdaARN',\n        'SecurityGroupList',\n        'ExecutionId'\n    ]\n    check_required_params(required_params, events)\n    lambda_client = boto3.client('lambda')\n    lambda_description = lambda_client.get_function(\n        FunctionName=events['LambdaARN']\n    )\n\n    subnet_ids = lambda_description['Configuration']['VpcConfig']['SubnetIds']\n\n    time_to_wait = 900\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = datetime.timestamp(datetime.now()) + int(time_to_wait)\n    while datetime.timestamp(datetime.now()) < timeout_timestamp:\n        try:\n            response = lambda_client.update_function_configuration(\n                FunctionName=events['LambdaARN'],\n                VpcConfig={\n                    'SecurityGroupIds': events['SecurityGroupList'],\n                    'SubnetIds': subnet_ids\n                }\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'ResourceConflictException':\n                logger.info(f'Function {events[\"LambdaARN\"]} is still updating, waiting...')\n            time.sleep(5)\n    return {'SecurityGroupListRestoredValue': events['SecurityGroupList']}"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{LambdaErrorAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "ClearEmptySecurityGroup",
+      "description": "Execute script that deletes emptry security group used in failure injection",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 900,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "remove_empty_security_group",
+        "InputPayload": {
+          "EmptySecurityGroupId": "{{CreateEmptySecurityGroup.EmptySecurityGroupId}}"
+        },
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef remove_empty_security_group(events, context):\n    required_params = [\n        'EmptySecurityGroupId'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    time_to_wait = 1800\n    ec2_client = boto3.client('ec2')\n    if 'Timeout' in events:\n        time_to_wait = events['Timeout']\n    timeout_timestamp = time.time() + int(time_to_wait)\n\n    while time.time() < timeout_timestamp:\n        try:\n            logger.info(f'Deleting empty security group: {events[\"EmptySecurityGroupId\"]}')\n            group_list = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        'Name': 'group-id',\n                        'Values': [\n                            events[\"EmptySecurityGroupId\"],\n                        ]\n                    },\n                ]\n            )\n            if not group_list['SecurityGroups']:\n                break\n            group_id = group_list['SecurityGroups'][0]['GroupId']\n            logger.info(f'Deleting empty security group: {group_id}')\n            response = ec2_client.delete_security_group(\n                GroupId=group_id\n            )\n            if response['ResponseMetadata']['HTTPStatusCode'] < 400:\n                break\n        except ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidGroup.NotFound':\n                logger.info(f\"Empty security group doesn't exist: {events['EmptySecurityGroupId']}\")\n                break\n            elif error.response['Error']['Code'] == 'DependencyViolation' \\\n                    or error.response['Error']['Code'] == 'RequestLimitExceeded':\n                time.sleep(5)\n                continue\n            else:\n                raise error\n\n    if datetime.timestamp(datetime.now()) > timeout_timestamp:\n        raise TimeoutError(f'Security group {events[\"EmptySecurityGroupId\"]} couldn\\'t '\n                           f'be deleted in {time_to_wait} seconds')"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress. This step starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}

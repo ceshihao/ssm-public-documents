@@ -1,0 +1,133 @@
+{
+  "description": "## Id\nAWSResilienceHub-ForceECSServiceTaskFailureTest_2020-04-01\n\n## Intent\nRestore ECS services when service task failure (compatible on EC2 and Fargate)\n\n## Type\nTest\n\n## Risk\nHigh\n\n## Requirements:\n  * Launch Amazon ECS cluster [Get setup for Amazon ECS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/get-set-up-for-amazon-ecs.html)\n  * Amazon cloudwatch alarm is setup for downtime metric expression. Include link for the same.\n    Should include the same description in description for parameters for DowntimeAlarmName as well.\n    We don't need to mention \"TreatMissingData\" property as \"missing\" runs.\n\n## Permissions required for AutomationAssumeRole:\n  * ecs:DescribeClusters\n  * ecs:DescribeServices\n  * ecs:ListTasks\n  * ecs:StopTask\n  * cloudwatch:DescribeAlarms\n  * cloudwatch:DescribeAlarmHistory\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs:\n### (Required) ClusterName\n  * type: String\n  * description: The name of the ECS Cluster\n\n### (Required) ServiceName\n  * type: String\n  * description: The name of ECS Service\n\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: The ARN of the role that allows Automation to perform the actions on your behalf.\n\n### (Required) CanaryAlarmName\n  * type: String\n  * description: The Synthetic Alarm which should be green within recovery time.\n\n### (Optional) PercentageOfTasksToStop\n  * type: Integer\n  * description: Percentage of tasks to be stopped. Only positive integer values,\n                 greater than 0 and less than 100.\n\n## Details\nStop the work of a certain percentage of tasks. Waits for the tasks to automatically recover successfully.\n\nPlease, use the following AWS documentation guidelines if something was left in a bad state.\n  * [Runtime Troubleshooting](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/troubleshooting.html)\n\n## Steps executed in normal flow:\n  * AssertAlarmToBeGreenBeforeTest\n  * InjectFailure\n  * FailWithIncorrectParams\n  * StopSelectedTasks\n  * WaitTasksToBeRestored\n  * AssertAlarmToBeGreen\n\n## Outputs\n  None",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "ClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the ECS Cluster"
+    },
+    "ServiceName": {
+      "type": "String",
+      "description": "(Required) The name of ECS Service"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "CanaryAlarmName": {
+      "type": "String",
+      "description": "(Required) The Synthetic Alarm which should be green within recovery time."
+    },
+    "PercentageOfTasksToStop": {
+      "type": "Integer",
+      "description": "(Optional) Percentage of tasks to be stopped. Only positive integer values, greater than 0 and less than 100.",
+      "default": 30
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "InjectFailure",
+      "action": "aws:branch",
+      "description": "check PercentageOfTasksToStop is greater than 0 and less than 100.",
+      "inputs": {
+        "Choices": [
+          {
+            "Or": [
+              {
+                "Variable": "{{PercentageOfTasksToStop}}",
+                "NumericLesser": 1
+              },
+              {
+                "Variable": "{{PercentageOfTasksToStop}}",
+                "NumericGreater": 100
+              }
+            ],
+            "NextStep": "FailWithIncorrectParams"
+          }
+        ],
+        "Default": "StopSelectedTasks"
+      }
+    },
+    {
+      "name": "FailWithIncorrectParams",
+      "action": "aws:executeScript",
+      "description": "Fail if PercentageOfTasksToStop is less than 1 or greater than 100.",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "raise_exception",
+        "InputPayload": {
+          "ErrorMessage": "PercentageOfTasksToStop should be greater than 0 and less than 100."
+        },
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef raise_exception(events, context):\n    \"\"\"\n    Raises AssertionError exception with defined error message\n    You can pass additional arguments to run python format() on the message.\n    Example:\n\n    ErrorMessage: \"test {test1} {test2}\"\n    test1: \"replaced1\"\n    test2: \"replaced2\"\n\n    will render in\n    `test replaced1 replaced2`\n\n\n    :param events: dict with the following keys:\n        * ErrorMessage: error message to return, you can add placeholders in {} and replace them with other parameters\n        * any_key: will replace placeholder {any_key} in ErrorMessage\n    :param context:\n    :return: None\n    \"\"\"\n    required_params = [\n        'ErrorMessage'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    format_dict = {k: v for k, v in events.items() if k != 'ErrorMessage'}\n    raise AssertionError(events['ErrorMessage'].format(**format_dict))"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "StopSelectedTasks",
+      "action": "aws:executeScript",
+      "description": "Stop percentage of tasks",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "stop_selected_tasks",
+        "Script": "import boto3\nfrom botocore.config import Config\nimport logging\n\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef stop_selected_tasks(events, context):\n    \"\"\"\n    Stop NumberOfTasksToStop or total number of tasks running\n    if NumberOfTasksToStop is greater than the total number.\n    :param events: The object which contains passed parameters from SSM document\n     * `ServiceName` - Required. Name of ECS Service\n     * `ClusterName` - Required. Name of ECS Cluster\n     * `NumberOfTasksToStop` - Required. Number of tasks to stop\n    :param context: context\n    :return: True or error\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ecs_client = boto3.client('ecs', config=config)\n\n    paginator = ecs_client.get_paginator('list_tasks')\n    pages = paginator.paginate(serviceName=events['ServiceName'],\n                               cluster=events['ClusterName'],\n                               desiredStatus='RUNNING')\n\n    desired_count = ecs_client.describe_services(services=[events['ServiceName']],\n                                                 cluster=events['ClusterName'])[\"services\"][0][\"desiredCount\"]\n\n    percentage_of_task_to_stop = events['PercentageOfTasksToStop']\n    number_of_task_to_stop = 0\n\n    if desired_count:\n        number_of_task_to_stop = round(desired_count * percentage_of_task_to_stop / 100)\n\n    tasks_stopped = 0\n    for page in pages:\n        task_arns = page.get('taskArns')\n        for task_arn in task_arns:\n            if tasks_stopped >= number_of_task_to_stop:\n                break\n            ecs_client.stop_task(\n                cluster=events['ClusterName'],\n                task=task_arn\n            )\n            tasks_stopped += 1\n\n    return True",
+        "InputPayload": {
+          "ServiceName": "{{ServiceName}}",
+          "ClusterName": "{{ClusterName}}",
+          "PercentageOfTasksToStop": "{{PercentageOfTasksToStop}}"
+        }
+      }
+    },
+    {
+      "name": "WaitForServiceToBeRestored",
+      "action": "aws:executeScript",
+      "description": "Wait for all status tasks in ECS application to be in \"RUNNING\" state",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "wait_services_stable",
+        "Script": "import boto3\nfrom botocore.config import Config\nimport logging\n\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef wait_services_stable(events, context):\n    \"\"\"\n    Wait while service will be stable.\n    :param events: The object which contains passed parameters from SSM document\n     * `ServiceName` - Required. Name of ECS Service\n     * `ClusterName` - Required. Name of ECS Cluster\n    :param context: context\n    :return: True or error\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ecs_client = boto3.client('ecs', config=config)\n\n    cluster_name = events['ClusterName']\n    service = events.get('ServiceName')\n\n    if service:\n        services = [service]\n    else:\n        services = []\n        paginator = ecs_client.get_paginator('list_services')\n        pages = paginator.paginate(cluster=cluster_name)\n\n        for page in pages:\n            service_arns = page.get('serviceArns')\n            services.extend(service_arns)\n\n    waiter = ecs_client.get_waiter('services_stable')\n    waiter.wait(\n        cluster=cluster_name,\n        services=services,\n        WaiterConfig={\n            'Delay': 15,\n            'MaxAttempts': 20\n        }\n    )\n    return True",
+        "InputPayload": {
+          "ServiceName": "{{ServiceName}}",
+          "ClusterName": "{{ClusterName}}"
+        }
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Wait for the alarm to be green after test is complete",
+      "maxAttempts": 10,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{CanaryAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}
