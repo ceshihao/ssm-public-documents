@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSConfigRemediation-UpdateOpenSearchDomainSecurityGroups\n\n## What does this document do?\nThis runbook updates the AWS security group configuration on a given Amazon OpenSearch Service (Amazon OpenSearch) domain using the [UpdateDomainConfig](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/configuration-api.html#configuration-api-actions-updatedomainconfig) API.\nPlease note, AWS security groups can only be applied to Amazon OpenSearch domains configured for Amazon Virtual Private Cloud (VPC) Access, not those configured for Public Access.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* DomainName: (Required) The name of the Amazon OpenSearch Service domain for which you want to update security groups.\n* SecurityGroupList: (Required) The list of AWS security group IDs.\n\n## Output Parameters\n* UpdateSecurityGroupsAndVerify.Output - Success message or failure exception.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:(?:aws|aws-us-gov|aws-cn):iam::\\d{12}:role\\/[\\w+=,.@/-]+$"
+    },
+    "DomainName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon OpenSearch Service domain for which you want to update security groups.",
+      "allowedPattern": "(\\d{12}/)?[a-z]{1}[a-z0-9-]{2,28}"
+    },
+    "SecurityGroupList": {
+      "type": "StringList",
+      "description": "(Required) The list of AWS security group IDs.",
+      "allowedPattern": "^sg-[0-9a-f]{1,17}$"
+    }
+  },
+  "outputs": [
+    "UpdateSecurityGroupsAndVerify.Output"
+  ],
+  "mainSteps": [
+    {
+      "name": "UpdateSecurityGroupsAndVerify",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "timeoutSeconds": 600,
+      "description": "## UpdateSecurityGroupsAndVerify\nMakes UpdateDomainConfig API call using Amazon OpenSearch domain name and security groups IDs and updates AWS security group configuration on Amazon OpenSearch domain and verifies its state.\n## Outputs\n* Output: Success message or failure exception.\n",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "DomainName": "{{ DomainName }}",
+          "SecurityGroupIds": "{{ SecurityGroupList }}"
+        },
+        "Script": "import boto3\nimport re\nfrom botocore.config import Config\n\nconfig = Config(\n    retries={\n        \"max_attempts\": 10,\n        \"mode\": \"standard\"\n    }\n)\n\nopensearch_client = boto3.client(\"opensearch\", config=config)\n\ndef update_security_group_ids(domain_name, security_grp_list):\n    return opensearch_client.update_domain_config(\n        DomainName=domain_name, VPCOptions={\"SecurityGroupIds\": security_grp_list}\n    )\n\ndef verify_security_groups_ids_updated(domain_name, security_grp_ids):\n    security_grp_list = opensearch_client.describe_domain(\n        DomainName=domain_name\n    )[\"DomainStatus\"][\"VPCOptions\"][\"SecurityGroupIds\"]\n    if sorted(security_grp_list) == sorted(security_grp_ids):\n        return True\n    return False\n\ndef handler(event, context):\n    domain_name = event[\"DomainName\"]\n    security_grp_ids = event[\"SecurityGroupIds\"]\n    domain_pattern = r\"(\\d{12}/)?[a-z]{1}[a-z0-9-]{2,28}\"\n    if re.match(domain_pattern, domain_name):\n        domain_name = domain_name.split(\"/\")[-1]\n    update_domain_response = update_security_group_ids(domain_name, security_grp_ids)['ResponseMetadata']\n    update_status = verify_security_groups_ids_updated(domain_name, security_grp_ids)\n    if update_status:\n        return {\n            \"output\": {\n                \"Message\": \"Verification of AWS security groups on Amazon OpenSearch domain is successful.\",\n                \"HTTPResponse\": update_domain_response,\n            }\n        }\n    raise Exception(\n        \"VERIFICATION OF AWS SECURITY GROUPS ON AMAZON OPENSEARCH DOMAIN FAILED.\"\n    )"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.output",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}

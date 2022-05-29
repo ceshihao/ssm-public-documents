@@ -1,0 +1,189 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Upgrade and patch minor version of an instance(Windows/Linux) attached to any load balancer (classic load balancer/ALB/NLB).  It will use the default connection draintime to wait before patching the instance. You can override the wait time by entering into ConnectionDrainTime in minutes(1-59).",
+  "parameters": {
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) ID of the Instance to patch.",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$"
+    },
+    "ConnectionDrainTime": {
+      "type": "String",
+      "description": "(Optional) Override load balancer's connection drain time in Minutes(1-59).",
+      "allowedPattern": "^([1-5][0-9]|[1-9]||null|empty)$",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "assertSSMAgentOnline",
+      "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": "true",
+      "nextStep": "deployChangeStateLambda"
+    },
+    {
+      "name": "deployChangeStateLambda",
+      "action": "aws:createStack",
+      "inputs": {
+        "StackName": "lb-instance-change-lambda-cfn-stack-{{automation:EXECUTION_ID}}",
+        "TemplateURL": "https://s3.us-west-2.amazonaws.com/aws.portingassistant.dotnet.datastore/cf_launch_lambda_for_rotating_instance.yaml",
+        "Parameters": [
+          {
+            "ParameterValue": "lb-instance-change-lambda-{{automation:EXECUTION_ID}}",
+            "ParameterKey": "FunctionName"
+          }
+        ],
+        "Capabilities": [
+          "CAPABILITY_IAM"
+        ]
+      },
+      "onFailure": "Abort"
+    },
+    {
+      "name": "invokeLambdaToDeregister",
+      "action": "aws:invokeLambdaFunction",
+      "inputs": {
+        "FunctionName": "lb-instance-change-lambda-{{automation:EXECUTION_ID}}",
+        "Payload": "{\"instance_id\": \"{{InstanceId}}\", \"drain_time\": \"{{ConnectionDrainTime}}\", \"to_remove\": true}"
+      },
+      "outputs": [
+        {
+          "Name": "PayLoad",
+          "Selector": "$.PayLoad",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "TimeToDrain",
+          "Selector": "$.max_drain_time",
+          "Type": "String"
+        },
+        {
+          "Name": "LambdaError",
+          "Selector": "$.is_error",
+          "Type": "String"
+        },
+        {
+          "Name": "TargetGroupArns",
+          "Selector": "$.target_group_details",
+          "Type": "MapList"
+        },
+        {
+          "Name": "ClassicELBNames",
+          "Selector": "$.elb_names",
+          "Type": "StringList"
+        }
+      ],
+      "maxAttempts": 1,
+      "onFailure": "step:deleteStack",
+      "isCritical": "true"
+    },
+    {
+      "name": "branchToSleepForPatchingOrAddBackInstance",
+      "action": "aws:branch",
+      "onFailure": "step:deleteStack",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "registerInstanceToElbAndTargetGroup",
+            "Variable": "{{ invokeLambdaToDeregister.LambdaError }}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "SleepForConnectionDraining"
+      },
+      "isCritical": "true"
+    },
+    {
+      "name": "SleepForConnectionDraining",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "{{invokeLambdaToDeregister.TimeToDrain}}"
+      },
+      "onFailure": "step:deleteStack",
+      "nextStep": "installMissingOSUpdates"
+    },
+    {
+      "name": "installMissingOSUpdates",
+      "action": "aws:runCommand",
+      "maxAttempts": 1,
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPatchBaseline",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "Operation": "Install"
+        }
+      },
+      "nextStep": "SleepToCompleteInstall"
+    },
+    {
+      "name": "SleepToCompleteInstall",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT2M"
+      },
+      "nextStep": "registerInstanceToElbAndTargetGroup"
+    },
+    {
+      "name": "registerInstanceToElbAndTargetGroup",
+      "action": "aws:invokeLambdaFunction",
+      "inputs": {
+        "FunctionName": "lb-instance-change-lambda-{{automation:EXECUTION_ID}}",
+        "Payload": "{\"instance_id\": \"{{InstanceId}}\", \"lb_map\": {{invokeLambdaToDeregister.Payload}}, \"to_remove\": false}"
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.status",
+          "Type": "String"
+        }
+      ],
+      "maxAttempts": 3,
+      "onFailure": "step:deleteStack",
+      "isCritical": "true"
+    },
+    {
+      "name": "waitForInstanceToBeRegistered",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT1M"
+      }
+    },
+    {
+      "name": "deleteStack",
+      "action": "aws:deleteStack",
+      "maxAttempts": 3,
+      "inputs": {
+        "StackName": "lb-instance-change-lambda-cfn-stack-{{automation:EXECUTION_ID}}"
+      },
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "registerInstanceToElbAndTargetGroup.Status",
+    "invokeLambdaToDeregister.LambdaError",
+    "invokeLambdaToDeregister.TargetGroupArns",
+    "invokeLambdaToDeregister.ClassicELBNames"
+  ]
+}
