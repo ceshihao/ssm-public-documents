@@ -1,0 +1,122 @@
+{
+  "description": "This action will install the AWS Elastic Disaster Recovery (DRS) Replication Agent on an EC2 instance.\n",
+  "schemaVersion": "2.2",
+  "parameters": {
+    "Region": {
+      "type": "String",
+      "description": "(Required) AWS Region into which you are replicating.",
+      "allowedValues": [
+        "us-east-1",
+        "us-east-2",
+        "us-west-2",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-northeast-1",
+        "eu-central-1",
+        "eu-west-1",
+        "eu-west-2"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runPowerShellScript",
+      "name": "InstallWindowsAgent",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "Remove-Item -LiteralPath 'C:/tempDRS' -Force -Recurse -ErrorAction Ignore",
+          "try {",
+          "mkdir C:/tempDRS",
+          "cd C:/tempDRS",
+          "}",
+          "catch {",
+          "Write-Error \"Failed while creating temporary directory for script invocation\"",
+          "exit 1",
+          "}",
+          "try {",
+          "Invoke-WebRequest https://aws-elastic-disaster-recovery-{{Region}}.s3.amazonaws.com/latest/windows/AwsReplicationWindowsInstaller.exe -OutFile AwsReplicationWindowsInstaller.exe",
+          "Invoke-WebRequest https://aws-elastic-disaster-recovery-hashes-{{Region}}.s3.amazonaws.com/latest/windows/AwsReplicationWindowsInstaller.exe.sha512 -OutFile AwsReplicationWindowsInstaller.exe.sha512",
+          "}",
+          "catch {",
+          "Write-Error \"Failed while trying to download the AWS Elastic Disaster Recovery client\"",
+          "exit 1",
+          "}",
+          "try {",
+          "$psMajorVersion=$PSVersionTable.PSVersion.Major",
+          "if ( $psMajorVersion -lt 4 ) {",
+          "$hashAlgorithm = [Security.Cryptography.HashAlgorithm]::Create(\"SHA512\")",
+          "$fileBytes = [io.File]::ReadAllBytes(\"C:/tempDRS/AwsReplicationWindowsInstaller.exe\")",
+          "$hashBytes = $hashAlgorithm.ComputeHash($fileBytes)",
+          "$fileHash = -Join ($hashBytes | ForEach {\"{0:x2}\" -f $_})",
+          "} else {",
+          "$hashObject = Get-FileHash -Algorithm SHA512 -Path AwsReplicationWindowsInstaller.exe",
+          "$fileHash = $hashObject.Hash",
+          "}",
+          "$hash = Get-Content AwsReplicationWindowsInstaller.exe.sha512",
+          "}",
+          "catch {",
+          "Write-Error \"Failed while trying to verify downloaded client hash\"",
+          "exit 1",
+          "}",
+          "try {",
+          "if($fileHash -eq $hash){",
+          "./AwsReplicationWindowsInstaller.exe --no-prompt --region {{Region}}",
+          "$result = $LastExitCode",
+          "}else{",
+          "Write-Error \"Checksum validation failed\"",
+          "exit 1",
+          "}",
+          "cd C:/",
+          "Remove-Item -LiteralPath 'C:/tempDRS' -Force -Recurse",
+          "if( $result -ne 0 ){",
+          "Write-Error \"Installation failed\"",
+          "exit $result",
+          "}",
+          "}",
+          "catch {",
+          "Write-Error \"General error during agent installation\"",
+          "exit 1",
+          "}"
+        ]
+      }
+    },
+    {
+      "action": "aws:runShellScript",
+      "name": "InstallLinuxAgent",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "sudo curl -o ./aws-installer.sha512 https://aws-elastic-disaster-recovery-hashes-{{ Region }}.s3.amazonaws.com/latest/linux/aws-replication-installer-init.py.sha512",
+          "asset_hash=$(cat ./aws-installer.sha512)",
+          "sudo curl -o ./aws-replication-installer-init.py https://aws-elastic-disaster-recovery-{{ Region }}.s3.amazonaws.com/latest/linux/aws-replication-installer-init.py",
+          "computed_hash=$(sha512sum ./aws-replication-installer-init.py | cut -d' ' -f1)",
+          "if [ \"$computed_hash\" != \"$asset_hash\" ]; then",
+          "echo \"Checksum validation failed\" >&2",
+          "else",
+          "pyexec=python3",
+          "which python3",
+          "ispy3=$?",
+          "if [ $ispy3 -eq 1 ]; then pyexec=python; fi",
+          "sudo $pyexec aws-replication-installer-init.py --no-prompt --region {{ Region }}",
+          "result=$?",
+          "fi",
+          "rm -f ./aws-installer.sha512 ./aws-replication-installer-init.py",
+          "if [ $result -ne 0 ]; then echo \"Installation failed\" 1>&2 && exit $result; fi"
+        ]
+      }
+    }
+  ]
+}
