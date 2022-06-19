@@ -1,14 +1,10 @@
 {
-  "description": "## Id\nAWSResilienceHub-ChangeLambdaConcurrencyLimitSOP_2020-10-26\n\n## Intent\nChange reserved concurrent executions limit of a Lambda function\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * Lambda Function\n\n## Permissions required for AutomationAssumeRole\n  * servicequotas:ListAWSDefaultServiceQuotas\n  * servicequotas:ListServiceQuotas\n  * servicequotas:GetAWSDefaultServiceQuota\n  * lambda:PutFunctionConcurrency\n  * lambda:ListFunctions\n  * lambda:GetFunctionConcurrency\n  * lambda:PutFunctionConcurrency\n\n##### To log output to CloudWatch\n  * logs:CreateLogStream\n  * logs:PutLogEvents\n  * logs:DescribeLogGroups\n  * logs:DescribeLogStreams\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) LambdaARN\n  * type: String\n  * description: The ARN of the Lambda function\n\n### (Optional) NewReservedConcurrentExecutions\n  * type: Integer\n  * description: New reserved concurrent executions limit value\n  * default: 0\n\n## Details\nThe document checks the amount of available concurrent executions and sets the specified value for the\nspecified Lambda if it's possible.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * GetConcurrentExecutionsQuota\n  * CalculateTotalReservedConcurrencyOfExistingLambdas\n  * CheckFeasibility\n  * SetReservedConcurrentExecutions\n  * OutputRecoveryTime\n\n## Outputs\n### GetConcurrentExecutionsQuota.ConcurrentExecutionsQuota\n  * type: Integer\n  * description: Service quota for account\n\n### CalculateTotalReservedConcurrencyOfExistingLambdas.TotalReservedConcurrency\n  * type: Integer\n  * description: Amount of reserved concurrency executions for all existing Lambda functions\n\n### CheckFeasibility.MaximumPossibleReservedConcurrency\n  * type: Integer\n  * description: Number of available reserved concurrency executions\n\n### SetReservedConcurrentExecutions.ReservedConcurrencyLeft\n  * type: Integer\n  * description: Number of available reserved concurrency executions after update\n\n### SetReservedConcurrentExecutions.NewReservedConcurrencyValue\n  * type: Integer\n  * description: Updated reserved concurrency executions value for the specified Lambda function\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: Execution time in seconds",
+  "description": "## Id\nAWSResilienceHub-ChangeLambdaConcurrencyLimitSOP_2020-10-26\n\n## Intent\nChange reserved concurrent executions limit of a Lambda function\n\n## Type\nSOP\n\n## Risk\nMedium\n\n## Requirements\n  * Lambda Function\n\n## Permissions required for AutomationAssumeRole\n  * lambda:PutFunctionConcurrency\n\n##### To log output to CloudWatch\n  * logs:CreateLogStream\n  * logs:PutLogEvents\n  * logs:DescribeLogGroups\n  * logs:DescribeLogStreams\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) LambdaARN\n  * type: String\n  * description: The ARN of the Lambda function\n\n### (Optional) NewReservedConcurrentExecutions\n  * type: Integer\n  * description: New reserved concurrent executions limit value\n  * default: 0\n\n## Details\nThe document checks the amount of available concurrent executions and sets the specified value for the\nspecified Lambda if it's possible.\n\n## Steps executed in normal flow\n  * RecordStartTime\n  * PutFunctionConcurrency\n  * OutputRecoveryTime\n\n## Outputs\n### SetReservedConcurrentExecutions.NewReservedConcurrencyValue\n  * type: Integer\n  * description: Updated reserved concurrency executions value for the specified Lambda function\n\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: Execution time in seconds",
   "schemaVersion": "0.3",
   "assumeRole": "{{AutomationAssumeRole}}",
   "outputs": [
-    "GetConcurrentExecutionsQuota.ConcurrentExecutionsQuota",
-    "CalculateTotalReservedConcurrencyOfExistingLambdas.TotalReservedConcurrency",
-    "CheckFeasibility.MaximumPossibleReservedConcurrency",
-    "SetReservedConcurrentExecutions.ReservedConcurrencyLeft",
-    "SetReservedConcurrentExecutions.NewReservedConcurrencyValue",
-    "OutputRecoveryTime.RecoveryTime"
+    "OutputRecoveryTime.RecoveryTime",
+    "PutFunctionConcurrency.NewReservedConcurrentExecutions"
   ],
   "parameters": {
     "LambdaARN": {
@@ -44,96 +40,19 @@
       }
     },
     {
-      "name": "GetConcurrentExecutionsQuota",
-      "description": "Get the current or default quota for AWS Lambda Service",
-      "action": "aws:executeScript",
-      "onFailure": "Abort",
-      "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "get_concurrent_execution_quota",
-        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\ndef get_concurrent_execution_quota(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        quotas_client = boto3.client('service-quotas', config=config)\n        paginator = quotas_client.get_paginator('list_service_quotas')\n        pages = paginator.paginate(ServiceCode='lambda')\n        concurrent_execution_quota = None\n        for page in pages:\n            quotas = page.get('Quotas')\n            for quota in quotas:\n                quota_code = quota.get('QuotaCode')\n                if quota_code == CONCURRENT_EXECUTION_QUOTA_CODE:\n                    concurrent_execution_quota = quota.get('Value')\n                    break\n        if not concurrent_execution_quota:\n            default_quota_info = quotas_client.get_aws_default_service_quota(\n                ServiceCode='lambda',\n                QuotaCode=CONCURRENT_EXECUTION_QUOTA_CODE\n            )\n            concurrent_execution_quota = default_quota_info.get('Quota').get('Value')\n        return {'ConcurrentExecutionsQuota': int(concurrent_execution_quota)}\n    except Exception as e:\n        logger.error(f'Loading ConcurrentExecutionsQuota for Lambda failed with error: {e}')\n        raise"
-      },
-      "outputs": [
-        {
-          "Name": "ConcurrentExecutionsQuota",
-          "Selector": "$.Payload.ConcurrentExecutionsQuota",
-          "Type": "Integer"
-        }
-      ]
-    },
-    {
-      "name": "CalculateTotalReservedConcurrencyOfExistingLambdas",
-      "description": "Calculate total reserved concurrency by summing up values from all Lambda functions",
-      "action": "aws:executeScript",
-      "onFailure": "Abort",
-      "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "calculate_total_reserved_concurrency",
-        "InputPayload": {
-          "LambdaARN": "{{ LambdaARN }}"
-        },
-        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\ndef calculate_total_reserved_concurrency(events, context):\n    try:\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        lambda_client = boto3.client('lambda', config=config)\n        lambda_arn = events.get('LambdaARN')\n        paginator = lambda_client.get_paginator('list_functions')\n        pages = paginator.paginate()\n        total_reserved_concurrency = 0\n        for page in pages:\n            functions = page.get('Functions')\n            for lambda_function in functions:\n                function_name: str = lambda_function.get('FunctionName')\n                function_arn: str = lambda_function.get('FunctionArn')\n                if lambda_arn != function_arn:\n                    function_concurrency_info = lambda_client.get_function_concurrency(\n                        FunctionName=function_name\n                    )\n                    function_concurrency = function_concurrency_info.get('ReservedConcurrentExecutions', 0)\n                    total_reserved_concurrency += function_concurrency\n        return {'TotalReservedConcurrency': total_reserved_concurrency}\n    except Exception as e:\n        logger.error(f'Calculating total reserved concurrency for all Lambda functions failed with error: {e}')\n        raise"
-      },
-      "outputs": [
-        {
-          "Name": "TotalReservedConcurrency",
-          "Selector": "$.Payload.TotalReservedConcurrency",
-          "Type": "Integer"
-        }
-      ]
-    },
-    {
-      "name": "CheckFeasibility",
-      "description": "Checks if it's possible to set Lambda's reserved concurrency to `NewReservedConcurrentExecutions`",
-      "action": "aws:executeScript",
-      "onFailure": "Abort",
-      "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "check_feasibility",
-        "InputPayload": {
-          "ConcurrentExecutionsQuota": "{{ GetConcurrentExecutionsQuota.ConcurrentExecutionsQuota }}",
-          "TotalReservedConcurrency": "{{ CalculateTotalReservedConcurrencyOfExistingLambdas.TotalReservedConcurrency }}",
-          "NewReservedConcurrentExecutions": "{{ NewReservedConcurrentExecutions }}"
-        },
-        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\ndef check_feasibility(events: dict, context):\n    try:\n        concurrent_executions_quota = events.get('ConcurrentExecutionsQuota')\n        total_reserved_concurrency = events.get('TotalReservedConcurrency')\n        new_reserved_concurrent_executions = events.get('NewReservedConcurrentExecutions')\n        maximum_possible_reserved_concurrency = (concurrent_executions_quota\n                                                 - total_reserved_concurrency\n                                                 - new_reserved_concurrent_executions\n                                                 - MINIMUM_UNRESERVED_CONCURRENCY)\n        can_set_reserved_concurrency = maximum_possible_reserved_concurrency > 0\n        if not can_set_reserved_concurrency:\n            raise Exception(\n                f'You can reserve up to the Unreserved account concurrency value that is shown, minus 100 for functions'\n                f' that don\\'t have reserved concurrency. There is only {maximum_possible_reserved_concurrency}'\n                f'concurrent executions left')\n        return {\n            'CanSetReservedConcurrency': can_set_reserved_concurrency,\n            'MaximumPossibleReservedConcurrency': maximum_possible_reserved_concurrency\n        }\n    except Exception as e:\n        logger.error(f'Checking feasibility failed with error: {e}')\n        raise"
-      },
-      "outputs": [
-        {
-          "Name": "MaximumPossibleReservedConcurrency",
-          "Selector": "$.Payload.MaximumPossibleReservedConcurrency",
-          "Type": "Integer"
-        },
-        {
-          "Name": "CanSetReservedConcurrency",
-          "Selector": "$.Payload.CanSetReservedConcurrency",
-          "Type": "Boolean"
-        }
-      ]
-    },
-    {
-      "name": "SetReservedConcurrentExecutions",
+      "name": "PutFunctionConcurrency",
       "description": "Set new value for reserved concurrent executions",
-      "action": "aws:executeScript",
-      "onFailure": "Abort",
+      "action": "aws:executeAwsApi",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "set_reserved_concurrent_executions",
-        "InputPayload": {
-          "LambdaARN": "{{ LambdaARN }}",
-          "NewReservedConcurrentExecutions": "{{ NewReservedConcurrentExecutions }}",
-          "MaximumPossibleReservedConcurrency": "{{ CheckFeasibility.MaximumPossibleReservedConcurrency }}"
-        },
-        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\nimport logging\n\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\nCONCURRENT_EXECUTION_QUOTA_CODE = 'L-B99A9384'\nMINIMUM_UNRESERVED_CONCURRENCY = 100\n\n\n\ndef set_reserved_concurrent_executions(events: dict, context):\n    try:\n        lambda_arn = events.get('LambdaARN')\n        new_reserved_concurrent_executions = events.get('NewReservedConcurrentExecutions')\n        maximum_possible_reserved_concurrency = events.get('MaximumPossibleReservedConcurrency')\n        config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n        lambda_client = boto3.client('lambda', config=config)\n        lambda_client.put_function_concurrency(\n            FunctionName=lambda_arn,\n            ReservedConcurrentExecutions=new_reserved_concurrent_executions\n        )\n        reserved_concurrency_left = maximum_possible_reserved_concurrency - new_reserved_concurrent_executions\n        return {\n            'ReservedConcurrencyLeft': reserved_concurrency_left,\n            'NewReservedConcurrencyValue': new_reserved_concurrent_executions\n        }\n    except Exception as e:\n        logger.error(f'Setting new value for reserved concurrent executions failed with error: {e}')\n        raise"
+        "Service": "lambda",
+        "Api": "PutFunctionConcurrency",
+        "FunctionName": "{{ LambdaARN }}",
+        "ReservedConcurrentExecutions": "{{ NewReservedConcurrentExecutions }}"
       },
       "outputs": [
         {
-          "Name": "NewReservedConcurrencyValue",
-          "Selector": "$.Payload.NewReservedConcurrencyValue",
-          "Type": "Integer"
-        },
-        {
-          "Name": "ReservedConcurrencyLeft",
-          "Selector": "$.Payload.ReservedConcurrencyLeft",
+          "Name": "NewReservedConcurrentExecutions",
+          "Selector": "$.ReservedConcurrentExecutions",
           "Type": "Integer"
         }
       ]
