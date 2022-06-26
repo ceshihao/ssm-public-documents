@@ -16,6 +16,12 @@
         "eu-west-1",
         "eu-west-2"
       ]
+    },
+    "Tags": {
+      "type": "String",
+      "description": "(Optional) Use this parameter to add resource tags to the Source server. Use a space to separate each tag (for example --tags KEY=VALUE [KEY=VALUE ...])",
+      "default": "",
+      "allowedPattern": "^(([a-zA-Z_0-9]{1,50}=[a-zA-Z_0-9]{1,50})( [a-zA-Z_0-9]{1,50}=[a-zA-Z_0-9]{1,50}){0,20})?$"
     }
   },
   "mainSteps": [
@@ -67,8 +73,17 @@
           "}",
           "try {",
           "if($fileHash -eq $hash){",
-          "./AwsReplicationWindowsInstaller.exe --no-prompt --region {{Region}}",
-          "$result = $LastExitCode",
+          "$requestedTags=\"{{Tags}}\"",
+          "$process = New-object System.Diagnostics.Process",
+          "$startInfo = New-object System.Diagnostics.ProcessStartInfo",
+          "$startInfo.FileName = \"C:\\tempDRS\\AwsReplicationWindowsInstaller.exe\"",
+          "if ( $requestedTags ) { $startInfo.Arguments = \"--no-prompt --region {{Region}} --tags {{Tags}}\"} else { $startInfo.Arguments = \"--no-prompt --region {{Region}}\" }",
+          "$startInfo.WorkingDirectory=\"C:\\tempDRS\"",
+          "$startInfo.UseShellExecute=$False",
+          "$process.StartInfo = $startInfo",
+          "$process.Start()",
+          "$process.WaitForExit()",
+          "$result = $process.ExitCode",
           "}else{",
           "Write-Error \"Checksum validation failed\"",
           "exit 1",
@@ -82,6 +97,8 @@
           "}",
           "catch {",
           "Write-Error \"General error during agent installation\"",
+          "Write-Error $_",
+          "Write-Error $_.ScriptStackTrace",
           "exit 1",
           "}"
         ]
@@ -110,11 +127,28 @@
           "which python3",
           "ispy3=$?",
           "if [ $ispy3 -eq 1 ]; then pyexec=python; fi",
-          "sudo $pyexec aws-replication-installer-init.py --no-prompt --region {{ Region }}",
+          "cat << EOF > install_agent.py",
+          "#!/usr/bin/python",
+          "import subprocess",
+          "import shlex",
+          "raw_cmd = \"$pyexec aws-replication-installer-init.py --no-prompt --region {0} \".format('{{ Region }}')",
+          "if len('{{ Tags }}' ) > 0:",
+          "   raw_cmd += \" --tags {0} \".format('{{ Tags }}')",
+          "cmd = shlex.split(raw_cmd)",
+          "try:",
+          "   response = subprocess.check_output(cmd, shell=False)",
+          "except Exception as e:",
+          "   print(e)",
+          "   exit(1)",
+          "exit(0)",
+          "EOF",
+          "chmod +x install_agent.py",
+          "$pyexec install_agent.py",
           "result=$?",
           "fi",
           "rm -f ./aws-installer.sha512 ./aws-replication-installer-init.py",
-          "if [ $result -ne 0 ]; then echo \"Installation failed\" 1>&2 && exit $result; fi"
+          "rm -f install_agent.py",
+          "exit $result"
         ]
       }
     }
