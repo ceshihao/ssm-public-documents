@@ -1,0 +1,326 @@
+{
+  "description": "## Id\nAWSResilienceHub-MisconfigureAsgR53ArcSecondarySiteTest_2020-07-18\n\n## Intent\nTest Amazon Route53 Application Recovery Controller behavior when Amazon EC2 Auto Scaling Groups deployed into two regions do not pass the ReadinessCheck\n\n## Type\nTEST\n\n## Risk\nMedium\n\n## Requirements\n  * A stack set of 2 stacks in different regions with Amazon EC2 Auto Scaling Groups behind the load balancer.\n  * Application Recovery Controller contains all the resources (Cells, ResourceSet, ReadinessCheck, RecoveryGroup) needed to monitor the Amazon EC2 Auto Scaling Groups\n\n## Permissions required for AutomationAssumeRole\n  * 'autoscaling:DescribeAutoScalingGroups'\n  * 'autoscaling:UpdateAutoScalingGroup'\n  * 'route53-recovery-readiness:GetReadinessCheckStatus'\n  * 'route53-recovery-readiness:ListResourceSets'\n  * 'ssm:GetAutomationExecution'\n  * 'ssm:StartAutomationExecution'\n  * 'ssm:GetParameters'\n\n## Supports Rollback\nYes. Restores the original Amazon EC2 Auto Scaling Group MaxSize\n\n## Cancellation behavior\nRestores the original Amazon EC2 Auto Scaling Group MaxSize\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) ResourceSetArn\n  * type: String\n  * description: Resource set Identifier\n\n### (Required) ReadinessCheckName\n  * type: String\n  * description: Name of the readiness check\n\n### (Optional) IsRollback\n  * type: String\n  * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n  * default: false\n\n### (Optional) PreviousExecutionId\n  * type: String\n  * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nThe document injects failure by increasing MaxSize of one of the Amazon EC2 Auto Scaling Groups by 1\n\n## Steps executed in normal flow\n  * CheckIsRollback\n  * AssertReadinessCheckToBeReadyBeforeTest\n  * BackupCurrentExecution\n  * IncreaseValueByOne\n  * InjectFailure\n  * AssertReadinessCheckToBeNotReady\n  * RollbackCurrentExecution\n  * AssertReadinessCheckToBeReady\n  * TriggerRollback\n\n## Steps executed in rollback flow\n  * CheckIsRollback\n  * GetInputsFromPreviousExecution\n  * AssertResourceSetArn\n  * PrepareRollbackOfPreviousExecution\n  * RollbackPreviousExecution\n  * AwaitAutoScalingGroupMaxSizeAfterRollbackPreviousExecution\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "ResourceSetArn": {
+      "type": "String",
+      "description": "(Required) The ARN of the Amazon Route53 Application Recovery Controller resourse set."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "ReadinessCheckName": {
+      "type": "String",
+      "description": "(Required) Amazon Route53 Application Recovery Controller ReadinessCheck which should become NOT_READY after injection of the failure and READY after the rollback process in the end of the test."
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`). Can be either true or false.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetInputsFromPreviousExecution",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "AssertReadinessCheckToBeReadyBeforeTest"
+      }
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "ResourceSetArn",
+          "Selector": "$.Payload.ResourceSetArn[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertResourceSetArn",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PrepareRollbackOfPreviousExecution",
+            "Variable": "{{ GetInputsFromPreviousExecution.ResourceSetArn }}",
+            "StringEquals": "{{ ResourceSetArn }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "PrepareRollbackOfPreviousExecution",
+      "description": "Get original Amazon EC2 Auto Scaling Group Name, Region and MaxSize for rollback",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RandomASGName",
+          "Selector": "$.Payload.RandomASGName[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "RandomASGRegion",
+          "Selector": "$.Payload.RandomASGRegion[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "RandomASGCurrentMaxSize",
+          "Selector": "$.Payload.RandomASGCurrentMaxSize[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "BackupCurrentExecution",
+          "ResponseField": "RandomASGName,RandomASGRegion,RandomASGCurrentMaxSize"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    # Sets values in string type regardless of what is the original value type. In order to set\n                    # values with original types please use 'get_typed_output_from_ssm_step_execution'.\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "RollbackPreviousExecution",
+      "description": "Restore original Amazon EC2 Auto Scaling Group MaxSize value from the previous execution",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RandomASGRollbackMaxSize",
+          "Selector": "$.Payload.MaxSize",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "update_asg_max_size",
+        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef update_asg_max_size(events, context):\n    \"\"\"\n    Update ASG MaxSize value\n    \"\"\"\n    required_params = ['RandomASGName', 'RandomASGRegion', 'RandomASGCurrentMaxSize']\n    check_required_params(required_params, events)\n\n    autoscaling_config = Config(\n        region_name=events['RandomASGRegion'],\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('autoscaling', config=autoscaling_config)\n    new_max_size = int(events['RandomASGCurrentMaxSize'])\n    response = client.update_auto_scaling_group(AutoScalingGroupName=events['RandomASGName'], MaxSize=new_max_size)\n    if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n        raise ValueError(f'Failed to update MaxSize to {new_max_size} for ASG {events[\"RandomASGName\"]} '\n                         f'in region {events[\"RandomASGRegion\"]}. Response is: {response}')\n    return {'MaxSize': new_max_size}",
+        "InputPayload": {
+          "RandomASGName": "{{ PrepareRollbackOfPreviousExecution.RandomASGName }}",
+          "RandomASGRegion": "{{ PrepareRollbackOfPreviousExecution.RandomASGRegion }}",
+          "RandomASGCurrentMaxSize": "{{ PrepareRollbackOfPreviousExecution.RandomASGCurrentMaxSize }}"
+        }
+      }
+    },
+    {
+      "name": "AwaitAutoScalingGroupMaxSizeAfterRollbackPreviousExecution",
+      "description": "Wait for the Amazon EC2 Auto Scaling Group MaxSize to settle after the step RollbackPreviousExecution.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "wait_for_asg_max_size",
+        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef wait_for_asg_max_size(events, context):\n    \"\"\"\n    Wait for the ASG to have expected MaxSize\n    \"\"\"\n    required_params = ['RandomASGName', 'RandomASGRegion', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n\n    autoscaling_config = Config(\n        region_name=events['RandomASGRegion'],\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('autoscaling', config=autoscaling_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.describe_auto_scaling_groups(AutoScalingGroupNames=[events['RandomASGName']])\n        actual_max_size = response['AutoScalingGroups'][0]['MaxSize']\n        expected_max_size = int(events['DesiredValue'])\n        if actual_max_size == expected_max_size:\n            logging.info(f'#{iteration}; AutoScalingGroup has the expected MaxSize: {actual_max_size} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; AutoScalingGroup has not changed the MaxSize: {actual_max_size} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n    raise TimeoutError(f'Waiting for AutoScaling Group {events[\"RandomASGName\"]} in region {events[\"RandomASGRegion\"]} '\n                       f'to have MaxSize {events[\"DesiredValue\"]}')",
+        "InputPayload": {
+          "RandomASGName": "{{ PrepareRollbackOfPreviousExecution.RandomASGName }}",
+          "RandomASGRegion": "{{ PrepareRollbackOfPreviousExecution.RandomASGRegion }}",
+          "DesiredValue": "{{ PrepareRollbackOfPreviousExecution.RandomASGCurrentMaxSize }}",
+          "Timeout": 1200
+        }
+      },
+      "isEnd": true
+    },
+    {
+      "name": "AssertReadinessCheckToBeReadyBeforeTest",
+      "description": "Ensure ReadinessCheck is READY before starting test. Fail if ReadinessCheck is not READY within expected time.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_readiness_check_state",
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")",
+        "InputPayload": {
+          "ReadinessCheckName": "{{ ReadinessCheckName }}",
+          "DesiredValue": "READY",
+          "Timeout": 1200
+        }
+      }
+    },
+    {
+      "name": "BackupCurrentExecution",
+      "description": "Select a random Amazon EC2 Auto Scaling Group from the resource set and back up its Name, Region and MaxSize",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RandomASGName",
+          "Selector": "$.Payload.RandomASGName",
+          "Type": "String"
+        },
+        {
+          "Name": "RandomASGARN",
+          "Selector": "$.Payload.RandomASGARN",
+          "Type": "String"
+        },
+        {
+          "Name": "RandomASGRegion",
+          "Selector": "$.Payload.RandomASGRegion",
+          "Type": "String"
+        },
+        {
+          "Name": "RandomASGCurrentMaxSize",
+          "Selector": "$.Payload.RandomASGCurrentMaxSize",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "backup_asg_info_from_resource_set",
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef get_random_resource_of_type(resource_set_arn, resource_set_type):\n    \"\"\"\n    Get ARN of a random resource from the resource set of the specified type\n    \"\"\"\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    response = client.list_resource_sets()\n    if not response or not response.get('ResourceSets'):\n        raise ValueError('ResourceSets not found in us-west-2.')\n\n    resource_sets = response['ResourceSets']\n    while 'NextToken' in response:\n        response = client.list_resource_sets(NextToken=response['NextToken'])\n        resource_sets.extend(response['ResourceSets'])\n\n    resource_set = [item for item in resource_sets if item['ResourceSetArn'] == resource_set_arn]\n    if not resource_set:\n        raise ValueError(f'Resource set with ARN {resource_set_arn} not found')\n    resource_set = resource_set[0]\n    if resource_set['ResourceSetType'] != resource_set_type:\n        raise ValueError(f'Found resource set is of unexpected type: {resource_set[\"ResourceSetType\"]}, '\n                         f'expected: {resource_set_type}')\n    resources = [item['ResourceArn'] for item in resource_set['Resources'] if item['ReadinessScopes']]\n    if not resources:\n        raise ValueError(f'Found resource set: {resource_set[\"ResourceSetArn\"]}, '\n                         f'doesnt contain any Resource with not empty ReadinessScopes')\n    random_resource = random.choice(resources)\n    logger.info(f'Continue with random resource: {random_resource}')\n    return random_resource\n\n\n\ndef backup_asg_info_from_resource_set(events, context):\n    \"\"\"\n    Describe ASG randomly selected from the resource set and return its Name, Region and MaxSize\n    \"\"\"\n    required_params = ['ResourceSetArn']\n    check_required_params(required_params, events)\n\n    resource_set_arn = events['ResourceSetArn']\n    asg_arn = get_random_resource_of_type(resource_set_arn, 'AWS::AutoScaling::AutoScalingGroup')\n    asg_region = asg_arn.split(':')[3]\n    asg_name = asg_arn.split(':')[7].split('/')[1]\n    logger.info(f'Search for AutoScaling Group with name {asg_name}. '\n                f'asg_region: {asg_region}. '\n                f'asg_arn: {asg_arn}')\n    autoscaling_config = Config(\n        region_name=asg_region,\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('autoscaling', config=autoscaling_config)\n    response = client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])\n    if not response or not response.get('AutoScalingGroups'):\n        raise ValueError(f'AutoScaling Group with name {asg_name} not found. '\n                         f'asg_region: {asg_region}. '\n                         f'asg_arn: {asg_arn}.')\n    asg_info = response['AutoScalingGroups'][0]\n    return {'RandomASGARN': asg_arn,\n            'RandomASGName': asg_name,\n            'RandomASGRegion': asg_region,\n            'RandomASGCurrentMaxSize': asg_info['MaxSize']}",
+        "InputPayload": {
+          "ResourceSetArn": "{{ ResourceSetArn }}"
+        }
+      }
+    },
+    {
+      "name": "IncreaseValueByOne",
+      "description": "Wait for expected alarm to be red after failure is injected",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "NewASGCurrentMaxSize",
+          "Selector": "$.Payload.Value",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "increase_value_by_one",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events. Allow empty, None or 0 values.\n    \"\"\"\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef increase_value_by_one(events, context):\n    required_params = ['InputValue']\n    check_required_params(required_params, events)\n\n    return {'Value': events['InputValue'] + 1}",
+        "InputPayload": {
+          "InputValue": "{{ BackupCurrentExecution.RandomASGCurrentMaxSize }}"
+        }
+      }
+    },
+    {
+      "name": "InjectFailure",
+      "description": "Inject failure by updating MaxSize of the Amazon EC2 Auto Scaling Group selected in the previous step",
+      "action": "aws:executeScript",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "NewASGCurrentMaxSize",
+          "Selector": "$.Payload.MaxSize",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "update_asg_max_size",
+        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef update_asg_max_size(events, context):\n    \"\"\"\n    Update ASG MaxSize value\n    \"\"\"\n    required_params = ['RandomASGName', 'RandomASGRegion', 'RandomASGCurrentMaxSize']\n    check_required_params(required_params, events)\n\n    autoscaling_config = Config(\n        region_name=events['RandomASGRegion'],\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('autoscaling', config=autoscaling_config)\n    new_max_size = int(events['RandomASGCurrentMaxSize'])\n    response = client.update_auto_scaling_group(AutoScalingGroupName=events['RandomASGName'], MaxSize=new_max_size)\n    if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n        raise ValueError(f'Failed to update MaxSize to {new_max_size} for ASG {events[\"RandomASGName\"]} '\n                         f'in region {events[\"RandomASGRegion\"]}. Response is: {response}')\n    return {'MaxSize': new_max_size}",
+        "InputPayload": {
+          "RandomASGName": "{{ BackupCurrentExecution.RandomASGName }}",
+          "RandomASGRegion": "{{ BackupCurrentExecution.RandomASGRegion }}",
+          "RandomASGCurrentMaxSize": "{{ IncreaseValueByOne.NewASGCurrentMaxSize }}"
+        }
+      }
+    },
+    {
+      "name": "AssertReadinessCheckToBeNotReady",
+      "description": "Wait for expected ReadinessCheck to become NOT_READY after failure is injected",
+      "action": "aws:executeScript",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_readiness_check_state",
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")",
+        "InputPayload": {
+          "ReadinessCheckName": "{{ ReadinessCheckName }}",
+          "DesiredValue": "NOT_READY",
+          "Timeout": 1200
+        }
+      }
+    },
+    {
+      "name": "RollbackCurrentExecution",
+      "action": "aws:executeScript",
+      "maxAttempts": 5,
+      "onCancel": "step:TriggerRollback",
+      "outputs": [
+        {
+          "Name": "RandomASGRollbackMaxSize",
+          "Selector": "$.Payload.MaxSize",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "update_asg_max_size",
+        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef update_asg_max_size(events, context):\n    \"\"\"\n    Update ASG MaxSize value\n    \"\"\"\n    required_params = ['RandomASGName', 'RandomASGRegion', 'RandomASGCurrentMaxSize']\n    check_required_params(required_params, events)\n\n    autoscaling_config = Config(\n        region_name=events['RandomASGRegion'],\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('autoscaling', config=autoscaling_config)\n    new_max_size = int(events['RandomASGCurrentMaxSize'])\n    response = client.update_auto_scaling_group(AutoScalingGroupName=events['RandomASGName'], MaxSize=new_max_size)\n    if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n        raise ValueError(f'Failed to update MaxSize to {new_max_size} for ASG {events[\"RandomASGName\"]} '\n                         f'in region {events[\"RandomASGRegion\"]}. Response is: {response}')\n    return {'MaxSize': new_max_size}",
+        "InputPayload": {
+          "RandomASGName": "{{ BackupCurrentExecution.RandomASGName }}",
+          "RandomASGRegion": "{{ BackupCurrentExecution.RandomASGRegion }}",
+          "RandomASGCurrentMaxSize": "{{ BackupCurrentExecution.RandomASGCurrentMaxSize }}"
+        }
+      }
+    },
+    {
+      "name": "AssertReadinessCheckToBeReady",
+      "description": "Wait for the ReadinessCheck to become READY after test is complete",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_readiness_check_state",
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")",
+        "InputPayload": {
+          "ReadinessCheckName": "{{ ReadinessCheckName }}",
+          "DesiredValue": "READY",
+          "Timeout": 1200
+        }
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}
