@@ -1,0 +1,120 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Install or uninstall a Distributor package.",
+  "parameters": {
+    "action": {
+      "description": "(Required) Specify whether or not to install or uninstall the package.",
+      "type": "String",
+      "allowedValues": [
+        "Install",
+        "Uninstall"
+      ]
+    },
+    "installationType": {
+      "description": "(Optional) Specify the type of installation. Uninstall and reinstall: The application is taken offline until the reinstallation process completes. In-place update: The application is available while new or updated files are added to the installation.",
+      "type": "String",
+      "allowedValues": [
+        "Uninstall and reinstall",
+        "In-place update"
+      ],
+      "default": "Uninstall and reinstall"
+    },
+    "name": {
+      "description": "(Required) The package to install/uninstall.",
+      "type": "String",
+      "allowedPattern": "^arn:[a-z0-9][-.a-z0-9]{0,62}:[a-z0-9][-.a-z0-9]{0,62}:([a-z0-9][-.a-z0-9]{0,62})?:([a-z0-9][-.a-z0-9]{0,62})?:(package|document)\\/[a-zA-Z0-9/:.\\-_]{1,128}$|^[a-zA-Z0-9/:.\\-_]{1,128}$"
+    },
+    "version": {
+      "description": "(Optional) The version of the package to install or uninstall. If you don't specify a version, the system installs the latest published version by default. The system will only attempt to uninstall the version that is currently installed. If no version of the package is installed, the system returns an error.",
+      "type": "String",
+      "default": ""
+    },
+    "additionalArguments": {
+      "description": "(Optional) The additional parameters to provide to your install, uninstall, or update scripts.",
+      "type": "StringMap",
+      "displayType": "textarea",
+      "default": {},
+      "maxChars": 4096
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runPowerShellScript",
+      "name": "createDownloadFolder",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "runCommand": [
+          "try {",
+          "  $sku = (Get-CimInstance -ClassName Win32_OperatingSystem).OperatingSystemSKU",
+          "  if ($sku -eq 143 -or $sku -eq 144) {",
+          "    Write-Host \"This document is not supported on Windows 2016 Nano Server.\"",
+          "    exit 40",
+          "  }",
+          "  $ssmAgentService = Get-ItemProperty 'HKLM:SYSTEM\\\\CurrentControlSet\\\\Services\\\\AmazonSSMAgent\\\\'",
+          "  if ($ssmAgentService -and [System.Version]$ssmAgentService.Version -ge [System.Version]'3.0.1031.0') {",
+          "     exit 0",
+          "  }",
+          "  $DataFolder = \"Application Data\"",
+          "  if ( ![string]::IsNullOrEmpty($env:ProgramData) ) {",
+          "    $DataFolder = $env:ProgramData",
+          "  } elseif ( ![string]::IsNullOrEmpty($env:AllUsersProfile) ) {",
+          "    $DataFolder = \"$env:AllUsersProfile\\\\Application Data\"",
+          "  }",
+          "  $TempFolder = \"/\"",
+          "  if ( $env:Temp -ne $null ) {",
+          "    $TempFolder = $env:Temp",
+          "  }",
+          "  $DataFolder = Join-Path $DataFolder 'Amazon\\\\SSM'",
+          "  $DownloadFolder = Join-Path $TempFolder 'Amazon\\\\SSM'",
+          "  if ( !( Test-Path -LiteralPath $DataFolder )) {",
+          "    $none = New-Item -ItemType directory -Path $DataFolder",
+          "  }",
+          "  $DataACL = Get-Acl $DataFolder",
+          "  if ( Test-Path -LiteralPath $DownloadFolder ) {",
+          "    $DownloadACL = Get-Acl $DownloadFolder",
+          "    $ACLDiff = Compare-Object ($DownloadACL.AccessToString) ($DataACL.AccessToString)",
+          "    if ( $ACLDiff.count -eq 0 ) {",
+          "      exit 0",
+          "    }",
+          "    Remove-Item $DownloadFolder -Recurse -Force",
+          "  }",
+          "  $none = New-Item -ItemType directory -Path $DownloadFolder",
+          "  Set-Acl $DownloadFolder -aclobject $DataACL",
+          "  $DownloadACL = Get-Acl $DownloadFolder",
+          "  $ACLDiff = Compare-Object ($DownloadACL.AccessToString) ($DataACL.AccessToString)",
+          "  if ( $ACLDiff.count -ne 0 ) {",
+          "    Write-Error \"Failed to create download folder\" -ErrorAction Continue",
+          "    exit 41",
+          "  }",
+          "} catch {",
+          "  Write-Host  \"Failed to create download folder\"",
+          "  Write-Error  $Error[0]  -ErrorAction Continue",
+          "  exit 42",
+          "}"
+        ]
+      }
+    },
+    {
+      "action": "aws:configurePackage",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "name": "configurePackage",
+      "inputs": {
+        "name": "{{ name }}",
+        "action": "{{ action }}",
+        "installationType": "{{installationType}}",
+        "version": "{{ version }}",
+        "additionalArguments": "{{ additionalArguments }}"
+      }
+    }
+  ]
+}
