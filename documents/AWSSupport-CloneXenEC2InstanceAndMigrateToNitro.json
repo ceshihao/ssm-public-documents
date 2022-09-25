@@ -1,0 +1,960 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWSSupport-CloneXenEC2InstanceAndMigrateToNitro\n\n----\n\nThe *AWSSupport-CloneXenEC2InstanceAndMigrateToNitro* runbook clones, prepares and migrates the cloned EC2 Linux instance, currently running on EC2 Xen platform, to run on [EC2 Nitro platform](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html#ec2-nitro-instances). This automation is divided into three different branches, details of which are as follows:\n\n\n### 1. Preliminary Checks\n\nIn this branch, automation evaluates all of the following pre-requisites to proceed with the migration. If any of the steps fails, automation stops.\n\n- Checks if the target EC2 instance is already running on Nitro platform\n- Determines if the [lifecycle](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-purchasing-options.html#check-instance-lifecycle) of the target EC2 instance is Spot\n- Checks if any [instance-store-volume](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/InstanceStorage.html#instance-store-volumes) is attached with the target EC2 instance\n- Validates if the Operating System is Linux\n- Determines if the target EC2 instance is a part of the AWS Auto Scaling. If yes, the EC2 instance should be in the [Standby state](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html)\n- Checks if the target EC2 instance is connected with SSM and configured to use AWS Systems Manager Run Command\n\n\n### 2. Test \n\nThe automation uses this phase as sanity test by creating a test Amazon Machine Image(AMI) from the target EC2 instance and launching a test EC2 instance using this AMI. \n\nIf the test EC2 instance passes the status checks, automation is temporarily paused and approval from the designated principals is requested via SNS notification. If approval is provided, automation stops the target EC2 instance.\n\n*Note:*\n\n*- Before providing approval, ensure that all the application(s) running on the target EC2 instance are gracefully closed.*\n\n*- If the EC2 does not have an Elastic IP addresses associated, the automatic public IPv4 address will change once the instance is stopped and started.*\n\n*- Test AMI & EC2 instance are deleted at the end of this branch*\n\n### 3. CloneAndMigrate \n\nIn this branch, automation creates a clone of your target EC2 instance in the same subnet and migrates the EC2 instance using the following steps:\n\n- Enables the [Enhanced networking (ENA) attribute](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enhanced-networking-ena.html#enable-enhanced-networking-ena-AL)\n- Installs the latest version of ENA drivers\n- Verifies if the NVMe module is installed. If installed, then verifies if the module is loaded in the initramfs\n- Analyzes */etc/fstab* and replaces entries with block device names(/dev/sd\\* or /dev/xvd\\*) with their respective UUIDs. Before modifying the configuration, the runbook creates a backup of the file at path */etc/fstab**\n- Disables [predictable interface naming](https://www.freedesktop.org/wiki/Software/systemd/PredictableNetworkInterfaceNames/) by adding the ``net.ifnames=0`` option to the ``GRUB_CMDLINE_LINUX`` line in */etc/default/grub*, if exists OR to the ``kernel`` in */boot/grub/menu.lst*\n- Removes */etc/udev/rules.d/70-persistent-net.rules* file, if exists. Before removing, creates a backup at path */etc/udev/rules.d/*\n\nAfter validating all the requirements, the cloned EC2 instance type is changed to the desired Nitro type.  Once the cloned instance passes the Status Checks on Nitro platform, automation seeks for designated principal's approval to create an AMI. If approval is denied, automation stops, leaving cloned EC2 instance.\n\n\n\n### Prerequisites:\n\nTarget EC2 instance requires outbound access to the repositories to install drivers and dependencies such as *kernel-devel, gcc,patch, rpm-build. wget,dracut, make, linux-headers,unzip* using package manager if needed.\n\n\n### Supported Operating Systems:\n  \n* Red Hat Enterprise Linux (RHEL) 7.x - 8.5\n* Amazon Linux, Amazon Linux 2\n* Ubuntu Server 18.04 LTS, 20.04 LTS, and 20.10 STR\n* SUSE12SP5, SUSE15SP(2,3,4)\n\n\n### Disclaimer:\n\n* Executing this runbook, may incur extra charges to your account for the EC2 instance, EBS Volumes & Amazon Machine Images(AMIs). Please refer to the [Amazon EC2 Pricing](https://aws.amazon.com/ec2/pricing/) & [Amazon EBS pricing](https://aws.amazon.com/ebs/pricing/) for more details.",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "default": "",
+      "type": "String",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook. For more information, visit - https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-setup.html",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::\\d{12}:role/[\\w+=/,.@-]+$"
+    },
+    "TargetInstanceId": {
+      "type": "String",
+      "description": "(Required) InstanceId of the target EC2 instance you want to migrate to Nitro platform.",
+      "allowedPattern": "^(i|mi)-[a-z0-9]{8,17}$"
+    },
+    "NitroInstanceType": {
+      "type": "String",
+      "default": "m5.xlarge",
+      "description": "(Required) Enter the destination Nitro instance type. Note: Only Nitro M5, M6, C5, C6, R5, R6 and T3 instances are supported (e.g. t3.small). For more details about the available Nitro instance types, please refer to the link: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html",
+      "allowedPattern": "^(m5a?z?d?n?|c5a?d?n?|r5a?d?n?b?|c6(a|i)?d?|m6(a|i)?d?|r6(a|i)?d?)\\.(x|2x|4x|8x|12x|16x|24x|32x)?large$|^t3a?\\.((x|2x)?large|nano|micro|small|medium)$"
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) Provide the ARN of the SNS Topic for Approval notification. This SNS topic is used to send approval notifications during required during the automation execution.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):sns:(us(-gov|-isob?)?|ap|ca|af|me|cn|eu|sa)-(central|(north|south)?(east|west)?)-\\d:\\d{12}:.*$"
+    },
+    "ApproverIAM": {
+      "type": "StringList",
+      "description": "(Required) Provide a list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of these formats, 1) An AWS Identity and Access Management (IAM) user name 2) An IAM user ARN 3) An IAM role ARN 4) An IAM assume role user ARN",
+      "allowedPattern": "^[a-zA-Z0-9_+=,.@\\-/]{1,128}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam:.*:[0-9]{12}:[a-zA-Z0-9_+=,.@\\-/]{1,256}$"
+    },
+    "MinimumRequiredApprovals": {
+      "type": "Integer",
+      "default": 1,
+      "description": "(Optional) The minimum number of approvals required to resume the automation. If you don't specify a value, the system defaults to one. The value for this parameter must be a positive number. The value for this parameter can't exceed the number of approvers defined by the ApproverIAM parameter.",
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    "DeleteResourcesOnFailure": {
+      "type": "Boolean",
+      "default": true,
+      "description": "(Optional) Whether to terminate the cloned EC2 instance and Amazon Machine Image(AMI) if the automation fails.",
+      "allowedValues": [
+        false,
+        true
+      ]
+    },
+    "Acknowledgement": {
+      "type": "String",
+      "description": "(Required) Please read the complete details of the actions performed by this automation runbook and write 'Yes, I understand and acknowledge' if you acknowledge the steps.",
+      "allowedPattern": "^Yes, I understand and acknowledge$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "checkConcurrency",
+      "action": "aws:executeScript",
+      "description": "Ensures there is only one execution of this runbook targeting the current EC2 instance. If the runbook finds another in progress execution targeting the same instance ID, it returns an error and ends.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkConcurrency.check_concurrency_handler",
+        "InputPayload": {
+          "TargetInstanceId": "{{TargetInstanceId}}"
+        },
+        "Attachment": "clone-xen-to-nitro-python.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "startOfPreliminaryChecksBranch"
+    },
+    {
+      "name": "startOfPreliminaryChecksBranch",
+      "action": "aws:sleep",
+      "description": "Start of Preliminary checks branch",
+      "onFailure": "step:getTargetInstanceProperties",
+      "nextStep": "getTargetInstanceProperties",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "getTargetInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the details of the target EC2 instance",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "nextStep": "checkIfNitroInstanceTypeIsSupportedInAZ",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PlatformType",
+          "Selector": "$.Reservations[0].Instances[0].Platform",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceSubnetId",
+          "Selector": "$.Reservations[0].Instances[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroup",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups[0].GroupId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileArn",
+          "Selector": "$.Reservations[0].Instances[0].IamInstanceProfile.Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileName",
+          "Selector": "$.Reservations[0].Instances[0].IamInstanceProfile.Name",
+          "Type": "String"
+        },
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "RootDeviceName",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+          "Type": "String"
+        },
+        {
+          "Name": "RootVolumeType",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceType",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "ENAAttrib",
+          "Selector": "$.Reservations[0].Instances[0].EnaSupport",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "InstanceLifecycle",
+          "Selector": "$.Reservations[0].Instances[0].InstanceLifecycle",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceState",
+          "Selector": "$.Reservations[0].Instances[0].State.Name",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "checkIfNitroInstanceTypeIsSupportedInAZ",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Determines if the target Nitro instance type is supported in the same Availability Zone as the Target EC2 instance ",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "maxAttempts": 3,
+      "nextStep": "getXenInstanceTypeDetails",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceTypeOfferings",
+        "LocationType": "availability-zone",
+        "Filters": [
+          {
+            "Name": "instance-type",
+            "Values": [
+              "{{NitroInstanceType}}"
+            ]
+          },
+          {
+            "Name": "location",
+            "Values": [
+              "{{getTargetInstanceProperties.AvailabilityZone}}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceTypeOfferings[0].Location",
+        "DesiredValues": [
+          "{{getTargetInstanceProperties.AvailabilityZone}}"
+        ]
+      }
+    },
+    {
+      "name": "getXenInstanceTypeDetails",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the details of the the Xen(source) Instance type",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "nextStep": "checkIfInstanceHypervisorIsNitroAlready",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceTypes",
+        "InstanceTypes": [
+          "{{getTargetInstanceProperties.InstanceType}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Hypervisor",
+          "Selector": "$.InstanceTypes[0].Hypervisor",
+          "Type": "String"
+        },
+        {
+          "Name": "NVMeSupport",
+          "Selector": "$.InstanceTypes[0].InstanceStorageInfo.NvmeSupport",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceStorageSupported",
+          "Selector": "$.InstanceTypes[0].InstanceStorageSupported",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "checkIfInstanceHypervisorIsNitroAlready",
+      "action": "aws:branch",
+      "description": "Checks if the target EC2 instance is already running on Nitro platform",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfTargetInstanceLifecycleIsSpot",
+            "Variable": "{{getXenInstanceTypeDetails.Hypervisor}}",
+            "StringEquals": "xen"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfTargetInstanceLifecycleIsSpot",
+      "action": "aws:branch",
+      "description": "Checks if the Lifecycle of the target EC2 instance is Spot",
+      "isCritical": true,
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfOperatingSystemIsLinux",
+            "Not": {
+              "Variable": "{{getTargetInstanceProperties.InstanceLifecycle}}",
+              "StringEquals": "spot"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfOperatingSystemIsLinux",
+      "action": "aws:branch",
+      "description": "Checks if the target EC2 instance is based on Linux Operating System",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "verifySSMConnectivityForTargetInstance",
+            "Not": {
+              "Variable": "{{getTargetInstanceProperties.PlatformType}}",
+              "StringEquals": "windows"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifySSMConnectivityForTargetInstance",
+      "action": "aws:runCommand",
+      "description": "Verifies if the target EC2 instance is connected with AWS Systems Manager and configured to use RunCommand",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "checkIfEphemeralVolumeAreSupported",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "#!/bin/bash\n\necho \"EC2 instance is connected with AWS Systems Manager and configured to use RunCommand\"\n"
+        }
+      }
+    },
+    {
+      "name": "checkIfEphemeralVolumeAreSupported",
+      "action": "aws:branch",
+      "description": "Checks if the target EC2 instance supports the Instance Store (Ephemeral) volumes",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "verifyIfTargetInstanceHasEphemeralVolumesAttached",
+            "Variable": "{{getXenInstanceTypeDetails.InstanceStorageSupported}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "checkIfRootVolumeIsEBS"
+      }
+    },
+    {
+      "name": "verifyIfTargetInstanceHasEphemeralVolumesAttached",
+      "action": "aws:runCommand",
+      "description": "Verifies if the target EC2 instance has Instance Store(Ephemeral) Volumes attached",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "checkIfRootVolumeIsEBS",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\n# Check if Instance Storage is supported or not  through API call\n\nNVME_SUPPORT='{{getXenInstanceTypeDetails.NVMeSupport}}'\n\nif [[ \"${AWS_SSM_INSTANCE_ID}\" =~ ^[i]-[a-z0-9]{8,17}$ ]]; then\n    if [ ${NVME_SUPPORT} = \"required\" ]; then\n        if [ $(ls -l /dev/disk/by-id/ | grep Amazon_EC2_NVMe_Instance_Storage | grep -wv ns-1 | awk '{ print $11 }' | sed 's/[./]//g' > /dev/null; echo $?) == \"0\" ]; then\n                echo -en \"\\n [ERROR] UnSupported Instance Type:Instance have instance store volumes attached. Exiting the automation... \\n\"\n                exit 1\n        else\n                echo -en \"\\n [INFO] No instance store volumes are attached with the EC2 instance  \\n\"\n        fi\n    elif [ $NVME_SUPPORT = \"unsupported\" ]; then\n        if [ $(TOKEN=`curl -s -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\"` && curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/block-device-mapping/ | grep -vE 'ami|root|swap' > /dev/null; echo $?) = \"0\" ]; then\n                echo -en \"\\n [ERROR] UnSupported Instance Type: Instance have instance store volumes attached. Exiting the automation...  \\n\"\n                exit 1\n        else\n                echo -en \"\\n [INFO] No instance store volumes are attached with the EC2 instance \\n\"\n            fi\n    else\n        echo -en \"\\n Unknown Error \\n\"\n        exit 1\n    fi\nelse\n    echo -en \"\\n InstanceID ${AWS_SSM_INSTANCE_ID} doesn't belong to an EC2 instance\"\n    exit 1\nfi\n"
+        }
+      }
+    },
+    {
+      "name": "checkIfRootVolumeIsEBS",
+      "action": "aws:branch",
+      "description": "Checks if target EC2 instance's root volume type is EBS",
+      "isCritical": true,
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfTargetInstanceIsInASG",
+            "Variable": "{{getTargetInstanceProperties.RootVolumeType}}",
+            "StringEquals": "ebs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfTargetInstanceIsInASG",
+      "action": "aws:executeScript",
+      "description": "Checks if the target EC2 instance is a part of any Amazon AutoScaling Group(ASG)",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "nextStep": "endOfPreliminaryChecksBranch",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkAutoScaling.checkAutoScaling_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "TargetInstanceId": "{{TargetInstanceId}}"
+        }
+      }
+    },
+    {
+      "name": "endOfPreliminaryChecksBranch",
+      "action": "aws:sleep",
+      "description": "End of Preliminary checks branch",
+      "onFailure": "Abort",
+      "nextStep": "startOfTestBranch",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "startOfTestBranch",
+      "action": "aws:sleep",
+      "description": "Start of Testing branch",
+      "onFailure": "Abort",
+      "nextStep": "createTestImage",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "createTestImage",
+      "action": "aws:createImage",
+      "description": "Creates a test Amazon Machine Image(AMI) from the provided instance",
+      "maxAttempts": 1,
+      "nextStep": "launchTestInstanceInSameSubnet",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceId": "{{TargetInstanceId}}",
+        "ImageName": "CloneXenEC2InstanceAndMigrateToNitro_TestImage_{{TargetInstanceId}}_{{global:DATE_TIME}}",
+        "NoReboot": true,
+        "ImageDescription": "SSMAutomationID-{{automation:EXECUTION_ID}}"
+      }
+    },
+    {
+      "name": "launchTestInstanceInSameSubnet",
+      "action": "aws:executeScript",
+      "description": "Launches a test EC2 instance from the test AMI using the same configuration as target EC2 instance",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "step:cleanupTestInstance",
+      "nextStep": "waitForTestInstanceStatusChecks",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "launchEC2Instance.launchInstanceInSameSubnet_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "ImageId": "{{createTestImage.ImageId}}",
+          "InstanceType": "{{getTargetInstanceProperties.InstanceType}}",
+          "IamInstanceProfileArn": "{{getTargetInstanceProperties.InstanceProfileArn}}",
+          "SubnetId": "{{getTargetInstanceProperties.InstanceSubnetId}}",
+          "SecurityGroupIds": [
+            "{{getTargetInstanceProperties.SecurityGroup}}"
+          ],
+          "TargetInstanceId": "{{TargetInstanceId}}",
+          "BranchType": "Test"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "TestInstanceId",
+          "Selector": "$.Payload.launchedInstanceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "waitForTestInstanceStatusChecks",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the test EC2 instance to pass the 2/2 Status Checks",
+      "onFailure": "step:cleanupTestInstance",
+      "isCritical": "true",
+      "timeoutSeconds": 1200,
+      "nextStep": "cleanupTestInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{launchTestInstanceInSameSubnet.TestInstanceId}}"
+        ],
+        "PropertySelector": "$.InstanceStatuses..InstanceStatus.Status",
+        "DesiredValues": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "name": "cleanupTestInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Terminates the test EC2 instance",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "nextStep": "endOfTestBranch",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchTestInstanceInSameSubnet.TestInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "endOfTestBranch",
+      "action": "aws:sleep",
+      "description": "End of Testing branch",
+      "onFailure": "Abort",
+      "nextStep": "checkIfTestingBranchSucceeded",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "checkIfTestingBranchSucceeded",
+      "action": "aws:executeScript",
+      "description": "Checks the status of testing branch",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "nextStep": "approvalToStopTargetInstance",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkStepStatus.checkStepStatus_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "StepName": "waitForTestInstanceStatusChecks"
+        }
+      }
+    },
+    {
+      "name": "approvalToStopTargetInstance",
+      "action": "aws:approve",
+      "description": "Waits for designated principals approval to stop the target instance",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "stopTargetEC2Instance",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Test EC2 instance launched from the target EC2 instance successfully passed the 2/2 status checks. Provide approval to stop the target EC2 instance {{TargetInstanceId}} in order to proceed with the automation. If approved, target EC2 instance will be stopped. Before providing approval, make sure 1) Elastic IP address is assigned to the EC2 instance, if not Public IP will be changed, once the instance is stopped. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "stopTargetEC2Instance",
+      "action": "aws:changeInstanceState",
+      "description": "Stops the target EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:forceStopTargetEC2Instance",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "startOfCloneAndMigrateBranch"
+    },
+    {
+      "name": "forceStopTargetEC2Instance",
+      "action": "aws:changeInstanceState",
+      "description": "Force stops the target EC2 instance, only if the step 'stopTargetEC2Instance' fails to stop",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      },
+      "nextStep": "startOfCloneAndMigrateBranch"
+    },
+    {
+      "name": "startOfCloneAndMigrateBranch",
+      "action": "aws:sleep",
+      "description": "Start of Clone and Migrate branch",
+      "onFailure": "Abort",
+      "nextStep": "createBackupImage",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "createBackupImage",
+      "action": "aws:createImage",
+      "description": "Creates an Amazon Machine Image(AMI) from the provided instance for backup",
+      "maxAttempts": 1,
+      "nextStep": "launchInstanceInSameSubnet",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceId": "{{TargetInstanceId}}",
+        "ImageName": "CloneXenEC2InstanceAndMigrateToNitro_BackupImage_{{TargetInstanceId}}_{{global:DATE_TIME}}",
+        "NoReboot": true,
+        "ImageDescription": "SSMAutomationID-{{automation:EXECUTION_ID}}"
+      }
+    },
+    {
+      "name": "launchInstanceInSameSubnet",
+      "action": "aws:executeScript",
+      "description": "Launches a new EC2 instance from the backup AMI using the same configuration as source EC2 instance",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "step:failureHandling",
+      "nextStep": "waitForClonedInstanceToPassStatusChecks",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "launchEC2Instance.launchInstanceInSameSubnet_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "ImageId": "{{createBackupImage.ImageId}}",
+          "InstanceType": "{{getTargetInstanceProperties.InstanceType}}",
+          "IamInstanceProfileArn": "{{getTargetInstanceProperties.InstanceProfileArn}}",
+          "SubnetId": "{{getTargetInstanceProperties.InstanceSubnetId}}",
+          "SecurityGroupIds": [
+            "{{getTargetInstanceProperties.SecurityGroup}}"
+          ],
+          "TargetInstanceId": "{{TargetInstanceId}}",
+          "BranchType": "CloneAndMigrate"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ClonedInstanceId",
+          "Selector": "$.Payload.launchedInstanceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "waitForClonedInstanceToPassStatusChecks",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the cloned EC2 instance to pass the 2/2 Status Checks",
+      "onFailure": "step:failureHandling",
+      "isCritical": "true",
+      "timeoutSeconds": 1200,
+      "nextStep": "verifySSMConnectivityForClonedInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "PropertySelector": "$.InstanceStatuses..InstanceStatus.Status",
+        "DesiredValues": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "name": "verifySSMConnectivityForClonedInstance",
+      "action": "aws:runCommand",
+      "description": "Verifies if the cloned EC2 instance is connected with AWS Systems Manager and configured to use RunCommand",
+      "onFailure": "step:failureHandling",
+      "isCritical": "true",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "checkAndInstallENADrivers",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "#!/bin/bash\n\necho \"EC2 instance is connected with AWS Systems Manager and configured to use RunCommand\"\n"
+        }
+      }
+    },
+    {
+      "name": "checkAndInstallENADrivers",
+      "action": "aws:runCommand",
+      "description": "Determines the availability of Enhanced Networking Adapter(ENA) drivers on the EC2 instance and installs, if missing",
+      "isCritical": true,
+      "nextStep": "checkAndAddNVMEDrivers",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "TimeoutSeconds": 3600,
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\nNITRO_INSTANCE_TYPE='{{NitroInstanceType}}'\n\nerror_exit()\n{\n    echo \" $1\"\n    echo \"\\\\nThe Execution did not complete successfully.\\\\n\"\n    exit 1\n    \n}\n\nunsupported_os() {\n        error_exit \"Unsupported OS for ENA. Stopping installation\"\n}\n\ninstallation_ubuntu(){\n        mkdir /var/lib/amazon/ssm/xen_to_nitro_automation\n        cd /var/lib/amazon/ssm/xen_to_nitro_automation \n        sudo apt update\n        sudo apt-get install make gcc unzip wget linux-headers-\"$(uname -r)\" -y || error_exit \"[ERROR] Error occured while installing required packages via APT\"\n        cd /var/lib/amazon/ssm/xen_to_nitro_automation\n        rm -rf  amzn-drivers-master\n        wget https://github.com/amzn/amzn-drivers/archive/master.zip || error_exit \"[ERROR] Error occured while downloading ENA drivers\"\n        unzip master.zip\n        cd amzn-drivers-master/kernel/linux/ena || exit\n        ABI=$(uname -r | awk -F '[.-]' '{print $4}')\n        make [UBUNTU_ABI=$ABI]\n        rm -rf /lib/modules/\"$(uname -r)\"/ena.ko\n        sudo mkdir /lib/modules/\"$(uname -r)\"/ena/\n        cp -f ena.ko /lib/modules/\"$(uname -r)\"/ena/\n        cd /lib/modules/\"$(uname -r)\"/ena/\n        if  [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n            ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n        else\n            ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')        \n        fi\n        if [ \"${ena_version}\" -le 1 ]; then\n               echo \"ENA version = $ena_version\"\n               modprobe -r ena\n               rmmod /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko #for safe side, as modprobe -r ena would be sufficient\n               rm -rf /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko\n        fi  \n        insmod ena.ko\n        if depmod -a ; then\n            if modinfo ena > /dev/null 2>&1 ; then\n                echo \" ENA driver Installation Complete\"\n            else\n                error_exit \"[ERROR] Driver Installation failed\"\n            fi\n        else\n            error_exit \"[ERROR] Depmod file creation failed\"\n        fi\n}\n\ninstallation_yum() {\n    mkdir /var/lib/amazon/ssm/xen_to_nitro_automation\n    cd /var/lib/amazon/ssm/xen_to_nitro_automation\n    yum install kernel-devel-\"$(uname -r)\" gcc patch rpm-build wget -y || error_exit \"[ERROR] Error occured while installing required packages via YUM\"\n    rm -rf  amzn-drivers-master\n    wget https://github.com/amzn/amzn-drivers/archive/master.zip || error_exit \"[ERROR] Error occured while downloading ENA drivers\"\n    unzip master.zip\n    cd amzn-drivers-master/kernel/linux/ena\n    make\n    rm -rf /lib/modules/\"$(uname -r)\"/ena.ko\n    mkdir /lib/modules/\"$(uname -r)\"/ena/\n    cp -f ena.ko /lib/modules/\"$(uname -r)\"/ena/\n    cd /lib/modules/\"$(uname -r)\"/ena/\n    ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')        \n    if [[ \"${ena_version}\" -le 1 ]]\n        then\n           modprobe -r ena\n           rmmod /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko.xz #for safe side, as modprobe -r ena would be sufficient\n           rm -rf /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko.xz\n    fi\n    insmod ena.ko\n    depmod -a\n    echo 'add_drivers+=\" ena \"' >> /etc/dracut.conf.d/ena.conf   # Appended drivers\n    if dracut -f -v; then\n            echo \"[INFO] ENA driver Installation Complete.\"\n    else\n            error_exit \"[ERROR] Driver installation failed\"\n    fi\n}\n\nfix_predictable_names(){\n    echo \"[INFO] Fixing predictable interface naming issue\"\n    if [ -f /etc/default/grub ]; then\n        cp /etc/default/grub \"/etc/default/grub.$(date +%F)\"\n        if ! grep -q \"net.ifnames\" /etc/default/grub ; then `sed -i '/^GRUB\\_CMDLINE\\_LINUX/s/\\\"$/\\ net\\.ifnames\\=0\\\"/' /etc/default/grub`; fi\n        if ! grep -q \"biosdevname\" /etc/default/grub; then `sed -i '/^GRUB\\_CMDLINE\\_LINUX/s/\\\"$/\\ biosdevname\\=0\\\"/' /etc/default/grub`; fi\n        if [ -f /etc/debian_version ]; then # added if statement as grub2-mkconfig doesn't work on ubuntu to update grub config\n            update-grub || error_exit \"[ERROR] Error occured while updating GRUB\"\n        else\n            grub2-mkconfig -o /boot/grub2/grub.cfg || error_exit \"[ERROR] Error occured while updating GRUB\"\n        fi\n    elif [ -f /boot/grub/menu.lst ]; then # added this just in case\n        cp /boot/grub/menu.lst \"/boot/grub/menu.lst.$(date +%F)\"\n        if ! grep -q \"net.ifnames\" /boot/grub/menu.lst ; then `sed -i '/^kernel/s/$/ net\\.ifnames\\=0/' /boot/grub/menu.lst`; fi    \n        if ! grep -q \"biosdevname\" /boot/grub/menu.lst; then `sed -i '/^kernel/s/$/ biosdevname\\=0\\\"/' /boot/grub/menu.lst`; fi        \n    fi\n\n}\n\n# To check if this file exists and if it does remove it to prevent booting issues from new AMI\n# If your instance operating system contains an /etc/udev/rules.d/70-persistent-net.rules file, you must delete it before creating the AMI. This file contains the MAC address for the Ethernet adapter of the original instance. If another instance boots with this file, the operating system will be unable to find the device and eth0 might fail, causing boot issues. This file is regenerated at the next boot cycle, and any instances launched from the AMI create their own version of the file.\nPersistent_rules(){\nif [ -f /etc/udev/rules.d/70-persistent-net.rules ]; then  \n    cp /etc/udev/rules.d/70-persistent-net.rules \"/etc/udev/rules.d/70-persistent-net-rules.$(date +%F)\"\n    rm -rf /etc/udev/rules.d/70-persistent-net.rules \nfi\n}\n\n\ninstall_ena_redhat() {\n    printf \"[INFO] Installation process for RHEL/CentOS beginning... \\n\"\n    installation_yum\n    if grep -q -i \"release 7\" /etc/redhat-release; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n}\n\ninstall_ena_ubuntu(){\n    printf \"[INFO] Installation process for Ubuntu beginning... \\n\"\n    CurrentKernel=\"$(uname -r)\"\n    echo \"[INFO] Current kernel version is\" \"$CurrentKernel\"\n    echo \"$CurrentKernel\" | grep -i aws > /dev/null 2>&1\n    if  [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    fi\n    if [ \"${ena_version}\" -eq 1 ]; then\n        installation_ubuntu\n    elif [ $? -eq 0 ]; then\n        echo \"[WARNING] This kernel should have ENA installed...\"\n    else\n        installation_ubuntu\n    fi\n    if grep -iq 'xenial\\|bionic' /etc/lsb-release; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n}\n\ninstall_ena_sles() {\n    printf \"[INFO] Installation process for SLES beginning... \\n\"\n    echo \"[OK] SUSE SLES 12 SP2 and later include ENA 2.02 by default, so you are not required to download and compile the ENA driver\"\n    echo \"\\n [INFO] Reinstalling the same kernel to fix this\"\n    zypper refresh\n    CurrentKernel=$(uname -r)\n    echo \"current kernel version is\" \"$CurrentKernel\" \n    KernelVersion=$(echo \"$CurrentKernel\" | sed -r 's/-default/.1/g')\n    if zypper install -f -y kernel-default-\"$KernelVersion\" || error_exit \"[ERROR] Error occured while re-installing kernel via ZYPPER\" ; then\n        echo \" [OK] Kernel reinstalled\"\n    else\n        error_exit \"[ERROR] Kernel Installation failed\" \n    fi\n    if modinfo ena > /dev/null 2>&1; then\n      ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n      echo -e \"[OK] ENA Module with version $ena_version is installed and available on your instance\"\n    fi\n    fix_predictable_names\n}\n\ninstall_ena_amzn() {\n    printf \"[INFO] Installation process for Amazon Linux and Amazon Linux 2 beginning... \\n\"\n    installation_yum\n    . /etc/os-release\n    version=$LINUX_DISTRO_VERSION_ID\n    a=2018.03\n    if ! echo \"$version == $a\" > /dev/null | bc; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n\n}\n\ninstall_ena(){\nif [ -f /etc/os-release ]; then\n    LINUX_DISTRO=$(cat /etc/os-release | grep -w \"NAME=\" | awk -F'=' '{print $2}')\n    LINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\n    echo \"LINUX_DISTRO >> $LINUX_DISTRO\"\n    echo \"LINUX_DISTRO_VERSION_ID >> $LINUX_DISTRO_VERSION_ID\"\nfi\n\nif [ -f /etc/redhat-release ] ; then\n    if grep -qi -e \"release 6\" -e \"release 7\" /etc/redhat-release ; then\n        install_ena_redhat\n    else\n        unsupported_os\n    fi\n\nelif grep 'Amazon Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    . /etc/os-release\n    version=$LINUX_DISTRO_VERSION_ID\n    a=2018.03\n    if echo \"$version == $a\" | bc; then\n        install_ena_amzn\n    elif [ \"${version}\" -eq 2 ]; then\n        install_ena_amzn\n    else\n        unsupported_os\n    fi\n\nelif grep 'SUSE Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    SUSE_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    SUSE_MINOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $2}')\n    echo \"SUSE_MAJOR_VERSION >> $SUSE_MAJOR_VERSION\"\n    echo \"SUSE_MINOR_VERSION >> $SUSE_MINOR_VERSION\"\n    if [ $SUSE_MAJOR_VERSION -lt 15 ] && [ $SUSE_MINOR_VERSION -lt 5 ]; then\n        unsupported_os\n    else\n       install_ena_sles\n    fi\n\nelif grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n    UBUNTU_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    UBUNTU_MINOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $2}')\n    if [ \"$UBUNTU_MAJOR_VERSION\" -lt \"14\" ]; then\n        unsupported_os\n    else \n        install_ena_ubuntu\n    fi\n\nelif grep 'Debian' /etc/os-release; then\n    DEBIAN_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    DEBIAN_MINOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $2}')\n    if [ \"$DEBIAN_MAJOR_VERSION\" -lt \"9\" ]; then\n            unsupported_os\n    else \n        install_ena_ubuntu\n    fi\n\nelse\n    unsupported_os\nfi\n}\n\n\nLINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\na='2018.03' #AL is EOL and is in maintenance support which will end in mind 2023. 2018.03 is the last AL OS version released, hence not supporting older versions\n\nif ! modinfo ena > /dev/null 2>&1;\n    then\n    echo \"[WARNING] ENA Module is not available on your instance.\"\n    install_ena\nelif echo \"${NITRO_INSTANCE_TYPE}\" | grep -qE '^[cmr]6[ia]\\.[0-9]{0,2}[x]?large$'; then\n    if grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n        LINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\n        UBUNTU_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n            if [ $UBUNTU_MAJOR_VERSION -eq 16 ]; then\n                unsupported_os\n            elif [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n                ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n            else\n                ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n            fi\n    elif echo \"$LINUX_DISTRO_VERSION_ID == $a\" > /dev/null | bc; then\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    elif grep Debian /etc/os-release 1>/dev/null 2>/dev/null; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    fi\n    if [ $ena_version -eq 1 ]\n       then\n        echo \"[INFO] Updating ENA version as instance type is 6th generation\"\n        install_ena\n    else\n     echo \"[INFO] No ena version update needed for 6th generation instance type. Already > 1.2.0\"\n    fi\n\nelif grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n    LINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\n    UBUNTU_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    if  [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk '{print $2}')\n        echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n        echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\n    fi\nelse \n    ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n    echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\nfi\n\nPersistent_rules\nfix_predictable_names\n"
+        }
+      }
+    },
+    {
+      "name": "checkAndAddNVMEDrivers",
+      "action": "aws:runCommand",
+      "description": "Determines the availability of NVMe drivers on the cloned EC2 instance and installs, if missing",
+      "timeoutSeconds": 3600,
+      "nextStep": "checkAndModifyFSTABEntries",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\n\ncheck_NVMe_omitted () {\n    lsinitrd /boot/initramfs-$(uname -r).img| grep -e \"--omit-drivers\" -e \"-o\" | grep nvme > /dev/null 2>&1\n    if [ $? -eq 0 ]; then \n        echo \"[ERROR] NVME module is ommited in initramfs image using parameter --omit-drivers or -o\"\n        exit 1\n    else\n        echo \"[INFO] NVME module is not ommited in initramfs image using parameter --omit-drivers or -o\"\n    fi\n}\n\nadd_nvme_driver(){\n    echo \"[ERROR] NVMe Module is not loaded in the initramfs image, recreating initramfs/initrd:\"\n    echo 'add_drivers+=\" nvme \"' >> /etc/dracut.conf.d/nvme.conf\n    echo 'add_drivers+=\" nvme_core \"' >> /etc/dracut.conf.d/nvme_core.conf\n    dracut -f -v\n    depmod -a\n}\n\ncheck_NVMe_in_initrd () {\n\nif [ -f /etc/redhat-release ] ; then\n    check_NVMe_omitted\n    lsinitrd /boot/initramfs-$(uname -r).img | grep -i nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then        \n        add_nvme_driver\n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module is not loaded in the newly built initramfs image\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"        \n        fi\n    else\n        Kernel_version=`uname -r`\n        echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n    fi\nelif grep 'Amazon Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    check_NVMe_omitted\n    lsinitrd /boot/initramfs-$(uname -r).img|grep nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        add_nvme_driver          \n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module is not loaded in the newly built initramfs image\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"        \n        fi\n    else\n        Kernel_version=`uname -r`\n        echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n    fi\nelif grep 'SUSE Linux' /etc/os-release 1>/dev/null 2>/dev/null; then     \n    check_NVMe_omitted\n    lsinitrd /boot/initrd|grep nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        add_nvme_driver        \n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module is not loaded in the newly built initramfs image\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n        fi\n    else \n        Kernel_version=`uname -r`\n        echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"     \n    fi\nelif [ -f /etc/debian_version ] ; then\n    lsinitramfs /boot/initrd.img-$(uname -r)|grep nvme > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        echo \"[ERROR] NVMe Module is not loaded in the initramfs image, recreating initrd:\"\n        update-initramfs -c -k all\n        lsinitramfs /boot/initrd.img-$(uname -r)| grep nvme > /dev/null 2>&1\n        if [ $? -ne 1 ]; then\n            echo \"[OK] NVME Module is installed in newly built initrd\"\n        else \n            echo \"[ERROR] NVME Module cannot be installed\"\n            exit 1\n        fi\n    else\n        Kernel_version=`uname -r`\n        echo \"[OK] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n    fi\nelse\n    echo \"[ERROR] Unsupported OS for this script.\"\n    exit 1\nfi\n}\n\n(grep 'nvme' /boot/System.map-$(uname -r)) > /dev/null 2>&1\nif [ $? -ne 0 ]     # NVMe module is not built into the kernel\n    then\n    (modinfo nvme) > /dev/null 2>&1\n    if [ $? -ne 0 ]\n        then\n        # NVMe Module is not installed. \n        echo \"[ERROR] NVMe Module is not available on your instance. \\n\\t- Please install NVMe module before changing your instance type to Nitro. Look at the following link for further guidance:\"\n        echo \"\\t> https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvme-ebs-volumes.html\"\n        exit 1\n\n    else\n        Kernel_version=`uname -r`\n        echo \"[OK] NVMe module is installed on your instance for Kernel version $Kernel_version\"\n        echo \"[INFO] Checking if NVME module is loaded in initramfs/initrd\"\n        check_NVMe_in_initrd                # Calling function to check if NVMe module is loaded in initramfs. \n    fi\nelse\n    Kernel_version=`uname -r`\n    echo \"[OK]  NVMe module is installed and available on your instance for Kernel version $Kernel_version\"\nfi\n"
+        }
+      }
+    },
+    {
+      "name": "checkAndModifyFSTABEntries",
+      "action": "aws:runCommand",
+      "description": "Determines if the device name are used in /etc/fstab and replaces them with their UUIDs, if found",
+      "timeoutSeconds": 3600,
+      "onFailure": "step:failureHandling",
+      "nextStep": "stopClonedInstance",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\ntime_stamp=$(date +%F-%H:%M:%S)\ncp -p /etc/fstab /etc/fstab.backup.$time_stamp\ncp -p /etc/fstab /etc/fstab.modified.$time_stamp\nmkdir /var/lib/amazon/ssm/xen_to_nitro_automation\ncat /etc/fstab | grep '^/dev' | grep -E 'sd[a-z]|xvd[a-z]|nvme([0-9]|1[0-9]|2[0-7])n1p?' | awk -F '/' '{print $3}'>/var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n\nwhile read LINE; do # For each line in /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n        UUID=`ls -l /dev/disk/by-uuid | grep \"$LINE\" | sed -n 's/^.* \\([^ ]*\\) -> .*$/\\1/p'` # Gets the UUID name for that device\n        if [ ! -z \"$UUID\" ]\n        then\n            sed -i \"s|^/dev/${LINE}|UUID=${UUID}|\" /etc/fstab.modified.$time_stamp # Changes the entry in fstab to UUID form\n        fi\ndone </var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n\nif [ -s /var/lib/amazon/ssm/xen_to_nitro_automation/device_names ]; then\n    echo -e \"[WARNING] Your fstab file contains device names.\"\n    echo -e \"[INFO] Replacing device names with UUID in /etc/fstab file to make it compatible for NVMe block device names\"\n    echo -e \"[INFO] Writing changes to /etc/fstab\"\n    cp -p /etc/fstab.modified.$time_stamp /etc/fstab\n    echo -e \"[INFO] Device name entries converted to UUIDs\"\n    echo -e \"[INFO] Original fstab file is stored as /etc/fstab.backup.$time_stamp\"\n    rm -rf /etc/fstab.modified.$time_stamp\n    rm -rf /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n    rmdir /var/lib/amazon/ssm/xen_to_nitro_automation\n\n\nelse\n    rm -rf /etc/fstab.backup.$time_stamp\n    rm -rf /etc/fstab.modified.$time_stamp\n    rm -rf /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n    rmdir /var/lib/amazon/ssm/xen_to_nitro_automation\n    echo -e \"[INFO] fstab file looks fine and does not contain any entry with device names and are with UUID\"\nfi\n\n\n\n"
+        }
+      }
+    },
+    {
+      "name": "stopClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Stops the cloned EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:forceStopClonedInstance",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "checkENAAttributeForClonedInstance"
+    },
+    {
+      "name": "forceStopClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Force stops the cloned EC2 instance, only if the step 'stopClonedInstance' fails to stop",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      },
+      "nextStep": "checkENAAttributeForClonedInstance"
+    },
+    {
+      "name": "checkENAAttributeForClonedInstance",
+      "action": "aws:branch",
+      "description": "Checks if the Enhanced Networking Adapter(ENA) attribute is enabled on the cloned EC2 instance",
+      "isCritical": true,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "setNitroInstanceTypeForClonedInstance",
+            "Variable": "{{getTargetInstanceProperties.ENAAttrib}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "enableENAAttributeForClonedInstance"
+      }
+    },
+    {
+      "name": "enableENAAttributeForClonedInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Enables the Enhanced Networking Adapter(ENA) attribute for the cloned instance, if not enabled already",
+      "nextStep": "setNitroInstanceTypeForClonedInstance",
+      "onFailure": "step:failureHandling",
+      "maxAttempts": 1,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{launchInstanceInSameSubnet.ClonedInstanceId}}",
+        "EnaSupport": {
+          "Value": true
+        }
+      }
+    },
+    {
+      "name": "setNitroInstanceTypeForClonedInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Sets the provided Target EC2 instance type for the cloned EC2 instance",
+      "onFailure": "step:failureHandling",
+      "nextStep": "startClonedInstance",
+      "maxAttempts": 1,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{launchInstanceInSameSubnet.ClonedInstanceId}}",
+        "InstanceType": {
+          "Value": "{{NitroInstanceType}}"
+        }
+      }
+    },
+    {
+      "name": "startClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Starts the cloned EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "isCritical": true,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      },
+      "nextStep": "approvalForCreatingImageAfterDriversInstallation"
+    },
+    {
+      "name": "approvalForCreatingImageAfterDriversInstallation",
+      "action": "aws:approve",
+      "description": "Waits for user approval if the cloned EC2 instance successfully boots on Nitro platform. If provided, creates an Amazon Machine Image(AMI) which can be used as Golden Image to launch Nitro instances",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "createImageAfterDriversInstallation",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Cloned EC2 Instance {{launchInstanceInSameSubnet.ClonedInstanceId}}, created from target EC2 instance {{TargetInstanceId}}, has been successfully migrated to {{NitroInstanceType}}. Provide approval to create an Amazon Machine Image(AMI) which can be used as a Golden Image to launch EC2 nitro instances. In case of 'Reject/Deny', the Automation will stop with Failed status. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "createImageAfterDriversInstallation",
+      "action": "aws:createImage",
+      "description": "Creates an Image from the new EC2 instance only if the new EC2 instance successfully boots on Nitro Platform",
+      "maxAttempts": 1,
+      "nextStep": "endOfCloneAndMigrateBranch",
+      "onFailure": "step:failureHandling",
+      "isCritical": true,
+      "inputs": {
+        "InstanceId": "{{launchInstanceInSameSubnet.ClonedInstanceId}}",
+        "ImageName": "CloneXenEC2InstanceAndMigrateToNitro_NitroImage_{{TargetInstanceId}}_{{global:DATE_TIME}}",
+        "NoReboot": true,
+        "ImageDescription": "Image created after driver installation - SSMAutomationID-{{automation:EXECUTION_ID}}"
+      }
+    },
+    {
+      "name": "endOfCloneAndMigrateBranch",
+      "action": "aws:sleep",
+      "description": "End of Clone & Migrate branch",
+      "onFailure": "Continue",
+      "nextStep": "cleanupTestImage",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "cleanupTestImage",
+      "action": "aws:deleteImage",
+      "description": "De-registers the Image(AMI) created for testing",
+      "maxAttempts": 3,
+      "isEnd": true,
+      "onFailure": "Continue",
+      "isCritical": true,
+      "inputs": {
+        "ImageId": "{{createTestImage.ImageId}}"
+      }
+    },
+    {
+      "name": "failureHandling",
+      "action": "aws:branch",
+      "description": "Checks if the user has chosen to terminate resources on failure",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "onFailureTerminateClonedInstance",
+            "Variable": "{{DeleteResourcesOnFailure}}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "onFailureTerminateClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Terminates the cloned EC2 instance, in case of automation failure",
+      "maxAttempts": 1,
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "nextStep": "onFailurecleanupTestImage",
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "onFailurecleanupTestImage",
+      "action": "aws:deleteImage",
+      "description": "De-registers the Image(AMI) created for testing",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "nextStep": "onFailureApprovalToStartTargetInstance",
+      "isCritical": true,
+      "inputs": {
+        "ImageId": "{{createTestImage.ImageId}}"
+      }
+    },
+    {
+      "name": "onFailureApprovalToStartTargetInstance",
+      "action": "aws:approve",
+      "description": "If automation fails, waits for designated principal's approval to start the target EC2 instance",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "onFailureStartTargetInstance",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Automation failed while migrating cloned EC2 Xen based instance to Nitro platform. Provide approval to start the target EC2 instance. In case of 'Reject/Deny', the Automation will stop with Failed status. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "onFailureStartTargetInstance",
+      "action": "aws:changeInstanceState",
+      "description": "If automation fails, starts the target EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      }
+    }
+  ],
+  "outputs": [
+    "launchInstanceInSameSubnet.ClonedInstanceId",
+    "createBackupImage.ImageId",
+    "createImageAfterDriversInstallation.ImageId"
+  ],
+  "files": {
+    "clone-xen-to-nitro-python.zip": {
+      "checksums": {
+        "sha256": "cde996ebf64c58fe8b65d657cdc34aa065c9c107b6aa25d0769bfcf098c5bfe9"
+      }
+    }
+  }
+}
