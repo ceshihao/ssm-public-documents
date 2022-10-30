@@ -1,0 +1,184 @@
+{
+  "description": "The **AWSSupport-ConfigureTrafficMirroring** runbook configures traffic mirroring to help you troubleshoot connectivity issues between a load balancer and Amazon Elastic Compute Cloud (Amazon EC2) instances. Traffic mirroring copies inbound and outbound traffic from the network interfaces that are attached to your instances. To configure traffic mirroring, this runbook creates the required targets, filters, and sessions. By default, the runbook configures mirroring for all inbound and outbound traffic for all protocols except Amazon DNS. If you want to mirror traffic from specific sources and destinations, you can modify the inbound and outbound rules after the automation completes.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "CreateTarget.TargetId",
+    "CreateFilter.FilterId",
+    "CreateSession.SessionId"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows the Automation runbook to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your current IAM user permissions context to execute this runbook.",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::\\d{12}:role/[\\w+=/,.@-]+$",
+      "maxChars": 2048,
+      "default": ""
+    },
+    "SourceENI": {
+      "type": "String",
+      "description": "(Required) The elastic network interface (ENI) you want to configure traffic mirroring for.",
+      "allowedPattern": "^eni-[a-z0-9]{8,17}"
+    },
+    "Target": {
+      "type": "String",
+      "description": "(Required) The destination for the mirrored traffic. You must specify the ID of a network interface, a Network Load Balancer, or a Gateway Load Balancer endpoint. If you specify a Network Load Balancer, there must be UDP listeners on port 4789.",
+      "allowedPattern": "(^eni-[a-z0-9]{8,17}|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):elasticloadbalancing:(us(-gov)?|ap|af|me|ca|cn|eu|sa)-(central|(north|south)?(east|west)?)-\\d:\\d{12}:loadbalancer/net/.*|vpce-[a-z0-9]{8,17})"
+    },
+    "SessionNumber": {
+      "type": "Integer",
+      "description": "(Required) The number of the mirror session you want to use. It must be in range of 1 to 32766.",
+      "allowedPattern": "^([0-9]{1,4}|[1-2][0-9]{4}|3[0-2][0-6][0-9]{2}|327[0-5][0-9]|3276[0-6])$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CreateTarget",
+      "description": "Creates a target for your Traffic Mirror session depending on the Target paremeter: network interface, Network Load Balancer, or Gateway Load Balancer endpoint.",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "create_target",
+        "Script": "import boto3\nimport sys\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\nclient = boto3.client('ec2')\n\n\ndef create_target(events, context):\n\n    try:\n        if 'eni-' in events['TargetType']:\n            response = client.create_traffic_mirror_target(NetworkInterfaceId=events['TargetType'],\n                                                           Description=f'AWSSupport_Traffic_Mirror_Target_{context[\"automation:EXECUTION_ID\"]}',\n                                                           TagSpecifications=[\n                {\n                    'ResourceType': 'traffic-mirror-target',\n                    'Tags': [\n                        {\n                            'Key': 'Name',\n                            'Value': events['TargetName']\n                        }\n                    ]\n                }\n            ]\n            )\n            output = response['TrafficMirrorTarget']['TrafficMirrorTargetId']\n            return output\n\n        elif 'elasticloadbalancing' in events['TargetType']:\n            response = client.create_traffic_mirror_target(NetworkLoadBalancerArn=events['TargetType'],\n                                                           Description=f'AWSSupport_Traffic_Mirror_Target_{context[\"automation:EXECUTION_ID\"]}',\n                                                           TagSpecifications=[\n                {\n                    'ResourceType': 'traffic-mirror-target',\n                    'Tags': [\n                        {\n                            'Key': 'Name',\n                            'Value': events['TargetName']\n                        }\n                    ]\n                }\n            ]\n            )\n            output = response['TrafficMirrorTarget']['TrafficMirrorTargetId']\n            return output\n\n        else:\n            response = client.create_traffic_mirror_target(GatewayLoadBalancerEndpointId=events['TargetType'],\n                                                           Description=f'AWSSupport_Traffic_Mirror_Target_{context[\"automation:EXECUTION_ID\"]}',\n                                                           TagSpecifications=[\n                {\n                    'ResourceType': 'traffic-mirror-target',\n                    'Tags': [\n                        {\n                            'Key': 'Name',\n                            'Value': events['TargetName']\n                        }\n                    ]\n                }\n            ]\n            )\n            output = response['TrafficMirrorTarget']['TrafficMirrorTargetId']\n            return output\n\n    except ClientError as e:\n        c = e.response['Error']['Code']\n        m = e.response['Error']['Message']\n        raise Exception(\n            f'An error occurred when creating the Traffic Mirror target: {c}:{m}')\n",
+        "InputPayload": {
+          "TargetType": "{{Target}}",
+          "TargetName": "AWSSupport_Target_{{ automation:EXECUTION_ID }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "TargetId",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CreateFilter",
+      "isCritical": "true",
+      "onFailure": "step:DeleteResourcesTarget"
+    },
+    {
+      "name": "CreateFilter",
+      "description": "Creates the Traffic Mirror filter.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:DeleteResourcesTarget",
+      "isCritical": "true",
+      "nextStep": "CreateTrafficMirrorFilterRuleIngress",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateTrafficMirrorFilter",
+        "Description": "AWSSupport_Mirror_Filter_{{ automation:EXECUTION_ID }}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "traffic-mirror-filter",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "AWSSupport_Filter_{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "FilterId",
+          "Selector": "$.TrafficMirrorFilter.TrafficMirrorFilterId"
+        }
+      ]
+    },
+    {
+      "name": "CreateTrafficMirrorFilterRuleIngress",
+      "action": "aws:executeAwsApi",
+      "description": "Creates a Traffic Mirror filter ingress rule allowing: \"ALL\" protocols, \"ALL\" traffic except Amazon DNS traffic. If you want to configure a specific Source/Destination and/or Protocol, you need to modify the Inbound/Outbound Filter Entries. To modify your traffic mirror rules, please refer to https://docs.aws.amazon.com/vpc/latest/mirroring/traffic-mirroring-filter.html#modify-traffic-mirroring-filter-rules.",
+      "onFailure": "step:DeleteResourcesFilter",
+      "nextStep": "CreateTrafficMirrorFilterRuleEgress",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateTrafficMirrorFilterRule",
+        "TrafficMirrorFilterId": "{{CreateFilter.FilterId}}",
+        "Description": "AWSSupport_AllTraffic_Ingress_{{CreateFilter.FilterId}}_{{ automation:EXECUTION_ID }",
+        "TrafficDirection": "ingress",
+        "RuleNumber": 100,
+        "RuleAction": "accept",
+        "SourceCidrBlock": "0.0.0.0/0",
+        "DestinationCidrBlock": "0.0.0.0/0"
+      }
+    },
+    {
+      "name": "CreateTrafficMirrorFilterRuleEgress",
+      "description": "Creates a Traffic Mirror filter egress rule allowing: \"ALL\" protocols, \"ALL\" traffic except Amazon DNS traffic. If you want to configure a specific Source/Destination and/or Protocol, you need to modify the Inbound/Outbound Filter Entries. To modify your traffic mirror rules, please refer to https://docs.aws.amazon.com/vpc/latest/mirroring/traffic-mirroring-filter.html#modify-traffic-mirroring-filter-rules.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:DeleteResourcesFilter",
+      "nextStep": "CreateSession",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateTrafficMirrorFilterRule",
+        "TrafficMirrorFilterId": "{{CreateFilter.FilterId}}",
+        "Description": "AWSSupport_AllTraffic_Egress_{{CreateFilter.FilterId}}_{{ automation:EXECUTION_ID }}",
+        "TrafficDirection": "egress",
+        "RuleNumber": 100,
+        "RuleAction": "accept",
+        "SourceCidrBlock": "0.0.0.0/0",
+        "DestinationCidrBlock": "0.0.0.0/0"
+      }
+    },
+    {
+      "name": "CreateSession",
+      "description": "Creates a Traffic Mirror session.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:DeleteResourcesFilter",
+      "isCritical": "true",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "CreateTrafficMirrorSession",
+        "Description": "AWSSupport_Traffic_Mirror_Session_{{CreateFilter.FilterId}}_{{ automation:EXECUTION_ID }}",
+        "TrafficMirrorTargetId": "{{CreateTarget.TargetId}}",
+        "TrafficMirrorFilterId": "{{CreateFilter.FilterId}}",
+        "NetworkInterfaceId": "{{SourceENI}}",
+        "SessionNumber": "{{SessionNumber}}",
+        "TagSpecifications": [
+          {
+            "ResourceType": "traffic-mirror-session",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "AWSSupport_Session_{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "SessionId",
+          "Selector": "$.TrafficMirrorSession.TrafficMirrorSessionId"
+        }
+      ],
+      "isEnd": "true"
+    },
+    {
+      "name": "DeleteResourcesFilter",
+      "description": "Deletes the Traffic Mirror filter if the creation of the Traffic Mirror filters or Traffic Mirror session fails.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "nextStep": "DeleteResourcesTarget",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteTrafficMirrorFilter",
+        "TrafficMirrorFilterId": "{{CreateFilter.FilterId}}"
+      }
+    },
+    {
+      "name": "DeleteResourcesTarget",
+      "description": "Deletes the Traffic Mirror target if the creation of the Traffic Mirror filters or Traffic Mirror session fails.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DeleteTrafficMirrorTarget",
+        "TrafficMirrorTargetId": "{{CreateTarget.TargetId}}"
+      },
+      "isEnd": "true"
+    }
+  ]
+}
