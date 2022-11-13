@@ -92,14 +92,21 @@
     {
       "name": "RestoreSnapshot",
       "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RestoredInstanceId",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
       "inputs": {
         "Runtime": "python3.8",
         "Handler": "script_handler",
-        "Script": "def script_handler(events, context):\n  import boto3\n  rds = boto3.client('rds')\n  db_instance_response = rds.describe_db_instances(DBInstanceIdentifier = events['SourceDBInstanceIdentifier'])['DBInstances'][0]\n  if db_instance_response['MultiAZ']:\n    rds.restore_db_instance_from_db_snapshot(\n      Engine = db_instance_response['Engine'],\n      StorageType = db_instance_response['StorageType'],\n      DBSnapshotIdentifier = events['DBSnapshotIdentifier'],\n      DBInstanceIdentifier = events['TargetDBInstanceIdentifier'],\n      DBInstanceClass = db_instance_response['DBInstanceClass'],\n      DBSubnetGroupName = db_instance_response['DBSubnetGroup']['DBSubnetGroupName'],\n      Port = db_instance_response[\"Endpoint\"]['Port'],\n      MultiAZ = db_instance_response['MultiAZ'],\n      CopyTagsToSnapshot = db_instance_response['CopyTagsToSnapshot'],\n      VpcSecurityGroupIds = [db_instance_response['VpcSecurityGroups'][0]['VpcSecurityGroupId']]\n    )\n  else:\n    rds.restore_db_instance_from_db_snapshot(\n      Engine = db_instance_response['Engine'],\n      StorageType = db_instance_response['StorageType'],\n      DBSnapshotIdentifier = events['DBSnapshotIdentifier'],\n      DBInstanceIdentifier = events['TargetDBInstanceIdentifier'],\n      DBInstanceClass = db_instance_response['DBInstanceClass'],\n      DBSubnetGroupName = db_instance_response['DBSubnetGroup']['DBSubnetGroupName'],\n      AvailabilityZone = db_instance_response['AvailabilityZone'],\n      Port = db_instance_response[\"Endpoint\"]['Port'],\n      MultiAZ = db_instance_response['MultiAZ'],\n      CopyTagsToSnapshot = db_instance_response['CopyTagsToSnapshot'],\n      VpcSecurityGroupIds = [db_instance_response['VpcSecurityGroups'][0]['VpcSecurityGroupId']]\n    )",
+        "Script": "\nimport logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef get_execution_instance_id(rds_instance_id, middle, execution_id):\n    \"\"\"\n    Valid RDS Instance identifier from string\n    \"\"\"\n    # identifier must be less than 63 characters, but we allow 2 chars for extra suffix\n    # https://docs.aws.amazon.com/cli/latest/reference/rds/create-db-instance.html\n    max_length = 61\n    prefix_length = max_length - len(execution_id) - len(middle) - 2 # hyphens\n    prefix = rds_instance_id[0:prefix_length].rstrip('-') # two consecutive hyphens is not allowed.\n    rds_instance_id = f\"{prefix}-{middle}-{execution_id}\"\n    return rds_instance_id\n\n\n\n\ndef script_handler(events, context):\n  import boto3\n  rds = boto3.client('rds')\n  db_instance_response = rds.describe_db_instances(DBInstanceIdentifier = events['SourceDBInstanceIdentifier'])['DBInstances'][0]\n  restored_db_instance_id = get_execution_instance_id(events['SourceDBInstanceIdentifier'], 'new', events['AutomationId'])\n  if db_instance_response['MultiAZ']:\n    rds.restore_db_instance_from_db_snapshot(\n      Engine = db_instance_response['Engine'],\n      StorageType = db_instance_response['StorageType'],\n      DBSnapshotIdentifier = events['DBSnapshotIdentifier'],\n      DBInstanceIdentifier = restored_db_instance_id,\n      DBInstanceClass = db_instance_response['DBInstanceClass'],\n      DBSubnetGroupName = db_instance_response['DBSubnetGroup']['DBSubnetGroupName'],\n      Port = db_instance_response[\"Endpoint\"]['Port'],\n      MultiAZ = db_instance_response['MultiAZ'],\n      CopyTagsToSnapshot = db_instance_response['CopyTagsToSnapshot'],\n      VpcSecurityGroupIds = [db_instance_response['VpcSecurityGroups'][0]['VpcSecurityGroupId']]\n    )\n  else:\n    rds.restore_db_instance_from_db_snapshot(\n      Engine = db_instance_response['Engine'],\n      StorageType = db_instance_response['StorageType'],\n      DBSnapshotIdentifier = events['DBSnapshotIdentifier'],\n      DBInstanceIdentifier = restored_db_instance_id,\n      DBInstanceClass = db_instance_response['DBInstanceClass'],\n      DBSubnetGroupName = db_instance_response['DBSubnetGroup']['DBSubnetGroupName'],\n      AvailabilityZone = db_instance_response['AvailabilityZone'],\n      Port = db_instance_response[\"Endpoint\"]['Port'],\n      MultiAZ = db_instance_response['MultiAZ'],\n      CopyTagsToSnapshot = db_instance_response['CopyTagsToSnapshot'],\n      VpcSecurityGroupIds = [db_instance_response['VpcSecurityGroups'][0]['VpcSecurityGroupId']]\n    )\n  return restored_db_instance_id",
         "InputPayload": {
           "SourceDBInstanceIdentifier": "{{DbInstanceIdentifier}}",
-          "TargetDBInstanceIdentifier": "{{DbInstanceIdentifier}}-new-{{automation:EXECUTION_ID}}",
-          "DBSnapshotIdentifier": "{{ResolveSnapshotId.SnapshotId}}"
+          "DBSnapshotIdentifier": "{{ResolveSnapshotId.SnapshotId}}",
+          "AutomationId": "{{automation:EXECUTION_ID}}"
         }
       }
     },
@@ -110,7 +117,7 @@
       "inputs": {
         "Service": "rds",
         "Api": "DescribeDBInstances",
-        "DBInstanceIdentifier": "{{DbInstanceIdentifier}}-new-{{automation:EXECUTION_ID}}",
+        "DBInstanceIdentifier": "{{RestoreSnapshot.RestoredInstanceId}}",
         "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
         "DesiredValues": [
           "available"
@@ -145,7 +152,7 @@
       "inputs": {
         "Runtime": "python3.8",
         "Handler": "script_handler",
-        "Script": "def script_handler(events, context):\n  masterId = events['DbInstanceIdentifier']\n  dryrun = events['Dryrun']\n  automation_id = events['AutomationId']\n  return {\n    'MasterSourceId' : masterId + '-new-' + automation_id if dryrun else masterId,\n    'MasterTargetId' : masterId + '-new-' + automation_id + '-1' if dryrun else masterId + '-old-' + automation_id,\n    'ReplicaSourceId' : masterId + '-new-' + automation_id + '-1' if dryrun else masterId  + '-new-' + automation_id,\n    'ReplicaTargetId' : masterId + '-new-' + automation_id + '-2' if dryrun else masterId\n  }",
+        "Script": "\nimport logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef get_execution_instance_id(rds_instance_id, middle, execution_id):\n    \"\"\"\n    Valid RDS Instance identifier from string\n    \"\"\"\n    # identifier must be less than 63 characters, but we allow 2 chars for extra suffix\n    # https://docs.aws.amazon.com/cli/latest/reference/rds/create-db-instance.html\n    max_length = 61\n    prefix_length = max_length - len(execution_id) - len(middle) - 2 # hyphens\n    prefix = rds_instance_id[0:prefix_length].rstrip('-') # two consecutive hyphens is not allowed.\n    rds_instance_id = f\"{prefix}-{middle}-{execution_id}\"\n    return rds_instance_id\n\n\n\n\ndef script_handler(events, context):\n  masterId = events['DbInstanceIdentifier']\n  dryrun = events['Dryrun']\n  automation_id = events['AutomationId']\n  target_db_instance_id = get_execution_instance_id(masterId, 'new', automation_id)\n  old_db_instance_id = get_execution_instance_id(masterId, 'old', automation_id)\n  return {\n    'MasterSourceId' : target_db_instance_id if dryrun else masterId,\n    'MasterTargetId' : target_db_instance_id + '-1' if dryrun else old_db_instance_id,\n    'ReplicaSourceId' : target_db_instance_id + '-1' if dryrun else target_db_instance_id,\n    'ReplicaTargetId' : target_db_instance_id + '-2' if dryrun else masterId\n  }",
         "InputPayload": {
           "Dryrun": "{{Dryrun}}",
           "DbInstanceIdentifier": "{{DbInstanceIdentifier}}",

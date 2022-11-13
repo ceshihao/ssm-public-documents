@@ -1,5 +1,5 @@
 {
-  "description": "# Id\nrds:sop:promote_non_aurora_replica:2020-04-01\n\n## Intent\nSOP to recover an instance by promoting a replica to master in case of failure in the master instance.\n\n## Type\nHARDWARE\n\n## Risk\nMEDIUM\n\n## Requirements\n* RDS db with at least one read replica\n\n## Permission required for AutomationAssumeRole\n* rds:CreateDBInstanceReadReplica\n* rds:DeleteDBInstance\n* rds:DescribeDBInstances\n* rds:ModifyDBInstance\n* rds:PromoteReadReplica\n* kms:DescribeKey\n* kms:CreateGrant\n\n## Supports Rollback\n  No.\n\n## Inputs\n### DbInstanceIdentifier\n  * Description: (Required) The identifier of the source DB instance with at least one read replica\n  * Type: String\n### Dryrun\n  * Description: (Optional) Dryrun indicates a testing run, changes will be rolled back.\n  * Type: String\n  * Default: False\n### AutomationAssumeRole:\n  * Description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n  * Type: String\n\n## Details of SSM Document steps:\n### On Dryrun mode (Dryrun=True):\n  * Dryrun_StartBranch\n  * CreateReadReplica\n  * WaitForCreateReadReplica\n  * ReplicaIdParameter\n  * RecordStartTime\n  * PromoteReadReplica\n  * WaitForPromotionToStart\n  * RenameParameters\n  * WaitPreviousDatabaseAvailable\n  * RenamePreviousDatabaseToOld\n  * WaitForMasterToBeRenamedToOld\n  * RenameNewDatabaseToNoSuffix\n  * WaitForNewToBeRenamedToMaster\n  * OutputRecoveryTime\n  * Dryrun_EndBranch\n  * DeletePromotedInstance\n\n### On Dryrun mode (Dryrun=False):\n  * Dryrun_StartBranch\n  * TrafficRedirectionPause\n  * FetchFirstReadReplicaName\n  * CreateReadReplica\n  * WaitForCreateReadReplica\n  * ReplicaIdParameter\n  * RecordStartTime\n  * PromoteReadReplica\n  * WaitForPromotionToStart\n  * RenameParameters\n  * WaitPreviousDatabaseAvailable\n  * RenamePreviousDatabaseToOld\n  * WaitForMasterToBeRenamedToOld\n  * RenameNewDatabaseToNoSuffix\n  * WaitForNewToBeRenamedToMaster\n  * OutputRecoveryTime\n  * Dryrun_EndBranch\n  * EmptyStepForWetrunEnd\n\n## Outputs\n  * OutputRecoveryTime.RecoveryTime: recovery time in seconds",
+  "description": "# Id\nrds:sop:promote_non_aurora_replica:2020-04-01\n\n## Intent\nSOP to recover an instance by promoting a replica to master in case of failure in the master instance.\n\n## Type\nHARDWARE\n\n## Risk\nMEDIUM\n\n## Requirements\n* RDS db with at least one read replica\n\n## Permission required for AutomationAssumeRole\n* rds:CreateDBInstanceReadReplica\n* rds:DeleteDBInstance\n* rds:DescribeDBInstances\n* rds:ModifyDBInstance\n* rds:PromoteReadReplica\n* kms:DescribeKey\n* kms:CreateGrant\n\n## Supports Rollback\n  No.\n\n## Inputs\n### DbInstanceIdentifier\n  * Description: (Required) The identifier of the source DB instance with at least one read replica\n  * Type: String\n### Dryrun\n  * Description: (Optional) Dryrun indicates a testing run, changes will be rolled back.\n  * Type: String\n  * Default: False\n### AutomationAssumeRole:\n  * Description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n  * Type: String\n\n## Details of SSM Document steps:\n### On Dryrun mode (Dryrun=True):\n  * Dryrun_StartBranch\n  * CreateReadReplica\n  * WaitForCreateReadReplica\n  * ReplicaIdParameter\n  * RecordStartTime\n  * PromoteReadReplica\n  * WaitForPromotionToStart\n  * RenameParameters\n  * WaitPreviousDatabaseAvailable\n  * RenamePreviousDatabaseToOld\n  * WaitForMasterToBeRenamedToOld\n  * RenameNewDatabaseToNoSuffix\n  * WaitForNewToBeRenamedToMaster\n  * OutputRecoveryTime\n  * Dryrun_EndBranch\n  * DeletePromotedInstance\n\n### On Dryrun mode (Dryrun=False):\n  * Dryrun_StartBranch\n  * TrafficRedirectionPause\n  * FetchFirstReadReplicaName\n  * ReplicaIdParameter\n  * RecordStartTime\n  * PromoteReadReplica\n  * WaitForPromotionToStart\n  * RenameParameters\n  * WaitPreviousDatabaseAvailable\n  * RenamePreviousDatabaseToOld\n  * WaitForMasterToBeRenamedToOld\n  * RenameNewDatabaseToNoSuffix\n  * WaitForNewToBeRenamedToMaster\n  * OutputRecoveryTime\n  * Dryrun_EndBranch\n  * EmptyStepForWetrunEnd\n\n## Outputs\n  * OutputRecoveryTime.RecoveryTime: recovery time in seconds",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
@@ -66,20 +66,23 @@
     },
     {
       "name": "CreateReadReplica",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "rds",
-        "Api": "CreateDBInstanceReadReplica",
-        "DBInstanceIdentifier": "{{DbInstanceIdentifier}}-new-{{automation:EXECUTION_ID}}",
-        "SourceDBInstanceIdentifier": "{{DbInstanceIdentifier}}"
-      },
+      "action": "aws:executeScript",
       "outputs": [
         {
           "Name": "ReplicaId",
-          "Selector": "$.DBInstance.DBInstanceIdentifier",
+          "Selector": "$.Payload",
           "Type": "String"
         }
-      ]
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "\nimport logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef get_execution_instance_id(rds_instance_id, middle, execution_id):\n    \"\"\"\n    Valid RDS Instance identifier from string\n    \"\"\"\n    # identifier must be less than 63 characters, but we allow 2 chars for extra suffix\n    # https://docs.aws.amazon.com/cli/latest/reference/rds/create-db-instance.html\n    max_length = 61\n    prefix_length = max_length - len(execution_id) - len(middle) - 2 # hyphens\n    prefix = rds_instance_id[0:prefix_length].rstrip('-') # two consecutive hyphens is not allowed.\n    rds_instance_id = f\"{prefix}-{middle}-{execution_id}\"\n    return rds_instance_id\n\n\n\n\ndef script_handler(events, context):\n  import boto3\n  rds = boto3.client('rds')\n  replica_db_instance_id = get_execution_instance_id(events['SourceDBInstanceIdentifier'], 'new', events['AutomationId'])\n  rds.create_db_instance_read_replica(\n    DBInstanceIdentifier = replica_db_instance_id,\n    SourceDBInstanceIdentifier = events['SourceDBInstanceIdentifier']\n  )\n  return replica_db_instance_id",
+        "InputPayload": {
+          "SourceDBInstanceIdentifier": "{{DbInstanceIdentifier}}",
+          "AutomationId": "{{automation:EXECUTION_ID}}"
+        }
+      }
     },
     {
       "name": "WaitForCreateReadReplica",
@@ -89,7 +92,7 @@
       "inputs": {
         "Service": "rds",
         "Api": "DescribeDBInstances",
-        "DBInstanceIdentifier": "{{DbInstanceIdentifier}}-new-{{automation:EXECUTION_ID}}",
+        "DBInstanceIdentifier": "{{CreateReadReplica.ReplicaId}}",
         "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
         "DesiredValues": [
           "available"
@@ -193,7 +196,7 @@
       "inputs": {
         "Runtime": "python3.8",
         "Handler": "script_handler",
-        "Script": "def script_handler(events, context):\n  master_id = events['MasterId']\n  wetrun_replica_id = events['WetrunReplicaId']\n  dryrun_replica_id = events['DryrunReplicaId']\n  dryrun = events['Dryrun']\n  automation_id = events['AutomationId']\n  return {\n    'MasterSourceId' : dryrun_replica_id  if dryrun else master_id,\n    'MasterTargetId' : dryrun_replica_id + '-1' if dryrun else master_id + '-old-' + automation_id,\n    'PromotedSourceId' : dryrun_replica_id + '-1' if dryrun else wetrun_replica_id,\n    'PromotedTargetId' : dryrun_replica_id + '-2' if dryrun else master_id\n  }",
+        "Script": "\nimport logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef get_execution_instance_id(rds_instance_id, middle, execution_id):\n    \"\"\"\n    Valid RDS Instance identifier from string\n    \"\"\"\n    # identifier must be less than 63 characters, but we allow 2 chars for extra suffix\n    # https://docs.aws.amazon.com/cli/latest/reference/rds/create-db-instance.html\n    max_length = 61\n    prefix_length = max_length - len(execution_id) - len(middle) - 2 # hyphens\n    prefix = rds_instance_id[0:prefix_length].rstrip('-') # two consecutive hyphens is not allowed.\n    rds_instance_id = f\"{prefix}-{middle}-{execution_id}\"\n    return rds_instance_id\n\n\n\n\ndef script_handler(events, context):\n  automation_id = events['AutomationId']\n  master_id = events['MasterId']\n  wetrun_replica_id = events['WetrunReplicaId']\n  dryrun_replica_id = events['DryrunReplicaId']\n  old_replica_id = get_execution_instance_id(master_id, 'old', automation_id)\n  dryrun = events['Dryrun']\n  return {\n    'MasterSourceId' : dryrun_replica_id  if dryrun else master_id,\n    'MasterTargetId' : dryrun_replica_id + '-1' if dryrun else old_replica_id,\n    'PromotedSourceId' : dryrun_replica_id + '-1' if dryrun else wetrun_replica_id,\n    'PromotedTargetId' : dryrun_replica_id + '-2' if dryrun else master_id\n  }",
         "InputPayload": {
           "Dryrun": "{{Dryrun}}",
           "MasterId": "{{DbInstanceIdentifier}}",
