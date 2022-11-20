@@ -1,0 +1,90 @@
+{
+  "description": "# Id sns:test:send_broken_message:2020-04-01\n## Intent Test for an alarm trigger when a message is being sent with invalid attributes in Amazon SNS.\n## Type Software Outage Test\n## Risk Small\n## Requirements * An existing SNS topic with a subscription, which has a FilterPolicy configured. * An alarm, which tracks the number of topic's notifications filtered out due to invalid attributes (NumberOfNotificationsFilteredOutInvalidAttributes).\n## Permissions required for AutomationAssumeRole * ssm:GetAutomationExecution * ssm:StartAutomationExecution * ssm:GetParameters * sns:GetSubscriptionAttributes * sns:GetTopicAttributes * sns:Publish * kms:GenerateDataKey * kms:Decrypt * iam:PassRole * cloudwatch:DescribeAlarms\n## Supports Rollback No\n## Inputs ### `SubscriptionArn`:\n    type: String\n    description: (Required) Amazon SNS Subscription ARN.\n### `NumberOfNotificationsFilteredOutInvalidAttributes`:\n    type: String\n    description: (Required) The alarm name, which should be green after test.\n### `NumberOfBrokenMessagesToPublish`:\n    type: Integer\n    description: (Optional) The number of broken messages to be published to the topic. Defaults to 3.\n    default: 3\n### `AutomationAssumeRole`:\n    type: String\n    description: (Required) The ARN of the role that allows automation to perform the actions on your behalf.\n\n## Details The document sends a number of broken messages (messages with invalid attributes) to the SNS Topic, and tests if an alarm is triggered for `NumberOfNotificationsFilteredOut-InvalidAttributes` metric. The number of broken messages that can be sent can be set by specifying the `NumberOfBrokenMessagesToPublish` parameter (by default, this parameter is set to 3).\n## Steps executed in normal flow * AssertAlarmToBeGreenBeforeTest * InjectFailure * AssertAlarmToBeRed * AssertAlarmToBeGreen",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "SubscriptionArn": {
+      "type": "String",
+      "description": "(Required) An Amazon SNS subscription ARN."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows automation to perform the actions on your behalf."
+    },
+    "NumberOfNotificationsFilteredOutInvalidAttributes": {
+      "type": "String",
+      "description": "(Required) The alarm name, which should be green after test."
+    },
+    "NumberOfBrokenMessagesToPublish": {
+      "type": "Integer",
+      "description": "(Optional) The number of broken messages to be published to the topic. Defaults to 3.",
+      "default": 3
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{NumberOfNotificationsFilteredOutInvalidAttributes}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "InjectFailure",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "send_broken_message",
+        "InputPayload": {
+          "SubscriptionArn": "{{SubscriptionArn}}",
+          "NumberOfBrokenMessagesToPublish": "{{NumberOfBrokenMessagesToPublish}}"
+        },
+        "Script": "\"\"\"SNS util.\"\"\"\n\nimport json\nimport logging\nimport random\nfrom datetime import datetime\nimport time\nfrom typing import List, Callable, Optional\nfrom uuid import uuid4\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nINITIAL_COUNT_OF_SUBSCRIPTIONS = 1\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef send_broken_message(events, context=None):\n    required_params = ['SubscriptionArn']\n    check_required_params(required_params, events)\n    number_of_broken_messages_to_publish = events['NumberOfBrokenMessagesToPublish']\n    sns_subscription_arn = events['SubscriptionArn']\n    sns_region = sns_subscription_arn.split(':')[3]\n    sns_config = Config(\n        region_name=sns_region,\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    sns_client = boto3.client('sns', config=sns_config)\n    topic_arn = sns_client.get_subscription_attributes(SubscriptionArn=sns_subscription_arn)['Attributes']['TopicArn']\n    message_attributes = {'event': {'StringValue': '[{\"anything-but\": \"order_cancelled\"}]', 'DataType': 'String'}}\n\n    topic_attributes = sns_client.get_topic_attributes(TopicArn=topic_arn)['Attributes']\n    is_fifo = 'FifoTopic' in topic_attributes.keys()\n    kwargs = {}\n    counter = 0\n    while (counter < number_of_broken_messages_to_publish):\n        if is_fifo:\n            kwargs = {'MessageDeduplicationId': str(uuid4()), 'MessageGroupId': str(uuid4())}\n\n        response = sns_client.publish(TopicArn=topic_arn, Message='msg', Subject='subj',\n                                      MessageAttributes=message_attributes, **kwargs)\n        if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n            raise ValueError(f'Failed to publish message to subscription with malformed message attributes.'\n                             f'Response is: {response}')\n        time.sleep(60)\n        counter += 1"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{NumberOfNotificationsFilteredOutInvalidAttributes}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{NumberOfNotificationsFilteredOutInvalidAttributes}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    }
+  ]
+}

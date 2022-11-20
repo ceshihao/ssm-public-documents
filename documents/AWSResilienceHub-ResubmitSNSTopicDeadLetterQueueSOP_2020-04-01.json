@@ -1,0 +1,73 @@
+{
+  "description": "# Id sns:sop:resubmit_dead_letter_notifications:2020-04-01\n## Intent Read Amazon SQS dead-letter queue and then re-submit the messages back to Amazon SNS.\n## Type Software Outage SOP\n## Risk Small\n## Requirements * An existing SNS topic with a subscription that has a dead-letter queue enabled.\n## Permissions required for AutomationAssumeRole * sqs:DeleteMessage * sqs:ReceiveMessage * sqs:GetQueueUrl * sns:GetSubscriptionAttributes * sns:GetTopicAttributes * sns:Publish * kms:GenerateDataKey * kms:Decrypt\n## Supports Rollback No\n## Inputs ### `SubscriptionArn`:\n    type: String\n    description: (Required) An Amazon SNS subscription ARN\n### `MessagesTransferBatchSize`:\n    type: Integer\n    description: (Optional) The number of messages that are going to be transferred per batch. Maximum number of messages is 10.\n    default: 10\n### `AutomationAssumeRole`:\n    type: String\n    description: (Required) The ARN of the role that allows automation to perform the actions on your behalf.\n\n## Details Given an SNS subscription ARN that has a dead-letter queue enabled, read messages from that dead-letter queue and re-submit them in batches to the SNS topic. The batch size is controlled by MessagesTransferBatchSize parameter. If there are no messages available in the queue, the execution will be successful.\n## Steps executed in normal flow\n  * RecordStartTime\n  * PerformRecovery\n  * OutputRecoveryTime\n\n## Outputs `OutputRecoveryTime.RecoveryTime`",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "parameters": {
+    "SubscriptionArn": {
+      "type": "String",
+      "description": "(Required) An Amazon SNS subscription ARN."
+    },
+    "MessagesTransferBatchSize": {
+      "type": "Integer",
+      "description": "(Optional) The number of messages that are going to be transferred per batch. Maximum number of messages is 10.",
+      "default": 10
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows automation to perform the actions on your behalf."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "PerformRecovery",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "resubmit_messages_from_dlq_to_sns",
+        "InputPayload": {
+          "SubscriptionArn": "{{SubscriptionArn}}",
+          "MessagesTransferBatchSize": "{{MessagesTransferBatchSize}}"
+        },
+        "Script": "\"\"\"SNS util.\"\"\"\n\nimport json\nimport logging\nimport random\nfrom datetime import datetime\nimport time\nfrom typing import List, Callable, Optional\nfrom uuid import uuid4\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nINITIAL_COUNT_OF_SUBSCRIPTIONS = 1\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef republish_from_sqs_to_sns(sns_client, topic_arn: str, is_fifo: bool, messages: List[dict] = None):\n    for message in messages:\n        message_body = json.loads(message['Body'])\n        if not message_body['TopicArn'] == topic_arn:\n            continue\n        kwargs = {}\n        if 'Subject' in message_body.keys():\n            kwargs['Subject'] = message_body['Subject']\n        if 'MessageAttributes' in message_body.keys():\n            kwargs['MessageAttributes'] = message_body['MessageAttributes']\n        if is_fifo:\n            kwargs = {'MessageDeduplicationId': str(uuid4()), 'MessageGroupId': str(uuid4())}\n        sns_client.publish(TopicArn=topic_arn, Message=message_body['Message'], **kwargs)\n\n\n\ndef resubmit_messages_from_dlq_to_sns(events, context=None):\n    required_params = ['SubscriptionArn', 'MessagesTransferBatchSize']\n    check_required_params(required_params, events)\n    sns_subscription_arn = events['SubscriptionArn']\n    batch_size = events['MessagesTransferBatchSize']\n    sns_region = sns_subscription_arn.split(':')[3]\n    config = Config(\n        region_name=sns_region,\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    sqs_client = boto3.client('sqs', config=config)\n    sns_client = boto3.client('sns', config=config)\n    subscription_attributes = sns_client.get_subscription_attributes(SubscriptionArn=sns_subscription_arn)\n    topic_arn = subscription_attributes['Attributes']['TopicArn']\n    topic_attributes = sns_client.get_topic_attributes(TopicArn=topic_arn)['Attributes']\n    is_fifo = 'FifoTopic' in topic_attributes.keys()\n    redrive_policy = subscription_attributes['Attributes']['RedrivePolicy']\n    if not redrive_policy or 'deadLetterTargetArn' not in json.loads(redrive_policy):\n        raise ValueError('Missing DLQ in subscriber')\n\n    dlq_arn = json.loads(redrive_policy)['deadLetterTargetArn']\n    queue_account_id, queue_name = dlq_arn.split(':')[4], dlq_arn.split(':')[-1]\n    queue_url = get_queue_url(queue_name=queue_name, queue_owner_account_id=queue_account_id, sqs_client=sqs_client)\n    messages = receive_messages(source_queue_url=queue_url, messages_transfer_batch_size=batch_size)\n\n    if messages:\n        republish_from_sqs_to_sns(sns_client, topic_arn, is_fifo, messages)\n\n        delete_message_entries: List = [{'Id': message.get('MessageId'), 'ReceiptHandle': message.get('ReceiptHandle')} for\n                                        message in messages]\n        delete_message_batch_response: dict = sqs_client.delete_message_batch(QueueUrl=queue_url,\n                                                                              Entries=delete_message_entries)\n        failed_delete_messages: List[dict] = delete_message_batch_response.get('Failed')\n        if failed_delete_messages is not None:\n            logging.error(failed_delete_messages)\n            raise ValueError(f'Failed to delete some of the messages from DLQ. Error: {failed_delete_messages}')\n\n\n\ndef get_queue_url(queue_name, queue_owner_account_id, sqs_client):\n    \"\"\"\n    Get queue url.\n    :param queue_name: The name of the queue\n    :param queue_owner_account_id: The account id who owns the queue\n    :param sqs_client: sqs client to retrieve values with\n    :return: Str queue_url\n    \"\"\"\n    try:\n        response = sqs_client.get_queue_url(QueueName=queue_name, QueueOwnerAWSAccountId=queue_owner_account_id)\n        return response['QueueUrl']\n    except ClientError as error:\n        logging.error(error)\n        raise error\n\n\n\ndef receive_messages(source_queue_url: str, messages_transfer_batch_size: int, wait_timeout: int = 0) -> \\\n        Optional[List[dict]]:\n    \"\"\"\n    Receive messages\n    :param wait_timeout: The duration i seconds for which the call waits for a message to arrive in the queue\n    :param messages_transfer_batch_size: how many messages to receive\n    :param source_queue_url:  URL of the queue where from messages are received\n    :return: response of receive_message method\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    sqs_client = boto3.client(\"sqs\", config=config)\n    receive_message_response: dict = \\\n        sqs_client.receive_message(QueueUrl=source_queue_url,\n                                   MaxNumberOfMessages=messages_transfer_batch_size,\n                                   WaitTimeSeconds=wait_timeout,\n                                   MessageAttributeNames=['All'],\n                                   AttributeNames=['All'])\n    return receive_message_response.get('Messages')"
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

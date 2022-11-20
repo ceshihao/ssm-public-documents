@@ -1,0 +1,147 @@
+{
+  "description": "# Id sns:sop:enable_dead_letter_queue:2020-11-26\n## Intent Enable a dead-letter queue when it is not set up for a topic's subscription\n## Type Software Outage SOP\n## Risk Small\n## Requirements * An existing SNS topic with a subscription * An SQS queue that will be used as the dead-letter queue for the subscription.\n## Permissions required for AutomationAssumeRole * sns:SetSubscriptionAttributes\n## Supports Rollback Yes\n## Inputs ### `SubscriptionArn`:\n    type: String\n    description: (Required) Amazon SNS subscription ARN.\n### `DeadLetterQueueArn`:\n    type: String\n    description: (Required) The dead-letter queue ARN for the subscription.\n### `AutomationAssumeRole`:\n    type: String\n    description: (Required) The ARN of the role that allows automation to perform the actions on your behalf.\n### `Dryrun`:\n    type: String\n    description: (Optional) Dryrun indicates a testing run and the changes will be rolled back.\n    default: true\n\n## Details Given an SNS subscription ARN that does not have a dead-letter queue enabled, enable the same for that subscription. Supports dryrun (rollback).\n## Steps executed in normal flow\n  * RecordStartTime\n  * SNSSubEnableDlq\n  * OutputRecoveryTime\n  * DryrunBranch\n  * EmptyStepForEnd\n\n## Steps executed in dry-run flow\n  * RecordStartTime\n  * SNSSubEnableDlq\n  * OutputRecoveryTime\n  * DryrunBranch\n  * SleepAfterEnableDlq\n  * SleepBeforeRollback\n  * RollbackEnableDlq\n  * EmptyStepForEnd\n\n## Outputs `OutputRecoveryTime.RecoveryTime`",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "parameters": {
+    "SubscriptionArn": {
+      "type": "String",
+      "description": "(Required) An Amazon SNS subscription ARN."
+    },
+    "DeadLetterQueueArn": {
+      "type": "String",
+      "description": "(Required) The dead-letter queue ARN for the subscription."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows automation to perform the actions on your behalf."
+    },
+    "Dryrun": {
+      "type": "Boolean",
+      "default": true,
+      "description": "(Optional) Dryrun indicates a testing run and the changes will be rolled back."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RecordStartTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "SNSSubEnableDlq",
+      "description": "Execute a script that gets an SNS subscription ARN as input, and enables DLQ for that subscription.",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "TimeElapsed",
+          "Selector": "$.Payload.TimeElapsed",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "sns_sub_set_dlq",
+        "InputPayload": {
+          "SubscriptionArn": "{{SubscriptionArn}}",
+          "DeadLetterQueueArn": "{{DeadLetterQueueArn}}"
+        },
+        "Script": "\"\"\"SNS util.\"\"\"\n\nimport json\nimport logging\nimport random\nfrom datetime import datetime\nimport time\nfrom typing import List, Callable, Optional\nfrom uuid import uuid4\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nINITIAL_COUNT_OF_SUBSCRIPTIONS = 1\n\n\n\ndef sns_sub_set_dlq(events: dict, context: dict) -> dict:\n    start_execution = datetime.utcnow()\n    sns_config = Config(\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    sns_client = boto3.client('sns', config=sns_config)\n    sub_arn: str = events['SubscriptionArn']\n    dlq_arn = events.get('DeadLetterQueueArn')\n\n    if dlq_arn:\n        sns_client.set_subscription_attributes(SubscriptionArn=sub_arn, AttributeName='RedrivePolicy',\n                                               AttributeValue=f'{{\"deadLetterTargetArn\":\"{dlq_arn}\"}}')\n    else:\n        sns_client.set_subscription_attributes(SubscriptionArn=sub_arn, AttributeName='RedrivePolicy')\n\n    return {'TimeElapsed': str((datetime.utcnow() - start_execution).total_seconds())}"
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "recovery_time",
+        "Script": "import boto3\nimport logging\nfrom datetime import datetime, timezone\nimport time\n\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    },
+    {
+      "name": "DryrunBranch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EmptyStepForEnd",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "SleepAfterEnableDlq",
+            "Variable": "{{Dryrun}}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "SleepAfterEnableDlq",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT600S"
+      },
+      "description": "Sleep after enabling DLQ to allow testing the alarm reliably during dry-runs."
+    },
+    {
+      "name": "SleepBeforeRollback",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT30S"
+      },
+      "description": "Sleep before rollback opertation to allow testing the alarm reliably during dry-runs."
+    },
+    {
+      "name": "RollbackEnableDlq",
+      "description": "Execute a script that gets an SNS subscription ARN as input, and resets DLQ for that subscription.",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "TimeElapsed",
+          "Selector": "$.Payload.TimeElapsed",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "sns_sub_set_dlq",
+        "InputPayload": {
+          "SubscriptionArn": "{{SubscriptionArn}}"
+        },
+        "Script": "\"\"\"SNS util.\"\"\"\n\nimport json\nimport logging\nimport random\nfrom datetime import datetime\nimport time\nfrom typing import List, Callable, Optional\nfrom uuid import uuid4\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nINITIAL_COUNT_OF_SUBSCRIPTIONS = 1\n\n\n\ndef sns_sub_set_dlq(events: dict, context: dict) -> dict:\n    start_execution = datetime.utcnow()\n    sns_config = Config(\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    sns_client = boto3.client('sns', config=sns_config)\n    sub_arn: str = events['SubscriptionArn']\n    dlq_arn = events.get('DeadLetterQueueArn')\n\n    if dlq_arn:\n        sns_client.set_subscription_attributes(SubscriptionArn=sub_arn, AttributeName='RedrivePolicy',\n                                               AttributeValue=f'{{\"deadLetterTargetArn\":\"{dlq_arn}\"}}')\n    else:\n        sns_client.set_subscription_attributes(SubscriptionArn=sub_arn, AttributeName='RedrivePolicy')\n\n    return {'TimeElapsed': str((datetime.utcnow() - start_execution).total_seconds())}"
+      }
+    },
+    {
+      "name": "EmptyStepForEnd",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT1S"
+      },
+      "description": "End"
+    }
+  ]
+}

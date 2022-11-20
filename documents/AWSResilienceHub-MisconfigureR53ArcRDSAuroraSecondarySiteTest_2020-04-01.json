@@ -1,0 +1,280 @@
+{
+  "description": "## Id\nAWSResilienceHub-MisconfigureR53ArcRDSAuroraSecondarySiteTest_2020-04-01\n\n## Intent\nAmazon Aurora serverless cluster deployed into several locations and controlled by Route53 ARC.\n\n## Type\nTEST\n\n## Risk\nHigh\n\n## Requirements\n * A stack set of several stacks in a different regions with Amazon RDS Aurora\n * Application Recovery Controller contains all the resources (Cells, ResourceSet, ReadinessCheck, RecoveryGroup) needed to monitor Amazon RDS\n\n## Permissions required for AutomationAssumeRole\n * route53-recovery-readiness:GetReadinessCheckStatus\n * route53-recovery-readiness:ListResourceSets\n * rds:DescribeDbClusters\n * rds:ModifyCurrentDbClusterCapacity\n * ssm:GetParameters\n * ssm:GetAutomationExecution\n * ssm:StartAutomationExecution\n\n## Supports Rollback\nYes. Restores the original Amazon RDS Cluster Capacity\n\n## Cancellation behavior\nRestores the original Amazon RDS Cluster Capacity\n\n## Inputs\n### (Required) AutomationAssumeRole\n * type: String\n * description: ARN of the IAM role with permissions listed above\n\n### (Required) ResourceSetArn\n * type: String\n * description: Resource set Identifier\n\n### (Required) ReadinessCheckName\n * type: String\n * description: Amazon Route53 Application Recovery Controller ReadinessCheck which should become NOT_READY after injection of the failure and READY after the rollback process in the end of the test.\n\n### (Optional) IsRollback\n * type: String\n * description: Run the rollback steps of the document. True or False. If True, the parameter PreviousExecutionId should also be specified\n * default: false\n\n### (Optional) PreviousExecutionId\n * type: String\n * description: SSM execution ID of the previous execution of this document for which resources need to be cleaned up\n\n## Details\nIn the secondary location after a new deployment completed, the cluster has different configuration\n\n## Steps executed in normal flow\n * CheckIsRollback\n * AssertReadinessCheckToBeReadyBeforeTest\n * BackupCurrentExecution\n * InjectFailure\n * AssertReadinessCheckToBeNotReady\n * RollbackCurrentExecution\n * AssertReadinessCheckToBeReady\n\n## Steps executed in rollback flow\n * CheckIsRollback\n * GetInputsFromPreviousExecution\n * AssertResourceSetArn\n * PrepareRollbackOfPreviousExecution\n * RollbackPreviousExecution\n * AssertRollbackPreviousExecutionSuccesfullyDone\n * TriggerRollback\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "ResourceSetArn": {
+      "type": "String",
+      "description": "(Required) The ARN of the Amazon Route53 Application Recovery Controller resourse set."
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "ReadinessCheckName": {
+      "type": "String",
+      "description": "(Required) Amazon Route53 Application Recovery Controller ReadinessCheck which should become NOT_READY after injection of the failure and READY after the rollback process in the end of the test."
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`). Can be either true or false.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetInputsFromPreviousExecution",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "AssertReadinessCheckToBeReadyBeforeTest"
+      }
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input.",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "ResourceSetArn",
+          "Selector": "$.Payload.ResourceSetArn[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertResourceSetArn",
+      "description": "Validate that rollback is executed with the same input",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PrepareRollbackOfPreviousExecution",
+            "Variable": "{{ GetInputsFromPreviousExecution.ResourceSetArn }}",
+            "StringEquals": "{{ ResourceSetArn }}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PrepareRollbackOfPreviousExecution",
+      "description": "Get original Cluster Capacity, DBClusterID for rollback",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "CurrentClusterCapacity",
+          "Selector": "$.Payload.CurrentClusterCapacity[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "DBClusterIdentifier",
+          "Selector": "$.Payload.DBClusterIdentifier[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "Region",
+          "Selector": "$.Payload.Region[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "BackupCurrentExecution",
+          "ResponseField": "CurrentClusterCapacity,Region,DBClusterIdentifier"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    # Sets values in string type regardless of what is the original value type. In order to set\n                    # values with original types please use 'get_typed_output_from_ssm_step_execution'.\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "RollbackPreviousExecution",
+      "description": "Restore original Cluster Capacity value from the previous execution",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "update_cluster_capacity",
+        "Script": "import logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef update_cluster_capacity(events, context=None, rds_client=None):\n    \"\"\"\n    Update current of the display name of a topic.\n    :param events: The dictionary that supposed to have the following keys:\n      * CurrentClusterCapacity: CurrentClusterCapacity\n      * DBClusterIdentifier: DBClusterIdentifier\n    :param context:\n    :param rds_client:\n    :return: dict {ClusterCapacity:...}\n    \"\"\"\n    required_params = ['ClusterCapacity', 'DBClusterIdentifier']\n    check_required_params(required_params, events)\n\n    new_cluster_capacity = int(events['ClusterCapacity'])\n\n    valid_capacity = valid_capacity_PostgreSQL\n\n    if new_cluster_capacity not in valid_capacity:\n        raise ValueError(f'Failed to update cluster capacity to {new_cluster_capacity} for RDS '\n                         f'Capacity should be in {valid_capacity}')\n\n    if not rds_client:\n        config = Config(region_name=events['Region'], signature_version='v4',\n                        retries={'max_attempts': 20, 'mode': 'standard'})\n        rds_client = boto3.client('rds', config=config)\n\n    db_cluster_id = events['DBClusterIdentifier']\n\n    clusters = rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n    status = clusters['DBClusters'][0]['Status']\n    while status != 'available':\n        time.sleep(15)\n        clusters = rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n        status = clusters['DBClusters'][0]['Status']\n\n    try:\n        response = rds_client.modify_current_db_cluster_capacity(\n            DBClusterIdentifier=db_cluster_id,\n            Capacity=new_cluster_capacity\n        )\n        if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n            raise ValueError(f'Failed to update cluster capacity to {new_cluster_capacity} for RDS'\n                             f'. Response is: {response}')\n        logging.info(f'Updated cluster capacity to {new_cluster_capacity}')\n        return {'ClusterCapacity': new_cluster_capacity}\n    except ClientError as error:\n        logging.error(f'The update cluster capacity function terminated with error {error}')\n        raise error",
+        "InputPayload": {
+          "ClusterCapacity": "{{ PrepareRollbackOfPreviousExecution.CurrentClusterCapacity }}",
+          "DBClusterIdentifier": "{{ PrepareRollbackOfPreviousExecution.DBClusterIdentifier }}",
+          "Region": "{{PrepareRollbackOfPreviousExecution.Region}}"
+        }
+      }
+    },
+    {
+      "name": "AssertRollbackPreviousExecutionSuccesfullyDone",
+      "description": "Ensure ReadinessCheck is READY after rollback. Fail if ReadinessCheck is not READY within expected time.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_readiness_check_state",
+        "InputPayload": {
+          "ReadinessCheckName": "{{ ReadinessCheckName }}",
+          "DesiredValue": "READY",
+          "Timeout": 1200
+        },
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "AssertReadinessCheckToBeReadyBeforeTest",
+      "description": "Ensure ReadinessCheck is READY before starting test. Fail if ReadinessCheck is not READY within expected time.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_readiness_check_state",
+        "InputPayload": {
+          "ReadinessCheckName": "{{ ReadinessCheckName }}",
+          "DesiredValue": "READY",
+          "Timeout": 1200
+        },
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")"
+      }
+    },
+    {
+      "name": "BackupCurrentExecution",
+      "description": "Backup CurrentClusterCapacity, DBClusterIdentifier and Region",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "Region",
+          "Selector": "$.Payload.Region",
+          "Type": "String"
+        },
+        {
+          "Name": "DBClusterIdentifier",
+          "Selector": "$.Payload.DBClusterId",
+          "Type": "String"
+        },
+        {
+          "Name": "CurrentClusterCapacity",
+          "Selector": "$.Payload.Capacity",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "backup_current_execution",
+        "InputPayload": {
+          "ResourceSetArn": "{{ ResourceSetArn }}"
+        },
+        "Script": "import logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef backup_current_execution(events, context, rds_client=None):\n    \"\"\"\n    Find EBS based on the given resource set\n    \"\"\"\n    # Constants\n    resource_set_type = 'AWS::RDS::DBCluster'\n\n    # Validate input parameters\n    required_params = ['ResourceSetArn']\n    check_required_params(required_params, events)\n\n    # Route53-recovery-readiness api working only at us-west-2\n    config = Config(region_name='us-west-2')\n    r53arc_client = boto3.client('route53-recovery-readiness', config=config)\n\n    # Get all resource sets into list\n    resource_sets = get_all_resource_sets(r53arc_client)\n\n    # Find RDS in resource sets by arn and type\n    rds_resources = get_set_type_from_resource_set(resource_sets, events['ResourceSetArn'], resource_set_type)\n\n    # Verify all volumes\n    clusters = []\n    for resource in rds_resources:\n        region = get_region_by_arn(resource['ResourceArn'])\n        cluster_id = get_cluster_id_by_arn(resource['ResourceArn'])\n        # The client is recreated each time because the volumes can be in a different regions.\n        config = Config(region_name=region)\n        rds_client = boto3.client('rds', config=config)\n        capacity = get_capacity_rds_by_id(cluster_id, rds_client)\n        clusters.append({'Region': region, 'DBClusterId': cluster_id, 'Capacity': capacity})\n\n    # Get all volumes with lowest IOps from the list\n    rds_with_highest_capacity = get_rds_list_with_highest_capacity(clusters)\n\n    # Randomly pick one volume from the list and return\n    return random.choice(rds_with_highest_capacity)\n\n\n\ndef get_rds_list_with_highest_capacity(clusters):\n    \"\"\"\n    Get list with RDS that have highest capacity in specified volumes list\n    \"\"\"\n    return [rds for rds in clusters if rds == max(clusters, key=lambda x: x['Capacity'])]\n\n\n\ndef get_cluster_id_by_arn(rds_arn):\n    \"\"\"\n    Parse RDS Arn to get Cluster ID\n    \"\"\"\n    return rds_arn.split(':')[-1]\n\n\n\ndef get_region_by_arn(rds_arn):\n    \"\"\"\n    Parse RDS Arn to get rds region\n    \"\"\"\n    return rds_arn.split(':')[3]\n\n\n\ndef get_capacity_rds_by_id(db_cluster_id, rds_client):\n    \"\"\"\n    Get capacity by Cluster ID.\n    \"\"\"\n    logger.info(f'Describing specified cluster: {db_cluster_id}')\n    try:\n        response: dict = rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n        return response[\"DBClusters\"][0][\"Capacity\"]\n    except botocore.exceptions.ClientError as error:\n        logger.error(f'While describing cluster: {db_cluster_id}, boto3 raise an ClientError: {error}')\n        raise error\n\n\n\ndef get_set_type_from_resource_set(resource_sets, resource_set_arn, resource_set_type):\n    \"\"\"\n    Get set_type from resource set by arn with ReadinessScopes not empty\n    Verify that volume type match to specified\n    \"\"\"\n    logger.info(f'Finding resource_set_type with arn: {resource_set_arn} and type: {resource_set_type} '\n                f'and ReadinessScopes is not empty from resource sets: {resource_sets}')\n    resources = []\n    for resource_set in resource_sets:\n        if resource_set['ResourceSetArn'] == resource_set_arn:\n            if resource_set['ResourceSetType'] != resource_set_type:\n                logger.error(f'Resource set type with ARN: {resource_set_arn} does not match {resource_set_type}')\n                raise Exception(f'Resource set type with ARN: {resource_set_arn} does not match {resource_set_type}')\n            for resource in resource_set['Resources']:\n                resources.append(resource)\n    logger.info(f'Resource_set_type with arn: {resource_set_arn} was successfully found ')\n    return resources\n\n\n\ndef get_all_resource_sets(r53arc_client):\n    \"\"\"\n    Get all resource sets into one list using NextToken\n    \"\"\"\n    resource_sets = []\n\n    logger.info('Getting list of resource sets')\n    try:\n        response = r53arc_client.list_resource_sets()\n    except botocore.exceptions.ClientError as error:\n        logger.error(f'While getting list of resource sets boto3 raise an error: {error}')\n        raise error\n    resource_sets.extend(response['ResourceSets'])\n\n    while 'NextToken' in response:\n        logger.info('Getting list of resource sets using next token')\n        try:\n            response: dict = r53arc_client.list_resource_sets(\n                NextToken=response['NextToken']\n            )\n        except botocore.exceptions.ClientError as error:\n            logger.error(f'While getting list of resource sets with next token boto3 raise an error: {error}')\n            raise error\n        resource_sets.extend(response['ResourceSets'])\n\n    return resource_sets"
+      }
+    },
+    {
+      "name": "InjectFailure",
+      "description": "Update Cluster Capacity value",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "inject_failure",
+        "InputPayload": {
+          "CurrentClusterCapacity": "{{BackupCurrentExecution.CurrentClusterCapacity}}",
+          "DBClusterIdentifier": "{{BackupCurrentExecution.DBClusterIdentifier}}",
+          "Region": "{{BackupCurrentExecution.Region}}"
+        },
+        "Script": "import logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef inject_failure(events, context):\n    \"\"\"\n    Inject failure by incrementing RDS Capacity\n    \"\"\"\n    # Validate input parameters\n    required_params = ['CurrentClusterCapacity', 'DBClusterIdentifier', 'Region']\n    check_required_params(required_params, events)\n\n    # Increment RDS Capacity\n    config: Config = Config(region_name=events['Region'])\n    rds_client = boto3.client('rds', config=config)\n    valid_capacity = valid_capacity_PostgreSQL\n    index = valid_capacity.index(int(events['CurrentClusterCapacity']))\n    index = index + 1 if index < len(valid_capacity) - 1 else index - 1\n    update_cluster_capacity({\"DBClusterIdentifier\": events['DBClusterIdentifier'],\n                             \"ClusterCapacity\": valid_capacity[index]},\n                            rds_client=rds_client)\n\n\n\ndef update_cluster_capacity(events, context=None, rds_client=None):\n    \"\"\"\n    Update current of the display name of a topic.\n    :param events: The dictionary that supposed to have the following keys:\n      * CurrentClusterCapacity: CurrentClusterCapacity\n      * DBClusterIdentifier: DBClusterIdentifier\n    :param context:\n    :param rds_client:\n    :return: dict {ClusterCapacity:...}\n    \"\"\"\n    required_params = ['ClusterCapacity', 'DBClusterIdentifier']\n    check_required_params(required_params, events)\n\n    new_cluster_capacity = int(events['ClusterCapacity'])\n\n    valid_capacity = valid_capacity_PostgreSQL\n\n    if new_cluster_capacity not in valid_capacity:\n        raise ValueError(f'Failed to update cluster capacity to {new_cluster_capacity} for RDS '\n                         f'Capacity should be in {valid_capacity}')\n\n    if not rds_client:\n        config = Config(region_name=events['Region'], signature_version='v4',\n                        retries={'max_attempts': 20, 'mode': 'standard'})\n        rds_client = boto3.client('rds', config=config)\n\n    db_cluster_id = events['DBClusterIdentifier']\n\n    clusters = rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n    status = clusters['DBClusters'][0]['Status']\n    while status != 'available':\n        time.sleep(15)\n        clusters = rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n        status = clusters['DBClusters'][0]['Status']\n\n    try:\n        response = rds_client.modify_current_db_cluster_capacity(\n            DBClusterIdentifier=db_cluster_id,\n            Capacity=new_cluster_capacity\n        )\n        if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n            raise ValueError(f'Failed to update cluster capacity to {new_cluster_capacity} for RDS'\n                             f'. Response is: {response}')\n        logging.info(f'Updated cluster capacity to {new_cluster_capacity}')\n        return {'ClusterCapacity': new_cluster_capacity}\n    except ClientError as error:\n        logging.error(f'The update cluster capacity function terminated with error {error}')\n        raise error"
+      }
+    },
+    {
+      "name": "AssertReadinessCheckToBeNotReady",
+      "description": "Wait for expected ReadinessCheck to become NOT_READY after failure is injected",
+      "action": "aws:executeScript",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_readiness_check_state",
+        "InputPayload": {
+          "ReadinessCheckName": "{{ ReadinessCheckName }}",
+          "DesiredValue": "NOT_READY",
+          "Timeout": 1200
+        },
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")"
+      }
+    },
+    {
+      "name": "RollbackCurrentExecution",
+      "description": "Restore original Cluster Capacity value from the backup execution",
+      "maxAttempts": 5,
+      "onFailure": "Abort",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "rollback_injection",
+        "InputPayload": {
+          "CurrentClusterCapacity": "{{BackupCurrentExecution.CurrentClusterCapacity}}",
+          "DBClusterIdentifier": "{{BackupCurrentExecution.DBClusterIdentifier}}",
+          "Region": "{{BackupCurrentExecution.Region}}"
+        },
+        "Script": "import logging\nfrom datetime import datetime, timezone\nimport boto3\nimport time\nimport random\nimport botocore\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom operator import itemgetter\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nvalid_capacity_PostgreSQL = [2, 4, 8, 16, 32, 64]\n\nRESTORED_CLUSTER_SUFFIX_FORMAT = '%m-%d-%Y-%H-%M-%S'\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef rollback_injection(events, context):\n    \"\"\"\n    Rollback failure by incrementing RDS Capacity\n    \"\"\"\n    required_params = ['CurrentClusterCapacity', 'DBClusterIdentifier', 'Region']\n    check_required_params(required_params, events)\n\n    config = Config(region_name=events['Region'])\n    rds_client = boto3.client('rds', config=config)\n    update_cluster_capacity({\"DBClusterIdentifier\": events['DBClusterIdentifier'],\n                             \"ClusterCapacity\": events[\"CurrentClusterCapacity\"]},\n                            rds_client=rds_client)\n\n\n\ndef update_cluster_capacity(events, context=None, rds_client=None):\n    \"\"\"\n    Update current of the display name of a topic.\n    :param events: The dictionary that supposed to have the following keys:\n      * CurrentClusterCapacity: CurrentClusterCapacity\n      * DBClusterIdentifier: DBClusterIdentifier\n    :param context:\n    :param rds_client:\n    :return: dict {ClusterCapacity:...}\n    \"\"\"\n    required_params = ['ClusterCapacity', 'DBClusterIdentifier']\n    check_required_params(required_params, events)\n\n    new_cluster_capacity = int(events['ClusterCapacity'])\n\n    valid_capacity = valid_capacity_PostgreSQL\n\n    if new_cluster_capacity not in valid_capacity:\n        raise ValueError(f'Failed to update cluster capacity to {new_cluster_capacity} for RDS '\n                         f'Capacity should be in {valid_capacity}')\n\n    if not rds_client:\n        config = Config(region_name=events['Region'], signature_version='v4',\n                        retries={'max_attempts': 20, 'mode': 'standard'})\n        rds_client = boto3.client('rds', config=config)\n\n    db_cluster_id = events['DBClusterIdentifier']\n\n    clusters = rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n    status = clusters['DBClusters'][0]['Status']\n    while status != 'available':\n        time.sleep(15)\n        clusters = rds_client.describe_db_clusters(DBClusterIdentifier=db_cluster_id)\n        status = clusters['DBClusters'][0]['Status']\n\n    try:\n        response = rds_client.modify_current_db_cluster_capacity(\n            DBClusterIdentifier=db_cluster_id,\n            Capacity=new_cluster_capacity\n        )\n        if response['ResponseMetadata']['HTTPStatusCode'] != 200:\n            raise ValueError(f'Failed to update cluster capacity to {new_cluster_capacity} for RDS'\n                             f'. Response is: {response}')\n        logging.info(f'Updated cluster capacity to {new_cluster_capacity}')\n        return {'ClusterCapacity': new_cluster_capacity}\n    except ClientError as error:\n        logging.error(f'The update cluster capacity function terminated with error {error}')\n        raise error"
+      }
+    },
+    {
+      "name": "AssertReadinessCheckToBeReady",
+      "description": "Wait for the ReadinessCheck to become READY after test is complete",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "assert_readiness_check_state",
+        "InputPayload": {
+          "ReadinessCheckName": "{{ ReadinessCheckName }}",
+          "DesiredValue": "READY",
+          "Timeout": 1200
+        },
+        "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress.\nThis step starts a new execution of document in rollback mode to rollback the changes made as part of normal execution",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}
