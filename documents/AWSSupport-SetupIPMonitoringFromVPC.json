@@ -1,11 +1,11 @@
 {
   "schemaVersion": "0.3",
-  "description": "AWSSupport-SetupIPMonitoringFromVPC creates an EC2 instance in the specified subnet and monitors selected target IPs by continuously running ping, MTR, traceroute and tracetcp tests. The results are stored in CloudWatch logs, and metric filters are applied to quickly visualize latency and packet loss statistics in a CloudWatch dashboard. The latest version of the runbook uses Amazon Cloudwatch Agent to send the metrics.",
+  "description": "AWSSupport-SetupIPMonitoringFromVPC creates an Amazon Elastic Compute Cloud (Amazon EC2) instance in the specified subnet and monitors selected target IPs (IPv4 or IPv6) by continuously running ping, MTR, traceroute and tracetcp tests. The results are stored in Amazon CloudWatch Logs logs, and metric filters are applied to quickly visualize latency and packet loss statistics in a CloudWatch dashboard. \n\nThe CloudWatch Logs data can be used for network troubleshooting and analysis of pattern/trends. Additionally, you can configure CloudWatch alarms with Amazon SNS notifications when packet loss and/or latency reach a threshold. The data can also be used when opening a case with AWS Support, to help isolate an issue quickly and reduce time to resolution when investigating a network issue.\n\nUsing this runbook incurs costs to your account for the running time of Amazon EC2 instance, Amazon CloudWatch logs and dashboard. For more details, see [Amazon EC2 Pricing](https://aws.amazon.com/ec2/pricing/) and [Amazon CloudWatch Pricing](https://aws.amazon.com/cloudwatch/pricing).\n\nTTo clean up resources created by created by this runbook, you can use **AWSSupport-TerminateIPMonitoringFromVPC**.\n",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "SubnetId": {
       "type": "String",
-      "description": "(Required) The subnet ID for the monitor instance. NOTE: If you specify a private subnet, make sure there is Internet access to allow the monitor instance to setup the test (i.e. install the CloudWatch Logs agent, interact with AWS Systems Manager and Amazon CloudWatch).",
+      "description": "(Required) The subnet ID for the monitor instance. NOTE: If you specify a private subnet, make sure there is Internet access to allow the monitor instance to setup the test (i.e. install the Amazon CloudWatch Logs agent, interact with Systems Manager and CloudWatch).",
       "allowedPattern": "^subnet-[a-z0-9]{8,17}$"
     },
     "TargetIPs": {
@@ -51,18 +51,27 @@
         "t2.micro",
         "t2.small",
         "t2.medium",
-        "t2.large"
+        "t2.large",
+        "t3.micro",
+        "t3.small",
+        "t3.medium",
+        "t3.large",
+        "t4g.micro",
+        "t4g.small",
+        "t4g.medium",
+        "t4g.large"
       ]
     },
     "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The IAM role for this execution. If no role is specified, AWS Systems Manager Automation will use the permissions of the user that executes this document.",
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
       "default": ""
     }
   },
   "mainSteps": [
     {
       "name": "describeSubnet",
+      "description": "Describes the provided subnet to get associated Amazon Virtual Private Cloud(VPC) Id",
       "action": "aws:executeAwsApi",
       "onFailure": "Abort",
       "inputs": {
@@ -83,6 +92,7 @@
     },
     {
       "name": "branchOnTargetIPs",
+      "description": "Evaluates the TargetIPs input",
       "action": "aws:branch",
       "onFailure": "Abort",
       "inputs": {
@@ -93,12 +103,13 @@
             "Contains": ":"
           }
         ],
-        "Default": "getLatestLinuxAMI"
+        "Default": "getInstanceArchitecture"
       },
       "isCritical": "true"
     },
     {
       "name": "assertSubnetHasIPv6CidrBlock",
+      "description": "Checks the provided subnet has an IPv6 pool associated ",
       "action": "aws:assertAwsResourceProperty",
       "onFailure": "Abort",
       "inputs": {
@@ -113,16 +124,44 @@
         ]
       },
       "isCritical": "true",
-      "nextStep": "getLatestLinuxAMI"
+      "nextStep": "getInstanceArchitecture"
+    },
+    {
+      "name": "getInstanceArchitecture",
+      "description": "Gets the architecture of the selected InstanceType",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "nextStep": "getLatestLinuxAMI",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": " # Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n # SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n # Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport boto3\nfrom botocore.exceptions import ClientError\nimport sys\n\nsys.tracebacklimit = 0\n\nSUPPORTED_ARCH =  {\n    \"x86_64\": \"/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2\",\n    \"arm64\": \"/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2\"\n    }\n\ndef script_handler(events,context):\n   \"\"\"\n   Gets architecture of the EC2 instance\n   \"\"\"\n   try:\n       ec2 = boto3.client('ec2')\n       supported_architectures = ec2.describe_instance_types(\n           InstanceTypes=[events.get('InstanceType')]\n           )['InstanceTypes'][0]['ProcessorInfo']['SupportedArchitectures']\n       \n       if \"arm64\" in supported_architectures:\n            instance_architecture = \"arm64\"        \n       elif \"x86_64\" in supported_architectures:\n            instance_architecture = \"x86_64\"\n       else:\n           sys.exit(f\"Unsupported architecture: {supported_architectures}\")\n    \n       return {\n            \"architecture\": instance_architecture,\n            \"latestLinuxAMIPath\": SUPPORTED_ARCH.get(instance_architecture)\n       }\n        \n   except ClientError as e:\n       c = e.response['Error']['Code']\n       m = e.response['Error']['Message']\n       sys.exit(f\"An error occurred when describing instance types: {c}:{m}\")\n",
+        "InputPayload": {
+          "InstanceType": "{{InstanceType}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Architecture",
+          "Selector": "$.Payload.architecture",
+          "Type": "String"
+        },
+        {
+          "Name": "LatestLinuxAMIPath",
+          "Selector": "$.Payload.latestLinuxAMIPath",
+          "Type": "String"
+        }
+      ]
     },
     {
       "name": "getLatestLinuxAMI",
+      "description": "Gets the latest Amazon Linux 2 AMI from AWS Systems Manager Parameter Store",
       "action": "aws:executeAwsApi",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ssm",
         "Api": "GetParameter",
-        "Name": "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+        "Name": "{{getInstanceArchitecture.LatestLinuxAMIPath}}"
       },
       "outputs": [
         {
@@ -136,6 +175,7 @@
     },
     {
       "name": "createSecurityGroup",
+      "description": "Creates a security group for the test in the subnet's VPC",
       "action": "aws:executeAwsApi",
       "onFailure": "step:deleteSecurityGroup",
       "inputs": {
@@ -156,6 +196,7 @@
     },
     {
       "name": "allowAllOutboundTrafficInSecurityGroup",
+      "description": "Allows all outbound traffic in the test security group",
       "action": "aws:executeAwsApi",
       "onFailure": "step:deleteSecurityGroup",
       "inputs": {
@@ -173,6 +214,7 @@
     },
     {
       "name": "createEC2Role",
+      "description": "Creates an AWS Identity and Access Management (IAM) role for the test EC2 instance",
       "action": "aws:executeAwsApi",
       "onFailure": "step:deleteEC2Role",
       "inputs": {
@@ -194,12 +236,13 @@
     },
     {
       "name": "attachSSMManagedPolicyToEC2Role",
+      "description": "Attaches the AmazonSSMManagedInstanceCore managed policy to the role created",
       "action": "aws:executeAwsApi",
       "onFailure": "step:detachSSMManagedPolicyFromEC2Role",
       "inputs": {
         "Service": "iam",
         "Api": "AttachRolePolicy",
-        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        "PolicyArn": "arn:{{global:AWS_PARTITION}}:iam::aws:policy/AmazonSSMManagedInstanceCore",
         "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}"
       },
       "isCritical": "true",
@@ -207,6 +250,7 @@
     },
     {
       "name": "addCloudWatchInlinePolicyToEC2Role",
+      "description": "Attaches an inline policy to allow setting Amazon CloudWatch log group retentions and creating a CloudWatch dashboard",
       "action": "aws:executeAwsApi",
       "onFailure": "step:removeCloudWatchInlinePolicyFromEC2Role",
       "inputs": {
@@ -221,6 +265,7 @@
     },
     {
       "name": "createIAMInstanceProfile",
+      "description": "Creates an IAM instance profile",
       "action": "aws:executeAwsApi",
       "onFailure": "step:deleteIAMInstanceProfile",
       "inputs": {
@@ -244,6 +289,7 @@
     },
     {
       "name": "addIAMRoleToInstanceProfile",
+      "description": "Associates the IAM instance profile to the IAM role",
       "action": "aws:executeAwsApi",
       "onFailure": "step:removeIAMRoleFromInstanceProfile",
       "inputs": {
@@ -257,6 +303,7 @@
     },
     {
       "name": "waitForInstanceProfileToBeAvailable",
+      "description": "Waits for the instance profile to become available",
       "action": "aws:sleep",
       "onFailure": "Continue",
       "inputs": {
@@ -267,6 +314,7 @@
     },
     {
       "name": "createManagedInstance",
+      "description": "Creates the test instance in the specified subnet, and with the instance profile created earlier attached",
       "action": "aws:executeAwsApi",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -327,6 +375,7 @@
     },
     {
       "name": "branchOnTargetIPsToAssignIPv6ToInstance",
+      "description": "Evaluates If TargetIPs input contains an IPv6",
       "action": "aws:branch",
       "onFailure": "Abort",
       "inputs": {
@@ -343,6 +392,7 @@
     },
     {
       "name": "assignIPv6ToInstance",
+      "description": "Assigns an IPv6 to the test instance",
       "action": "aws:executeAwsApi",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -356,6 +406,7 @@
     },
     {
       "name": "waitForInstanceToBeManaged",
+      "description": "Waits for the test instance to become a managed instance",
       "action": "aws:waitForAwsResourceProperty",
       "timeoutSeconds": 600,
       "onFailure": "step:terminateInstance",
@@ -380,6 +431,7 @@
     },
     {
       "name": "installPrerequisites",
+      "description": "Installs test pre-requisites",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -402,6 +454,7 @@
     },
     {
       "name": "validateIPs",
+      "description": "Validates the provided IPs are syntactically correct IPv4 and/or IPv6 addresses",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -476,6 +529,7 @@
     },
     {
       "name": "defineMTRTest",
+      "description": "Defines the MTR test for each of the provided IPs",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -515,6 +569,7 @@
     },
     {
       "name": "definePing64Test",
+      "description": "Defines the first ping test for each of the provided IPs",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -554,6 +609,7 @@
     },
     {
       "name": "definePing1500Test",
+      "description": "Defines the second ping test for each of the provided IPs",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -593,6 +649,7 @@
     },
     {
       "name": "defineTracepathTest",
+      "description": "Defines the tracepath test for each of the provided IPs",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -632,6 +689,7 @@
     },
     {
       "name": "defineTracerouteTCPTest",
+      "description": "Defines the traceroute test for each of the provided IPs",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -647,7 +705,7 @@
             "logPath='/home/ec2-user/logs'",
             "",
             "for ip in ${ipList[@]}; do",
-            "    touch /home/ec2-user/ping1500_${ip}.sh",
+            "    touch /home/ec2-user/traceroutetcp_${ip}.sh",
             "    cat <<EOT >> /home/ec2-user/traceroutetcp_${ip}.sh",
             "#!/bin/bash",
             "sudo traceroute -n $ip -q 2 -A -T -p 80 | sed -e \"s/^/     /\" >> $logPath/traceroutetcp-to-$ip.txt",
@@ -662,6 +720,7 @@
     },
     {
       "name": "configureCloudWatchLogsForTestResults",
+      "description": "Configures CloudWatch logs",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -769,6 +828,7 @@
     },
     {
       "name": "startNetworkTests",
+      "description": "Schedules cronjobs to run each test every minute",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -812,6 +872,7 @@
     },
     {
       "name": "sleepBeforeSettingRetentions",
+      "description": "Waits for the tests to generate some data",
       "action": "aws:sleep",
       "onFailure": "Continue",
       "inputs": {
@@ -822,6 +883,7 @@
     },
     {
       "name": "configureLocalLogRotation",
+      "description": "Sets the desired CloudWatch log group retentions",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -869,6 +931,7 @@
     },
     {
       "name": "setCloudWatchLogsMetricFilters",
+      "description": "Sets the CloudWatch log group metric filters",
       "action": "aws:runCommand",
       "onFailure": "step:terminateInstance",
       "inputs": {
@@ -943,6 +1006,7 @@
     },
     {
       "name": "createCloudWatchDashboard",
+      "description": "Creates the CloudWatch dashboard",
       "action": "aws:runCommand",
       "onFailure": "step:deleteDashboard",
       "inputs": {
@@ -1084,6 +1148,7 @@
     },
     {
       "name": "deleteDashboard",
+      "description": "DeleteS the CloudWatch dashboard, if it exists",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -1098,6 +1163,7 @@
     },
     {
       "name": "terminateInstance",
+      "description": "Terminates the test EC2 instance",
       "action": "aws:changeInstanceState",
       "onFailure": "Continue",
       "inputs": {
@@ -1112,6 +1178,7 @@
     },
     {
       "name": "removeIAMRoleFromInstanceProfile",
+      "description": "Removes the IAM instance profile from the role",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -1125,6 +1192,7 @@
     },
     {
       "name": "deleteIAMInstanceProfile",
+      "description": "Deletes the IAM instance profile created by the automation",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -1137,6 +1205,7 @@
     },
     {
       "name": "removeCloudWatchInlinePolicyFromEC2Role",
+      "description": "Deletes the CloudWatch inline policy from the role created by the automation",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -1150,6 +1219,7 @@
     },
     {
       "name": "detachSSMManagedPolicyFromEC2Role",
+      "description": "Detaches the AmazonSSMManagedInstanceCore managed policy from the role created by the automation",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -1163,6 +1233,7 @@
     },
     {
       "name": "deleteEC2Role",
+      "description": "Deletes the IAM role created by the automation",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -1175,6 +1246,7 @@
     },
     {
       "name": "deleteSecurityGroup",
+      "description": "Deletes the security group created by the automation, if it exists",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
