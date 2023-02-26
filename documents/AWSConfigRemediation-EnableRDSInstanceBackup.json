@@ -6,7 +6,7 @@
     "AutomationAssumeRole": {
       "type": "String",
       "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
-      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@/-]+$"
+      "allowedPattern": "^arn:aws[a-z0-9-]*:iam::\\d{12}:role\\/[\\w-\\/.@+=,]{1,1017}$"
     },
     "DbiResourceId": {
       "type": "String",
@@ -20,13 +20,13 @@
     },
     "BackupRetentionPeriod": {
       "type": "Integer",
-      "description": "(Required) A positive integer value that indicates the number of days to retain automated backups.",
-      "allowedPattern": "^([1-9]|[1-2][0-9]|[3][0-5])$"
+      "description": "(Required) The integer number of days, between 1 and 35, to retain automated backups.",
+      "allowedPattern": "^([1-9]|[12][\\d]|3[0-5])$"
     },
     "PreferredBackupWindow": {
       "type": "String",
-      "description": "(Optional) A daily time range value of at least 30 minutes, in Universal Time Coordinated (UTC).",
-      "allowedPattern": "^(?![\\s\\S])|^((?:[01]\\d|2[0123]):(?:[012345]\\d)-(?:[01]\\d|2[0123]):(?:[012345]\\d))$",
+      "description": "(Optional) A daily time range value of at least 30 minutes, in Universal Time Coordinated (UTC) in the format hh:mm-hh:mm.",
+      "allowedPattern": "^$|^([01]\\d|2[0-3]):[0-5]\\d-([01]\\d|2[0-3]):[0-5]\\d$",
       "default": ""
     }
   },
@@ -35,21 +35,63 @@
   ],
   "mainSteps": [
     {
+      "name": "GetRDSInstanceIdentifier",
+      "action": "aws:executeAwsApi",
+      "description": "## GetRDSInstanceIdentifier\nMakes DescribeDBInstances API call using the database instance resource identifier to get DBInstanceIdentifier.\n## Outputs\n* DBInstanceIdentifier: DBInstance identifier of the Amazon RDS instance.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "Filters": [
+          {
+            "Name": "dbi-resource-id",
+            "Values": [
+              "{{ DbiResourceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DBInstanceIdentifier",
+          "Selector": "$.DBInstances[0].DBInstanceIdentifier",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyDBInstanceStatus",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 900,
+      "isEnd": false,
+      "description": "## VerifyDBInstanceStatus\nWaits and verifies whether AWS RDS DBInstance status is available before enabling AutoMiniorVersionUpgrade.\n",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBInstances",
+        "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DBInstanceIdentifier }}",
+        "PropertySelector": "$.DBInstances[0].DBInstanceStatus",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
       "name": "EnableBackupsOnRDSInstanceAndVerify",
       "action": "aws:executeScript",
       "description": "## EnableBackupsOnRDSInstanceAndVerify\nAccepts the Resource ID as input, modifies it to enable backups and verifies that backups are enabled or in `PendingModifiedValues` pending to be enabled.\n## Outputs\n* Output: A success message or failure exception.\n",
       "isEnd": true,
       "timeoutSeconds": 600,
       "inputs": {
-        "Runtime": "python3.7",
+        "Runtime": "python3.8",
         "Handler": "handler",
         "InputPayload": {
-          "DbiResourceId": "{{ DbiResourceId }}",
+          "DBInstanceIdentifier": "{{ GetRDSInstanceIdentifier.DBInstanceIdentifier }}",
           "ApplyImmediately": "{{ ApplyImmediately }}",
           "BackupRetentionPeriod": "{{ BackupRetentionPeriod }}",
           "PreferredBackupWindow": "{{ PreferredBackupWindow }}"
         },
-        "Script": "import boto3\nimport botocore\n\n\ndef get_rds_instance_identifier(rds_client, dbi_resource_id):\n    paginator = rds_client.get_paginator(\"describe_db_instances\")\n    page_iterator = paginator.paginate(\n        Filters=[{\"Name\": \"dbi-resource-id\", \"Values\": [dbi_resource_id]}],\n    )\n\n    for page in page_iterator:\n        for instance in page[\"DBInstances\"]:\n            return instance[\"DBInstanceIdentifier\"], instance[\"DBInstanceStatus\"]\n    return None, None\n\n\ndef enable_backups(\n    rds_client, db_instance_identifier, apply_immediately, backup_retention_period, preferred_backup_window\n):\n    try:\n        response = None\n        if preferred_backup_window == \"\":\n            response = rds_client.modify_db_instance(\n                DBInstanceIdentifier=db_instance_identifier,\n                ApplyImmediately=apply_immediately,\n                BackupRetentionPeriod=backup_retention_period,\n            )\n        else:\n            response = rds_client.modify_db_instance(\n                DBInstanceIdentifier=db_instance_identifier,\n                ApplyImmediately=apply_immediately,\n                BackupRetentionPeriod=backup_retention_period,\n                PreferredBackupWindow=preferred_backup_window,\n            )\n        if response[\"DBInstance\"].get(\"InstanceCreateTime\") is not None:\n            response[\"DBInstance\"][\"InstanceCreateTime\"] = str(response[\"DBInstance\"][\"InstanceCreateTime\"])\n        if response[\"DBInstance\"].get(\"LatestRestorableTime\") is not None:\n            response[\"DBInstance\"][\"LatestRestorableTime\"] = str(response[\"DBInstance\"][\"LatestRestorableTime\"])\n        return response\n    except botocore.exceptions.ClientError as error:\n        if \"member of a cluster\" in error.response[\"Error\"][\"Message\"]:\n            error_message = f\"DB INSTANCE {db_instance_identifier} MODIFICATION FAILED. DB INSTANCE IS A MEMBER OF A CLUSTER, BACKUP RETENTION MANAGED ON THE DB CLUSTER.\"\n            raise Exception(error_message)\n        elif \"backup window and maintenance window must not overlap\" in error.response[\"Error\"][\"Message\"]:\n            error_message = f\"DB INSTANCE {db_instance_identifier} MODIFICATION FAILED.  BACKUP WINDOW AND MAINTENANCE WINDOW MUST NOT OVERLAP.\"\n            raise Exception(error_message)\n        elif \"backup window must be at least 30 minutes\" in error.response[\"Error\"][\"Message\"]:\n            error_message = (\n                f\"DB INSTANCE {db_instance_identifier} MODIFICATION FAILED. BACKUP WINDOW MUST BE AT LEAST 30 MINUTES.\"\n            )\n            raise Exception(error_message)\n        else:\n            raise error\n\n\ndef verify_backups_enabled(rds_client, db_instance_identifier, backup_retention_period, preferred_backup_window):\n    paginator = rds_client.get_paginator(\"describe_db_instances\")\n    page_iterator = paginator.paginate(DBInstanceIdentifier=db_instance_identifier)\n\n    for page in page_iterator:\n        for instance in page[\"DBInstances\"]:\n            results = []\n            if (\n                backup_retention_period == instance[\"PendingModifiedValues\"].get(\"BackupRetentionPeriod\")\n                or backup_retention_period == instance[\"BackupRetentionPeriod\"]\n            ):\n                results.append(\"True\")\n            if preferred_backup_window == \"\" or (\n                preferred_backup_window == instance[\"PendingModifiedValues\"].get(\"PreferredBackupWindow\")\n                or preferred_backup_window == instance[\"PreferredBackupWindow\"]\n            ):\n                results.append(\"True\")\n\n            if results == [\"True\", \"True\"]:\n                return True\n    return False\n\ndef handler(event, context):\n    rds_client = boto3.client(\"rds\")\n    apply_immediately = event[\"ApplyImmediately\"]\n    dbi_resource_id = event[\"DbiResourceId\"]\n    backup_retention_period = event[\"BackupRetentionPeriod\"]\n    preferred_backup_window = event.get(\"PreferredBackupWindow\")\n\n    db_instance_identifier, db_instance_status = get_rds_instance_identifier(rds_client, dbi_resource_id)\n    if db_instance_identifier is None:\n        error_message = f\"AMAZON RDS DATABASE RESOURCE ID {dbi_resource_id} DOES NOT EXIST.\"\n        raise Exception(error_message)\n\n    response = None\n    if db_instance_status == \"available\":\n        response = enable_backups(\n            rds_client, db_instance_identifier, apply_immediately, backup_retention_period, preferred_backup_window\n        )\n    else:\n        error_message = (\n            f\"DB RESOURCE ID {dbi_resource_id} MODIFICATION FAILED BECAUSE INSTANCE STATUS IS NOT AVAILABLE.\"\n        )\n        raise Exception(error_message)\n\n    backups_enabled = verify_backups_enabled(\n        rds_client, db_instance_identifier, backup_retention_period, preferred_backup_window\n    )\n\n    if backups_enabled:\n        return {\n            \"output\": \"Verification of backups enabled for Amazon RDS DB instance is successful.\",\n            \"ModifyDBInstanceResponse\": response,\n        }\n    error_message = f\"VERIFICATION FAILED. DB RESOURCE ID {dbi_resource_id} BACKUPS NOT ENABLED PER PARAMETERS.\"\n    raise Exception(error_message)"
+        "Script": "import boto3\nimport botocore\n\ndef enable_backups(rds_client,event):\n    try:\n        modifyparams = {\"DBInstanceIdentifier\"  : event[\"DBInstanceIdentifier\"],\n                        \"ApplyImmediately\"      : event[\"ApplyImmediately\"],\n                        \"BackupRetentionPeriod\" : event[\"BackupRetentionPeriod\"]}\n        if event.get(\"PreferredBackupWindow\") != \"\":\n            modifyparams[\"PreferredBackupWindow\"] = event.get(\"PreferredBackupWindow\")\n        response = rds_client.modify_db_instance(**modifyparams)\n        response[\"DBInstance\"][\"InstanceCreateTime\"] = str(response[\"DBInstance\"].get(\"InstanceCreateTime\"))\n        response[\"DBInstance\"][\"LatestRestorableTime\"] = str(response[\"DBInstance\"].get(\"LatestRestorableTime\"))\n        return response\n    except botocore.exceptions.ClientError as error:\n        if \"member of a cluster\" in error.response[\"Error\"][\"Message\"]:\n            raise Exception(f\"DB INSTANCE {event['DBInstanceIdentifier']} MODIFICATION FAILED. DB INSTANCE IS A MEMBER OF A CLUSTER, BACKUP RETENTION MANAGED ON THE DB CLUSTER.\")\n        elif \"backup window and maintenance window must not overlap\" in error.response[\"Error\"][\"Message\"]:\n            raise Exception(f\"DB INSTANCE {event['DBInstanceIdentifier']} MODIFICATION FAILED.  BACKUP WINDOW AND MAINTENANCE WINDOW MUST NOT OVERLAP.\")\n        elif \"backup window must be at least 30 minutes\" in error.response[\"Error\"][\"Message\"]:\n            raise Exception(f\"DB INSTANCE {event['DBInstanceIdentifier']} MODIFICATION FAILED. BACKUP WINDOW MUST BE AT LEAST 30 MINUTES.\")\n        else:\n            raise error\n\ndef verify_backups_enabled(rds_client, db_instance_identifier, backup_retention_period, preferred_backup_window):\n    db_instance = rds_client.describe_db_instances(DBInstanceIdentifier=db_instance_identifier)[\"DBInstances\"][0]\n    properties = [\"BackupRetentionPeriod\",\"PreferredBackupWindow\"]\n    retention_periods, backup_windows = ([db_instance[\"PendingModifiedValues\"].get(p), db_instance[p]] for p in properties)\n    return (backup_retention_period in retention_periods and \n        (preferred_backup_window == \"\" or preferred_backup_window in backup_windows))\n\ndef handler(event, context):\n    rds_client = boto3.client(\"rds\")\n    db_instance_identifier = event[\"DBInstanceIdentifier\"]\n    response = enable_backups(rds_client, event)\n    if verify_backups_enabled(rds_client, db_instance_identifier, event[\"BackupRetentionPeriod\"], event.get(\"PreferredBackupWindow\")):\n        return {\"output\": \"Verification of backups enabled for Amazon RDS DB instance is successful.\",\n                \"ModifyDBInstanceResponse\": response,}\n    raise Exception(f\"VERIFICATION FAILED. DB RESOURCE ID {db_instance_identifier} BACKUPS NOT ENABLED PER PARAMETERS.\")"
       },
       "outputs": [
         {

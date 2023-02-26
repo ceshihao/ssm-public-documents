@@ -1,0 +1,52 @@
+{
+  "description": "### Document name - AWS-BulkDeleteAssociation\n\n## What does this document do?\nThis document Delete State Manager associations in bulk.\n\n## Input Parameters\n* AssociationsIds: (Required) List of up to 50 AWS Systems Manager State Manager Association Ids.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows Systems Manager Automation to perform actions on your behalf.\n## Output parameters\n* BulkDeleteAssociationStep.IsSuccessful - 'false' represents the overall execution status failed, 'true' represents execution status successful.\n* BulkDeleteAssociationStep.AssociationsIdsDeleteFailed - Empty List represents execution status successful, otherwise failed AssociationIds will be displayed.\n\n## Minimum Permissions Required\n* `ssm:DeleteAssociation`",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "outputs": [
+    "BulkDeleteAssociationStep.IsSuccessful",
+    "BulkDeleteAssociationStep.AssociationsIdsDeleteFailed"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The role ARN to assume during automation execution.",
+      "default": "",
+      "allowedPattern": "^$|arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role\\/?[a-zA-Z_0-9+=,.@\\-_\\/]+"
+    },
+    "AssociationsIds": {
+      "type": "StringList",
+      "description": "(Required) List of up to 50 AWS Systems Manager State Manager Association Ids. (e.g. 2e144556-ceb6-47d6-b596-xxxxxxxxxxxx ...).",
+      "allowedPattern": "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+      "maxItems": 50
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "BulkDeleteAssociationStep",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "function_start",
+        "Script": "import boto3\nimport botocore\n\nfrom botocore.config import Config\n\nimport os, time\n\nregion = os.environ['AWS_REGION']\nspacing = 2\n\nconfig = Config(\n    retries = {\n  'max_attempts': 5,\n  'mode': 'standard'\n  }\n)\nssm_client = boto3.client(\"ssm\", region_name=region, config=config)\n\ndef function_start(event, context):\n\n    # Get parameters\n    association_ids = event.get('AssociationIds')\n\n    # Testing parameters existence\n    if association_ids is None or len(association_ids) == 0:\n      raise ValueError(\"association_ids is a required field.\")\n\n    response = bulk_delete_association(association_ids, spacing)\n\n    # Return outputs\n    return response\n  \ndef bulk_delete_association(association_ids, spacing):\n\n    association_ids_failed_delete = []\n\n    # Loop through each association_ids\n    for curr_id in association_ids:\n\n      # delete each association_id\n      response = delete_association(curr_id)\n\n      # Append to list of failed association ids on error\n      if response is not None:\n        association_ids_failed_delete.append({\n        'association_id': curr_id,\n        'Response': str(response)\n      })\n      \n      time.sleep(float(spacing))\n    # Determine if bulk association delete failed\n    is_successful = False\n    if len(association_ids_failed_delete) == 0:\n      is_successful = True\n\n    return {\n      \"is_successful\": is_successful,\n      \"association_ids_failed_delete\": association_ids_failed_delete\n    } \n\n\ndef delete_association(association_id):\n\n    error = None\n    hasPermissions = True\n\n    try:\n      # Try to delete\n      ssm_client.delete_association(AssociationId=association_id)\n    except ssm_client.exceptions.AssociationDoesNotExist as e:              \n      error = e\n    except ssm_client.exceptions.TooManyUpdates as e:\n      # raise error if it is stuck with the previous association.\n      raise e\n    except botocore.exceptions.ClientError as e:\n      # If there is a permission error, fail early\n      if e.response['Error']['Code'].strip() == \"AccessDeniedException\":\n        hasPermissions = False\n      else:\n        # other error, return message\n        error = e\n    except botocore.exceptions.NoCredentialsError as e:\n      hasPermissions = False\n    except Exception as e:\n      # Return error if it fails\n      error = e\n    if not hasPermissions:\n      raise PermissionError(\"Role provided does not have permission to perform ssm:DeleteAssociation\")\n    return error",
+        "InputPayload": {
+          "AssociationIds": "{{AssociationsIds}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "IsSuccessful",
+          "Selector": "$.Payload.is_successful",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AssociationsIdsDeleteFailed",
+          "Selector": "$.Payload.association_ids_failed_delete",
+          "Type": "MapList"
+        }
+      ],
+      "description": "##BulkDeleteAssociationStep\nThis step iterates through each AssociationsIds and calls Delete Associations with the specified parameters\n## Input Parameters\n  * AssociationsIds: (Required) List of up to 50 AWS Systems Manager State Manager Association Ids.\n  * AutomationAssumeRole: (Optional) The ARN of the role that allows Systems Manager Automation to perform actions on your behalf.\n## Output parameters\n  * BulkDeleteAssociationStep.IsSuccessful - 'false' represents the overall execution status failed, 'true' represents execution status successful.\n  * BulkDeleteAssociationStep.AssociationsIdsDeleteFailed - Empty List represents execution status successful, otherwise failed AssociationIds will be displayed.",
+      "timeoutSeconds": 600,
+      "isEnd": true
+    }
+  ]
+}
