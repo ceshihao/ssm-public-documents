@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "2.2",
+  "description": "This document verifies that EBS volumes on the launched instance are accessible, identical to the source, and properly mounted on the EC2 instance.",
+  "parameters": {
+    "Volumes": {
+      "type": "String",
+      "description": "(Required) List of all volumes to verify (for example: [{\"deviceName\": \"/dev/xvda\", \"totalStorageBytes\": 8589934592}])",
+      "allowedPattern": "^\\[\\{(\"backloggedStorageBytes\"\\: \\d{1,20}, )?\"deviceName\"\\: \"[\\w\\/\\?\\.:\\\\]{1,40}\", (\"replicatedStorageBytes\"\\: \\d{1,20}, )?(\"rescannedStorageBytes\"\\: \\d{1,20}, )?\"totalStorageBytes\"\\: \\d{1,20}\\}(, \\{(\"backloggedStorageBytes\"\\: \\d{1,20}, )?\"deviceName\"\\: \"[\\w\\/\\?\\.:\\\\]{1,40}\", (\"replicatedStorageBytes\"\\: \\d{1,20}, )?(\"rescannedStorageBytes\"\\: \\d{1,20}, )?\"totalStorageBytes\"\\: \\d{1,20}\\}){0,25}(, \\{(\"backloggedStorageBytes\"\\: \\d{1,20}, )?\"deviceName\"\\: \"[\\w\\/\\?\\.:\\\\]{1,40}\", (\"replicatedStorageBytes\"\\: \\d{1,20}, )?(\"rescannedStorageBytes\"\\: \\d{1,20}, )?\"totalStorageBytes\"\\: \\d{1,20}\\}){0,24}\\]$"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runPowerShellScript",
+      "name": "VerifyWindowsMountedVolumes",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "function NormalizeSize {\n    param($sizeBytes)\n\n    return [Math]::Ceiling($sizeBytes / 1GB)\n}\n\ntry {\n    $userDisks = ConvertFrom-Json '{{Volumes}}'\n}\n\ncatch {\n    Write-Host \"Error: failed to parse Volumes:\"\n    exit 1\n}\n\n$systemDisks = [System.Collections.ArrayList]@(Get-Disk | Select-Object -Property Number,Size,IsOffline,IsReadOnly)\n\nif ($systemDisks.Count -ne $userDisks.Count) {\n    Write-Host \"Error: found #$(@($systemDisks).Count) disks, expected #$(@($userDisks).Count)\"\n    exit 1\n}\n\n$ret = 0\n\nforeach ($userDisk in $userDisks) {\n\n    $systemDisk = $null\n\n    for ($i=0; $i -lt $systemDisks.Count; $i++) {\n        if (\"$(NormalizeSize $userDisk.totalStorageBytes)\" -eq \"$(NormalizeSize $systemDisks[$i].Size)\") {\n            $systemDisk = $systemDisks[$i]\n            $systemDisks.RemoveAt($i)\n            break\n        }\n    }\n\n    if ($systemDisk -eq $null) {\n        Write-Host \"Error: disk $($userDisk.deviceName) is not found\"\n        $ret = 1\n    }\n\n    else {\n        if ($systemDisk.isOffline) {\n            Write-Host \"Error: disk $($userDisk.deviceName) is offline\"\n            $ret = 1\n        }\n\n        if ($systemDisk.isReadOnly) {\n            Write-Host \"Error: disk $($userDisk.deviceName) is read_only\"\n            $ret = 1\n        }\n\n        if (-not ($systemDisk.isOffline -or $systemDisk.isReadOnly)) {\n            Write-Host \"Success: disk $($userDisk.deviceName) is found\"\n        }\n    }\n}\n\nexit $ret\n"
+        ]
+      }
+    },
+    {
+      "action": "aws:runShellScript",
+      "name": "VerifyLinuxMountedVolumes",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "#!/bin/bash\nGB=$((1024 * 1024 * 1024))\n\nfunction parse_volumes_json () {\n  pyexec=python3\n  which python3 > /dev/null 2>&1\n  is_py3=$?\n  if [ $is_py3 -eq 1 ]; then pyexec=python; fi\n  $pyexec - <<END\nimport json\ndata = json.loads('{{Volumes}}')\nfor d in data:\n  print(d['deviceName'] + '-' + str(d['totalStorageBytes']))\nEND\n}\n\nfunction normalize_size () {\n  echo $(awk -v size_bytes=\"$1\" -v GB=\"$GB\" 'BEGIN {\n    res = size_bytes / GB\n    if (res % 1 != 0) {\n      res += 0.5\n    }\n    printf \"%.0f\", res\n  }')\n}\n\nuser_disks=($(parse_volumes_json))\n\nif [ \"$?\" -ne \"0\" ]; then\n  echo \"Error: failed to parse Volumes\"\n  exit 1\nfi\n\nreadarray -t lsblk_disks_output_arr < <(lsblk -d -e 7 --noheadings -b -o NAME,SIZE)\nsystem_disks_count=\"${#lsblk_disks_output_arr[@]}\"\nuser_disks_count=\"${#user_disks[@]}\"\n\nif [ \"$system_disks_count\" -ne \"$user_disks_count\" ]; then\n  echo \"Error: found #$system_disks_count disks, expected #$user_disks_count\"\n  exit 1\nfi\n\nfor i in \"${!user_disks[@]}\"; do\n  IFS=\"-\" read -r name sizeBytes <<< \"${user_disks[$i]}\"\n  sizeGb=$(normalize_size \"$sizeBytes\")\n  user_disks[$i]=\"$name-$sizeGb\"\ndone\n\ndeclare -a system_disks\n\nfor disk in \"${lsblk_disks_output_arr[@]}\"; do\n  IFS=\" \" read -r name sizeBytes <<< \"$disk\"\n  sizeGb=$(normalize_size \"$sizeBytes\")\n  system_disks+=(\"$name-$sizeGb\")\ndone\n\nret=0\n\nfor user_disk in \"${user_disks[@]}\"; do\n  IFS=\"-\" read -r user_disk_name user_disk_size <<< \"$user_disk\"\n  found=0\n  for i in \"${!system_disks[@]}\"; do\n\n    IFS=\"-\" read -r system_disk_name system_disk_size <<< \"${system_disks[$i]}\"\n    if [ \"$user_disk_size\" == \"$system_disk_size\" ]; then\n      echo \"Success: disk $user_disk_name is found\"\n      unset 'system_disks[$i]'\n      found=1\n      break\n    fi\n  done\n\n  if [ \"$found\" -eq \"0\" ]; then\n    echo \"Error: disk $user_disk_name is not found\"\n    ret=1\n  fi\ndone\n\nexit $ret\n"
+        ]
+      }
+    }
+  ]
+}

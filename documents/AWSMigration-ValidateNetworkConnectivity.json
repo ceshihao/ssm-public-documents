@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "2.2",
+  "description": "This document tests network connectivity to a defined list of hosts and ports.",
+  "parameters": {
+    "HostsAndPorts": {
+      "type": "String",
+      "description": "(Required) Host IP addresses and ports for which the test connectivity is conducted. Use a space to separate up to 5 connections (for example, 127.0.0.1:22 [192.168.3.2:555 ...])",
+      "allowedPattern": "^((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]):([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))(\\s(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]):([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])){0,4}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runPowerShellScript",
+      "name": "ValidateWindowsConnectivity",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "$returnValue = 0\n$timeBetweenConnectionsInSeconds = 30\n$getTestNetConnectionScriptBlock = {\n    Param ($ip_and_port)\n    $ip, $port = $ip_and_port.Split(\":\")\n    try {\n        $res = Test-NetConnection -ComputerName \"$ip\" -Port \"$port\" -WarningAction SilentlyContinue\n        $res.TcpTestSucceeded\n    }\n    catch {\n        Write-Host \"An error occured during the connectivity check\"\n        $False\n    }\n}\n\n'{{HostsAndPorts}}'.split(' ') | foreach {\n    $startTime = Get-Date\n    $testNetConnectionJob = Start-Job -ScriptBlock $getTestNetConnectionScriptBlock -ArgumentList \"$_\" -Name \"$_\"\n    Wait-Job $testNetConnectionJob -Timeout $timeBetweenConnectionsInSeconds | Out-Null\n    Stop-Job $testNetConnectionJob.id\n    Wait-Job $testNetConnectionJob.id | Out-Null\n\n    $jobDetails = Get-Job $testNetConnectionJob.id\n    if (\"$($jobDetails.State)\" -eq \"Completed\") {\n        $res = Receive-Job $testNetConnectionJob.id\n        if ($res) {\n            Write-Host $jobDetails.Name, \"connection succeeded\"\n        }\n        else {\n            Write-Host $jobDetails.Name, \"connection failed\"\n            $returnValue = 1\n        }\n    } elseif (\"$($jobDetails.State)\" -eq \"Stopped\") {\n        Write-Host $jobDetails.Name, \"connection timeout\"\n        $returnValue = 1\n    } else {\n        Write-Host $jobDetails.Name, \"unexpected error\"\n        $returnValue = 1\n    }\n    $secondsUntilNextTest = $timeBetweenConnectionsInSeconds - [Int]((Get-Date) - $startTime).TotalSeconds\n    if ($secondsUntilNextTest -gt 0) {\n        Start-Sleep -Seconds $secondsUntilNextTest\n    }\n}\n\nexit $returnValue\n"
+        ]
+      }
+    },
+    {
+      "action": "aws:runShellScript",
+      "name": "ValidateLinuxConnectivity",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "#!/usr/bin/env bash\nreturn_value=0\nIFS=' ' read -ra hosts_and_ports <<< '{{HostsAndPorts}}'\n\ntime_between_connections_in_seconds=30\nfor ip_and_port_entry in \"${hosts_and_ports[@]}\"\ndo\n    start_time=$SECONDS\n    IFS=':' read -ra ip_and_port_vals <<< \"$ip_and_port_entry\"\n    ip=\"${ip_and_port_vals[0]}\"\n    port=\"${ip_and_port_vals[1]}\"\n    timeout \"$time_between_connections_in_seconds\" bash -c \"</dev/tcp/$ip/$port\"\n    connection_result=\"$?\"\n    if [ \"$connection_result\" -eq '124' ]; then\n        echo \"$ip_and_port_entry connection timeout\"\n        return_value=1\n    else\n        if [ \"$connection_result\" -eq '0' ]; then\n            echo \"$ip_and_port_entry connection succeeded\"\n        else\n            echo \"$ip_and_port_entry connection failed\"\n            return_value=1\n        fi\n\n        seconds_until_next_test=\"$(($time_between_connections_in_seconds-($SECONDS-start_time)))\"\n        if [ $seconds_until_next_test -ge 0 ]; then\n          sleep \"$seconds_until_next_test\"\n        fi\n      fi\ndone\nexit $return_value\n"
+        ]
+      }
+    }
+  ]
+}

@@ -25,64 +25,47 @@
         "SupportAndBillingFullAccess"
       ]
     },
-    "LambdaAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The ARN of the role assumed by lambda.",
-      "default": ""
-    },
     "AutomationAssumeRole": {
-      "type": "String",
+      "type": "AWS::IAM::Role::Arn",
       "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, AWS Systems Manager Automation will use the permissions of the user that executes this document.",
       "default": ""
     }
   },
   "mainSteps": [
     {
-      "name": "createDocumentStack",
-      "action": "aws:createStack",
-      "inputs": {
-        "StackName": "AWSSupport-GrantPermissionsToIAMUser-{{ automation:EXECUTION_ID }}",
-        "OnFailure": "DELETE",
-        "TemplateURL": "https://awssupport-ssm.{{ global:REGION }}.s3.amazonaws.com/AWSSupport-GrantPermissionsToIAMUser/CloudFormationTemplates/AWSSupport-GrantPermissionsToIAMUser_vea09867bbb31b3cc3284b7b92d226e3990a1469c.template",
-        "Capabilities": [
-          "CAPABILITY_IAM"
-        ],
-        "Parameters": [
-          {
-            "ParameterKey": "LambdaName",
-            "ParameterValue": "AWSSupport-ConfigureIAM-{{ automation:EXECUTION_ID }}"
-          },
-          {
-            "ParameterKey": "LambdaRoleArn",
-            "ParameterValue": "{{ LambdaAssumeRole }}"
-          }
-        ],
-        "Tags": [
-          {
-            "Key": "AWSSupport-AutomationExecution",
-            "Value": "{{ automation:EXECUTION_ID }}"
-          }
-        ]
-      }
-    },
-    {
       "name": "configureIAM",
-      "action": "aws:invokeLambdaFunction",
-      "onFailure": "step:deleteDocumentStack",
+      "description": "Executes python script to set IAM permissions",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
       "inputs": {
-        "FunctionName": "AWSSupport-ConfigureIAM-{{ automation:EXECUTION_ID }}",
-        "Payload": "{\"ResourceProperties\": {\"IAMGroupName\": \"{{ IAMGroupName }}\", \"Permissions\": \"{{ Permissions }}\", \"IAMUserName\": \"{{ IAMUserName }}\", \"Region\": \"{{ global:REGION }}\", \"AccountId\": \"{{ global:ACCOUNT_ID }}\", \"ExecutionId\": \"{{ automation:EXECUTION_ID }}\" }}"
-      }
-    },
-    {
-      "name": "deleteDocumentStack",
-      "action": "aws:deleteStack",
-      "inputs": {
-        "StackName": "AWSSupport-GrantPermissionsToIAMUser-{{ automation:EXECUTION_ID }}"
-      }
+        "Runtime": "python3.8",
+        "Handler": "configure_iam_handler",
+        "Script": "\n# Copyright 2017-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n#\n# This software and all associated files are licensed as AWS Content under \n# the AWS Customer Agreement (the \"Agreement\"). You may not use this software \n# except in compliance with the Agreement. A copy of the Agreement is located \n# at http://aws.amazon.com/agreement/ or in the \"license\" file \n# accompanying this software. This software is distributed on an \"AS IS\" BASIS, \n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the \n# Agreement for the specific language governing permissions and limitations \n# under the Agreement.\n\nimport boto3\nfrom botocore.exceptions import ClientError\nimport logging\nimport sys\nfrom operator import itemgetter\n\n\ndef setup_boto_clients(region=None, account_id=None):\n    \"\"\"\n    Sets up the Boto3 clients.\n    \"\"\"\n    global iam_client\n    global logs_client\n    \n    try:\n        iam_client = boto3.client('iam')\n        logs_client = boto3.client('logs')\n    except ClientError as error:\n        raise Exception(f'Cannot setup Boto3 clients - {error}')\n    \n\ndef create_or_return_iam_group(iam_group_name, account_summary_map):\n    \"\"\"\n    Checks if an IAM group exists.\n    \"\"\"\n    try:\n        iam_client.get_group(GroupName=iam_group_name)\n        print(f'PASSED - IAM group {iam_group_name} exists.')\n    except ClientError as error:\n        if error.response['Error']['Code'] == 'NoSuchEntity':\n            print(f'FAILED - IAM group {iam_group_name} does not exist.')\n            print('Checking Groups Quota before creating a new IAM Group')\n            if account_summary_map['Groups'] == account_summary_map['GroupsQuota']:\n                sys.exit(\"\"\"You have reached the limit of IAM groups you can create. \n                    Please request a limit increase, or delete an IAM group you don't need anymore.\"\"\")\n            else:\n                create_iam_group(iam_group_name)\n        else:\n            raise Exception(f'ERROR - Cannot check IAM group {iam_group_name} - {error}')\n\n\ndef create_iam_group(iam_group_name):\n    \"\"\"\n    Creates an IAM group.\n    \"\"\"\n    try:\n        print(f'Creating IAM group {iam_group_name}.')\n\n        iam_client.create_group(\n            GroupName=iam_group_name)\n        \n        print(f'Created IAM group {iam_group_name} successfully.')\n\n    except ClientError as error:\n        raise Exception(f'FAILED - Cannot create IAM group {iam_group_name} - {error}')\n\n\ndef check_iam_user_exists(iam_user_name):\n    \"\"\"\n    Checks if an IAM user exists.\n    \"\"\"\n    try:\n        print(f'Checking if IAM user {iam_user_name} exists.')\n        iam_client.get_user(\n            UserName=iam_user_name)\n        print(f'PASSED - IAM user {iam_user_name} exists.')\n    except ClientError as error:\n        if error.response['Error']['Code'] == 'NoSuchEntity':\n            raise Exception(f'FAILED -IAM user {iam_user_name} does not exist.')\n        else:\n            raise Exception(f'ERROR - Cannot check IAM user {iam_user_name} - {error}')\n\ndef get_account_summary():\n    \"\"\"\n    Gets the account summary map.\n    \"\"\"\n    try:\n        return iam_client.get_account_summary()['SummaryMap']\n    except ClientError as error:\n        raise Exception(f'ERROR - Cannot get account summary - {error}')\n\n\ndef get_account_alias():\n    \"\"\"\n    Gets the account alias.\n    \"\"\"\n    try:\n        iam_client.list_account_aliases()['AccountAliases']\n    except ClientError as error:\n        raise Exception(f'ERROR - Cannot get account alias - {error}')\n\n\ndef list_attached_group_policies(iam_group_name):\n    \"\"\"\n    Lists attached group policies.\n    \"\"\"\n    try:\n        print(f'Listing attached group policies for IAM group {iam_group_name}.')\n\n        attached_policies = iam_client.list_attached_group_policies(\n            GroupName=iam_group_name)['AttachedPolicies']\n        return [policy['PolicyName'] for policy in attached_policies]\n    except ClientError as error:\n        raise Exception(f'ERROR - Cannot list attached group policies - {error}')\n\n\ndef get_managed_policies_to_attach(required_iam_permissions):\n    \"\"\"\n    Returns the list of the managed policies to attach.\n    \"\"\"\n    print(f'Getting managed policies to attach {required_iam_permissions}.')\n\n    if required_iam_permissions == 'SupportAndBillingFullAccess':\n        return [\n            MANAGED_POLICIES_MAP.get(\"SupportFullAccess\"),\n            MANAGED_POLICIES_MAP.get(\"BillingFullAccess\")]\n    else:\n        return [\n            MANAGED_POLICIES_MAP.get(required_iam_permissions)]\n\n\ndef assert_policy_limit_reached(num_attached_policies, num_policies_to_attach,\n                                account_summary_map):\n    \"\"\"\n    Asserts that the policy limit has not been reached.\n    \"\"\"\n    if (num_attached_policies + num_policies_to_attach) > account_summary_map.get('AttachedPoliciesPerGroupQuota'):\n        return False\n    else:\n        return True\n\n\ndef attach_policies_to_group(iam_group_name, policies_to_attach):\n    \"\"\"\n    Attaches the policies to the IAM group.\n    \"\"\"\n    try:\n        print(f'Attaching policies to IAM group {iam_group_name}.')\n\n        for policy in policies_to_attach:\n            print(f'Attaching policy {policy} to IAM group {iam_group_name}.')\n            iam_client.attach_group_policy(\n                GroupName=iam_group_name,\n                PolicyArn=policy\n            )\n            print(f'Successfully attached {policy} policy to IAM group {iam_group_name}.')\n    except ClientError as error:\n        raise Exception(f'ERROR - Cannot attach policies to IAM group {iam_group_name} - {error}')\n\n\ndef add_user_to_group(iam_group_name, iam_user_name):\n    \"\"\"\n    Adds the user to the IAM group.\n    \"\"\"\n    try:\n        print(f'Adding user {iam_user_name} to IAM group {iam_group_name}.')\n        iam_client.add_user_to_group(\n            GroupName=iam_group_name,\n            UserName=iam_user_name\n        )\n        print(f'Successfully added user {iam_user_name} to IAM group {iam_group_name}.')\n    except ClientError as error:\n        raise Exception(f'ERROR - Cannot add user {iam_user_name} to IAM group {iam_group_name} - {error}')\n    \n\ndef configure_iam_handler(event, context):\n    try:\n        print(f'REQUEST RECEIVED: {event}')\n\n        iam_group_name, required_iam_permissions, iam_user_name,\\\n            region, account_id, aws_partition = itemgetter(\n                            'IAMGroupName', 'Permissions', 'IAMUserName',\n                            'Region', 'AccountId', 'AWS_Partition'\n                            )(event)\n\n        global MANAGED_POLICIES_MAP\n        MANAGED_POLICIES_MAP = {\n                    \"SupportFullAccess\": f\"arn:{aws_partition}:iam::aws:policy/AWSSupportAccess\",\n                    \"BillingFullAccess\": f\"arn:{aws_partition}:iam::aws:policy/job-function/Billing\"}\n\n        setup_boto_clients()\n        account_summary_map = get_account_summary()\n        account_alias = get_account_alias()\n\n        if account_alias:\n            account_alias = account_alias[0]\n        else:\n            account_alias = account_id\n            \n        print(f'Account alias is {account_alias}')\n\n        check_iam_user_exists(iam_user_name)\n        create_or_return_iam_group(iam_group_name, account_summary_map)\n        attached_group_policies = list_attached_group_policies(iam_group_name)\n        policies_to_attach = get_managed_policies_to_attach(required_iam_permissions)\n\n        if not assert_policy_limit_reached(\n                                        len(attached_group_policies),len(policies_to_attach),\n                                        account_summary_map):\n            sys.exit(\"\"\"You cannot attach more IAM managed policies to the IAM group. \n                    Please review the existing IAM group, or create new one.\"\"\")\n        \n        attach_policies_to_group(iam_group_name, policies_to_attach)\n        add_user_to_group(iam_group_name, iam_user_name)\n\n        return {\n            'IAMGroup': iam_group_name,\n            'IAMUser': iam_user_name,\n            'AddedPermissions': policies_to_attach,\n            'LoginUrl':  f\"https://{account_alias}.signin.aws.amazon.com/console\"\n        }\n\n    except ClientError as error:\n        c = error.response['Error']['Code']\n        m = error.response['Error']['Message']\n        sys.exit(f'An error occurred during script execution - {c}:{m}')\n    except Exception as error:\n        sys.exit(f'An error occurred during script execution - {error}')\n\n",
+        "InputPayload": {
+          "IAMGroupName": "{{ IAMGroupName }}",
+          "Permissions": "{{ Permissions }}",
+          "IAMUserName": "{{ IAMUserName }}",
+          "Region": "{{ global:REGION }}",
+          "AccountId": "{{ global:ACCOUNT_ID }}",
+          "AWS_Partition": "{{ global:AWS_PARTITION }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "AddedPermissions",
+          "Selector": "$.Payload.AddedPermissions",
+          "Type": "StringList"
+        },
+        {
+          "Name": "LoginUrl",
+          "Selector": "$.Payload.LoginUrl",
+          "Type": "String"
+        }
+      ]
     }
   ],
   "outputs": [
-    "configureIAM.Payload"
+    "configureIAM.AddedPermissions",
+    "configureIAM.LoginUrl"
   ]
 }

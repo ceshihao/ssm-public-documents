@@ -1,0 +1,85 @@
+{
+  "description": "This document verifies that your instance has the right usage operation per your Microsoft SQL Server edition.\nThis document is only supported for Windows machines.",
+  "schemaVersion": "0.3",
+  "parameters": {
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The instance ID for which the verification will be performed."
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the IAM role to assume by the automation. If no role is provided, this document will run with the permissions of the user that initiated the automation.",
+      "default": ""
+    }
+  },
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "mainSteps": [
+    {
+      "name": "GetImageId",
+      "action": "aws:executeAwsApi",
+      "description": "Obtains the AMI ID of an instance.",
+      "timeoutSeconds": "3600",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "Filters": [
+          {
+            "Name": "instance-id",
+            "Values": [
+              "{{InstanceId}}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Reservations[0].Instances[0].ImageId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetUsageOperation",
+      "action": "aws:executeAwsApi",
+      "description": "Obtains the UsageOperation of an AMI.",
+      "timeoutSeconds": "3600",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "Filters": [
+          {
+            "Name": "image-id",
+            "Values": [
+              "{{GetImageId.ImageId}}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "UsageOperation",
+          "Selector": "$.Images[0].UsageOperation",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifySqlVersionAndUsageOperation",
+      "action": "aws:runCommand",
+      "description": "Obtains the Microsoft SQL Server edition installed on the instance and verifies that it matches the usage operation.",
+      "timeoutSeconds": "3600",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "commands": [
+            "try\n{\n    Import-Module 'sqlps' -DisableNameChecking\n    [System.Reflection.Assembly]::LoadWithPartialName('Microsoft.SqlServer.SMO')\n    $managedComputer = New-Object ('Microsoft.SqlServer.Management.Smo.Wmi.ManagedComputer')\n    foreach ($instance in ($managedComputer.ServerInstances |  SELECT Name))\n    {\n        $instanceName = $instance.Name\n    }\n    $sqlServerPath = Get-ItemPropertyValue -Path \"HKLM:/SYSTEM/CurrentControlSet/Services/$instanceName/\" -Name 'ImagePath'\n    $valueSplits = $sqlServerPath -split 'MSSQL'\n    $version = $valueSplits[1].Split('.', [System.StringSplitOptions]::RemoveEmptyEntries)\n    if (\"$version\" -eq '') {\n        Write-Error 'Microsoft SQL Server not detected.'\n        exit 1\n    }\n\n    $edition = Get-ItemPropertyValue -Path \"HKLM:/software/Microsoft/Microsoft SQL Server/MSSQL$version.$instanceName/Setup\" -Name 'Edition'\n    $edition = $edition.ToLower()\n    echo \"Microsoft SQL Server $edition edition found.\"\n}\ncatch\n{\n     Write-Error 'Microsoft SQL Server not detected.'\n     exit 1\n}\n\n$versionMismatch = $True\nif ((\"$edition\" -like '*standard*') -and ('{{GetUsageOperation.UsageOperation}}' -eq 'RunInstances:0006')) {\n    $versionMismatch = $False\n} elseif ((\"$edition\" -like '*enterprise*') -and ('{{GetUsageOperation.UsageOperation}}' -eq 'RunInstances:0102')) {\n    $versionMismatch = $False\n}elseif ((\"$edition\" -like '*web*') -and ('{{GetUsageOperation.UsageOperation}}' -eq 'RunInstances:0202'))  {\n    $versionMismatch = $False\n}\n\nif ($versionMismatch -eq $True) {\n    Write-Error 'The usage operation does not match the expected one.'\n    exit 1\n}\nWrite-Output 'Usage operation verification succeeded.'\n"
+          ]
+        }
+      }
+    }
+  ]
+}

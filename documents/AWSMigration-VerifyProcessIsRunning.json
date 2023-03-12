@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "2.2",
+  "description": "This action verifies that one or more processes are running locally on the instance WaitSeconds seconds after instance launch.",
+  "parameters": {
+    "Processes": {
+      "type": "String",
+      "description": "(Required) List of all processes to verify locally, separated by a space.",
+      "allowedPattern": "^[\\w\\.\\-]{1,32}(\\s[\\w\\.\\-]{1,32}){0,31}(\\s[\\w\\.\\-]{1,32}){0,18}$"
+    },
+    "WaitSeconds": {
+      "type": "String",
+      "description": "(Optional) Number of seconds to wait before starting process verification.",
+      "default": "0",
+      "allowedPattern": "^(?:0|[1-9][0-9]?|[1-2][0-9][0-9]|300)$"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runPowerShellScript",
+      "name": "VerifyWindowsProcessIsRunning",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "$waitSecondsInt = [int]'{{WaitSeconds}}'\nStart-Sleep -Seconds $waitSecondsInt\n\n$userProcesses = '{{Processes}}'.Trim().split(\" \")\n\n$runningProcessesGroups = Get-Process | Group-Object ProcessName\n$userProcessesGroups = $userProcesses | Group-Object\n\n$ret = 0\n\nforeach ($userProcess in $userProcessesGroups) {\n    $runningProcess = $runningProcessesGroups | Where-Object {\"$($_.Name)\" -eq \"$($userProcess.Name)\"}\n    if ($runningProcess -eq $null) {\n        Write-Host \"Error: $($userProcess.Name) is not running\"\n        $ret = 1\n    }\n    elseif ($runningProcess.Count -gt $userProcess.Count) {\n        Write-Host \"Warning: $($userProcess.Name) appeared $($runningProcess.Count) times, $($userProcess.Count) expected\"\n    }\n    elseif ($runningProcess.Count -lt $userProcess.Count) {\n        Write-Host \"Error: $($userProcess.Name) appeared $($runningProcess.Count) times, $($userProcess.Count) expected\"\n        $ret = 1\n    }\n    else {\n        Write-Host \"Success: $($userProcess.Name) is running\"\n    }\n}\n\nexit $ret\n"
+        ]
+      }
+    },
+    {
+      "action": "aws:runShellScript",
+      "name": "VerifyLinuxProcessIsRunning",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "#!/bin/bash\nsleep '{{WaitSeconds}}'\nrunning_processes=()\nreadarray -t processes < <(ps -eo cmd --no-headers)\nfor process in \"${processes[@]}\"; do\n  if [[ \"$process\" =~ ^\\[.*\\]$ ]]; then\n    process_name=$(echo \"$process\" | sed -e 's/^\\[//' -e 's/\\]$//')\n  else\n    process_name=$(basename -- $(echo \"$process\" | awk '{print $1}'))\n    if [ \"$?\" -ne \"0\" ]; then\n      echo \"Error: basename command failed for process $process\" >&2\n      continue\n    fi\n    process_name=\"${process_name%:}\"\n  fi\n    running_processes+=(\"$process_name\")\ndone\n\nIFS=\" \" read -ra user_processes <<< '{{Processes}}'\n\ndeclare -Ai running_processes_count\ndeclare -Ai user_processes_count\n\nfor process in \"${running_processes[@]}\"; do\n  running_processes_count[\"$process\"]+=1\ndone\n\nfor process in \"${user_processes[@]}\"; do\n  user_processes_count[\"$process\"]+=1\ndone\n\nret=0\n\nfor process in \"${!user_processes_count[@]}\"; do\n  running_count=\"${running_processes_count[\"$process\"]:-0}\"\n  expected_count=\"${user_processes_count[\"$process\"]}\"\n  if [ \"$running_count\" -eq \"0\" ]; then\n    echo \"Error: $process is not running\"\n    ret=1\n  elif [ \"$running_count\" -gt \"$expected_count\" ]; then\n    echo \"Warning: $process appeared $running_count times, $expected_count expected\"\n  elif [ \"$running_count\" -lt \"$expected_count\" ]; then\n    echo \"Error: $process appeared $running_count times, $expected_count expected\"\n    ret=1\n  else\n    echo \"Success: $process is running\"\n  fi\ndone\n\nexit $ret\n"
+        ]
+      }
+    }
+  ]
+}

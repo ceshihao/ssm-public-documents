@@ -1,16 +1,16 @@
 {
   "schemaVersion": "0.3",
-  "description": "The AWSSupport-StartEC2RescueWorkflow automation document runs the provided base64 encoded script (Bash or Powershell) on a helper instance created to rescue your instance. The root volume of your instance is attached and mounted to the helper instance, also known as the EC2Rescue instance.",
+  "description": "The AWSSupport-StartEC2RescueWorkflow runbook runs the provided base64 encoded script (Bash or PowerShell) on a helper Amazon Elastic Compute Cloud (Amazon EC2) instance created to rescue your Amazon EC2 instance. The Amazon Elastic Block Store (Amazon EBS) root volume of your instance is attached and mounted to the helper instance, also known as the EC2Rescue instance. If your instance is Windows, provide a PowerShell script, otherwise, use Bash. The runbook sets some environment variables which you can use in your script. The environment variables contain information about the input you provided, as well as information about the offline EBS root volume. The offline volume is already mounted and ready to use. For example, you can save a Desired State Configuration file to an offline Windows root volume, or chroot to an offline Linux root volume and perform an offline remediation.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "InstanceId": {
-      "type": "String",
-      "description": "(Required) ID of your EC2 instance. IMPORTANT: AWS Systems Manager Automation stops this instance. Data stored in instance store volumes will be lost. The public IP address will change if you are not using an Elastic IP.",
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) ID of your EC2 instance. IMPORTANT: AWS Systems Manager Automation stops this instance. When the instance is stopped, any data stored in the RAM or the instance store volumes is lost, and the automatic public IPv4 address is released if you are not using an Elastic IP.",
       "allowedPattern": "^i-[a-z0-9]{8,17}$"
     },
     "OfflineScript": {
       "type": "String",
-      "description": "(Required) Base64 encoded script to execute against the helper instance. Use Bash if your source instance is Linux, and PowerShell if it is Windows.",
+      "description": "(Required) The base64 encoded script to execute against the helper instance. Use Bash if your source instance is Linux, and PowerShell if it is Windows.",
       "allowedPattern": "^[a-zA-Z0-9+/]{3,}[=]{0,2}$"
     },
     "EC2RescueInstanceType": {
@@ -33,14 +33,13 @@
       "allowedPattern": "^SelectedInstanceSubnet$|^CreateNewVPC$|^subnet-[a-z0-9]{8,17}$"
     },
     "S3BucketName": {
-      "description": "(Optional) S3 bucket name in your account where you want to upload the troubleshooting logs. Make sure the bucket policy does not grant unnecessary read/write permissions to parties that do not need access to the collected logs.",
-      "allowedPattern": "^$|^[_a-zA-Z0-9][-._a-zA-Z0-9]{2,62}$",
-      "type": "String",
+      "description": "(Optional) The Amazon S3 bucket name in your account where you want to upload the troubleshooting logs. Make sure the bucket policy does not grant unnecessary read/write permissions to parties that do not need access to the collected logs.",
+      "type": "AWS::S3::Bucket::Name",
       "default": ""
     },
     "S3Prefix": {
       "type": "String",
-      "description": "(Optional) A prefix for the S3 logs.",
+      "description": "(Optional) A prefix for the Amazon S3 logs.",
       "default": "AWSSupport-EC2Rescue",
       "allowedPattern": "^[a-zA-Z0-9][-./a-zA-Z0-9]{0,255}$"
     },
@@ -81,7 +80,28 @@
   },
   "mainSteps": [
     {
+      "name": "waitForInstanceStatus",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the instance is in 'running' or 'stopped' state.",
+      "onFailure": "Abort",
+      "maxAttempts": 5,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "Reservations[0].Instances[0].State.Name",
+        "DesiredValues": [
+          "running",
+          "stopped"
+        ]
+      }
+    },
+    {
       "name": "describeInstance",
+      "description": "Describes the provided instance.",
       "action": "aws:executeAwsApi",
       "onFailure": "Abort",
       "inputs": {
@@ -95,6 +115,11 @@
         {
           "Name": "RootDeviceName",
           "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+          "Type": "String"
+        },
+        {
+          "Name": "Architecture",
+          "Selector": "$.Reservations[0].Instances[0].Architecture",
           "Type": "String"
         },
         {
@@ -116,14 +141,18 @@
           "Name": "AvailabilityZone",
           "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
           "Type": "String"
+        },
+        {
+          "Name": "InstanceLifecycle",
+          "Selector": "$.Reservations[0].Instances[0].InstanceLifecycle",
+          "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "describeInstanceRootVolume"
+      ]
     },
     {
       "name": "describeInstanceRootVolume",
       "action": "aws:executeAwsApi",
+      "description": "Describes the provided instance's EBS root volume.",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
@@ -154,13 +183,12 @@
           "Selector": "$.Volumes[0].Attachments[0].DeleteOnTermination",
           "Type": "Boolean"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "assertInstanceRootVolumeIsEbs"
+      ]
     },
     {
       "name": "assertInstanceRootVolumeIsEbs",
       "action": "aws:assertAwsResourceProperty",
+      "description": "Checks the EBS root volume device type is EBS.",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
@@ -172,13 +200,12 @@
         "DesiredValues": [
           "ebs"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "assertInstanceRootVolumeIsNotEncrypted"
+      }
     },
     {
       "name": "assertInstanceRootVolumeIsNotEncrypted",
       "action": "aws:assertAwsResourceProperty",
+      "description": "Checks the EBS root volume is not encrypted.",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
@@ -201,49 +228,174 @@
         "DesiredValues": [
           "False"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "branchOnSubnetId"
+      }
+    },
+    {
+      "name": "assertInstanceStopBehaviorIsStop",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Ensures the provided instance's shutdown behavior is 'stop' and not 'terminate'.",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceAttribute",
+        "InstanceId": "{{ InstanceId }}",
+        "Attribute": "instanceInitiatedShutdownBehavior",
+        "PropertySelector": "$.InstanceInitiatedShutdownBehavior.Value",
+        "DesiredValues": [
+          "stop"
+        ]
+      }
+    },
+    {
+      "name": "assertNotFromMarketPlace",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Ensures the provided instance's does not have an AWS Marketplace product code associated.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].ProductCodes",
+        "DesiredValues": [
+          "[]"
+        ]
+      }
+    },
+    {
+      "name": "assertInstanceLifecycleIsNotSpot",
+      "action": "aws:branch",
+      "description": "Ensures the provided instance's Lifecycle is not 'Spot'.",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "assertNotPartOfAutoScalingGroup",
+            "Not": {
+              "Variable": "{{ describeInstance.InstanceLifecycle }}",
+              "StringEquals": "spot"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "assertNotPartOfAutoScalingGroup",
+      "action": "aws:executeScript",
+      "description": "Ensures the provided instance is not part of an Amazon EC2 Auto Scaling group by calling the 'DescribeAutoScalingInstances' API. If the instance is part of an Amazon EC2 Auto Scaling group, ensures the EC2 instance is in 'Standby' lifecycle state.",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_autoscaling_resource",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}"
+        },
+        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\nautoscaling = boto3.client('autoscaling')\n\n\ndef check_autoscaling_resource(events, context):\n\n    try:\n        instances = autoscaling.describe_auto_scaling_instances(\n            InstanceIds=[events['InstanceId']]\n        )['AutoScalingInstances']\n        if instances and instances[0]['LifecycleState'] not in ['Standby']:\n            raise Exception(\n                'The target EC2 instance is part of an EC2 Auto Scaling Group and not in \"Standby\" lifecycle state')\n        else:\n            return\n\n    except ClientError as e:\n        c = e.response['Error']['Code']\n        m = e.response['Error']['Message']\n        raise Exception(\n            f'An error occurred when describing Auto Scaling instances: {c}:{m}')\n"
+      }
     },
     {
       "name": "branchOnSubnetId",
       "action": "aws:branch",
+      "description": "Branches the automation depending on whether a custom subnet ID for the target EC2 instance.",
       "onFailure": "Abort",
       "inputs": {
         "Choices": [
           {
-            "NextStep": "stageEC2RescueAutomationWithInstanceSubnet",
+            "NextStep": "stageEC2RescueAutomation",
             "Variable": "{{ SubnetId }}",
             "StringEquals": "SelectedInstanceSubnet"
           },
           {
-            "NextStep": "stageEC2RescueAutomationWithNewVPC",
+            "NextStep": "stageEC2RescueAutomation",
             "Variable": "{{ SubnetId }}",
             "StringEquals": "CreateNewVPC"
           }
         ],
         "Default": "assertCustomSubnetIsInSameAZAsInstance"
-      },
-      "isCritical": "true"
+      }
     },
     {
-      "name": "stageEC2RescueAutomationWithInstanceSubnet",
+      "name": "assertCustomSubnetIsInSameAZAsInstance",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Checks the provided subnet is in the same Availability Zone as the provided instance.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeSubnets",
+        "SubnetIds": [
+          "{{ SubnetId }}"
+        ],
+        "PropertySelector": "$.Subnets[0].AvailabilityZone",
+        "DesiredValues": [
+          "{{ describeInstance.AvailabilityZone }}"
+        ]
+      }
+    },
+    {
+      "name": "ensureNoConcurrentExecutionsForTheInstance",
+      "action": "aws:executeScript",
+      "description": "Ensures there is only one execution of this runbook targeting the provided EC2 instance. If the runbook finds another in progress execution targeting the same instance ID, it returns an error and ends.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_concurrency",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}"
+        },
+        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nimport boto3\nfrom datetime import datetime, timezone\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\nssm = boto3.client('ssm')\n\n\ndef check_concurrency(events, context):\n\n    try:\n        # Get the current execution details\n        current_execution = ssm.describe_automation_executions(\n            Filters=[{'Key': 'ExecutionId',\n                      'Values': [context['automation:EXECUTION_ID']]}])['AutomationExecutionMetadataList'][0]\n\n        current_execution_id = current_execution['AutomationExecutionId']\n\n        # Get the target of execution (Instance ID)\n        if current_execution.get('Target'):\n            instance_id = current_execution['Target']\n        else:\n            instance_id = next(iter(ssm.get_automation_execution(AutomationExecutionId=current_execution_id)[\n                               'AutomationExecution'].get('Parameters', []).get('InstanceId', [])), '')\n\n        # Parent automations do not have a Target or instance parameter set. We just return.\n        if not instance_id:\n            return\n\n        # Check for other previous/older running automations for the same current document that are in progress\n        current_execution_start_time = datetime.fromtimestamp(\n            current_execution['ExecutionStartTime'].timestamp(), timezone.utc)\n        document_executions = ssm.describe_automation_executions(\n            Filters=[{'Key': 'DocumentNamePrefix', 'Values': [current_execution['DocumentName']]},\n                     {'Key': 'ExecutionStatus', 'Values': ['InProgress']},\n                     {'Key': 'StartTimeBefore', 'Values': [\n                         current_execution_start_time.strftime('%Y-%m-%dT%H:%M:%SZ')]}\n                     ])['AutomationExecutionMetadataList']\n\n        # Check for other previous executions targetting the same instance ID. If any, return an error\n        for execution in document_executions:\n            execution_id = execution['AutomationExecutionId']\n            if execution_id != current_execution_id:\n                if execution.get('Target', '') == instance_id:\n                    raise Exception('There is another execution of this document already in progress for {} with id {}'.format(\n                        instance_id, execution['AutomationExecutionId']))\n\n                execution_details = ssm.get_automation_execution(AutomationExecutionId=execution_id)[\n                    'AutomationExecution'].get('Parameters', []).get('InstanceId', [])\n                execution_instance_id = next(iter(execution_details), '')\n                if execution_instance_id == instance_id:\n                    raise Exception('There is another execution of this document already in progress for {} with id {}'.format(\n                        instance_id, execution['AutomationExecutionId']))\n\n    except ClientError as e:\n        c = e.response['Error']['Code']\n        m = e.response['Error']['Message']\n        raise Exception(\n            f'An error occurred when checking concurrent executions: {c}:{m}')\n\n    return\n"
+      }
+    },
+    {
+      "name": "setRootVolumeDeleteOnTerminationToFalse",
+      "onFailure": "Continue",
+      "action": "aws:executeAwsApi",
+      "description": "Sets the delete on termination attribute for the root volume of the provided instance to 'false'.",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{ InstanceId }}",
+        "BlockDeviceMappings": [
+          {
+            "DeviceName": "{{ describeInstance.RootDeviceName }}",
+            "Ebs": {
+              "DeleteOnTermination": false,
+              "VolumeId": "{{ describeInstanceRootVolume.RootDeviceVolumeId }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "stageEC2RescueAutomation",
       "action": "aws:createStack",
+      "description": "Deploys the EC2Rescue CloudFormation stack.",
       "onFailure": "step:describeCloudFormationErrorFromStackEvents",
       "inputs": {
         "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}",
-        "TemplateURL": "https://awssupport-ssm.{{ global:REGION }}.s3.amazonaws.com/AWSSupport-StartEC2RescueWorkflow/CloudFormationTemplates/AWSSupport-EC2Rescue_ve776cc8f275f56ede70e128093f3261260eeca7e.template",
+        "TemplateBody": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nAWSTemplateFormatVersion: 2010-09-09\nDescription: Creates a helper instance in the specified AZ or subnet\nParameters:\n  AZ:\n    Description: Availability Zone in the current region.\n    Type: String\n    Default: ''\n  Architecture:\n    Type: String\n    AllowedValues:\n      - arm64\n      - x86_64\n  CurrentSubnetId:\n    Description: >-\n      Current instance subnet ID to use for the Automation.\n    Type: AWS::EC2::Subnet::Id\n  SubnetId:\n    Description: >-\n      Existing subnet ID to use for the Automation. If specified, no VPC is created.\n    Type: String\n    Default: ''\n  Platform:\n    Description: Source instance's platform.\n    Type: String\n    Default: ''\n  S3BucketName:\n    Description: S3 bucket name to upload troubleshooting logs to.\n    Type: String\n    Default: ''\n  S3Prefix:\n    Description: S3 bucket prefix to upload troubleshooting logs to.\n    Type: String\n    Default: ''\n  ExecutionId:\n    Description: Systems Manager Automation Execution ID.\n    Type: String\n    Default: ''\n  HelperInstanceWindowsAMI:\n    Description: SSM Parameter that resolves to a Windows AMI ID.\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    ConstraintDescription: must be a valid SSM Parameter that resolves to an AMI ID.\n    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base\n  HelperInstanceLinuxAMI:\n    Description: SSM Parameter that resolves to an Amazon Linux AMI ID.\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    ConstraintDescription: must be a valid SSM Parameter that resolves to an AMI ID.\n    Default: /aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2\n  HelperInstanceARMLinuxAMI:\n    Description: SSM Parameter that resolves to an ARM Amazon Linux AMI ID.\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    ConstraintDescription: must be a valid SSM Parameter that resolves to an AMI ID.\n    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2\n  CustomAMI:\n    Type: String\n    Description: >-\n      (Optional) Custom AMI to use for the server. This parameter overrides the\n      previously specified SSM Parameter.\n    ConstraintDescription: must be a valid AMI ID.\n    Default: ''\n  HelperInstanceType:\n    Description: >-\n      The EC2 instance type for the EC2Rescue Windows instance. Recommended\n      size: t2.small.\n    Type: String\n    Default: t3.small\n    ConstraintDescription: must be a valid EC2 instance type.\n  CreateHelperInstance:\n    Description: 'Confirm that you want to create the helper instance. Default: False'\n    Type: String\n    Default: 'False'\n    AllowedValues:\n      - 'True'\n      - 'False'\nConditions:\n  ArchitectureIsARM: !Equals \n    - !Ref Architecture\n    - arm64\n  CreateHelperInstance: !Equals \n    - !Ref CreateHelperInstance\n    - 'True'\n  UseWindowsAMI: !Equals \n    - !Ref Platform\n    - windows\n  UseCustomAMI: !Not \n    - !Equals \n      - !Ref CustomAMI\n      - ''\n  UseS3: !Not \n    - !Equals \n      - !Ref S3BucketName\n      - ''\n  NeedVPC: !Equals \n    - !Ref SubnetId\n    - 'CreateNewVPC'\n  UseInstanceSubnet: !Equals \n    - !Ref SubnetId\n    - 'SelectedInstanceSubnet'\nResources:\n  EC2RescueEC2Role:\n    Type: 'AWS::IAM::Role'\n    Properties:\n      RoleName: !Sub 'AWSSupport-EC2Rescue-EC2Role${ExecutionId}'\n      AssumeRolePolicyDocument:\n        Version: 2012-10-17\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: ec2.amazonaws.com\n            Action: 'sts:AssumeRole'\n      Policies:\n        - PolicyName: AWSSupport-EC2Rescue-EC2Role_Permissions\n          PolicyDocument:\n            Version: 2012-10-17\n            Statement:\n              - Sid: LinuxOfflineSSHKeyResetPermissions\n                Action:\n                  - 'ssm:PutParameter'\n                  - 'kms:Encrypt'\n                Resource: '*'\n                Effect: Allow\n        - PolicyName: AWSSupport-EC2Rescue-EC2Role_Read_S3_Permissions\n          PolicyDocument:\n            Version: 2012-10-17\n            Statement:\n              - Sid: S3ReadPermissions\n                Action:\n                  - 's3:GetBucketLocation'\n                  - 's3:GetObject'\n                  - 's3:GetEncryptionConfiguration'\n                  - 's3:ListMultipartUploadParts'\n                  - 's3:ListBucket'\n                  - 's3:ListBucketMultipartUploads'\n                Resource: '*'\n                Effect: Allow\n        - !If \n          - UseS3\n          - PolicyName: AWSSupport-EC2Rescue-EC2Role_Write_S3_Permissions\n            PolicyDocument:\n              Version: 2012-10-17\n              Statement:\n                - Sid: S3WritePermissions\n                  Action:\n                    - 's3:PutObject'\n                    - 's3:AbortMultipartUpload'\n                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/${S3Prefix}/*'\n                  Effect: Allow\n          - !Ref 'AWS::NoValue'\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMPatchAssociation'\n  EC2RescueInstanceProfile:\n    Type: 'AWS::IAM::InstanceProfile'\n    Properties:\n      Roles:\n        - !Ref EC2RescueEC2Role\n      InstanceProfileName: !Sub 'AWSSupport-EC2Rescue-EC2Role${ExecutionId}'\n  HelperEc2InstanceLaunchTemplate:\n    Type: AWS::EC2::LaunchTemplate\n    Properties:\n      LaunchTemplateData:\n        MetadataOptions:\n          HttpEndpoint: enabled\n          HttpTokens: optional\n  HelperInstance:\n    Condition: CreateHelperInstance\n    Type: 'AWS::EC2::Instance'\n    Properties:\n      ImageId: !If \n        - UseCustomAMI\n        - !Ref CustomAMI\n        - !If \n          - UseWindowsAMI\n          - !Ref HelperInstanceWindowsAMI\n          - !If\n            - ArchitectureIsARM\n            - !Ref HelperInstanceARMLinuxAMI\n            - !Ref HelperInstanceLinuxAMI\n      LaunchTemplate:\n        LaunchTemplateId: !Ref HelperEc2InstanceLaunchTemplate\n        Version: !GetAtt HelperEc2InstanceLaunchTemplate.LatestVersionNumber\n      InstanceType: !Ref HelperInstanceType\n      PropagateTagsToVolumeOnCreation: true\n      NetworkInterfaces:\n        - AssociatePublicIpAddress: true\n          DeleteOnTermination: true\n          DeviceIndex: '0'\n          SubnetId: !If \n            - NeedVPC\n            - !Ref Subnet\n            - !If\n              - UseInstanceSubnet\n              - !Ref CurrentSubnetId\n              - !Ref SubnetId\n      IamInstanceProfile: !Ref EC2RescueInstanceProfile\n  EC2RescueVPC:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::VPC'\n    Properties:\n      CidrBlock: 172.31.0.0/16\n      InstanceTenancy: default\n      EnableDnsSupport: true\n      EnableDnsHostnames: true\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-VPC\n  Subnet:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::Subnet'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      CidrBlock: 172.31.0.0/24\n      AvailabilityZone: !Ref AZ\n      MapPublicIpOnLaunch: true\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-Subnet\n  InternetGateway:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::InternetGateway'\n    Properties:\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-IGW\n  GatewayToInternet:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::VPCGatewayAttachment'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      InternetGatewayId: !Ref InternetGateway\n  PublicRouteTable:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::RouteTable'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-RT\n        - Key: Network\n          Value: Public\n  PublicRoute:\n    Condition: NeedVPC\n    DependsOn: GatewayToInternet\n    Type: 'AWS::EC2::Route'\n    Properties:\n      RouteTableId: !Ref PublicRouteTable\n      DestinationCidrBlock: 0.0.0.0/0\n      GatewayId: !Ref InternetGateway\n  PublicSubnetRouteTableAssociation:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::SubnetRouteTableAssociation'\n    Properties:\n      SubnetId: !Ref Subnet\n      RouteTableId: !Ref PublicRouteTable\nOutputs:\n  HelperInstanceId:\n    Condition: CreateHelperInstance\n    Value: !Ref HelperInstance\n",
         "Capabilities": [
           "CAPABILITY_NAMED_IAM"
         ],
         "ClientRequestToken": "AWSSupport-EC2Rescue-{{ UniqueId }}",
         "Parameters": [
           {
+            "ParameterKey": "CreateHelperInstance",
+            "ParameterValue": "True"
+          },
+          {
+            "ParameterKey": "Architecture",
+            "ParameterValue": "{{ describeInstance.Architecture }}"
+          },
+          {
             "ParameterKey": "AZ",
             "ParameterValue": "{{ describeInstance.AvailabilityZone }}"
           },
           {
             "ParameterKey": "SubnetId",
+            "ParameterValue": "{{ SubnetId }}"
+          },
+          {
+            "ParameterKey": "CurrentSubnetId",
             "ParameterValue": "{{ describeInstance.SubnetId }}"
           },
           {
@@ -278,250 +430,57 @@
           }
         ]
       },
-      "isCritical": "true",
-      "nextStep": "ensureNoConcurrentExecutionsForTheInstance"
-    },
-    {
-      "name": "stageEC2RescueAutomationWithNewVPC",
-      "action": "aws:createStack",
-      "onFailure": "step:describeCloudFormationErrorFromStackEvents",
-      "inputs": {
-        "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}",
-        "TemplateURL": "https://awssupport-ssm.{{ global:REGION }}.s3.amazonaws.com/AWSSupport-StartEC2RescueWorkflow/CloudFormationTemplates/AWSSupport-EC2Rescue_ve776cc8f275f56ede70e128093f3261260eeca7e.template",
-        "Capabilities": [
-          "CAPABILITY_NAMED_IAM"
-        ],
-        "ClientRequestToken": "AWSSupport-EC2Rescue-{{ UniqueId }}",
-        "Parameters": [
-          {
-            "ParameterKey": "AZ",
-            "ParameterValue": "{{ describeInstance.AvailabilityZone }}"
-          },
-          {
-            "ParameterKey": "SubnetId",
-            "ParameterValue": ""
-          },
-          {
-            "ParameterKey": "S3BucketName",
-            "ParameterValue": "{{ S3BucketName }}"
-          },
-          {
-            "ParameterKey": "S3Prefix",
-            "ParameterValue": "{{ S3Prefix }}"
-          },
-          {
-            "ParameterKey": "HelperInstanceType",
-            "ParameterValue": "{{ EC2RescueInstanceType }}"
-          },
-          {
-            "ParameterKey": "Platform",
-            "ParameterValue": "{{ describeInstance.Platform }}"
-          },
-          {
-            "ParameterKey": "ExecutionId",
-            "ParameterValue": "{{ UniqueId }}"
-          }
-        ],
-        "Tags": [
-          {
-            "Key": "Name",
-            "Value": "AWSSupport-EC2Rescue: {{ InstanceId }}"
-          },
-          {
-            "Key": "AWSSupport-EC2Rescue-AutomationExecution",
-            "Value": "{{ UniqueId }}"
-          }
-        ]
-      },
-      "isCritical": "true",
-      "nextStep": "ensureNoConcurrentExecutionsForTheInstance"
-    },
-    {
-      "name": "assertCustomSubnetIsInSameAZAsInstance",
-      "action": "aws:assertAwsResourceProperty",
-      "onFailure": "Abort",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeSubnets",
-        "SubnetIds": [
-          "{{ SubnetId }}"
-        ],
-        "PropertySelector": "$.Subnets[0].AvailabilityZone",
-        "DesiredValues": [
-          "{{ describeInstance.AvailabilityZone }}"
-        ]
-      },
-      "isCritical": "true",
-      "nextStep": "stageEC2RescueAutomationWithCustomSubnet"
-    },
-    {
-      "name": "stageEC2RescueAutomationWithCustomSubnet",
-      "action": "aws:createStack",
-      "onFailure": "step:describeCloudFormationErrorFromStackEvents",
-      "inputs": {
-        "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}",
-        "TemplateURL": "https://awssupport-ssm.{{ global:REGION }}.s3.amazonaws.com/AWSSupport-StartEC2RescueWorkflow/CloudFormationTemplates/AWSSupport-EC2Rescue_ve776cc8f275f56ede70e128093f3261260eeca7e.template",
-        "Capabilities": [
-          "CAPABILITY_NAMED_IAM"
-        ],
-        "ClientRequestToken": "AWSSupport-EC2Rescue-{{ UniqueId }}",
-        "Parameters": [
-          {
-            "ParameterKey": "AZ",
-            "ParameterValue": "{{ describeInstance.AvailabilityZone }}"
-          },
-          {
-            "ParameterKey": "SubnetId",
-            "ParameterValue": "{{ SubnetId }}"
-          },
-          {
-            "ParameterKey": "S3BucketName",
-            "ParameterValue": "{{ S3BucketName }}"
-          },
-          {
-            "ParameterKey": "S3Prefix",
-            "ParameterValue": "{{ S3Prefix }}"
-          },
-          {
-            "ParameterKey": "HelperInstanceType",
-            "ParameterValue": "{{ EC2RescueInstanceType }}"
-          },
-          {
-            "ParameterKey": "Platform",
-            "ParameterValue": "{{ describeInstance.Platform }}"
-          },
-          {
-            "ParameterKey": "ExecutionId",
-            "ParameterValue": "{{ UniqueId }}"
-          }
-        ],
-        "Tags": [
-          {
-            "Key": "Name",
-            "Value": "AWSSupport-EC2Rescue: {{ InstanceId }}"
-          },
-          {
-            "Key": "AWSSupport-EC2Rescue-AutomationExecution",
-            "Value": "{{ UniqueId }}"
-          }
-        ]
-      },
-      "isCritical": "true",
-      "nextStep": "ensureNoConcurrentExecutionsForTheInstance"
-    },
-    {
-      "name": "ensureNoConcurrentExecutionsForTheInstance",
-      "action": "aws:invokeLambdaFunction",
-      "onFailure": "step:unstageEC2RescueAutomation",
-      "inputs": {
-        "FunctionName": "AWSSupport-EC2Rescue-Check-{{ UniqueId }}",
-        "Payload": "{\"ResourceProperties\": {\"Region\": \"{{ global:REGION }}\", \"InstanceId\": \"{{ InstanceId }}\", \"ExecutionId\": \"{{ automation:EXECUTION_ID }}\", \"UniqueId\": \"{{ UniqueId }}\" }}"
-      },
-      "isCritical": "true",
-      "nextStep": "createEC2RescueInstance"
-    },
-    {
-      "name": "createEC2RescueInstance",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:describeCloudFormationErrorFromStackEvents",
-      "inputs": {
-        "Service": "cloudformation",
-        "Api": "UpdateStack",
-        "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}",
-        "UsePreviousTemplate": true,
-        "ClientRequestToken": "AWSSupport-EC2Rescue-Update-{{ UniqueId }}",
-        "Parameters": [
-          {
-            "ParameterKey": "CreateHelperInstance",
-            "ParameterValue": "True"
-          },
-          {
-            "ParameterKey": "AZ",
-            "UsePreviousValue": true
-          },
-          {
-            "ParameterKey": "SubnetId",
-            "UsePreviousValue": true
-          },
-          {
-            "ParameterKey": "S3BucketName",
-            "UsePreviousValue": true
-          },
-          {
-            "ParameterKey": "S3Prefix",
-            "UsePreviousValue": true
-          },
-          {
-            "ParameterKey": "Platform",
-            "UsePreviousValue": true
-          },
-          {
-            "ParameterKey": "ExecutionId",
-            "UsePreviousValue": true
-          },
-          {
-            "ParameterKey": "HelperInstanceType",
-            "UsePreviousValue": true
-          }
-        ],
-        "Capabilities": [
-          "CAPABILITY_NAMED_IAM"
-        ],
-        "Tags": [
-          {
-            "Key": "Name",
-            "Value": "AWSSupport-EC2Rescue: {{ InstanceId }}"
-          },
-          {
-            "Key": "AWSSupport-EC2Rescue-AutomationExecution",
-            "Value": "{{ UniqueId }}"
-          }
-        ]
-      },
-      "isCritical": "true",
-      "nextStep": "waitForEC2RescueInstanceCreation"
+      "outputs": [
+        {
+          "Name": "CloudFormationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        }
+      ]
     },
     {
       "name": "waitForEC2RescueInstanceCreation",
       "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the EC2Rescue CloudFormation stack update to complete.",
       "onFailure": "step:describeCloudFormationErrorFromStackEvents",
-      "timeoutSeconds": "600",
+      "maxAttempts": 5,
+      "timeoutSeconds": 600,
       "inputs": {
         "Service": "cloudformation",
         "Api": "DescribeStacks",
-        "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}",
+        "StackName": "{{ stageEC2RescueAutomation.CloudFormationStackId }}",
         "PropertySelector": "$.Stacks[0].StackStatus",
         "DesiredValues": [
-          "UPDATE_COMPLETE"
+          "UPDATE_COMPLETE",
+          "CREATE_COMPLETE"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "describeEC2RescueInstance"
+      }
     },
     {
       "name": "describeEC2RescueInstance",
       "action": "aws:executeAwsApi",
-      "onFailure": "step:unstageEC2RescueAutomation",
+      "description": "Describes the EC2Rescue CloudFormation stack resources to obtain the EC2Rescue helper instance ID.",
+      "onFailure": "step:waitForCloudFormationStack",
       "inputs": {
         "Service": "cloudformation",
-        "Api": "DescribeStacks",
-        "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}"
+        "Api": "DescribeStackResource",
+        "StackName": "{{ stageEC2RescueAutomation.CloudFormationStackId }}",
+        "LogicalResourceId": "HelperInstance"
       },
       "outputs": [
         {
           "Name": "EC2RescueInstanceId",
-          "Selector": "$.Stacks[0].Outputs[0].OutputValue",
+          "Selector": "$.StackResourceDetail.PhysicalResourceId",
           "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "waitForEC2RescueInstanceToBeManaged"
+      ]
     },
     {
       "name": "waitForEC2RescueInstanceToBeManaged",
       "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the EC2Rescue helper instance to become a managed instance.",
       "onFailure": "step:rebootEC2RescueInstance",
-      "timeoutSeconds": "600",
+      "timeoutSeconds": 600,
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -544,22 +503,22 @@
     {
       "name": "rebootEC2RescueInstance",
       "action": "aws:executeAwsApi",
-      "onFailure": "step:unstageEC2RescueAutomation",
+      "description": "Reboots the EC2Rescue helper instance if failed to become a managed instance.",
+      "onFailure": "step:waitForCloudFormationStack",
       "inputs": {
         "Service": "ec2",
         "Api": "RebootInstances",
         "InstanceIds": [
           "{{ describeEC2RescueInstance.EC2RescueInstanceId }}"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "waitAgainForEC2RescueInstanceToBeManaged"
+      }
     },
     {
       "name": "waitAgainForEC2RescueInstanceToBeManaged",
       "action": "aws:waitForAwsResourceProperty",
-      "onFailure": "step:unstageEC2RescueAutomation",
-      "timeoutSeconds": "600",
+      "description": "Waits again for the EC2Rescue helper instance to become a managed instance.",
+      "onFailure": "step:waitForCloudFormationStack",
+      "timeoutSeconds": 600,
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -575,14 +534,13 @@
         "DesiredValues": [
           "Online"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "stopInstance"
+      }
     },
     {
       "name": "stopInstance",
       "action": "aws:changeInstanceState",
-      "onFailure": "Continue",
+      "description": "Stops the provided instance.",
+      "onFailure": "step:forceStopInstance",
       "inputs": {
         "InstanceIds": [
           "{{ InstanceId }}"
@@ -591,12 +549,13 @@
         "DesiredState": "stopped"
       },
       "isCritical": "false",
-      "nextStep": "forceStopInstance"
+      "nextStep": "branchOnPreEC2RescueBackup"
     },
     {
       "name": "forceStopInstance",
       "action": "aws:changeInstanceState",
-      "onFailure": "step:unstageEC2RescueAutomation",
+      "description": "Forces stop the provided instance.",
+      "onFailure": "step:waitForCloudFormationStack",
       "inputs": {
         "InstanceIds": [
           "{{ InstanceId }}"
@@ -604,13 +563,12 @@
         "CheckStateOnly": false,
         "DesiredState": "stopped",
         "Force": true
-      },
-      "isCritical": "true",
-      "nextStep": "branchOnPreEC2RescueBackup"
+      }
     },
     {
       "name": "branchOnPreEC2RescueBackup",
       "action": "aws:branch",
+      "description": "Checks the CreatePreEC2RescueBackup input value. Creates a pre-EC2Rescue backup If 'CreatePreEC2RescueBackup' is equal to 'True'.",
       "onFailure": "Continue",
       "inputs": {
         "Choices": [
@@ -621,13 +579,13 @@
           }
         ],
         "Default": "installEC2RescueOnEC2RescueInstance"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "preScriptBackup",
       "action": "aws:executeAwsApi",
-      "onFailure": "step:unstageEC2RescueAutomation",
+      "description": "Creates an AMI backup of the provided instance.",
+      "onFailure": "step:waitForCloudFormationStack",
       "inputs": {
         "Service": "ec2",
         "Api": "CreateImage",
@@ -642,13 +600,12 @@
           "Selector": "$.ImageId",
           "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "tagPreScriptBackup"
+      ]
     },
     {
       "name": "tagPreScriptBackup",
       "action": "aws:createTags",
+      "description": "Tags the AMI backup.",
       "onFailure": "Continue",
       "inputs": {
         "ResourceType": "EC2",
@@ -665,13 +622,12 @@
             "Value": "{{ UniqueId }}"
           }
         ]
-      },
-      "isCritical": "false",
-      "nextStep": "installEC2RescueOnEC2RescueInstance"
+      }
     },
     {
       "name": "installEC2RescueOnEC2RescueInstance",
       "action": "aws:runCommand",
+      "description": "Installs EC2Rescue on the EC2Rescue helper instance.",
       "onFailure": "step:restoreInstanceRootVolumeDeleteOnTerminationState",
       "inputs": {
         "DocumentName": "AWS-ConfigureAWSPackage",
@@ -683,25 +639,23 @@
           "action": "Install",
           "version": "latest"
         }
-      },
-      "isCritical": "true",
-      "nextStep": "detachInstanceRootVolume"
+      }
     },
     {
       "name": "detachInstanceRootVolume",
       "action": "aws:executeAwsApi",
+      "description": "Detaches the EBS root volume from the provided instance.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
         "Api": "DetachVolume",
         "VolumeId": "{{ describeInstanceRootVolume.RootDeviceVolumeId }}"
-      },
-      "isCritical": "true",
-      "nextStep": "waitForInstanceRootVolumeToBeDetached"
+      }
     },
     {
       "name": "waitForInstanceRootVolumeToBeDetached",
       "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits until the EBS root volume is in 'available' state.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -713,13 +667,12 @@
         "DesiredValues": [
           "available"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "branchOnPlatform"
+      }
     },
     {
       "name": "branchOnPlatform",
       "action": "aws:branch",
+      "description": "Branches on the provided instance platform.",
       "onFailure": "Continue",
       "inputs": {
         "Choices": [
@@ -730,12 +683,12 @@
           }
         ],
         "Default": "attachInstanceRootVolumeToLinuxEC2RescueInstance"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "attachInstanceRootVolumeToWindowsEC2RescueInstance",
       "action": "aws:executeAwsApi",
+      "description": "Attaches the EBS root volume to the Windows EC2Rescue helper instance as *xvdf*.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -743,13 +696,12 @@
         "Device": "xvdf",
         "InstanceId": "{{ describeEC2RescueInstance.EC2RescueInstanceId }}",
         "VolumeId": "{{ describeInstanceRootVolume.RootDeviceVolumeId }}"
-      },
-      "isCritical": "true",
-      "nextStep": "waitForInstanceRootVolumeToBeAttachedToWindowsEC2RescueInstance"
+      }
     },
     {
       "name": "waitForInstanceRootVolumeToBeAttachedToWindowsEC2RescueInstance",
       "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the EBS root volume status is 'in-use.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -761,23 +713,22 @@
         "DesiredValues": [
           "in-use"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "waitBeforeRunningScriptForWindows"
+      }
     },
     {
       "name": "waitBeforeRunningScriptForWindows",
       "action": "aws:sleep",
+      "description": "Sleeps for 30 seconds.",
       "onFailure": "Continue",
       "inputs": {
         "Duration": "PT30S"
       },
-      "isCritical": "false",
-      "nextStep": "runScriptForWindows"
+      "isCritical": "false"
     },
     {
       "name": "runScriptForWindows",
       "action": "aws:runCommand",
+      "description": "Runs the provided offline script in PowerShell.",
       "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
@@ -848,12 +799,12 @@
           ]
         }
       },
-      "isCritical": "true",
       "nextStep": "stopEC2RescueInstance"
     },
     {
       "name": "attachInstanceRootVolumeToLinuxEC2RescueInstance",
       "action": "aws:executeAwsApi",
+      "description": "Attaches the EBS root volume back to Linux EC2Rescue helper instance as */dev/sdf*.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -861,13 +812,12 @@
         "Device": "/dev/sdf",
         "InstanceId": "{{ describeEC2RescueInstance.EC2RescueInstanceId }}",
         "VolumeId": "{{ describeInstanceRootVolume.RootDeviceVolumeId }}"
-      },
-      "isCritical": "true",
-      "nextStep": "waitForInstanceRootVolumeToBeAttachedToLinuxEC2RescueInstance"
+      }
     },
     {
       "name": "waitForInstanceRootVolumeToBeAttachedToLinuxEC2RescueInstance",
       "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the EBS root volume status is 'in-use.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -879,13 +829,12 @@
         "DesiredValues": [
           "in-use"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "waitBeforeRunningScriptForLinux"
+      }
     },
     {
       "name": "waitBeforeRunningScriptForLinux",
       "action": "aws:sleep",
+      "description": "Sleeps for 30 seconds.",
       "onFailure": "Continue",
       "inputs": {
         "Duration": "PT30S"
@@ -896,6 +845,7 @@
     {
       "name": "runScriptForLinux",
       "action": "aws:runCommand",
+      "description": "Runs the provided offline script in Bash.",
       "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
@@ -1120,14 +1070,13 @@
             "cleanup"
           ]
         }
-      },
-      "isCritical": "true",
-      "nextStep": "stopEC2RescueInstance"
+      }
     },
     {
       "name": "stopEC2RescueInstance",
       "action": "aws:changeInstanceState",
-      "onFailure": "Continue",
+      "description": "Stops the EC2Rescue helper instance.",
+      "onFailure": "step:forceStopEC2RescueInstance",
       "inputs": {
         "InstanceIds": [
           "{{ describeEC2RescueInstance.EC2RescueInstanceId }}"
@@ -1136,11 +1085,12 @@
         "DesiredState": "stopped"
       },
       "isCritical": "false",
-      "nextStep": "forceStopEC2RescueInstance"
+      "nextStep": "detachInstanceRootVolumeFromEC2RescueInstance"
     },
     {
       "name": "forceStopEC2RescueInstance",
       "action": "aws:changeInstanceState",
+      "description": "Forces stop the EC2Rescue helper instance.",
       "onFailure": "Continue",
       "inputs": {
         "InstanceIds": [
@@ -1149,25 +1099,23 @@
         "CheckStateOnly": false,
         "DesiredState": "stopped",
         "Force": true
-      },
-      "isCritical": "true",
-      "nextStep": "detachInstanceRootVolumeFromEC2RescueInstance"
+      }
     },
     {
       "name": "detachInstanceRootVolumeFromEC2RescueInstance",
       "onFailure": "Continue",
+      "description": "Detaches the EBS root volume from the EC2Rescue helper instance.",
       "action": "aws:executeAwsApi",
       "inputs": {
         "Service": "ec2",
         "Api": "DetachVolume",
         "VolumeId": "{{ describeInstanceRootVolume.RootDeviceVolumeId }}"
-      },
-      "isCritical": "true",
-      "nextStep": "waitForRescuedInstanceRootVolumeToBeDetached"
+      }
     },
     {
       "name": "waitForRescuedInstanceRootVolumeToBeDetached",
       "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits until the EBS root volume is in 'available' state.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -1179,13 +1127,12 @@
         "DesiredValues": [
           "available"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "attachInstanceRootVolumeToInstance"
+      }
     },
     {
       "name": "attachInstanceRootVolumeToInstance",
       "onFailure": "Continue",
+      "description": "Attaches the EBS root volume back to the provided instance.",
       "action": "aws:executeAwsApi",
       "inputs": {
         "Service": "ec2",
@@ -1193,13 +1140,12 @@
         "Device": "{{ describeInstance.RootDeviceName }}",
         "InstanceId": "{{ InstanceId }}",
         "VolumeId": "{{ describeInstanceRootVolume.RootDeviceVolumeId }}"
-      },
-      "isCritical": "true",
-      "nextStep": "waitForRescuedInstanceRootVolumeToBeAttached"
+      }
     },
     {
       "name": "waitForRescuedInstanceRootVolumeToBeAttached",
       "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the EBS root volume status is 'in-use.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -1211,13 +1157,12 @@
         "DesiredValues": [
           "in-use"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "branchOnPostEC2RescueBackup"
+      }
     },
     {
       "name": "branchOnPostEC2RescueBackup",
       "action": "aws:branch",
+      "description": "Checks the CreatePostEC2RescueBackup input value. Creates post-EC2Rescue backup If 'CreatePostEC2RescueBackup' is set to 'True'.",
       "onFailure": "Continue",
       "inputs": {
         "Choices": [
@@ -1228,12 +1173,12 @@
           }
         ],
         "Default": "restoreInstanceRootVolumeDeleteOnTerminationState"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "postScriptBackup",
       "action": "aws:executeAwsApi",
+      "description": "Creates an AMI backup of the provided instance.",
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -1249,13 +1194,12 @@
           "Selector": "$.ImageId",
           "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "tagPostScriptBackup"
+      ]
     },
     {
       "name": "tagPostScriptBackup",
       "action": "aws:createTags",
+      "description": "Tags the AMI backup.",
       "onFailure": "Continue",
       "inputs": {
         "ResourceType": "EC2",
@@ -1273,13 +1217,13 @@
           }
         ]
       },
-      "isCritical": "false",
-      "nextStep": "restoreInstanceRootVolumeDeleteOnTerminationState"
+      "isCritical": "false"
     },
     {
       "name": "restoreInstanceRootVolumeDeleteOnTerminationState",
       "onFailure": "Continue",
       "action": "aws:executeAwsApi",
+      "description": "Restores the initial delete on termination state for the root volume of the provided instance.",
       "inputs": {
         "Service": "ec2",
         "Api": "ModifyInstanceAttribute",
@@ -1293,13 +1237,12 @@
             }
           }
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "restoreInstanceInitialState"
+      }
     },
     {
       "name": "restoreInstanceInitialState",
       "action": "aws:changeInstanceState",
+      "description": "Restores the initial state of the provided instance ('running' or 'stopped').",
       "onFailure": "Continue",
       "inputs": {
         "InstanceIds": [
@@ -1307,17 +1250,18 @@
         ],
         "DesiredState": "{{ describeInstance.State }}"
       },
-      "isCritical": "true",
       "nextStep": "unstageEC2RescueAutomation"
     },
     {
       "name": "describeCloudFormationErrorFromStackEvents",
       "onFailure": "Continue",
       "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "description": "Describes errors from the EC2Rescue CloudFormation stack.",
       "inputs": {
         "Service": "cloudformation",
         "Api": "DescribeStackEvents",
-        "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}"
+        "StackName": "{{ stageEC2RescueAutomation.CloudFormationStackId }}"
       },
       "outputs": [
         {
@@ -1326,17 +1270,43 @@
           "Type": "StringList"
         }
       ],
-      "isCritical": "false",
-      "nextStep": "unstageEC2RescueAutomation"
+      "isCritical": "false"
+    },
+    {
+      "name": "waitForCloudFormationStack",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits until the AWS CloudFormation stack is in a terminal status before deleting it.",
+      "onFailure": "Continue",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ stageEC2RescueAutomation.CloudFormationStackId }}",
+        "PropertySelector": "$.Stacks[0].StackStatus",
+        "DesiredValues": [
+          "UPDATE_COMPLETE",
+          "CREATE_COMPLETE",
+          "ROLLBACK_FAILED",
+          "ROLLBACK_COMPLETE",
+          "DELETE_COMPLETE",
+          "CREATE_FAILED",
+          "DELETE_FAILED",
+          "UPDATE_ROLLBACK_FAILED",
+          "UPDATE_ROLLBACK_COMPLETE"
+        ]
+      },
+      "isCritical": false
     },
     {
       "name": "unstageEC2RescueAutomation",
       "action": "aws:deleteStack",
+      "description": "Deletes the EC2Rescue CloudFormation stack.",
       "maxAttempts": 3,
       "inputs": {
-        "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}"
+        "StackName": "{{ stageEC2RescueAutomation.CloudFormationStackId }}"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "isEnd": "true"
     }
   ],
