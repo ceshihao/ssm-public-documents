@@ -1,0 +1,91 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## Document name - AWS-ArchiveEBSVolumesnapshots\n\n## Input parameters \n  * TagKey  : (Required) The tag key for filtering snapshots.\n  * TagValue : (Required) The tag value for filtering snapshots.\n  * DryRun : (Required) DryRun parameter should be Yes or No\n  * RetentionCount: (Optional) Number of snapshots to keep for the volume.  Either RetentionCount\n      or RetentionDays should be provided, not both.\n  * RetentionDays: (Optional) Number of snapshots to keep for the volume.  Either RetentionCount\n      or RetentionDays should be provided, not both.\n  * AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf\n\n## Output parameters \n  * ArchivedSnapshots : List of archived snapshots \n\n## Minimum permissions required\n  * ec2:DescribeSnapshots\n  * ec2:ArchiveSnapshots\n  * lambda:exceution\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "SnapshotWithTag": {
+      "type": "String",
+      "description": "(Required) Specify Yes or No based on if the snapshot to archive has Tag",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ],
+      "default": "No"
+    },
+    "TagKey": {
+      "type": "String",
+      "description": "(Optional) The tag key for filtering snapshots.",
+      "allowedPattern": "^$|^[\\s+-_a-zA-Z0-9]*$",
+      "default": ""
+    },
+    "TagValue": {
+      "type": "String",
+      "description": "(Optional) The tag value for filtering snapshots.",
+      "allowedPattern": "^$|^[\\s+-_a-zA-Z0-9]*$",
+      "default": ""
+    },
+    "VolumeId": {
+      "type": "String",
+      "description": "(Optional) provide snapshot-id in case there are no Tags assigned",
+      "allowedPattern": "^$|vol-[a-z0-9]{8,17}$",
+      "default": ""
+    },
+    "DryRun": {
+      "type": "String",
+      "description": "(Required) DryRun parameter should be Yes or No",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ]
+    },
+    "RetentionCount": {
+      "type": "String",
+      "description": "(Optional) Number of snapshots to keep for the volume.  Either RetentionCount or RetentionDays should be provided, not both.",
+      "default": "",
+      "allowedPattern": "^[0-9]$"
+    },
+    "RetentionDays": {
+      "type": "String",
+      "description": "(Optional) Number of days to keep snapshots for the volume. Either RetentionCount or RetentionDays should be provided, not both",
+      "default": "",
+      "allowedPattern": "^[0-9]$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the role that allows the document to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^$|arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role\\/?[a-zA-Z_0-9+=,.@\\-_\\/]+"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "archiveVolumeSnapshots",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 100,
+      "description": "## Document name - AWS-ArchiveEBSVolumeSnapshots\n",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "tag_key": "{{TagKey}}",
+          "tag_value": "{{TagValue}}",
+          "retention_count": "{{RetentionCount}}",
+          "retention_days": "{{RetentionDays}}",
+          "dry_run": "{{DryRun}}",
+          "volume_id": "{{VolumeId}}",
+          "SnapshotWithTag": "{{SnapshotWithTag}}"
+        },
+        "Script": "import time\nfrom datetime import datetime, timedelta, tzinfo\n\nimport boto3\n\nZERO = timedelta(0)\nclient = boto3.client(\"ec2\")\n\n\nclass UTC(tzinfo):\n    def utcoffset(self, dt):\n        return ZERO\n\n    def tzname(self, dt):\n        return \"UTC\"\n\n    def dst(self, dt):\n        return ZERO\n\n\ndef get_volume_snapshots(tag_key, tag_value, client, volume_id, SnapshotWithTag):\n    if SnapshotWithTag == \"Yes\":\n        args = {\n            \"Filters\": [\n                {\"Name\": \"tag:\" + tag_key, \"Values\": [tag_value]},\n                {\"Name\": \"status\", \"Values\": [\"completed\"]},\n                {\"Name\": \"storage-tier\", \"Values\": [\"standard\"]},\n            ],\n            \"OwnerIds\": [\"self\"],\n        }\n    else:\n        args = {\n            \"Filters\": [\n                {\"Name\": \"volume-id\", \"Values\": [volume_id]},\n                {\"Name\": \"status\", \"Values\": [\"completed\"]},\n                {\"Name\": \"storage-tier\", \"Values\": [\"standard\"]},\n            ],\n            \"OwnerIds\": [\"self\"],\n        }\n    snapshots = []\n    while True:\n        resp = client.describe_snapshots(**args)\n        snapshots += resp.get(\"Snapshots\", [])\n        if \"NextToken\" in resp:\n            args[\"NextToken\"] = resp[\"NextToken\"]\n        else:\n            break\n    try:\n        if len(snapshots) > 0:\n            return snapshots\n    except Exception as ex:\n        if len(snapshots) == 0:\n            raise ex\n\n\ndef archive_snapshot(snapshot_id):\n    wait_period = 5\n    retries = 5\n    while True:\n        try:\n            client.modify_snapshot_tier(SnapshotId=snapshot_id, StorageTier=\"archive\")\n            return True\n        except Exception as ex:\n            # As the list of snapshot is eventually consistent old snapshots might appear in listed snapshots\n            if (\n                getattr(ex, \"response\", {}).get(\"Error\", {}).get(\"Code\", \"\")\n                == \"'InvalidSnapshot.NotFound\"\n            ):\n                return False\n            # Throttling might occur when archiving snapshots too fast\n            if \"throttling\" in ex.message.lower():\n                retries -= 1\n                if retries == 0:\n                    raise ex\n                time.sleep(wait_period)\n                wait_period = min(wait_period + 10, 30)\n                continue\n            raise ex\n\n\ndef handler(event, context):\n    client = boto3.client(\"ec2\")\n    tag_key = event[\"tag_key\"].strip()\n    tag_value = event[\"tag_value\"].strip()\n    dry_run = str(event[\"dry_run\"]).lower() in (\"yes\", \"true\")\n    volume_id = event[\"volume_id\"].strip()\n    SnapshotWithTag = event[\"SnapshotWithTag\"].strip()\n\n    try:\n        retention_count = int(event.get(\"retention_count\", \"0\").strip('\"').strip())\n    except:\n        retention_count = 0\n\n    try:\n        retention_days = int(event.get(\"retention_days\", \"0\").strip('\"').strip())\n    except:\n        retention_days = 0\n\n    if (retention_count == 0) and (retention_days == 0):\n        raise ValueError(\"RetentionCount or RetentionDays parameter must be specified\")\n\n    if (retention_count > 0) and (retention_days > 0):\n        raise ValueError(\n            \"Only one of RetentionCount or RetentionDays parameters can be specified\"\n        )\n\n    snapshots_to_archive = []\n\n    if retention_days > 0:\n        archive_before = datetime.utcnow().replace(tzinfo=UTC()) - timedelta(\n            days=int(retention_days)\n        )\n        i = retention_days\n        snapshots_for_volume = sorted(\n            get_volume_snapshots(\n                tag_key, tag_value, client, volume_id, SnapshotWithTag\n            ),\n            key=lambda s: s[\"StartTime\"],\n            reverse=True,\n        )\n        while i < len(snapshots_for_volume):\n            if snapshots_for_volume[i][\"StartTime\"] < archive_before:\n                snapshots_to_archive.append(snapshots_for_volume.pop(i)[\"SnapshotId\"])\n            else:\n                i += 1\n\n    elif retention_count > 0:\n        snapshots_for_volume = sorted(\n            get_volume_snapshots(\n                tag_key, tag_value, client, volume_id, SnapshotWithTag\n            ),\n            key=lambda s: s[\"StartTime\"],\n            reverse=True,\n        )\n        snapshots_to_archive = [\n            b[\"SnapshotId\"] for b in snapshots_for_volume[retention_count:]\n        ]\n\n    snapshots_archived = []\n    if dry_run:\n        return {\n            \"The following list of snapshots should have been archived. if you want to take the action, re-run the automation with same conditions but let DryRun option = No\": snapshots_to_archive\n        }\n    else:\n        for snapshot_id in snapshots_to_archive:\n            storage_tier = client.describe_snapshots(SnapshotIds=[snapshot_id])[\n                \"Snapshots\"\n            ][0][\"StorageTier\"]\n            if storage_tier != \"x\":\n                archive_snapshot(snapshot_id)\n                snapshots_archived.append(snapshot_id)\n        return {\"ArchivedSnapshots\": snapshots_archived}\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

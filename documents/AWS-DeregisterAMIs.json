@@ -1,0 +1,113 @@
+{
+  "description": "## Name\n  AWS-DeregisterAMIs\n\n## Intent\n  Deregister Amazon Machine Images (AMIs) owned by an account for specific region.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "DryRun": {
+      "type": "String",
+      "description": "(Optional) Dry run for the automation without deregistered any AMIs, just printout matching ones",
+      "allowedValues": [
+        "No",
+        "Yes"
+      ],
+      "default": "No"
+    },
+    "TagKey": {
+      "type": "String",
+      "description": "(Optional) The key of the tag to select desired AMIs",
+      "default": "",
+      "allowedPattern": "^[\\s+-_a-zA-Z0-9]*$"
+    },
+    "TagValue": {
+      "type": "String",
+      "description": "(Optional) The value of the tag to select desired AMIs",
+      "default": "",
+      "allowedPattern": "^[\\s+-_a-zA-Z0-9]*$"
+    },
+    "Age": {
+      "type": "Integer",
+      "description": "(Optional) (You can only enter either Age or RetainNumber) The number of days to deregister after it",
+      "default": 0,
+      "allowedPattern": "^[0-9]$"
+    },
+    "RetainNumber": {
+      "type": "Integer",
+      "description": "(Optional) (You can only enter either Age or RetainNumber) Number of retaining AMIs",
+      "default": 0,
+      "allowedPattern": "^[0-9]$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the role that allows the document to perform the actions on your behalf",
+      "default": "",
+      "allowedPattern": "^$|arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role\\/?[a-zA-Z_0-9+=,.@\\-_\\/]+"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateParameters",
+      "timeoutSeconds": 60,
+      "description": "Running execute script to Validate Parameters\n",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "validate",
+        "InputPayload": {
+          "Age": "{{ Age }}",
+          "RetainNumber": "{{ RetainNumber }}"
+        },
+        "Script": "def validate(events, context):\n  if events[\"Age\"] == 0 and events[\"RetainNumber\"] == 0:\n    raise Exception(\"Either Age or RetainNumber should be entered\")\n  elif events[\"Age\"] > 0 and events[\"RetainNumber\"] > 0:\n    raise Exception(\n      \"You can not enter Age and RetainNumber together, \"\n      \"either Age or RetainNumber should be entered\"\n    )"
+      },
+      "onFailure": "Abort"
+    },
+    {
+      "name": "FilterAMIs",
+      "description": "Filtering AMIs by tag using executeAwsApi.\n",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeImages",
+        "Filters": [
+          {
+            "Name": "tag:{{ TagKey }}",
+            "Values": [
+              "{{ TagValue }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Images",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "DeregisterAMIS",
+      "timeoutSeconds": 300,
+      "description": "Deregister AMIs.\n",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "deregisterOldAMIs",
+        "InputPayload": {
+          "Images": "{{ FilterAMIs.Images }}",
+          "Age": "{{ Age }}",
+          "RetainNumber": "{{ RetainNumber }}",
+          "DryRun": "{{ DryRun }}"
+        },
+        "Script": "import datetime\n\nimport boto3\nfrom dateutil.parser import parse\n\n\ndef days_old(date):\n  get_date_obj = parse(date)\n  date_obj = get_date_obj.replace(tzinfo=None)\n  diff = datetime.datetime.now() - date_obj\n  return diff.days\n\n\ndef defineOldAMIs(data, days):\n  results = []\n  for ami in data:\n    if days_old(ami[\"CreationDate\"]) > days:\n      results.append(ami)\n  return results\n\n\ndef deregisterOldAMIs(events, context):\n  ec2 = boto3.client(\"ec2\")\n  images_ids = []\n  isDryRun = False\n  if events[\"DryRun\"] == \"Yes\":\n    isDryRun = True\n  deregisteredAMIs = []\n\n  if events[\"Age\"] > 0:\n    deregisteredAMIs = defineOldAMIs(\n      events[\"Images\"][\"Images\"], events[\"Age\"]\n    )\n\n  if events[\"RetainNumber\"] > 0:\n    sortedAMIs = sorted(\n      events[\"Images\"][\"Images\"],\n      key=lambda k: k[\"CreationDate\"],\n      reverse=True\n    )\n    deregisteredAMIs = sortedAMIs[events[\"RetainNumber\"] :]\n\n  for ami in deregisteredAMIs:\n    images_ids.append(\n      ami[\"ImageId\"] + \"-\" + ami[\"Name\"] + \"-\" + ami[\"CreationDate\"]\n    )\n    if not isDryRun:\n      ec2.deregister_image(ImageId=ami[\"ImageId\"])\n\n  if not isDryRun:\n    out = {\"The following AMIs have been deregistered: \": images_ids}\n    return out\n  else:\n    out = {\n      \"The following list of AMIs should have been deregistered, \"\n      \"if you want to take the action, re-run the automation with \"\n      \"same conditions but let DryRun option = No \": images_ids\n    }\n    return out"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

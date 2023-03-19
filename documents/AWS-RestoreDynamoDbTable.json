@@ -1,0 +1,83 @@
+{
+  "description": "## Name\n  AWS-RestoreDynamoDbTable.\n\n## Intent\n  Recover the table into an old stable state using existing point in time snapshot.\n\n## Notes\n  * GlobalSecondaryIndexOverride and LocalSecondaryIndexOverride accept array of indexes to override the existing properties of the source table indexes. \n  If these parameters left blank, No indexes will be restored.\n  * If initially PITR is disabled and the EnablePointInTimeRecoverAsNeeded is true, \n  then the restore will be at the exact time of enabling PITR ignoring RestoreDateTime value.\n  * If initially PITR is enabled, then the restore time will be the RestoreDateTime value. \n\n## Permissions required for AutomationAssumeRole\n  * dynamodb:RestoreTableToPointInTime\n  * dynamodb:DescribeTable\n  * dynamodb:Scan\n  * dynamodb:Query\n  * dynamodb:UpdateItem\n  * dynamodb:PutItem\n  * dynamodb:GetItem\n  * dynamodb:DeleteItem\n  * dynamodb:BatchWriteItem",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "TargetTableName": {
+      "type": "String",
+      "description": "(Required) The name of the restored table.",
+      "allowedPattern": "(?=^.{3,255}$)(^[A-Za-z0-9_.-]*$)"
+    },
+    "SourceTableArn": {
+      "type": "String",
+      "description": "(Required) The source table ARN which is to be restored.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:dynamodb:\\w+(?:-\\w+)+:\\d{12}:table\\/[-_a-zA-Z0-9]*$"
+    },
+    "RestoreDateTime": {
+      "type": "String",
+      "description": "(Required) The recovery point in time in format 'DD/MM/YYYY HH:MM:SS'.",
+      "allowedPattern": "^([1-9]|([012][0-9])|(3[01]))\\/([0]{0,1}[1-9]|1[012])\\/\\d\\d\\d\\d (20|21|22|23|[0-1]?\\d):[0-5]?\\d:[0-5]?\\d$"
+    },
+    "EnablePointInTimeRecoverAsNeeded": {
+      "type": "Boolean",
+      "description": "(Optional) A boolean value to specify wether to enable PITR or not.",
+      "default": true,
+      "allowedPattern": "^(true|false)$"
+    },
+    "GlobalSecondaryIndexOverride": {
+      "type": "String",
+      "description": "(Optional) The new GSIs for the new table to override the current ones.",
+      "default": "[]",
+      "allowedPattern": "[-_a-zA-Z0-9]*\\[[^\\]]*\\]"
+    },
+    "LocalSecondaryIndexOverride": {
+      "type": "String",
+      "description": "(Optional) The new LSIs for the new table to override the current ones.",
+      "default": "[]",
+      "allowedPattern": "[-_a-zA-Z0-9]*\\[[^\\]]*\\]"
+    },
+    "SseSpecificationOverride": {
+      "type": "String",
+      "description": "(Optional) The SSE specification for the new table.",
+      "allowedPattern": "[-_a-zA-Z0-9]*\\{[^\\]]*\\}",
+      "default": ""
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf",
+      "default": "",
+      "allowedPattern": "^$|arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role\\/?[a-zA-Z_0-9+=,.@\\-_\\/]+"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RestoreDynamodbTable",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 500,
+      "description": "## Dynamodb-table-cross-region-restore.\n",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "restore_dynamodb_table",
+        "InputPayload": {
+          "TargetTableName": "{{TargetTableName}}",
+          "SourceTableArn": "{{SourceTableArn}}",
+          "RestoreDateTime": "{{RestoreDateTime}}",
+          "EnablePointInTimeRecoverAsNeeded": "{{EnablePointInTimeRecoverAsNeeded}}",
+          "GlobalSecondaryIndexOverride": "{{GlobalSecondaryIndexOverride}}",
+          "LocalSecondaryIndexOverride": "{{LocalSecondaryIndexOverride}}",
+          "SseSpecificationOverride": "{{SseSpecificationOverride}}"
+        },
+        "Script": "import json\nimport boto3\nimport time\nfrom datetime import datetime\nssm_client = boto3.client('ssm')\ndynamodb_client = boto3.client('dynamodb')\ndynamodb_client_source_region = ''\n\n\ndef restore_dynamodb_table(event, context):\n  UseLatestRestorableTime = False\n  try:\n    source_table_name = event[\"SourceTableArn\"].split('/')[1]\n    source_region = event[\"SourceTableArn\"].split(':')[3]\n    dynamodb_client_source_region = boto3.client('dynamodb', region_name=source_region)\n  except Exception:\n    raise Exception(\"Invalid DynamoDB table Arn\")\n  \n  # check if PITR is Enabled, continue... otherwise we check\n  # EnablePointInTimeRecoverAsNeeded flag\n  response = dynamodb_client_source_region.describe_continuous_backups(TableName=source_table_name)\n  if response[\"ContinuousBackupsDescription\"][\"PointInTimeRecoveryDescription\"][\"PointInTimeRecoveryStatus\"] == 'DISABLED':\n    if not event[\"EnablePointInTimeRecoverAsNeeded\"]:\n      raise Exception(\"point-in-time-recovery feature must be enabled.\")\n    else:\n      enable_pitr(source_table_name, dynamodb_client_source_region)\n      UseLatestRestorableTime = True\n  \n  if UseLatestRestorableTime:\n    return restore_to_latest_restorable_time(event)\n  else:\n    return restore_to_datetime(event)\n\n\ndef enable_pitr(table_name, dynamodb_client):\n  dynamodb_client.update_continuous_backups(\n  TableName=table_name,\n  PointInTimeRecoverySpecification={\n  'PointInTimeRecoveryEnabled': True\n}\n  )\n\n\ndef restore_to_latest_restorable_time(event):\n  dynamodb_client.restore_table_to_point_in_time(\n  SourceTableArn=event[\"SourceTableArn\"],\n  TargetTableName=event[\"TargetTableName\"],\n  UseLatestRestorableTime=True,\n  GlobalSecondaryIndexOverride=json.loads(event[\"GlobalSecondaryIndexOverride\"]),\n  LocalSecondaryIndexOverride=json.loads(event[\"LocalSecondaryIndexOverride\"]),\n  SSESpecificationOverride=json.loads(event[\"SseSpecificationOverride\"])\n  )\n  return \"Table restored successfully\"\n\n\ndef restore_to_datetime(event):\n  dynamodb_client.restore_table_to_point_in_time(\n  SourceTableArn=event[\"SourceTableArn\"],\n  TargetTableName=event[\"TargetTableName\"],\n  RestoreDateTime=datetime.strptime(event[\"RestoreDateTime\"], '%d/%m/%Y %H:%M:%S'),\n  GlobalSecondaryIndexOverride=json.loads(event[\"GlobalSecondaryIndexOverride\"]),\n  LocalSecondaryIndexOverride=json.loads(event[\"LocalSecondaryIndexOverride\"]),\n  SSESpecificationOverride=json.loads(event[\"SseSpecificationOverride\"])\n  )\n  return \"Table restored successfully\"\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

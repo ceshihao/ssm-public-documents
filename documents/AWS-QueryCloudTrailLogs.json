@@ -1,0 +1,143 @@
+{
+  "description": "## Name\n  AWS-QueryCloudTrailLogs.\n\n## Intent\n  Creates an Athena table from a specified s3 path of cloudtrail logs and Run SQL queries against it and then deletes the table.\n\n## Notes\n  * No need to specify the database name in the query. The query runs against the 'default' database.\n  * The table name in the query must be the same as the TableName parameter.  \n  * If the Output bucket path is not provided, then the document will create a bucket for the user and delete it at the end of the document execution.\n\n## Permissions required for AutomationAssumeRole\n  * s3:PutObject.\n  * s3:GetObject.\n  * s3:CreateBucket.\n  * s3:ListBucketMultipartUploads.\n  * s3:AbortMultipartUpload.\n  * s3:ListBucket.\n  * s3:GetBucketLocation.\n  * s3:ListMultipartUploadParts.\n  * athena:StartQueryExecution.\n  * athena:GetQueryExecution.\n  * athena:GetQueryResults.\n  * glue:GetTable.\n  * glue:CreateTable.\n  * glue:DeleteTable.\n  * glue:GetPartitions.\n  * glue:GetDatabase.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "Query": {
+      "type": "String",
+      "description": "(Required) The query to be executed.",
+      "allowedPattern": "^.{1,262144}$"
+    },
+    "SourceBucketPath": {
+      "type": "String",
+      "description": "(Required) The bucket path of the logs where the queries are executed against. example s3 uri: (s3://bucket-name/).",
+      "allowedPattern": "(s3:\\/\\/)?(.*)"
+    },
+    "TableName": {
+      "type": "String",
+      "description": "(Optional) The table name that will be created from the cloudtrail logs.",
+      "default": "cloudtrail_logs",
+      "allowedPattern": "[-_a-zA-Z0-9]*"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": "",
+      "allowedPattern": "^$|arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role\\/?[a-zA-Z_0-9+=,.@\\-_\\/]+"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckSourceBucketPath",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "description": "## CheckSourceBucketPath.\nChecking Source Bucket Path.\n",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_source_bucket_path",
+        "InputPayload": {
+          "SourceBucketPath": "{{SourceBucketPath}}",
+          "Id": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import re\nimport boto3\nfrom botocore.exceptions import ClientError\ns3_client = boto3.resource(\"s3\")\ndef check_source_bucket_path(event, context):\n    bucket_name = re.search(r\"(?<=s3:\\/\\/)[^\\/]+\", event[\"SourceBucketPath\"]).group(0)\n    try:\n        s3_client.meta.client.head_bucket(Bucket=bucket_name)\n        print(\"Bucket exists.\", bucket_name)\n    except ClientError as error:\n        error_code = int(error.response[\"Error\"][\"Code\"])\n        if error_code == 403:\n            print(\"Private Bucket. Forbidden Access! \", bucket_name)\n        elif error_code == 404:\n            print(\"Bucket Does Not Exist!\", bucket_name)\n    return {\"bucket_path\": event[\"SourceBucketPath\"]}\n"
+      },
+      "outputs": [
+        {
+          "Name": "bucket_path",
+          "Selector": "$.Payload.bucket_path",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateTable",
+      "timeoutSeconds": 300,
+      "description": "## CreateTable.\nCreating Tables.\n",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "athena",
+        "Api": "StartQueryExecution",
+        "QueryString": " CREATE EXTERNAL TABLE {{TableName}}( eventVersion STRING, userIdentity STRUCT< type: STRING, principalId: STRING, arn: STRING, accountId: STRING, invokedBy: STRING, accessKeyId: STRING, userName: STRING, sessionContext: STRUCT< attributes: STRUCT< mfaAuthenticated: STRING, creationDate: STRING>, sessionIssuer: STRUCT< type: STRING, principalId: STRING, arn: STRING, accountId: STRING, userName: STRING>>>, eventTime STRING, eventSource STRING, eventName STRING, awsRegion STRING, sourceIpAddress STRING, userAgent STRING, errorCode STRING, errorMessage STRING, requestParameters STRING, responseElements STRING, additionalEventData STRING, requestId STRING, eventId STRING, readOnly STRING, resources ARRAY<STRUCT< arn: STRING, accountId: STRING, type: STRING>>, eventType STRING, apiVersion STRING, recipientAccountId STRING, serviceEventDetails STRING, sharedEventID STRING, vpcEndpointId STRING ) ROW FORMAT SERDE 'com.amazon.emr.hive.serde.CloudTrailSerde' STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat' OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat' LOCATION '{{SourceBucketPath}}' ",
+        "ResultConfiguration": {
+          "OutputLocation": "{{CheckSourceBucketPath.bucket_path}}"
+        }
+      }
+    },
+    {
+      "name": "ExecuteQuery",
+      "timeoutSeconds": 300,
+      "description": "## ExecuteQuery.\nExecuting Tables.\n",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:WaitForQueryToFinish",
+      "inputs": {
+        "Service": "athena",
+        "Api": "StartQueryExecution",
+        "QueryString": "{{Query}}",
+        "ResultConfiguration": {
+          "OutputLocation": "{{CheckSourceBucketPath.bucket_path}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "queryExecutionId",
+          "Selector": "$.QueryExecutionId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitForQueryToFinish",
+      "action": "aws:executeScript",
+      "onFailure": "step:GetQueryResults",
+      "timeoutSeconds": 600,
+      "description": "## WaitForQueryToFinish.\nWait For Query To Finish.\n",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "wait_for_query_results",
+        "InputPayload": {
+          "query_execution_id": "{{ExecuteQuery.queryExecutionId}}"
+        },
+        "Script": "import time\nimport boto3\nathena_client = boto3.client(\"athena\")\ndef wait_for_query_results(event, context):\n    status = \"RUNNING\"\n    iterations = 180\n    while iterations > 0:\n      iterations -= 1\n      response = athena_client.get_query_execution(\n      QueryExecutionId=event[\"query_execution_id\"]\n      )\n      status = response[\"QueryExecution\"][\"Status\"][\"State\"]\n      if (status == \"FAILED\") or (status == \"CANCELLED\"):\n        error_message = response[\"QueryExecution\"][\"Status\"][\"StateChangeReason\"]\n        raise Exception(error_message)\n      elif status == \"SUCCEEDED\":\n        return \"Success\"\n      else:\n        time.sleep(2)\n"
+      }
+    },
+    {
+      "name": "GetQueryResults",
+      "timeoutSeconds": 300,
+      "action": "aws:executeAwsApi",
+      "description": "## GetQueryResults.\nGet Query Results.\n",
+      "onFailure": "step:DeleteTable",
+      "inputs": {
+        "Service": "athena",
+        "Api": "GetQueryResults",
+        "QueryExecutionId": "{{ExecuteQuery.queryExecutionId}}"
+      },
+      "outputs": [
+        {
+          "Name": "result",
+          "Selector": "$.ResultSet.Rows",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "DeleteTable",
+      "timeoutSeconds": 300,
+      "action": "aws:executeAwsApi",
+      "description": "## DeleteTable.\nDeleting Table.\n",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "athena",
+        "Api": "StartQueryExecution",
+        "QueryString": "DROP TABLE {{TableName}}",
+        "ResultConfiguration": {
+          "OutputLocation": "{{CheckSourceBucketPath.bucket_path}}"
+        }
+      }
+    }
+  ],
+  "outputs": [
+    "GetQueryResults.result"
+  ]
+}
