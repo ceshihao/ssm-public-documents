@@ -1,0 +1,169 @@
+{
+  "description": "## Id\nAWSResilienceHub-DeleteEFSReplicationSOP_2023-01-01\n\n## Intent\nDelete an existing EFS Replication configuration in order to fail over to the destination file system\n\n## Type\nSOP\n\n## Risk\nHigh\n\n## Requirements\n  * EFS file system\n  * Automatic Approval Boolean Value. If not stated,an SNS Topic and a Role the has permissions to authorize should be passed\n\n## Permissions required for AutomationAssumeRole\n  * elasticfilesystem:DeleteReplicationConfiguration\n  * elasticfilesystem:DescribeReplicationConfigurations\n  * SNS:Publish\n\n## Supports Rollback\nNo\n\n## Cancellation behavior\nFail\n\n## Inputs\n### (Required) AutomationAssumeRole\n  * type: String\n  * description: ARN of the IAM role with permissions listed above\n\n### (Required) FileSystemId\n  * type: String\n  * description: ID of the EFS file system\n\n ### (Optional) ApproveDeleteReplicationAutomatically\n  * type: String\n  * description: If it is true, approve deleting EFE Replication automatically.\n    Otherwise, give a user a chance to decide. It is false by default.\n\n### (Optional) SNSTopicARNForManualApproval\n  * type: String\n  * description: The ARN of the SNS Topic where a user will receive the notification\n                  about the manual approval of deleting the given EFS Replication\n\n ### (Optional) IAMPrincipalForManualApproval\n  * type: String\n  * description: ARN of AWS authenticated principal who are able to either approve or reject the deletion of the given EFS Replication.\n                 Can be either an AWS Identity and Access Management (IAM) user name or IAM user ARN or IAM role ARN or IAM assume role user ARN\n\n## Details\nThe document deletes an EFS Replication Configuration\n\n## Steps executed in normal flow\n  * CheckApproveInputs\n  * CheckAutomaticApproval\n  * ApproveChangeOrCancel\n  * RecordStartTime\n  * DeleteEfsReplication\n  * OutputRecoveryTime\n\n## Outputs\n### OutputRecoveryTime.RecoveryTime\n  * type: Integer\n  * description: SOP execution time in seconds",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "FileSystemId": {
+      "type": "String",
+      "description": "(Required) ID of the EFS file system"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf"
+    },
+    "ApproveDeleteReplicationAutomatically": {
+      "type": "Boolean",
+      "description": "(Optional) If it is true, approve changing approve deleting EFE Replication automatically.\nOtherwise, give a user a chance to decide. It is false by default.",
+      "default": false
+    },
+    "SNSTopicARNForManualApproval": {
+      "type": "String",
+      "description": "(Optional) The ARN of the SNS Topic where a user will receive the notification\nabout the manual approval of deleting the given EFS Replication.",
+      "default": ""
+    },
+    "IAMPrincipalForManualApproval": {
+      "type": "String",
+      "description": "(Optional) ARN of AWS authenticated principal who are able to either approve or reject the deletion of the given EFS Replication.\nCan be either an AWS Identity and Access Management (IAM) user name or IAM user ARN or IAM role ARN or IAM assume role user ARN",
+      "default": ""
+    }
+  },
+  "outputs": [
+    "OutputRecoveryTime.RecoveryTime"
+  ],
+  "mainSteps": [
+    {
+      "name": "CheckApproveInputs",
+      "action": "aws:branch",
+      "description": "Validate inputs in case automatic approval is not true",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ApproveDeleteReplicationAutomatically}}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{SNSTopicARNForManualApproval}}",
+                "StringEquals": ""
+              }
+            ],
+            "NextStep": "FailWithIncorrectApproveParams"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ApproveDeleteReplicationAutomatically}}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{IAMPrincipalForManualApproval}}",
+                "StringEquals": ""
+              }
+            ],
+            "NextStep": "FailWithIncorrectApproveParams"
+          }
+        ],
+        "Default": "CheckAutomaticApproval"
+      }
+    },
+    {
+      "name": "CheckAutomaticApproval",
+      "description": "Branch for automatic approval",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RecordStartTime",
+            "Variable": "{{ApproveDeleteReplicationAutomatically}}",
+            "BooleanEquals": true
+          },
+          {
+            "NextStep": "ApproveChangeOrCancel",
+            "Variable": "{{ApproveDeleteReplicationAutomatically}}",
+            "BooleanEquals": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "FailWithIncorrectApproveParams",
+      "action": "aws:executeScript",
+      "description": "Fail with message",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "raise_exception",
+        "InputPayload": {
+          "ErrorMessage": "If ApproveDeleteReplicationAutomatically parameter is set to `true`, both IAMPrincipalForManualApproval and SNSTopicARNForManualApproval parameters must be non-empty"
+        },
+        "Script": "import logging\nimport time\nfrom datetime import datetime, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef raise_exception(events, context):\n    \"\"\"\n    Raises AssertionError exception with defined error message\n    You can pass additional arguments to run python format() on the message.\n    Example:\n\n    ErrorMessage: \"test {test1} {test2}\"\n    test1: \"replaced1\"\n    test2: \"replaced2\"\n\n    will render in\n    `test replaced1 replaced2`\n\n\n    :param events: dict with the following keys:\n        * ErrorMessage: error message to return, you can add placeholders in {} and replace them with other parameters\n        * any_key: will replace placeholder {any_key} in ErrorMessage\n    :param context:\n    :return: None\n    \"\"\"\n    required_params = [\n        'ErrorMessage'\n    ]\n\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n    format_dict = {k: v for k, v in events.items() if k != 'ErrorMessage'}\n    raise AssertionError(events['ErrorMessage'].format(**format_dict))"
+      }
+    },
+    {
+      "name": "ApproveChangeOrCancel",
+      "action": "aws:approve",
+      "description": "Manual Approval for deleting EFS Replication",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicARNForManualApproval}}",
+        "Message": "Do you agree to delete the given EFS replication configuration? Data will cease to sync between your source and target file systems",
+        "MinRequiredApprovals": 1,
+        "Approvers": [
+          "{{IAMPrincipalForManualApproval}}"
+        ]
+      }
+    },
+    {
+      "name": "RecordStartTime",
+      "description": "Start recording execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_time",
+        "Script": "import logging\nimport time\nfrom datetime import datetime, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
+      }
+    },
+    {
+      "name": "DeleteEfsReplication",
+      "description": "Delete Replication",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "delete_efs_replication",
+        "InputPayload": {
+          "FileSystemId": "{{ FileSystemId }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef update_boto3_version():\n    boto_modules = []\n    for m in sys.modules.keys():\n        if m.startswith(\"boto\"):\n            boto_modules.append(m)\n    for m in boto_modules:\n        del sys.modules[m]\n    subprocess.check_call(\n        [sys.executable, \"-m\", \"pip\", \"install\", \"boto3\", \"-t\", \"/tmp/\"]\n    )\n    sys.path.insert(0, \"/tmp/\")\n\n\n\ndef delete_efs_replication(events, context):\n    update_boto3_version()\n    import boto3\n    replication_region = boto3.client(\"efs\").describe_replication_configurations(\n        FileSystemId=events[\"FileSystemId\"]\n    )[\"Replications\"][0][\"Destinations\"][0][\"Region\"]\n    boto3.client(\"efs\", region_name=replication_region).delete_replication_configuration(\n        SourceFileSystemId=events[\"FileSystemId\"]\n    )"
+      }
+    },
+    {
+      "name": "OutputRecoveryTime",
+      "description": "Calculate execution time",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "RecoveryTime",
+          "Selector": "$.Payload",
+          "Type": "Integer"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "recovery_time",
+        "Script": "import logging\nimport time\nfrom datetime import datetime, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
+        "InputPayload": {
+          "StartTime": "{{ RecordStartTime.StartTime }}"
+        }
+      }
+    }
+  ]
+}

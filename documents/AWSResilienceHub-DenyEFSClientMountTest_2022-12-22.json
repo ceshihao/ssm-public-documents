@@ -1,0 +1,338 @@
+{
+  "description": "## Id\nefs:test:deny_client_mount:2022-12-22\n\n## Intent\nTest the denial of an EFS Client Mount\n\n## Type\nSoftware Outage Test\n\n## Risk\nHigh\n\n## Requirements\n* An alarm that tracks the number of mount failures for the EFS filesystem.\n* An EC2 instance which conforms to the guidelines below.\n* Make sure that the instance is provisioned in one of the EFS filesystem's AZs.\n* Make sure that there is a mount target in the AZ of the EC2 instance.\n* Make sure that the mount target security groups allows incoming traffic from the EC2 instance on port 2049.\n* Make sure Amazon EFS utils are installed.\n* Make sure cloudwatch logs are enabled in efs-utils.\n* Make sure that (on the instance) you've configured `log_group_name` in `/etc/amazon/efs/efs-utils.conf`, as the same log group used for the mount_failure alarm which is a dependency of this FIS.\n\n## Permissions required for AutomationAssumeRole\n* elasticfilesystem:DescribeFileSystems\n* elasticfilesystem:DescribeFileSystemPolicy\n* elasticfilesystem:PutFileSystemPolicy\n* elasticfilesystem:DeleteFileSystemPolicy\n* cloudwatch:DescribeAlarms\n* ssm:GetAutomationExecution\n* ssm:StartAutomationExecution\n* ssm:GetParameters\n* ssm:DescribeInstanceInformation\n* ssm:ListCommands\n* ssm:ListCommandInvocations\n* ssm:SendCommand\n* iam:PassRole\n\n## Supports Rollback\nYes. Users can run the script with `IsRollback` and `PreviousExecutionId` to rollback changes from the previous run.\n\n## Cancellation behavior\nRestore the original resource policy for the EFS filesystem.\n\n## Inputs\n### `FileSystemId`:\n    type: String\n    description: (Required) The EFS File System ID\n### `MountFailureAlarmName`:\n    type: String\n    description: (Required) The name of the MountFailure Alarm for the specified FileSystemId.\n### `InstanceId`:\n    type: String\n    description: (Required) The ID of the test EC2 Instance on which mounting should fail.\n### `MountPath`:\n    type: String\n    description: (Optional) The path on the filesystem of the instance where the EFS file system should be mounted.\n### `MountFailureTestRole`:\n    type: String\n    description: (Required) The ARN of the role that will be denied mounting of the EFS file system (AKA the principal of the deny statement added to the policy of the EFS). The instance profile role should be used.\n### `IsRollback`:\n    type: String\n    description: (Optional) Run rollback step of the given previous execution parameter (`PreviousExecutionId`). Can be either true or false.\n    default: \"false\"\n### `PreviousExecutionId`:\n    type: String\n    description: (Optional) Previous execution ID for which resources need to be cleaned up.\n    default: \"\"\n### `AutomationAssumeRole`:\n    type: String\n    description: (Required) The Amazon Resource Name (ARN) of the role that allows Automation to perform the actions on your behalf.\n\n## Details\nThe document updates the policy of an EFS filesystem with an explicit deny statement for mounting the specified EC2 instance (if there's no resource policy on the EFS to begin with, it adds one with the default permissions (elasticfilesystem:ClientMount, elasticfilesystem:ClientWrite and elasticfilesystem:ClientRootAccess granted to all principals, which means unrestricted) and adds the explicit deny statement to that policy). Then, the document tests if an alarm is triggered for the `MountFailures` custom metric. After that, the document rolls back the policy its original state (if there was no resource policy on the EFS to begin with, it gets deleted), and waits for the alarm to return into an \"OK\" state.\n\n## Steps executed in normal flow\n* CheckIsRollback\n* AssertAlarmToBeGreenBeforeTest\n* BackupCurrentExecution\n* GenerateBadEfsPolicy\n* InjectFailure\n* MountEfsOnDeniedInstance\n* AssertAlarmToBeRed\n* RollbackCurrentExecution\n* MountEfsOnNoLongerDeniedInstance\n* AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n* CheckIsRollback\n* GetInputsFromPreviousExecution\n* AssertFileSystemId\n* PrepareRollbackOfPreviousExecution\n* RollbackPreviousExecution\n\n## Outputs\nNone",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "FileSystemId": {
+      "type": "String",
+      "description": "(Required) The EFS File System ID"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "MountFailureAlarmName": {
+      "type": "String",
+      "description": "(Required) The name of the MountFailure Alarm for the specified FileSystemId."
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) The ID of the test EC2 Instance on which mounting should fail."
+    },
+    "MountPath": {
+      "type": "String",
+      "description": "(Optional) The path on the filesystem of the instance where the EFS file system should be mounted.",
+      "default": "/mnt/efsMountTest"
+    },
+    "MountFailureTestRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that will be denied mounting of the EFS file system (AKA the principal of the deny statement added to the policy of the EFS). The instance profile role should be used."
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Run rollback step of the given previous execution parameter (`PreviousExecutionId`). Can be set to either true or false.",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution ID for which resources need to be cleaned up.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckIsRollback",
+      "description": "Check if document should be executed in rollback mode.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetInputsFromPreviousExecution",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "AssertAlarmToBeGreenBeforeTest"
+      }
+    },
+    {
+      "name": "GetInputsFromPreviousExecution",
+      "description": "Get input from previous execution. This will be used to validate that rollback is executed with the same input",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "FileSystemId",
+          "Selector": "$.Payload.FileSystemId[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_inputs_from_ssm_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}"
+        },
+        "Script": "import json\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events:\n        raise KeyError('Requires ExecutionId')\n\n    if not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    response_parameters = response['AutomationExecution']['Parameters']\n    # TODO DIG-853\n    for parameter in response_parameters:\n        output[parameter] = response_parameters[parameter]\n\n    return output"
+      }
+    },
+    {
+      "name": "AssertFileSystemId",
+      "description": "Make sure that the file system id from this execution is equal to the one from the previous execution.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PrepareRollbackOfPreviousExecution",
+            "Variable": "{{ GetInputsFromPreviousExecution.FileSystemId }}",
+            "StringEquals": "{{ FileSystemId }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "PrepareRollbackOfPreviousExecution",
+      "description": "Get the original EFS policy",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "EfsPolicy",
+          "Selector": "$.Payload.EfsPolicy[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_output_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{ PreviousExecutionId }}",
+          "StepName": "BackupCurrentExecution",
+          "ResponseField": "EfsPolicy"
+        },
+        "Script": "import json\n\nimport boto3\nfrom botocore.config import Config\n\n\n\ndef get_output_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                if response_field in step['Outputs']:\n                    # Sets values in string type regardless of what is the original value type. In order to set\n                    # values with original types please use 'get_typed_output_from_ssm_step_execution'.\n                    output[response_field] = step['Outputs'][response_field]\n                else:\n                    \"\"\"\n                    By default SSM ignores empty values when encodes API outputs to JSON. It may result in\n                    a situation when an empty value is a valid value but step output completely misses it.\n                    Usually happens with SQS queue policies, default policy is returned by API as an empty value\n                    and executeApi step output ignores it. As a result, further steps in rollback execution will fail.\n                    Instead of ignoring this value we should use a default empty value in rollback, i.e. empty string\n                    represents a default sqs policy\n                    \"\"\"\n                    output[response_field] = ['']\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "RollbackPreviousExecution",
+      "description": "Apply the original policy from the previous execution to the EFS.",
+      "maxAttempts": 5,
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "deny_client_mount_rollback_current_execution",
+        "InputPayload": {
+          "FileSystemId": "{{ GetInputsFromPreviousExecution.FileSystemId }}",
+          "OriginalEfsPolicy": "{{ PrepareRollbackOfPreviousExecution.EfsPolicy }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef deny_client_mount_rollback_current_execution(events: dict, context: dict):\n    efs_client = boto3.client(\"efs\")\n\n    file_system_id: str = events.get(\"FileSystemId\") or \"\"\n    original_efs_policy = events.get(\"OriginalEfsPolicy\") or \"\"\n    original_efs_policy = (\n        None\n        if type(original_efs_policy) == str and original_efs_policy.startswith(\"{{\")\n        else original_efs_policy\n    )\n\n    if not original_efs_policy:\n        efs_client.delete_file_system_policy(FileSystemId=file_system_id)\n        return\n\n    efs_client.put_file_system_policy(\n        FileSystemId=file_system_id, Policy=original_efs_policy\n    )"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ MountFailureAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "BackupCurrentExecution",
+      "description": "Backup current execution.",
+      "action": "aws:executeScript",
+      "outputs": [
+        {
+          "Name": "EfsArn",
+          "Selector": "$.Payload.EfsArn",
+          "Type": "String"
+        },
+        {
+          "Name": "EfsPolicy",
+          "Selector": "$.Payload.EfsPolicy",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_efs_policy",
+        "InputPayload": {
+          "FileSystemId": "{{ FileSystemId }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef get_efs_policy(events: dict, context: dict) -> dict:\n    efs_client = boto3.client(\"efs\")\n\n    file_system_id: str = events.get(\"FileSystemId\") or \"\"\n    efs_arn = efs_client.describe_file_systems(FileSystemId=file_system_id)[\n        \"FileSystems\"\n    ][0][\"FileSystemArn\"]\n    try:\n        efs_policy = efs_client.describe_file_system_policy(\n            FileSystemId=file_system_id\n        )[\"Policy\"]\n    except ClientError as error:\n        if error.response[\"Error\"][\"Code\"] == \"PolicyNotFound\":\n            return {\"EfsArn\": efs_arn, \"EfsPolicy\": None}\n        else:\n            raise error\n\n    return {\"EfsArn\": efs_arn, \"EfsPolicy\": efs_policy}"
+      }
+    },
+    {
+      "name": "GenerateBadEfsPolicy",
+      "description": "Generate an EFS policy that denies client mount.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "add_deny_in_efs_policy",
+        "InputPayload": {
+          "SourcePolicy": "{{ BackupCurrentExecution.EfsPolicy }}",
+          "Principal": "{{ MountFailureTestRole }}",
+          "ActionsToDeny": [
+            "elasticfilesystem:ClientMount"
+          ],
+          "Resource": "{{ BackupCurrentExecution.EfsArn }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef add_deny_in_efs_policy(events: dict, context: dict) -> dict:\n    \"\"\"\n    Add deny policy statement(-s) to the EFS policy whether it is empty or not\n    :return: updated EFS policy with deny\n    \"\"\"\n    if (\n        \"ActionsToDeny\" not in events\n        or \"Resource\" not in events\n        or \"SourcePolicy\" not in events\n        or \"Principal\" not in events\n    ):\n        raise KeyError(\n            \"Requires ActionsToDeny and Resource and SourcePolicy and Principal in events\"\n        )\n\n    actions_to_deny: List = events.get(\"ActionsToDeny\") or \"\"\n    resource: str = events.get(\"Resource\") or \"\"\n    source_policy = events.get(\"SourcePolicy\") or None\n    source_policy = (\n        None\n        if type(source_policy) == str and source_policy.startswith(\"{{\")\n        else source_policy\n    )\n    principal: dict = {\"AWS\": events.get(\"Principal\") or \"\"}\n\n    deny_policy_statement_id: str = f\"DenyPolicyStatement-{uuid.uuid4()}\"\n    deny_policy_statement: dict = {\n        \"Effect\": \"Deny\",\n        \"Sid\": deny_policy_statement_id,\n        \"Principal\": principal,\n        \"Action\": actions_to_deny,\n        \"Resource\": resource,\n    }\n\n    if source_policy is None:\n        policy_id: str = f\"DenyPolicy-{uuid.uuid4()}\"\n        allow_policy_statement_id: str = f\"AllowPolicyStatement-{uuid.uuid4()}\"\n        default_policy_statement: dict = {\n            \"Effect\": \"Allow\",\n            \"Sid\": allow_policy_statement_id,\n            \"Principal\": \"*\",\n            \"Action\": [\n                \"elasticfilesystem:ClientMount\",\n                \"elasticfilesystem:ClientWrite\",\n                \"elasticfilesystem:ClientRootAccess\",\n            ],\n            \"Resource\": resource,\n            \"Condition\": {\"Bool\": {\"elasticfilesystem:AccessedViaMountTarget\": True}},\n        }\n\n        new_efs_policy: dict = {\n            \"Version\": \"2012-10-17\",\n            \"Id\": policy_id,\n            \"Statement\": [default_policy_statement, deny_policy_statement],\n        }\n        return {\n            \"Policy\": json.dumps(new_efs_policy),\n            \"PolicySid\": policy_id,\n            \"DenyPolicyStatementSid\": deny_policy_statement_id,\n        }\n\n    source_policy: dict = json.loads(source_policy)\n    statement: List = source_policy.get(\"Statement\") or None\n    if not statement:\n        raise KeyError(\"Requires not empty Statement in EFS Policy\")\n    statement.append(deny_policy_statement)\n    return {\n        \"Policy\": json.dumps(source_policy),\n        \"PolicySid\": source_policy.get(\"Id\") or \"\",\n        \"DenyPolicyStatementSid\": deny_policy_statement_id,\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "Policy",
+          "Selector": "$.Payload.Policy",
+          "Type": "String"
+        },
+        {
+          "Name": "PolicySid",
+          "Selector": "$.Payload.PolicySid",
+          "Type": "String"
+        },
+        {
+          "Name": "DenyPolicyStatementSid",
+          "Selector": "$.Payload.DenyPolicyStatementSid",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "InjectFailure",
+      "description": "Inject failure by setting the EFS policy to the generated one, which has deny-mount permissions.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "efs",
+        "Api": "PutFileSystemPolicy",
+        "FileSystemId": "{{ FileSystemId }}",
+        "Policy": "{{ GenerateBadEfsPolicy.Policy }}"
+      }
+    },
+    {
+      "name": "MountEfsOnDeniedInstance",
+      "description": "Try to mount the EFS filesystem on the test EC2 instance which should be denied, for the alarm to trigger.",
+      "action": "aws:runCommand",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "mkdir -p {{ MountPath }}",
+            "mount -t efs -o tls,iam {{ FileSystemId }}:/ {{ MountPath }} || true",
+            "umount {{ MountPath }} || true"
+          ]
+        }
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Ensure alarm is red after injecting the failure. Fail if alarm is not red within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:RollbackCurrentExecution",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ MountFailureAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "RollbackCurrentExecution",
+      "description": "Apply the original EFS policy, or delete it if there was none.",
+      "maxAttempts": 5,
+      "onCancel": "step:TriggerRollback",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "deny_client_mount_rollback_current_execution",
+        "InputPayload": {
+          "FileSystemId": "{{ FileSystemId }}",
+          "OriginalEfsPolicy": "{{ BackupCurrentExecution.EfsPolicy }}"
+        },
+        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef deny_client_mount_rollback_current_execution(events: dict, context: dict):\n    efs_client = boto3.client(\"efs\")\n\n    file_system_id: str = events.get(\"FileSystemId\") or \"\"\n    original_efs_policy = events.get(\"OriginalEfsPolicy\") or \"\"\n    original_efs_policy = (\n        None\n        if type(original_efs_policy) == str and original_efs_policy.startswith(\"{{\")\n        else original_efs_policy\n    )\n\n    if not original_efs_policy:\n        efs_client.delete_file_system_policy(FileSystemId=file_system_id)\n        return\n\n    efs_client.put_file_system_policy(\n        FileSystemId=file_system_id, Policy=original_efs_policy\n    )"
+      }
+    },
+    {
+      "name": "MountEfsOnNoLongerDeniedInstance",
+      "description": "Try to mount the EFS filesystem on the test EC2 instance which should succeed.",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "mkdir -p {{ MountPath }}",
+            "mount -t efs -o tls,iam {{ FileSystemId }}:/ {{ MountPath }} || true",
+            "umount {{ MountPath }} || true"
+          ]
+        }
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Wait for the alarm to be green after test is complete",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{ MountFailureAlarmName }}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "description": "This step is executed when ssm document is cancelled while it was in progress. This step starts a new execution of document in rollback mode to rollback the changes made as part of normal execution.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}
