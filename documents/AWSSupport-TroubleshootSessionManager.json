@@ -1,0 +1,592 @@
+{
+  "description": "The **AWSSupport-TroubleshootSessionManager** runbook helps you troubleshoot common issues that prevent you from connecting to managed\nAmazon Elastic Compute Cloud (Amazon EC2) instances using Session Manager. Session Manager is a capability of AWS Systems Manager.\nThis runbook checks the following:\n\n* Checks whether the instance is running and reporting as managed by Systems Manager.\n* Runs the **AWSSupport-TroubleshootManagedInstance** runbook if the instance is not reporting as managed by Systems Manager.\n* Checks the version of the SSM Agent installed on the instance.\n* Checks whether an instance profile containing a recommended AWS Identity and Access Management (IAM) policy for Session Manager\nis attached to the Amazon EC2 instance.\n* Collects diagnotics output from ssm-cli from the instance.\n* Analyzes your Session Manager preferences.\n* Runs the **AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2** runbook to analyze the instance's connectivity to the endpoints for Session Manager,\nAWS Key Management Service (AWS KMS), Amazon Simple Storage Service (Amazon S3) and Amazon CloudWatch Logs (CloudWatch Logs).\n\n### Considerations\n\n- Hybrid managed nodes are not supported.\n- This runbook only checks whether a recommended managed IAM policy is attached to the instance profile.\nIt does not analyze IAM or AWS KMS permissions contained in your instance profile. \n- The **AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2** runbook uses\n[VPC Reachability Analyzer](https://docs.aws.amazon.com/vpc/latest/reachability/what-is-reachability-analyzer.html)\nto analyze the network connectivity between a source and a service endpoint. You are charged per analysis run between a source and destination.\nFor more details, see [Amazon VPC Pricing](http://aws.amazon.com/vpc/pricing/)",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "outputs": [
+    "generateReport.EvalReport"
+  ],
+  "parameters": {
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$",
+      "description": "(Required) The ID of the Amazon EC2 instance that you are unable to connect to using Session Manager."
+    },
+    "SessionPreferenceDocument": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9_\\-.:/]{3,200}$",
+      "description": "(Optional) The name of your session preferences document. If you don't specify a custom session preferences document when starting sessions, use the default value `SSM-SessionManagerRunShell`.",
+      "default": "SSM-SessionManagerRunShell"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "default": "",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that runs this runbook."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "waitForEC2InstanceStatusCheck",
+      "description": "Waits up to 6 minutes for your target instance to pass status checks.",
+      "isCritical": false,
+      "onFailure": "Continue",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 360,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceStatus.Status",
+        "DesiredValues": [
+          "ok"
+        ]
+      },
+      "nextStep": "getSessionPreferences"
+    },
+    {
+      "name": "getSessionPreferences",
+      "description": "Parses the session preference document.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_session_preferences.script_handler",
+        "InputPayload": {
+          "SessionDocument": "{{SessionPreferenceDocument}}"
+        },
+        "Attachment": "troubleshoot_session_manager.zip"
+      },
+      "outputs": [
+        {
+          "Name": "S3BucketName",
+          "Selector": "$.Payload.prefs.s3BucketName",
+          "Type": "String"
+        },
+        {
+          "Name": "S3BucketPrefix",
+          "Selector": "$.Payload.prefs.s3KeyPrefix",
+          "Type": "String"
+        },
+        {
+          "Name": "CloudWatchLogGroupName",
+          "Selector": "$.Payload.prefs.cloudWatchLogGroupName",
+          "Type": "String"
+        },
+        {
+          "Name": "KMSKeyId",
+          "Selector": "$.Payload.prefs.kmsKeyId",
+          "Type": "String"
+        },
+        {
+          "Name": "RunAsEnabled",
+          "Selector": "$.Payload.prefs.runAsEnabled",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "RunAsUser",
+          "Selector": "$.Payload.prefs.runAsDefaultUser",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getEC2InstanceProfile"
+    },
+    {
+      "name": "getEC2InstanceProfile",
+      "description": "Gets the ARN of the instance profile attached to your instance.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceProfile",
+          "Selector": "$.Reservations[0].Instances[0].IamInstanceProfile.Arn",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getInstanceInformationFromSSM"
+    },
+    {
+      "name": "getInstanceInformationFromSSM",
+      "description": "Checks whether your instance is reporting as managed by Systems Manager.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 2,
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PingStatus",
+          "Selector": "$.InstanceInformationList[0].PingStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "AgentVersion",
+          "Selector": "$.InstanceInformationList[0].AgentVersion",
+          "Type": "String"
+        },
+        {
+          "Name": "IsLatestVersion",
+          "Selector": "$.InstanceInformationList[0].IsLatestVersion",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "Platform",
+          "Selector": "$.InstanceInformationList[0].PlatformType",
+          "Type": "String"
+        },
+        {
+          "Name": "LastPingTime",
+          "Selector": "$.InstanceInformationList[0].LastPingDateTime",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnManagedInstancePingStatus"
+    },
+    {
+      "name": "branchOnManagedInstancePingStatus",
+      "description": "Branches based on whether your instance is reporting as managed by Systems Manager.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "evalSSMAgentVersion",
+            "Variable": "{{getInstanceInformationFromSSM.PingStatus}}",
+            "StringEquals": "Online"
+          }
+        ],
+        "Default": "runTroubleshootManagedInstanceAutomation"
+      }
+    },
+    {
+      "name": "evalSSMAgentVersion",
+      "description": "Checks whether the SSM Agent installed on your instance supports Session Manager.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "eval_ssm_agent_version.script_handler",
+        "InputPayload": {
+          "AgentVersion": "{{getInstanceInformationFromSSM.AgentVersion}}",
+          "IsLatestVersion": "{{getInstanceInformationFromSSM.IsLatestVersion}}"
+        },
+        "Attachment": "troubleshoot_session_manager.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EvalResult",
+          "Selector": "$.Payload.result",
+          "Type": "String"
+        },
+        {
+          "Name": "CliDebugSupport",
+          "Selector": "$.Payload.cliDebugSupport",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "branchToRunSSMAgentDiagnosticsLogs"
+    },
+    {
+      "name": "branchToRunSSMAgentDiagnosticsLogs",
+      "description": "Branches based on the platform of your instance to collect ssm-cli logs.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{getInstanceInformationFromSSM.Platform}}",
+                "StringEquals": "Linux"
+              },
+              {
+                "Variable": "{{evalSSMAgentVersion.CliDebugSupport}}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "getAgentDiagnosticsLinux"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{getInstanceInformationFromSSM.Platform}}",
+                "StringEquals": "MacOS"
+              },
+              {
+                "Variable": "{{evalSSMAgentVersion.CliDebugSupport}}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "getAgentDiagnosticsLinux"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{getInstanceInformationFromSSM.Platform}}",
+                "StringEquals": "Windows"
+              },
+              {
+                "Variable": "{{evalSSMAgentVersion.CliDebugSupport}}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "getAgentDiagnosticsWindows"
+          }
+        ],
+        "Default": "parseAgentDiagnosticsLogs"
+      }
+    },
+    {
+      "name": "getAgentDiagnosticsLinux",
+      "description": "Collects logs output from ssm-cli from a Linux or macOS instance.",
+      "isCritical": false,
+      "onFailure": "step:parseAgentDiagnosticsLogs",
+      "timeoutSeconds": 200,
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "executionTimeout": "60",
+          "commands": [
+            "ssm-cli get-diagnostics"
+          ]
+        },
+        "Comment": "Sent by SSM automation execution {{automation:EXECUTION_ID}}",
+        "TimeoutSeconds": 120
+      },
+      "nextStep": "parseAgentDiagnosticsLogs"
+    },
+    {
+      "name": "getAgentDiagnosticsWindows",
+      "description": "Collects logs output from ssm-cli from a Windows instance.",
+      "isCritical": false,
+      "onFailure": "step:parseAgentDiagnosticsLogs",
+      "timeoutSeconds": 200,
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "executionTimeout": "60",
+          "commands": [
+            "& \"C:\\Program Files\\Amazon\\SSM\\ssm-cli.exe\" get-diagnostics"
+          ]
+        },
+        "Comment": "Sent by SSM automation execution {{automation:EXECUTION_ID}}",
+        "TimeoutSeconds": 120
+      },
+      "nextStep": "parseAgentDiagnosticsLogs"
+    },
+    {
+      "name": "parseAgentDiagnosticsLogs",
+      "description": "Parses the ssm-cli logs.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "parse_agent_diagnostics_logs.script_handler",
+        "InputPayload": {
+          "AgentDiagnosticsLinOut": "{{getAgentDiagnosticsLinux.Output}}",
+          "AgentDiagnosticsLinStat": "{{getAgentDiagnosticsLinux.Status}}",
+          "AgentDiagnosticsWinOut": "{{getAgentDiagnosticsWindows.Output}}",
+          "AgentDiagnosticsWinStat": "{{getAgentDiagnosticsWindows.Status}}"
+        },
+        "Attachment": "troubleshoot_session_manager.zip"
+      },
+      "outputs": [
+        {
+          "Name": "SessionManagerConnectivity",
+          "Type": "String",
+          "Selector": "$.Payload.ssmmessagesConnectivity"
+        },
+        {
+          "Name": "S3Connectivity",
+          "Type": "String",
+          "Selector": "$.Payload.s3Connectivity"
+        },
+        {
+          "Name": "KMSConnectivity",
+          "Type": "String",
+          "Selector": "$.Payload.kmsConnectivity"
+        },
+        {
+          "Name": "CloudWatchLogsConnectivity",
+          "Type": "String",
+          "Selector": "$.Payload.logsConnectivity"
+        }
+      ],
+      "nextStep": "evalInstanceProfile"
+    },
+    {
+      "name": "evalInstanceProfile",
+      "description": "Checks whether a recommended IAM policy is attached to the instance profile.",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "eval_instance_profile.script_handler",
+        "InputPayload": {
+          "InstanceProfile": "{{getEC2InstanceProfile.InstanceProfile}}",
+          "InstanceId": "{{InstanceId}}"
+        },
+        "Attachment": "troubleshoot_session_manager.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EvalResult",
+          "Selector": "$.Payload.result",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnSessionManagerEndpointConnectivity"
+    },
+    {
+      "name": "branchOnSessionManagerEndpointConnectivity",
+      "description": "Determines whether to evaluate ssmmessages endpoint connectivity based on ssm-cli logs.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkSessionManagerEndpointConnectivity",
+            "Not": {
+              "Variable": "{{parseAgentDiagnosticsLogs.SessionManagerConnectivity}}",
+              "StringEquals": "Success"
+            }
+          }
+        ],
+        "Default": "branchOnS3EndpointConnectivity"
+      }
+    },
+    {
+      "name": "checkSessionManagerEndpointConnectivity",
+      "description": "Evaluates whether the instance can connect to ssmmessages endpoint.",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "action": "aws:executeAutomation",
+      "inputs": {
+        "DocumentName": "AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2",
+        "RuntimeParameters": {
+          "Source": "{{InstanceId}}",
+          "ServiceEndpoint": "ssmmessages.{{global:REGION}}.amazonaws.com",
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}"
+        }
+      },
+      "nextStep": "branchOnS3EndpointConnectivity"
+    },
+    {
+      "name": "branchOnS3EndpointConnectivity",
+      "description": "Determines whether to evaluate Amazon S3 endpoint connectivity based on ssm-cli logs and your session preferences.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Not": {
+                  "Variable": "{{parseAgentDiagnosticsLogs.S3Connectivity}}",
+                  "StringEquals": "Success"
+                }
+              },
+              {
+                "Not": {
+                  "Variable": "{{getSessionPreferences.S3BucketName}}",
+                  "StringEquals": ""
+                }
+              }
+            ],
+            "NextStep": "checkS3EndpointConnectivity"
+          }
+        ],
+        "Default": "branchOnKMSEndpointConnectivity"
+      }
+    },
+    {
+      "name": "checkS3EndpointConnectivity",
+      "description": "Evaluates whether the instance can connect to an Amazon S3 endpoint.",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "action": "aws:executeAutomation",
+      "inputs": {
+        "DocumentName": "AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2",
+        "RuntimeParameters": {
+          "Source": "{{InstanceId}}",
+          "ServiceEndpoint": "s3.{{global:REGION}}.amazonaws.com",
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}"
+        }
+      },
+      "nextStep": "branchOnKMSEndpointConnectivity"
+    },
+    {
+      "name": "branchOnKMSEndpointConnectivity",
+      "description": "Determines whether to evaluate AWS KMS endpoint connectivity based on ssm-cli logs and your session preferences.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Not": {
+                  "Variable": "{{parseAgentDiagnosticsLogs.KMSConnectivity}}",
+                  "StringEquals": "Success"
+                }
+              },
+              {
+                "Not": {
+                  "Variable": "{{getSessionPreferences.KMSKeyId}}",
+                  "StringEquals": ""
+                }
+              }
+            ],
+            "NextStep": "checkKMSEndpointConnectivity"
+          }
+        ],
+        "Default": "branchOnCloudWatchLogsEndpointConnectivity"
+      }
+    },
+    {
+      "name": "checkKMSEndpointConnectivity",
+      "description": "Evaluates whether the instance can connect to an AWS KMS endpoint.",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "action": "aws:executeAutomation",
+      "inputs": {
+        "DocumentName": "AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2",
+        "RuntimeParameters": {
+          "Source": "{{InstanceId}}",
+          "ServiceEndpoint": "kms.{{global:REGION}}.amazonaws.com",
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}"
+        }
+      },
+      "nextStep": "branchOnCloudWatchLogsEndpointConnectivity"
+    },
+    {
+      "name": "branchOnCloudWatchLogsEndpointConnectivity",
+      "description": "Determines whether to evaluate CloudWatch Logs endpoint connectivity based on ssm-cli logs and your session preferences.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Not": {
+                  "Variable": "{{parseAgentDiagnosticsLogs.CloudWatchLogsConnectivity}}",
+                  "StringEquals": "Success"
+                }
+              },
+              {
+                "Not": {
+                  "Variable": "{{getSessionPreferences.CloudWatchLogGroupName}}",
+                  "StringEquals": ""
+                }
+              }
+            ],
+            "NextStep": "checkCloudWatchLogsEndpointConnectivity"
+          }
+        ],
+        "Default": "generateReport"
+      }
+    },
+    {
+      "name": "checkCloudWatchLogsEndpointConnectivity",
+      "description": "Evaluates whether the instance can connect to an CloudWatch Logs endpoint.",
+      "isCritical": true,
+      "onFailure": "step:generateReport",
+      "action": "aws:executeAutomation",
+      "inputs": {
+        "DocumentName": "AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2",
+        "RuntimeParameters": {
+          "Source": "{{InstanceId}}",
+          "ServiceEndpoint": "logs.{{global:REGION}}.amazonaws.com",
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}"
+        }
+      },
+      "nextStep": "generateReport"
+    },
+    {
+      "name": "runTroubleshootManagedInstanceAutomation",
+      "description": "Runs the AWSSupport-TroubleshootManagedInstance runbook.",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "action": "aws:executeAutomation",
+      "inputs": {
+        "DocumentName": "AWSSupport-TroubleshootManagedInstance",
+        "RuntimeParameters": {
+          "InstanceId": "{{InstanceId}}",
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}"
+        }
+      },
+      "nextStep": "generateReport"
+    },
+    {
+      "name": "generateReport",
+      "description": "Compiles the output of the previous steps and outputs a report.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "generate_report.script_handler",
+        "InputPayload": {
+          "Instance": "{{InstanceId}}",
+          "PingStatus": "{{getInstanceInformationFromSSM.PingStatus}}",
+          "Platform": "{{getInstanceInformationFromSSM.Platform}}",
+          "LastPingTime": "{{getInstanceInformationFromSSM.LastPingTime}}",
+          "AgentDiagSsmmessagesConnectivity": "{{parseAgentDiagnosticsLogs.SessionManagerConnectivity}}",
+          "AgentDiagS3Connectivity": "{{parseAgentDiagnosticsLogs.S3Connectivity}}",
+          "AgentDiagCloudWatchLogsConnectivity": "{{parseAgentDiagnosticsLogs.CloudWatchLogsConnectivity}}",
+          "AgentDiagKMSConnectivity": "{{parseAgentDiagnosticsLogs.KMSConnectivity}}",
+          "S3Bucket": "{{getSessionPreferences.S3BucketName}}",
+          "CloudWatchLogGroup": "{{getSessionPreferences.CloudWatchLogGroupName}}",
+          "KMSKey": "{{getSessionPreferences.KMSKeyId}}",
+          "RunAsStatus": "{{getSessionPreferences.RunAsEnabled}}",
+          "RunAsUser": "{{getSessionPreferences.RunAsUser}}",
+          "SSMAgentVersionEvalResult": "{{evalSSMAgentVersion.EvalResult}}",
+          "InstanceProfileEvalResult": "{{evalInstanceProfile.EvalResult}}",
+          "AutomationExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Attachment": "troubleshoot_session_manager.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EvalReport",
+          "Type": "String",
+          "Selector": "$.Payload.result"
+        }
+      ]
+    }
+  ],
+  "files": {
+    "troubleshoot_session_manager.zip": {
+      "checksums": {
+        "sha256": "da33a359b6e303848055214aa5bdc487f29c5be6162ddf123cc7e658b41545d1"
+      }
+    }
+  }
+}

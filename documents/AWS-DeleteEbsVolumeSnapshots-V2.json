@@ -1,0 +1,56 @@
+{
+  "description": "### Document name - AWS-DeleteEbsVolumeSnapshots-V2\n\n## What does this document do?\nThis will delete backups for a specified EBS volume. If the retention count parameter is used\nit will keep the latest number of specified snapshots for the volume. If the retention days parameter is\nused it will delete snapshots for the volume which are older than the specified number of days. Either\nRetentionCount or RetentionDays can be used, not both\"\n\n## Input Parameters\n* VolumeId: (Required) The volume identifier to delete snapshots for.\n* RetentionCount: (Optional) Number of snapshots to keep for the volume.  Either RetentionCount or RetentionDays should be mentioned, not both.\n* RetentionDays: (Optional) Number of days to keep snapshots for the volume. Either RetentionCount or RetentionDays should be mentioned, not both.\n* AutomationAssumeRole: (Optional) The ARN of the role that allows the document to perform the actions on your behalf.\n\n## Output Parameters\n* DeleteEbsVolumeSnapshots.DeletedSnapshots: The snapshot Ids of the deleted snapshots.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "VolumeId": {
+      "type": "String",
+      "description": "(Required) The volume identifier to delete snapshots for.",
+      "allowedPattern": "^vol-[a-f0-9]{8}(?:[a-f0-9]{9})?$"
+    },
+    "RetentionCount": {
+      "type": "String",
+      "description": "(Optional) Number of snapshots to keep for the volume.  Either RetentionCount or RetentionDays should be mentioned, not both.",
+      "default": "10",
+      "allowedPattern": "^$|[0-9]+$"
+    },
+    "RetentionDays": {
+      "type": "String",
+      "description": "(Optional) Number of days to keep snapshots for the volume. Either RetentionCount or RetentionDays should be mentioned, not both.",
+      "default": "",
+      "allowedPattern": "^$|[0-9]+$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the role that allows the document to perform the actions on your behalf",
+      "default": "",
+      "allowedPattern": "^$|arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role\\/?[a-zA-Z_0-9+=,.@\\-_\\/]+"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "DeleteEbsVolumeSnapshots",
+      "timeoutSeconds": 600,
+      "action": "aws:executeScript",
+      "description": "Deletes the volume snapshots",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "deleteEbsVolumeSnapshots",
+        "InputPayload": {
+          "VolumeId": "{{ VolumeId }}",
+          "RetentionCount": "{{ RetentionCount }}",
+          "RetentionDays": "{{ RetentionDays }}"
+        },
+        "Script": "import time\nfrom datetime import datetime, timedelta, tzinfo\nimport boto3\nZERO = timedelta(0)\nclass UTC(tzinfo):\n  def utcoffset(self, dt):\n    return ZERO\n  \n  def tzname(self, dt):\n    return \"UTC\"\n  \n  def dst(self, dt):\n    return ZERO\ndef get_volume_snapshots(client, volume_id):\n  args = {\n    \"Filters\": [\n      {\"Name\": \"volume-id\", \"Values\": [volume_id]},\n      {\"Name\": \"status\", \"Values\": [\"completed\"]},\n    ],\n    \"OwnerIds\": [\"self\"],\n  }\n  snapshots = []\n  while True:\n    resp = client.describe_snapshots(**args)\n    snapshots += resp.get(\"Snapshots\", [])\n    if \"NextToken\" in resp:\n      args[\"NextToken\"] = resp[\"NextToken\"]\n    else:\n      break\n  \n  return snapshots\ndef delete_snapshot(client, snapshot_id):\n  wait_period = 5\n  retries = 5\n  while True:\n    try:\n      client.delete_snapshot(SnapshotId=snapshot_id)\n      return True\n    except Exception as ex:\n      # As the list of snapshot is eventually consistent\n      # old snapshots might appear in listed snapshots\n      if (\n      getattr(ex, \"response\", {}).get(\"Error\", {}).get(\"Code\", \"\")\n      == \"'InvalidSnapshot.NotFound\"\n      ):\n        return False\n      # Throttling might occur when deleting snapshots too fast\n      if \"throttling\" in ex.message.lower():\n        retries -= 1\n        if retries == 0:\n          raise ex\n        time.sleep(wait_period)\n        wait_period = min(wait_period + 10, 30)\n        continue\n      raise ex\ndef deleteEbsVolumeSnapshots(event, context):\n  client = boto3.client(\"ec2\")\n  \n  snapshot_id = event[\"VolumeId\"].strip()\n  try:\n    retention_count = int(event.get(\n      \"RetentionCount\", \"0\").strip('\"').strip())\n  except Exception:\n    retention_count = 0\n  \n  try:\n    retention_days = int(event.get(\n      \"RetentionDays\", \"0\").strip('\"').strip())\n  except Exception:\n    retention_days = 0\n  \n  if (retention_count == 0) and (retention_days == 0):\n    raise ValueError(\n      \"RetentionCount or RetentionDays \"\n      \"parameter must be specified\"\n    )\n  \n  if (retention_count > 0) and (retention_days > 0):\n    raise ValueError(\n      \"Only one of RetentionCount or \"\n      \"RetentionDays parameters can be specified\"\n    )\n  \n  snapshots_for_volume = sorted(\n    get_volume_snapshots(client, snapshot_id),\n    key=lambda s: s[\"StartTime\"],\n    reverse=True,\n  )\n  \n  snapshots_to_delete = []\n  \n  if retention_days > 0:\n    delete_before = datetime.utcnow().replace(tzinfo=UTC()) - timedelta(\n      days=int(retention_days)\n    )\n    i = 0\n    while i < len(snapshots_for_volume):\n      if snapshots_for_volume[i][\"StartTime\"] < delete_before:\n        snapshots_to_delete.append(\n          snapshots_for_volume.pop(i)[\"SnapshotId\"]\n        )\n      else:\n        i += 1\n  \n  elif retention_count > 0:\n    snapshots_to_delete = [\n      b[\"SnapshotId\"] for b in snapshots_for_volume[retention_count:]\n    ]\n  \n  snapshots_deleted = []\n  for snapshot_id in snapshots_to_delete:\n    if delete_snapshot(client, snapshot_id):\n      snapshots_deleted.append(snapshot_id)\n  \n  return {\"Deleted_Snapshots\": snapshots_deleted}"
+      },
+      "outputs": [
+        {
+          "Name": "DeletedSnapshots",
+          "Selector": "$.Payload.Deleted_Snapshots",
+          "Type": "StringList"
+        }
+      ]
+    }
+  ]
+}
