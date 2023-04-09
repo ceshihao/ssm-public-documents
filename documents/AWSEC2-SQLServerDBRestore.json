@@ -1,6 +1,6 @@
 {
   "schemaVersion": "0.3",
-  "description": "The AWSEC2-SQLServerDBRestore document restores Microsoft SQL Server database backups stored in Amazon S3 to SQL Server 2017 running on an Amazon EC2 Linux instance. You may provide your own EC2 instance running SQL Server 2017 Linux. If an EC2 instance is not provided, the automation workflow launches and configures a new Ubuntu 16.04 EC2 instance with SQL Server 2017. The automation supports restoring full, differential, and transactional log backups. This automation accepts multiple database backup files and automatically restores the most recent valid backup of each database in the files provided. To automate both backup and restore of an on-premises SQL Server database to an EC2 instance running SQL Server 2017 Linux, see the AWS-signed PowerShell script (https://s3-us-west-1.amazonaws.com/awsec2-server-upgrade-prod/MigrateSQLServerToEC2Linux.ps1). Note: This automation resets the SQL Server 'SA' user password every time it runs. Once the automation is complete, you will need to set your own 'SA' user password again before you can connect to the SQL Server instance.",
+  "description": "The AWSEC2-SQLServerDBRestore document restores Microsoft SQL Server database backups stored in Amazon S3 to SQL Server 2017/2019 running on an Amazon EC2 Linux instance. You may provide your own EC2 instance running SQL Server 2017 Linux. If an EC2 instance is not provided, the automation workflow launches and configures a new Ubuntu 16.04 EC2 instance with SQL Server 2017/2019. The automation supports restoring full, differential, and transactional log backups. This automation accepts multiple database backup files and automatically restores the most recent valid backup of each database in the files provided. To automate both backup and restore of an on-premises SQL Server database to an EC2 instance running SQL Server 2017/2019 Linux, see the AWS-signed PowerShell script (https://s3-us-west-1.amazonaws.com/awsec2-server-upgrade-prod/MigrateSQLServerToEC2Linux.ps1). Note: This automation resets the SQL Server 'SA' user password every time it runs. Once the automation is complete, you will need to set your own 'SA' user password again before you can connect to the SQL Server instance.",
   "parameters": {
     "S3Input": {
       "type": "String",
@@ -18,13 +18,22 @@
     },
     "InstanceId": {
       "type": "String",
-      "description": "(Optional) The instance running SQL Server 2017 on Linux. If no InstanceId is provided, the automation launches a new EC2 instance using the InstanceType and SQLServerEdition provided.",
+      "description": "(Optional) The instance running SQL Server 2017/2019 on Linux. If no InstanceId is provided, the automation launches a new EC2 instance using the InstanceType and SQLServerEdition provided.",
       "default": ""
     },
     "InstanceType": {
       "type": "String",
       "description": "(Optional) The instance type of the EC2 instance to be launched.",
-      "default": ""
+      "default": "m4.xlarge"
+    },
+    "SQLServerVersion": {
+      "type": "String",
+      "description": "(Optional) The version of SQL Server 2017/2019 to be installed on the newly created EC2 instance. Default value is 2017.",
+      "default": "2017",
+      "allowedValues": [
+        "2017",
+        "2019"
+      ]
     },
     "SQLServerEdition": {
       "type": "String",
@@ -40,7 +49,7 @@
     "IamInstanceProfileName": {
       "type": "String",
       "description": "(Optional) The IAM instance profile to attach to the new EC2 instance. The IAM instance profile must have the SSM managed policy attached as documented https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-instance-profile.html",
-      "default": ""
+      "default": "AmazonEC2RoleforSSM"
     },
     "KeyPair": {
       "type": "String",
@@ -136,7 +145,7 @@
           {
             "Name": "name",
             "Values": [
-              "ubuntu-xenial-16.04-amd64-server-20180306-SQL_2017_{{ SQLServerEdition }}-2018.04.10"
+              "Ubuntu_16.04-x86_64-SQL_2017_{{ SQLServerEdition }}-2021.09.20"
             ]
           },
           {
@@ -427,6 +436,26 @@
     {
       "name": "restoreToNewInstanceLinux",
       "action": "aws:runCommand",
+      "timeoutSeconds": "600",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ getInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -",
+            "curl https://packages.microsoft.com/config/ubuntu/16.04/prod.list | sudo tee /etc/apt/sources.list.d/microsoft.list",
+            "sudo apt-get update",
+            "sudo apt-get install -y powershell"
+          ]
+        }
+      },
+      "nextStep": "restoreToNewInstanceLinuxUsingPowershell"
+    },
+    {
+      "name": "restoreToNewInstanceLinuxUsingPowershell",
+      "action": "aws:runCommand",
       "timeoutSeconds": 18000,
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
@@ -441,7 +470,7 @@
             "Write-Host SSM current directory: $currentDirectory",
             "Write-Host To view restore logs, go to: $currentDirectory/logs/{{automation:EXECUTION_ID}}/log.txt",
             "New-Item -Name Scripts -ItemType directory",
-            "[void](wget -P $currentDirectory/Scripts https://s3-us-west-1.amazonaws.com/awsec2-server-upgrade-prod/SQLServerRestore.zip -q)",
+            "[void](wget -P $currentDirectory/Scripts https://s3.us-west-2.amazonaws.com/aws.portingassistant.dotnet.datastore/SQLServerRestore.zip -q)",
             "Expand-Archive -Path $currentDirectory/Scripts/SQLServerRestore.zip -DestinationPath $currentDirectory/Scripts",
             "$smoDirectory = $currentDirectory+'/Scripts/SMODLL'",
             "./Scripts/SQLServerRestore.ps1 -S3Input '{{ S3Input }}' -IsS3PresignedURL {{IsS3PresignedURL}} -InstanceIsNew $true -RunningDirectory $currentDirectory -DatabaseNames \"{{ DatabaseNames }}\" -ExecutionId {{automation:EXECUTION_ID}} -SmodllPath $smoDirectory",
@@ -454,6 +483,26 @@
     },
     {
       "name": "restoreToExistingEC2InstanceLinux",
+      "action": "aws:runCommand",
+      "timeoutSeconds": "600",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ getInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -",
+            "curl https://packages.microsoft.com/config/ubuntu/16.04/prod.list | sudo tee /etc/apt/sources.list.d/microsoft.list",
+            "sudo apt-get update",
+            "sudo apt-get install -y powershell"
+          ]
+        }
+      },
+      "nextStep": "restoreToExistingEC2InstanceLinuxUsingPowershell"
+    },
+    {
+      "name": "restoreToExistingEC2InstanceLinuxUsingPowershell",
       "action": "aws:runCommand",
       "timeoutSeconds": 18000,
       "inputs": {
@@ -470,7 +519,7 @@
             "Write-Host To view restore logs, go to: $currentDirectory/logs/{{automation:EXECUTION_ID}}/log.txt",
             "if ($(Test-Path Scripts) -eq $True) { rm -r Scripts }",
             "New-Item -Name Scripts -ItemType directory",
-            "[void](wget -P $currentDirectory/Scripts https://s3-us-west-1.amazonaws.com/awsec2-server-upgrade-prod/SQLServerRestore.zip -q)",
+            "[void](wget -P $currentDirectory/Scripts https://s3.us-west-2.amazonaws.com/aws.portingassistant.dotnet.datastore/SQLServerRestore.zip -q)",
             "Expand-Archive -Path $currentDirectory/Scripts/SQLServerRestore.zip -DestinationPath $currentDirectory/Scripts",
             "$smoDirectory = $currentDirectory+'/Scripts/SMODLL'",
             "./Scripts/SQLServerRestore.ps1 -S3Input '{{ S3Input }}' -IsS3PresignedURL {{IsS3PresignedURL}} -InstanceIsNew $false -RunningDirectory $currentDirectory -DatabaseNames \"{{ DatabaseNames }}\" -ExecutionId {{automation:EXECUTION_ID}} -SmodllPath $smoDirectory",
