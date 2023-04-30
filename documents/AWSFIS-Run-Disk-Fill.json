@@ -1,0 +1,63 @@
+{
+  "description": "### Document name - AWSFIS-Run-Disk-Fill\n\n## What does this document do?\nIt runs disk filling stress on an instance using fallocate. If fallocate is not already installed on the instance, this SSM document will install it together with other dependencies listed below, unless InstallDependencies parameter is set to False.\nThis SSM document supports the Amazon Linux and Ubuntu operating systems only.\n\n## Dependencies installed by this SSM Document\n* bc\n* fallocate\n* atd\nNote: This SSM document does not uninstall dependencies once installed. If you don't want this SSM document to install any dependencies, set InstallDependencies to False and bake the dependencies into your EC2 instance. For example, by using image-builder (https://aws.amazon.com/image-builder/).\n\n## Input Parameters\n* DurationSeconds: (Required) The duration - in seconds - of the disk fill up stress.\n* Percent: (Optional) The total target percentage of the disk to be allocated. (default 95)\n* InstallDependencies: If set to True, this SSM document installs the required dependencies on the target instances. (default True)\n\n## Output Parameters\nNone.",
+  "schemaVersion": "2.2",
+  "parameters": {
+    "DurationSeconds": {
+      "type": "String",
+      "description": "(Required) The duration - in seconds - of the disk fill up stress.",
+      "allowedPattern": "^[0-9]+$"
+    },
+    "Percent": {
+      "type": "String",
+      "description": "Specify the percentage of the allocated disk space dependent on the total available size. (default 95)",
+      "default": "95",
+      "allowedPattern": "^([1-9][0-9]?|100)$"
+    },
+    "InstallDependencies": {
+      "type": "String",
+      "description": "If set to True, Systems Manager installs the required dependencies on the target instances (default: True)",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "InstallDependencies",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "description": "## Parameter: InstallDependencies\nIf set to True, this step installs the required dependencies using the operating system's repository. It supports both\nDebian (apt) and CentOS (yum) based package managers.\n",
+      "inputs": {
+        "onFailure": "exit",
+        "runCommand": [
+          "#!/bin/bash\n\nif [[ \"$( command -v atd 2>/dev/null )\" && \"$( command -v bc 2>/dev/null )\" && \"$( command -v fallocate 2>/dev/null )\" ]] ; then echo Dependency is already installed. ; exit ; fi\nif  [[ \"{{ InstallDependencies }}\" == True ]] ; then\n  echo \"Installing required dependencies\"\n  if [ -f  \"/etc/system-release\" ] ; then\n    if cat /etc/system-release | grep -i 'Amazon Linux' && ! grep -Fiq 'VERSION_ID=\"2023\"' /etc/os-release ; then\n      yum -y install at bc util-linux\n    elif grep -Fiq 'ID=\"amzn\"' /etc/os-release && grep -Fiq 'VERSION_ID=\"2023\"' /etc/os-release ; then\n      \n      \n      yum -y install at bc util-linux\n      # AL2023 sometimes doesnt start/enable ATD, this should enable if not enabled\n      if [[ \"at bc util-linux == *at*\" ]] && !  systemctl is-enabled atd ; then\n          echo \"Enabling and starting atd\"\n          systemctl enable atd\n          systemctl start atd\n      fi\n    else\n      echo \"Exiting - This SSM document supports Amazon Linux and Ubuntu operating systems only.\"\n      exit 1\n    fi\n  elif cat /etc/issue | grep -i Ubuntu ; then\n    apt-get update -y\n    # when installing, sometimes ubuntu has stderr that are not breaking errors.\n    install_error=$(apt-get install -y at bc util-linux) 2>&1\n    if [[ -n \"$install_error\" ]]  ; then\n        echo \"$install_error\"\n    fi\n    ubuntu_commands=( atd bc fallocate )\n    for dependency_command in \"${ubuntu_commands[@]}\"\n    do\n       if ! command -v $dependency_command >/dev/null 2>&1 ; then\n            echo \"Exiting - $dependency_command not installed\"\n            exit 1\n       fi\n    done\n  else\n    echo \"Exiting - This SSM document supports Amazon Linux and Ubuntu operating systems only.\"\n    exit 1\n  fi\nelse\n  echo \"Dependencies are not installed - Please set InstallDependencies to True.\"\n  exit 1\nfi\n"
+        ]
+      }
+    },
+    {
+      "action": "aws:runShellScript",
+      "name": "ExecuteDiskFill",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "description": "## Parameters: Duration and Percent\nThis step will perform a disk fill up stress for the specified Duration time in seconds.\n",
+      "inputs": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 43200,
+        "runCommand": [
+          "#!/bin/bash\n\n########################\n# Fault-specific logic #\n########################\n\nFAULT_NAME=\"Run-Disk-Fill\"\nFILE_STRING=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)\nDURATION={{ DurationSeconds }}\nDISK_FILLUP_PATH=\"/var/lib/amazon/ssm/$FAULT_NAME-$FILE_STRING-DISK_FILLUP_FILE\"\n\nif [ $DURATION -lt 1 ] || [ $DURATION -gt 43200 ] ; then echo \"DurationSeconds parameter value must be between 1 and 43200\" && exit 1; fi\n\nif [ {{ Percent }} -lt 1 ] || [ {{ Percent }} -gt 100 ] ; then echo \"Percent parameter value must be between 1 and 100\" && exit 1; fi\n\nif [ {{ Percent }} -le $(df / | awk '/\\//{print 0+$5}') ] ; then echo \"Target percentage fill is less than current disk space usage\" && exit 1; fi\n\n\nread -r -d '' ENABLE_FAULT_COMMAND <<'EOF'\n\n  # Exit if FIS disk fill up fault is already running\n  test_file_exit() {\n    if [ \"$(ls \"$1\" 2>/dev/null | wc -l)\" -ge \"2\" ]; then { echo \"Fault might be already running (Found flag file matching \"$1\"). Exiting...\" 1>&2 ; exit 1; } ; fi;\n  }\n  test_file_exit \"/var/lib/amazon/ssm/Run-Disk-Fill-*.flag\"\n\n  used_disk_space=( $(df -l / | awk '/\\//{print $3}') )\n  available_disk_space=( $(df -l / | awk '/\\//{print $4}') )\n\n  # disk space is allocated in 512 byte spaces, so attempting to allocate files that are not cleanly divisible can\n  # cause issues where the files are not created. This takes the desired space and makes sure it conforms to this\n  # pattern to avoid the file not being created. The 'rollback_space' accounts for the space necessary to hold the\n  # rollback logic file creation.\n  rollback_space=300\n  if [ {{ Percent }} -eq 100 ] ; then\n    fillup_file_size=( $(echo \"(($available_disk_space / 512) * 512) - $rollback_space\" | bc)K ) ;\n  else\n    fillup_file_size=( $(echo \"((((($used_disk_space + $available_disk_space) * .{{ Percent }}) - $used_disk_space) / 512) * 512) - $rollback_space\" | bc)K ) ;\n  fi\n\n  echo \"Injecting fault...\"\n  echo Initiating disk stress for $DURATION seconds...\n\n  fallocate -l \"$fillup_file_size\" \"$DISK_FILLUP_PATH\"\n\nEOF\n\n\nread -r -d '' DISABLE_FAULT_COMMAND <<EOF\n\n  echo \"Cleaning up allocated disk space...\"\n  rm -f \"$DISK_FILLUP_PATH\"\n  echo \"Disk stress finished.\"\n\nEOF\n\n\n#################################\n# General fault-execution logic #\n#################################\n\nSTOP_TIME=$(( $(date +%s) + $DURATION ))\n\nMAX_FLAG_AGE_SECONDS=10\nATTEMPT_ROLLBACK_AT_SECONDS=20\nINJECTION_LOOP_SLEEP_SECONDS=5\n\nRANDOM_STRING=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)\nFLAG_PATH=\"/var/lib/amazon/ssm/$FAULT_NAME-$RANDOM_STRING.flag\"\nROLLBACK_PATH=\"/var/lib/amazon/ssm/$FAULT_NAME-$RANDOM_STRING-Rollback.sh\"\n\n# Creating a file with rollback check command to be executed by atd\ncat << EOF > \"$ROLLBACK_PATH\"\n#!/bin/bash\n# Dont sleep if run in terminal\nif ! [ -t 0 ] ; then\n  sleep $ATTEMPT_ROLLBACK_AT_SECONDS\nfi\nif ! [ -f \"$FLAG_PATH\" ] || [ \"\\$(( \\$(date +%s) - \\$(stat -c \"%Y\" \"$FLAG_PATH\") ))\" -gt $MAX_FLAG_AGE_SECONDS ] || [ -t 0 ]; then\n  $DISABLE_FAULT_COMMAND\n  rm -f \"$FLAG_PATH\"\n  # Dont delete rollback script if run in terminal\n  if ! [ -t 0 ] ; then\n    rm -f \"$ROLLBACK_PATH\"\n  fi\nfi\nEOF\necho \"Temporary rollback file created: $ROLLBACK_PATH\"\n\n# Enqueue a rollback check after $ATTEMPT_ROLLBACK_AT_SECONDS seconds\nschedule_rollback_attempt() {\n  echo \"bash $ROLLBACK_PATH\" | at now 2> >(sed '/warning: commands will be executed using \\/bin\\/sh/d' )\n}\n\n# Function to delete the flag file and rollback the fault injection\nrollback() {\n  rm \"$FLAG_PATH\"\n  rm \"$ROLLBACK_PATH\"\n  eval \"$DISABLE_FAULT_COMMAND\" ; STATUS=$?\n  echo Rollback done.\n  exit $STATUS\n}\n\n# Binding the rollback function to these exit signals\ntrap rollback INT\ntrap rollback TERM\n\necho \"Making sure atd daemon is running\"\n# atd must be running in order to use \"at\" later\natd || { echo Failed to run atd daemon, exiting... 1>&2 ; exit 1; }\n\necho \"Scheduling rollback\"\nschedule_rollback_attempt\n\n# Injecting fault\necho \"Enabling fault injection\"\ntouch \"$FLAG_PATH\"\neval \"$ENABLE_FAULT_COMMAND\"\n\n# For the duration of the injection, the flag file is updated, and a rollback check is enqueued\nwhile [[ $(date +%s) -lt $STOP_TIME ]] ; do\n  # If the background rollback process fires, it will delete the script\n  # from disk containing the rollback logic.  That should not happen while\n  # this script is running, but if it does, we immediately fail the script\n  # to prevent the script from continuing to run as if the fault were active.\n  if ! [ -f \"$ROLLBACK_PATH\" ]; then\n    echo Fault rollback script was deleted from disk prematurely, exiting... 1>&2\n    # though the rollback likely already happened, we attempt rollback again since\n    # the rollback script might have been deleted by some unanticipated mechanism\n    eval \"$DISABLE_FAULT_COMMAND\"\n    exit 1\n  fi\n  touch \"$FLAG_PATH\"\n  schedule_rollback_attempt\n  sleep $INJECTION_LOOP_SLEEP_SECONDS\ndone\n\n# After the desired duration, the fault injection is removed\nrollback\n"
+        ]
+      }
+    }
+  ]
+}
