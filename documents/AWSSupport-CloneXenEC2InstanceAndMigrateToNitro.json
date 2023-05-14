@@ -4,21 +4,19 @@
   "assumeRole": "{{AutomationAssumeRole}}",
   "parameters": {
     "AutomationAssumeRole": {
-      "default": "",
-      "type": "String",
-      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook. For more information, visit - https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-setup.html",
-      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::\\d{12}:role/[\\w+=/,.@-]+$"
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the role that allows the Automation runbook to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your current IAM user permissions context to execute this runbook.",
+      "default": ""
     },
     "TargetInstanceId": {
-      "type": "String",
-      "description": "(Required) InstanceId of the target EC2 instance you want to migrate to Nitro platform.",
-      "allowedPattern": "^(i|mi)-[a-z0-9]{8,17}$"
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) InstanceId of the target EC2 instance you want to migrate to Nitro platform."
     },
     "NitroInstanceType": {
       "type": "String",
       "default": "m5.xlarge",
       "description": "(Required) Enter the destination Nitro instance type. Note: Only Nitro M5, M6, C5, C6, R5, R6 and T3 instances are supported (e.g. t3.small). For more details about the available Nitro instance types, please refer to the link: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html",
-      "allowedPattern": "^(m5a?z?d?n?|c5a?d?n?|r5a?d?n?b?|c6(a|i)?d?|m6(a|i)?d?|r6(a|i)?d?)\\.(x|2x|4x|8x|12x|16x|24x|32x)?large$|^t3a?\\.((x|2x)?large|nano|micro|small|medium)$"
+      "allowedPattern": "^(m5a?z?d?n?|c5a?d?n?|r5a?d?n?b?|(c|m|r)6(a|i)?d?)\\.(2|4|8|12|16|24|32)?xlarge$|^t3a?\\.((x|2x)?large|nano|micro|small|medium)$"
     },
     "SNSTopicArn": {
       "type": "String",
@@ -28,7 +26,7 @@
     "ApproverIAM": {
       "type": "StringList",
       "description": "(Required) Provide a list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of these formats, 1) An AWS Identity and Access Management (IAM) user name 2) An IAM user ARN 3) An IAM role ARN 4) An IAM assume role user ARN",
-      "allowedPattern": "^[a-zA-Z0-9_+=,.@\\-/]{1,128}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam:.*:[0-9]{12}:[a-zA-Z0-9_+=,.@\\-/]{1,256}$"
+      "allowedPattern": "^[a-zA-Z0-9_+=,.@\\-/]{1,128}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):(sts|iam):.*:[0-9]{12}:[a-zA-Z0-9_+=,.@\\-/]{1,256}$"
     },
     "MinimumRequiredApprovals": {
       "type": "Integer",
@@ -75,7 +73,7 @@
         "InputPayload": {
           "TargetInstanceId": "{{TargetInstanceId}}"
         },
-        "Attachment": "clone-xen-to-nitro-python.zip"
+        "Attachment": "attachment.zip"
       },
       "outputs": [
         {
@@ -83,13 +81,12 @@
           "Selector": "$.Payload.NoExecutionFound",
           "Type": "String"
         }
-      ],
-      "nextStep": "startOfPreliminaryChecksBranch"
+      ]
     },
     {
       "name": "startOfPreliminaryChecksBranch",
       "action": "aws:sleep",
-      "description": "Start of Preliminary checks branch",
+      "description": "End of Preliminary checks branch and Start of Testing branch",
       "onFailure": "step:getTargetInstanceProperties",
       "nextStep": "getTargetInstanceProperties",
       "isCritical": false,
@@ -307,7 +304,7 @@
         "DocumentName": "AWS-RunShellScript",
         "TimeoutSeconds": 300,
         "Parameters": {
-          "commands": "#!/bin/bash\n\necho \"EC2 instance is connected with AWS Systems Manager and configured to use RunCommand\"\n"
+          "commands": "#!/bin/bash\necho \"EC2 connected with AWS SSM, configured to use RunCommand\"\n"
         }
       }
     },
@@ -344,7 +341,7 @@
         "DocumentName": "AWS-RunShellScript",
         "TimeoutSeconds": 300,
         "Parameters": {
-          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\n# Check if Instance Storage is supported or not  through API call\n\nNVME_SUPPORT='{{getXenInstanceTypeDetails.NVMeSupport}}'\n\nif [[ \"${AWS_SSM_INSTANCE_ID}\" =~ ^[i]-[a-z0-9]{8,17}$ ]]; then\n    if [ ${NVME_SUPPORT} = \"required\" ]; then\n        if [ $(ls -l /dev/disk/by-id/ | grep Amazon_EC2_NVMe_Instance_Storage | grep -wv ns-1 | awk '{ print $11 }' | sed 's/[./]//g' > /dev/null; echo $?) == \"0\" ]; then\n                echo -en \"\\n [ERROR] UnSupported Instance Type:Instance have instance store volumes attached. Exiting the automation... \\n\"\n                exit 1\n        else\n                echo -en \"\\n [INFO] No instance store volumes are attached with the EC2 instance  \\n\"\n        fi\n    elif [ $NVME_SUPPORT = \"unsupported\" ]; then\n        if [ $(TOKEN=`curl -s -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\"` && curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/block-device-mapping/ | grep -vE 'ami|root|swap' > /dev/null; echo $?) = \"0\" ]; then\n                echo -en \"\\n [ERROR] UnSupported Instance Type: Instance have instance store volumes attached. Exiting the automation...  \\n\"\n                exit 1\n        else\n                echo -en \"\\n [INFO] No instance store volumes are attached with the EC2 instance \\n\"\n            fi\n    else\n        echo -en \"\\n Unknown Error \\n\"\n        exit 1\n    fi\nelse\n    echo -en \"\\n InstanceID ${AWS_SSM_INSTANCE_ID} doesn't belong to an EC2 instance\"\n    exit 1\nfi\n"
+          "commands": "#!/bin/bash\n\nNVME_SUPPORT='{{getXenInstanceTypeDetails.NVMeSupport}}'\nERROR=\"\\n [ERROR] UnSupported Instance Type: instance store volumes attached. Exiting... \\n\"\nINFO=\"\\n [INFO] No instance store volumes are attached with the EC2  \\n\"\nif [[ \"${AWS_SSM_INSTANCE_ID}\" =~ ^[i]-[a-z0-9]{8,17}$ ]]; then\n\n    if [ ${NVME_SUPPORT} = \"required\" ]; then\n        if [ $(ls -l /dev/disk/by-id/ | grep Amazon_EC2_NVMe_Instance_Storage | grep -wv ns-1 | awk '{ print $11 }' | sed 's/[./]//g' > /dev/null; echo $?) == \"0\" ]; then\n                echo -en $ERROR\n                exit 1\n        else\n                echo -en $INFO\n        fi\n    elif [ $NVME_SUPPORT = \"unsupported\" ]; then\n        TOKEN =`curl -s -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\"` && curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/block-device-mapping/ | grep -vE 'ami|root|swap' > /dev/null; echo $?\n        if [ ${TOKEN} = \"0\" ]; then\n                echo -en $ERROR\n                exit 1\n        else\n                echo -en $INFO\n            fi\n    else\n        echo -en \"\\n Unknown Error \\n\"\n        exit 1\n    fi\nelse\n    echo -en \"\\n InstanceID ${AWS_SSM_INSTANCE_ID} is not an EC2 instance\"\n    exit 1\nfi\n"
         }
       }
     },
@@ -372,31 +369,19 @@
       "isCritical": true,
       "maxAttempts": 1,
       "onFailure": "Abort",
-      "nextStep": "endOfPreliminaryChecksBranch",
       "inputs": {
         "Runtime": "python3.8",
         "Handler": "checkAutoScaling.checkAutoScaling_handler",
-        "Attachment": "clone-xen-to-nitro-python.zip",
         "InputPayload": {
           "TargetInstanceId": "{{TargetInstanceId}}"
-        }
-      }
-    },
-    {
-      "name": "endOfPreliminaryChecksBranch",
-      "action": "aws:sleep",
-      "description": "End of Preliminary checks branch",
-      "onFailure": "Abort",
-      "nextStep": "startOfTestBranch",
-      "isCritical": false,
-      "inputs": {
-        "Duration": "PT5S"
+        },
+        "Attachment": "attachment.zip"
       }
     },
     {
       "name": "startOfTestBranch",
       "action": "aws:sleep",
-      "description": "Start of Testing branch",
+      "description": "End of Preliminary checks branch and Start of Testing branch",
       "onFailure": "Abort",
       "nextStep": "createTestImage",
       "isCritical": false,
@@ -429,7 +414,6 @@
       "inputs": {
         "Runtime": "python3.8",
         "Handler": "launchEC2Instance.launchInstanceInSameSubnet_handler",
-        "Attachment": "clone-xen-to-nitro-python.zip",
         "InputPayload": {
           "ImageId": "{{createTestImage.ImageId}}",
           "InstanceType": "{{getTargetInstanceProperties.InstanceType}}",
@@ -440,7 +424,8 @@
           ],
           "TargetInstanceId": "{{TargetInstanceId}}",
           "BranchType": "Test"
-        }
+        },
+        "Attachment": "attachment.zip"
       },
       "outputs": [
         {
@@ -478,24 +463,12 @@
       "isCritical": true,
       "timeoutSeconds": 300,
       "onFailure": "Abort",
-      "nextStep": "endOfTestBranch",
       "inputs": {
         "InstanceIds": [
           "{{launchTestInstanceInSameSubnet.TestInstanceId}}"
         ],
         "CheckStateOnly": false,
         "DesiredState": "terminated"
-      }
-    },
-    {
-      "name": "endOfTestBranch",
-      "action": "aws:sleep",
-      "description": "End of Testing branch",
-      "onFailure": "Abort",
-      "nextStep": "checkIfTestingBranchSucceeded",
-      "isCritical": false,
-      "inputs": {
-        "Duration": "PT5S"
       }
     },
     {
@@ -509,10 +482,10 @@
       "inputs": {
         "Runtime": "python3.8",
         "Handler": "checkStepStatus.checkStepStatus_handler",
-        "Attachment": "clone-xen-to-nitro-python.zip",
         "InputPayload": {
           "StepName": "waitForTestInstanceStatusChecks"
-        }
+        },
+        "Attachment": "attachment.zip"
       }
     },
     {
@@ -567,7 +540,7 @@
     {
       "name": "startOfCloneAndMigrateBranch",
       "action": "aws:sleep",
-      "description": "Start of Clone and Migrate branch",
+      "description": "End of Preliminary checks branch and Start of Testing branch",
       "onFailure": "Abort",
       "nextStep": "createBackupImage",
       "isCritical": false,
@@ -600,7 +573,6 @@
       "inputs": {
         "Runtime": "python3.8",
         "Handler": "launchEC2Instance.launchInstanceInSameSubnet_handler",
-        "Attachment": "clone-xen-to-nitro-python.zip",
         "InputPayload": {
           "ImageId": "{{createBackupImage.ImageId}}",
           "InstanceType": "{{getTargetInstanceProperties.InstanceType}}",
@@ -611,7 +583,8 @@
           ],
           "TargetInstanceId": "{{TargetInstanceId}}",
           "BranchType": "CloneAndMigrate"
-        }
+        },
+        "Attachment": "attachment.zip"
       },
       "outputs": [
         {
@@ -657,7 +630,7 @@
         "DocumentName": "AWS-RunShellScript",
         "TimeoutSeconds": 300,
         "Parameters": {
-          "commands": "#!/bin/bash\n\necho \"EC2 instance is connected with AWS Systems Manager and configured to use RunCommand\"\n"
+          "commands": "#!/bin/bash\necho \"EC2 connected with AWS SSM, configured to use RunCommand\"\n"
         }
       }
     },
@@ -675,7 +648,7 @@
         "DocumentName": "AWS-RunShellScript",
         "TimeoutSeconds": 3600,
         "Parameters": {
-          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\nNITRO_INSTANCE_TYPE='{{NitroInstanceType}}'\n\nerror_exit()\n{\n    echo \" $1\"\n    echo \"\\\\nThe Execution did not complete successfully.\\\\n\"\n    exit 1\n    \n}\n\nunsupported_os() {\n        error_exit \"Unsupported OS for ENA. Stopping installation\"\n}\n\ninstallation_ubuntu(){\n        mkdir /var/lib/amazon/ssm/xen_to_nitro_automation\n        cd /var/lib/amazon/ssm/xen_to_nitro_automation \n        sudo apt update\n        sudo apt-get install make gcc unzip wget linux-headers-\"$(uname -r)\" -y || error_exit \"[ERROR] Error occured while installing required packages via APT\"\n        cd /var/lib/amazon/ssm/xen_to_nitro_automation\n        rm -rf  amzn-drivers-master\n        wget https://github.com/amzn/amzn-drivers/archive/master.zip || error_exit \"[ERROR] Error occured while downloading ENA drivers\"\n        unzip master.zip\n        cd amzn-drivers-master/kernel/linux/ena || exit\n        ABI=$(uname -r | awk -F '[.-]' '{print $4}')\n        make [UBUNTU_ABI=$ABI]\n        rm -rf /lib/modules/\"$(uname -r)\"/ena.ko\n        sudo mkdir /lib/modules/\"$(uname -r)\"/ena/\n        cp -f ena.ko /lib/modules/\"$(uname -r)\"/ena/\n        cd /lib/modules/\"$(uname -r)\"/ena/\n        if  [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n            ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n        else\n            ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')        \n        fi\n        if [ \"${ena_version}\" -le 1 ]; then\n               echo \"ENA version = $ena_version\"\n               modprobe -r ena\n               rmmod /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko #for safe side, as modprobe -r ena would be sufficient\n               rm -rf /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko\n        fi  \n        insmod ena.ko\n        if depmod -a ; then\n            if modinfo ena > /dev/null 2>&1 ; then\n                echo \" ENA driver Installation Complete\"\n            else\n                error_exit \"[ERROR] Driver Installation failed\"\n            fi\n        else\n            error_exit \"[ERROR] Depmod file creation failed\"\n        fi\n}\n\ninstallation_yum() {\n    mkdir /var/lib/amazon/ssm/xen_to_nitro_automation\n    cd /var/lib/amazon/ssm/xen_to_nitro_automation\n    yum install kernel-devel-\"$(uname -r)\" gcc patch rpm-build wget -y || error_exit \"[ERROR] Error occured while installing required packages via YUM\"\n    rm -rf  amzn-drivers-master\n    wget https://github.com/amzn/amzn-drivers/archive/master.zip || error_exit \"[ERROR] Error occured while downloading ENA drivers\"\n    unzip master.zip\n    cd amzn-drivers-master/kernel/linux/ena\n    make\n    rm -rf /lib/modules/\"$(uname -r)\"/ena.ko\n    mkdir /lib/modules/\"$(uname -r)\"/ena/\n    cp -f ena.ko /lib/modules/\"$(uname -r)\"/ena/\n    cd /lib/modules/\"$(uname -r)\"/ena/\n    ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')        \n    if [[ \"${ena_version}\" -le 1 ]]\n        then\n           modprobe -r ena\n           rmmod /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko.xz #for safe side, as modprobe -r ena would be sufficient\n           rm -rf /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko.xz\n    fi\n    insmod ena.ko\n    depmod -a\n    echo 'add_drivers+=\" ena \"' >> /etc/dracut.conf.d/ena.conf   # Appended drivers\n    if dracut -f -v; then\n            echo \"[INFO] ENA driver Installation Complete.\"\n    else\n            error_exit \"[ERROR] Driver installation failed\"\n    fi\n}\n\nfix_predictable_names(){\n    echo \"[INFO] Fixing predictable interface naming issue\"\n    if [ -f /etc/default/grub ]; then\n        cp /etc/default/grub \"/etc/default/grub.$(date +%F)\"\n        if ! grep -q \"net.ifnames\" /etc/default/grub ; then `sed -i '/^GRUB\\_CMDLINE\\_LINUX/s/\\\"$/\\ net\\.ifnames\\=0\\\"/' /etc/default/grub`; fi\n        if ! grep -q \"biosdevname\" /etc/default/grub; then `sed -i '/^GRUB\\_CMDLINE\\_LINUX/s/\\\"$/\\ biosdevname\\=0\\\"/' /etc/default/grub`; fi\n        if [ -f /etc/debian_version ]; then # added if statement as grub2-mkconfig doesn't work on ubuntu to update grub config\n            update-grub || error_exit \"[ERROR] Error occured while updating GRUB\"\n        else\n            grub2-mkconfig -o /boot/grub2/grub.cfg || error_exit \"[ERROR] Error occured while updating GRUB\"\n        fi\n    elif [ -f /boot/grub/menu.lst ]; then # added this just in case\n        cp /boot/grub/menu.lst \"/boot/grub/menu.lst.$(date +%F)\"\n        if ! grep -q \"net.ifnames\" /boot/grub/menu.lst ; then `sed -i '/^kernel/s/$/ net\\.ifnames\\=0/' /boot/grub/menu.lst`; fi    \n        if ! grep -q \"biosdevname\" /boot/grub/menu.lst; then `sed -i '/^kernel/s/$/ biosdevname\\=0\\\"/' /boot/grub/menu.lst`; fi        \n    fi\n\n}\n\n# To check if this file exists and if it does remove it to prevent booting issues from new AMI\n# If your instance operating system contains an /etc/udev/rules.d/70-persistent-net.rules file, you must delete it before creating the AMI. This file contains the MAC address for the Ethernet adapter of the original instance. If another instance boots with this file, the operating system will be unable to find the device and eth0 might fail, causing boot issues. This file is regenerated at the next boot cycle, and any instances launched from the AMI create their own version of the file.\nPersistent_rules(){\nif [ -f /etc/udev/rules.d/70-persistent-net.rules ]; then  \n    cp /etc/udev/rules.d/70-persistent-net.rules \"/etc/udev/rules.d/70-persistent-net-rules.$(date +%F)\"\n    rm -rf /etc/udev/rules.d/70-persistent-net.rules \nfi\n}\n\n\ninstall_ena_redhat() {\n    printf \"[INFO] Installation process for RHEL/CentOS beginning... \\n\"\n    installation_yum\n    if grep -q -i \"release 7\" /etc/redhat-release; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n}\n\ninstall_ena_ubuntu(){\n    printf \"[INFO] Installation process for Ubuntu beginning... \\n\"\n    CurrentKernel=\"$(uname -r)\"\n    echo \"[INFO] Current kernel version is\" \"$CurrentKernel\"\n    echo \"$CurrentKernel\" | grep -i aws > /dev/null 2>&1\n    if  [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    fi\n    if [ \"${ena_version}\" -eq 1 ]; then\n        installation_ubuntu\n    elif [ $? -eq 0 ]; then\n        echo \"[WARNING] This kernel should have ENA installed...\"\n    else\n        installation_ubuntu\n    fi\n    if grep -iq 'xenial\\|bionic' /etc/lsb-release; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n}\n\ninstall_ena_sles() {\n    printf \"[INFO] Installation process for SLES beginning... \\n\"\n    echo \"[OK] SUSE SLES 12 SP2 and later include ENA 2.02 by default, so you are not required to download and compile the ENA driver\"\n    echo \"\\n [INFO] Reinstalling the same kernel to fix this\"\n    zypper refresh\n    CurrentKernel=$(uname -r)\n    echo \"current kernel version is\" \"$CurrentKernel\" \n    KernelVersion=$(echo \"$CurrentKernel\" | sed -r 's/-default/.1/g')\n    if zypper install -f -y kernel-default-\"$KernelVersion\" || error_exit \"[ERROR] Error occured while re-installing kernel via ZYPPER\" ; then\n        echo \" [OK] Kernel reinstalled\"\n    else\n        error_exit \"[ERROR] Kernel Installation failed\" \n    fi\n    if modinfo ena > /dev/null 2>&1; then\n      ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n      echo -e \"[OK] ENA Module with version $ena_version is installed and available on your instance\"\n    fi\n    fix_predictable_names\n}\n\ninstall_ena_amzn() {\n    printf \"[INFO] Installation process for Amazon Linux and Amazon Linux 2 beginning... \\n\"\n    installation_yum\n    . /etc/os-release\n    version=$LINUX_DISTRO_VERSION_ID\n    a=2018.03\n    if ! echo \"$version == $a\" > /dev/null | bc; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n\n}\n\ninstall_ena(){\nif [ -f /etc/os-release ]; then\n    LINUX_DISTRO=$(cat /etc/os-release | grep -w \"NAME=\" | awk -F'=' '{print $2}')\n    LINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\n    echo \"LINUX_DISTRO >> $LINUX_DISTRO\"\n    echo \"LINUX_DISTRO_VERSION_ID >> $LINUX_DISTRO_VERSION_ID\"\nfi\n\nif [ -f /etc/redhat-release ] ; then\n    if grep -qi -e \"release 6\" -e \"release 7\" /etc/redhat-release ; then\n        install_ena_redhat\n    else\n        unsupported_os\n    fi\n\nelif grep 'Amazon Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    . /etc/os-release\n    version=$LINUX_DISTRO_VERSION_ID\n    a=2018.03\n    if echo \"$version == $a\" | bc; then\n        install_ena_amzn\n    elif [ \"${version}\" -eq 2 ]; then\n        install_ena_amzn\n    else\n        unsupported_os\n    fi\n\nelif grep 'SUSE Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    SUSE_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    SUSE_MINOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $2}')\n    echo \"SUSE_MAJOR_VERSION >> $SUSE_MAJOR_VERSION\"\n    echo \"SUSE_MINOR_VERSION >> $SUSE_MINOR_VERSION\"\n    if [ $SUSE_MAJOR_VERSION -lt 15 ] && [ $SUSE_MINOR_VERSION -lt 5 ]; then\n        unsupported_os\n    else\n       install_ena_sles\n    fi\n\nelif grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n    UBUNTU_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    UBUNTU_MINOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $2}')\n    if [ \"$UBUNTU_MAJOR_VERSION\" -lt \"14\" ]; then\n        unsupported_os\n    else \n        install_ena_ubuntu\n    fi\n\nelif grep 'Debian' /etc/os-release; then\n    DEBIAN_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    DEBIAN_MINOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $2}')\n    if [ \"$DEBIAN_MAJOR_VERSION\" -lt \"9\" ]; then\n            unsupported_os\n    else \n        install_ena_ubuntu\n    fi\n\nelse\n    unsupported_os\nfi\n}\n\n\nLINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\na='2018.03' #AL is EOL and is in maintenance support which will end in mind 2023. 2018.03 is the last AL OS version released, hence not supporting older versions\n\nif ! modinfo ena > /dev/null 2>&1;\n    then\n    echo \"[WARNING] ENA Module is not available on your instance.\"\n    install_ena\nelif echo \"${NITRO_INSTANCE_TYPE}\" | grep -qE '^[cmr]6[ia]\\.[0-9]{0,2}[x]?large$'; then\n    if grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n        LINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\n        UBUNTU_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n            if [ $UBUNTU_MAJOR_VERSION -eq 16 ]; then\n                unsupported_os\n            elif [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n                ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n            else\n                ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n            fi\n    elif echo \"$LINUX_DISTRO_VERSION_ID == $a\" > /dev/null | bc; then\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    elif grep Debian /etc/os-release 1>/dev/null 2>/dev/null; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    fi\n    if [ $ena_version -eq 1 ]\n       then\n        echo \"[INFO] Updating ENA version as instance type is 6th generation\"\n        install_ena\n    else\n     echo \"[INFO] No ena version update needed for 6th generation instance type. Already > 1.2.0\"\n    fi\n\nelif grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n    LINUX_DISTRO_VERSION_ID=$(cat /etc/os-release | grep VERSION_ID | awk -F'=' '{print $2}' | tr -d '\"')\n    UBUNTU_MAJOR_VERSION=$(echo $LINUX_DISTRO_VERSION_ID | awk -F'.' '{print $1}')\n    if  [ $UBUNTU_MAJOR_VERSION -gt 16 ]; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk '{print $2}')\n        echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n        echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\n    fi\nelse \n    ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n    echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\nfi\n\nPersistent_rules\nfix_predictable_names\n"
+          "commands": "#!/bin/bash\n\nNITRO_INSTANCE_TYPE='{{NitroInstanceType}}'\n\nerror_exit()\n{\n    echo \" $1\"\n    echo \"\\\\nThe Execution did not complete successfully.\\\\n\"\n    exit 1\n    \n}\n\nunsupported_os() {\n        error_exit \"Unsupported OS for ENA. Stopping installation\"\n}\n\ninstallation_ubuntu(){\n        mkdir /var/lib/amazon/ssm/xen_to_nitro_automation\n        cd /var/lib/amazon/ssm/xen_to_nitro_automation \n        sudo apt update\n        sudo apt-get install make gcc unzip wget linux-headers-\"$(uname -r)\" -y || error_exit \"[ERROR] Error occured while installing required packages via APT\"\n        cd /var/lib/amazon/ssm/xen_to_nitro_automation\n        rm -rf  amzn-drivers-master\n        wget https://github.com/amzn/amzn-drivers/archive/master.zip || error_exit \"[ERROR] Error occured while downloading ENA drivers\"\n        unzip master.zip\n        cd amzn-drivers-master/kernel/linux/ena || exit\n        ABI=$(uname -r | awk -F '[.-]' '{print $4}')\n        make [UBUNTU_ABI=$ABI]\n        rm -rf /lib/modules/\"$(uname -r)\"/ena.ko\n        sudo mkdir /lib/modules/\"$(uname -r)\"/ena/\n        cp -f ena.ko /lib/modules/\"$(uname -r)\"/ena/\n        cd /lib/modules/\"$(uname -r)\"/ena/\n        if  [ $UBUNTU_MAJOR_VER -gt 16 ]; then\n            ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n        else\n            ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')        \n        fi\n        if [ \"${ena_version}\" -le 1 ]; then\n               echo \"ENA version = $ena_version\"\n               modprobe -r ena\n               rmmod /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko #for safe side, as modprobe -r ena would be sufficient\n               rm -rf /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko\n        fi  \n        insmod ena.ko\n        if depmod -a ; then\n            if modinfo ena > /dev/null 2>&1 ; then\n                echo \" ENA driver Installation Complete\"\n            else\n                error_exit \"[ERROR] Driver Installation failed\"\n            fi\n        else\n            error_exit \"[ERROR] Depmod file creation failed\"\n        fi\n}\n\ninstallation_yum() {\n    mkdir /var/lib/amazon/ssm/xen_to_nitro_automation\n    cd /var/lib/amazon/ssm/xen_to_nitro_automation\n    yum install kernel-devel-\"$(uname -r)\" gcc patch rpm-build wget -y || error_exit \"[ERROR] Error occured while installing required packages via YUM\"\n    rm -rf  amzn-drivers-master\n    wget https://github.com/amzn/amzn-drivers/archive/master.zip || error_exit \"[ERROR] Error occured while downloading ENA drivers\"\n    unzip master.zip\n    cd amzn-drivers-master/kernel/linux/ena\n    make\n    rm -rf /lib/modules/\"$(uname -r)\"/ena.ko\n    mkdir /lib/modules/\"$(uname -r)\"/ena/\n    cp -f ena.ko /lib/modules/\"$(uname -r)\"/ena/\n    cd /lib/modules/\"$(uname -r)\"/ena/\n    ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')        \n    if [[ \"${ena_version}\" -le 1 ]]\n        then\n           modprobe -r ena\n           rmmod /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko.xz #for safe side, as modprobe -r ena would be sufficient\n           rm -rf /lib/modules/\"$(uname -r)\"/kernel/drivers/net/ethernet/amazon/ena/ena.ko.xz\n    fi\n    insmod ena.ko\n    depmod -a\n    echo 'add_drivers+=\" ena \"' >> /etc/dracut.conf.d/ena.conf   # Appended drivers\n    if dracut -f -v; then\n            echo \"[INFO] ENA driver Installation Complete.\"\n    else\n            error_exit \"[ERROR] Driver installation failed\"\n    fi\n}\n\nfix_predictable_names(){\n    echo \"[INFO] Fixing predictable interface naming issue\"\n    if [ -f /etc/default/grub ]; then\n        cp /etc/default/grub \"/etc/default/grub.$(date +%F)\"\n        if ! grep -q \"net.ifnames\" /etc/default/grub ; then `sed -i '/^GRUB\\_CMDLINE\\_LINUX/s/\\\"$/\\ net\\.ifnames\\=0\\\"/' /etc/default/grub`; fi\n        if ! grep -q \"biosdevname\" /etc/default/grub; then `sed -i '/^GRUB\\_CMDLINE\\_LINUX/s/\\\"$/\\ biosdevname\\=0\\\"/' /etc/default/grub`; fi\n        if [ -f /etc/debian_version ]; then # added if statement as grub2-mkconfig doesn't work on ubuntu to update grub config\n            update-grub || error_exit \"[ERROR] Error occured while updating GRUB\"\n        else\n            grub2-mkconfig -o /boot/grub2/grub.cfg || error_exit \"[ERROR] Error occured while updating GRUB\"\n        fi\n    elif [ -f /boot/grub/menu.lst ]; then # added this just in case\n        cp /boot/grub/menu.lst \"/boot/grub/menu.lst.$(date +%F)\"\n        if ! grep -q \"net.ifnames\" /boot/grub/menu.lst ; then `sed -i '/^kernel/s/$/ net\\.ifnames\\=0/' /boot/grub/menu.lst`; fi    \n        if ! grep -q \"biosdevname\" /boot/grub/menu.lst; then `sed -i '/^kernel/s/$/ biosdevname\\=0\\\"/' /boot/grub/menu.lst`; fi        \n    fi\n\n}\n\n# To check if this file exists and if it does remove it to prevent booting issues from new AMI\n# If your instance operating system contains an /etc/udev/rules.d/70-persistent-net.rules file, you must delete it before creating the AMI. This file contains the MAC address for the Ethernet adapter of the original instance. If another instance boots with this file, the operating system will be unable to find the device and eth0 might fail, causing boot issues. This file is regenerated at the next boot cycle, and any instances launched from the AMI create their own version of the file.\nPersistent_rules(){\nif [ -f /etc/udev/rules.d/70-persistent-net.rules ]; then  \n    cp /etc/udev/rules.d/70-persistent-net.rules \"/etc/udev/rules.d/70-persistent-net-rules.$(date +%F)\"\n    rm -rf /etc/udev/rules.d/70-persistent-net.rules \nfi\n}\n\n\ninstall_ena_redhat() {\n    printf \"[INFO] Installation process for RHEL/CentOS beginning... \\n\"\n    installation_yum\n    if grep -q -i \"release 7\" /etc/redhat-release; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n}\n\ninstall_ena_ubuntu(){\n    printf \"[INFO] Installation process for Ubuntu beginning... \\n\"\n    CurrentKernel=\"$(uname -r)\"\n    echo \"[INFO] Current kernel version is\" \"$CurrentKernel\"\n    echo \"$CurrentKernel\" | grep -i aws > /dev/null 2>&1\n    if  [ $UBUNTU_MAJOR_VER -gt 16 ]; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    fi\n    if [ \"${ena_version}\" -eq 1 ]; then\n        installation_ubuntu\n    elif [ $? -eq 0 ]; then\n        echo \"[WARNING] This kernel should have ENA installed...\"\n    else\n        installation_ubuntu\n    fi\n    if grep -iq 'xenial\\|bionic' /etc/lsb-release; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n}\n\ninstall_ena_sles() {\n    printf \"[INFO] Installation process for SLES beginning... \\n\"\n    echo \"[OK] SUSE SLES 12 SP2 and later include ENA 2.02 by default, so you are not required to download and compile the ENA driver\"\n    echo \"\\n [INFO] Reinstalling the same kernel to fix this\"\n    zypper refresh\n    CurrentKernel=$(uname -r)\n    echo \"current kernel version is\" \"$CurrentKernel\" \n    KernelVersion=$(echo \"$CurrentKernel\" | sed -r 's/-default/.1/g')\n    if zypper install -f -y kernel-default-\"$KernelVersion\" || error_exit \"[ERROR] Error occured while re-installing kernel via ZYPPER\" ; then\n        echo \" [OK] Kernel reinstalled\"\n    else\n        error_exit \"[ERROR] Kernel Installation failed\" \n    fi\n    if modinfo ena > /dev/null 2>&1; then\n      ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n      echo -e \"[OK] ENA Module with version $ena_version is installed and available on your instance\"\n    fi\n    fix_predictable_names\n}\n\ninstall_ena_amzn() {\n    printf \"[INFO] Installation process for Amazon Linux and Amazon Linux 2 beginning... \\n\"\n    installation_yum\n    . /etc/os-release\n    version=$LINUX_DIST_VER\n    a=2018.03\n    if ! echo \"$version == $a\" > /dev/null | bc; then\n        fix_predictable_names\n    else\n        echo \"[OK] No need to fix predictable name issues on this version of OS\"\n    fi\n\n}\n\ninstall_ena(){\nif [ -f /etc/os-release ]; then\n    LINUX_DIST=$(cat /etc/os-release | grep -w \"NAME=\" | awk -F'=' '{print $2}')\n    LINUX_DIST_VER=$(cat /etc/os-release | grep VER_ID | awk -F'=' '{print $2}' | tr -d '\"')\n    echo \"LINUX_DIST >> $LINUX_DIST\"\n    echo \"LINUX_DIST_VER >> $LINUX_DIST_VER\"\nfi\n\nif [ -f /etc/redhat-release ] ; then\n    if grep -qi -e \"release 6\" -e \"release 7\" /etc/redhat-release ; then\n        install_ena_redhat\n    else\n        unsupported_os\n    fi\n\nelif grep 'Amazon Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    . /etc/os-release\n    version=$LINUX_DIST_VER\n    a=2018.03\n    if echo \"$version == $a\" | bc; then\n        install_ena_amzn\n    elif [ \"${version}\" -eq 2 ]; then\n        install_ena_amzn\n    else\n        unsupported_os\n    fi\n\nelif grep 'SUSE Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    SUSE_MAJOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $1}')\n    SUSE_MINOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $2}')\n    echo \"SUSE_MAJOR_VER >> $SUSE_MAJOR_VER\"\n    echo \"SUSE_MINOR_VER >> $SUSE_MINOR_VER\"\n    if [ $SUSE_MAJOR_VER -lt 15 ] && [ $SUSE_MINOR_VER -lt 5 ]; then\n        unsupported_os\n    else\n       install_ena_sles\n    fi\n\nelif grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n    UBUNTU_MAJOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $1}')\n    UBUNTU_MINOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $2}')\n    if [ \"$UBUNTU_MAJOR_VER\" -lt \"14\" ]; then\n        unsupported_os\n    else \n        install_ena_ubuntu\n    fi\n\nelif grep 'Debian' /etc/os-release; then\n    DEBIAN_MAJOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $1}')\n    DEBIAN_MINOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $2}')\n    if [ \"$DEBIAN_MAJOR_VER\" -lt \"9\" ]; then\n            unsupported_os\n    else \n        install_ena_ubuntu\n    fi\n\nelse\n    unsupported_os\nfi\n}\n\n\nLINUX_DIST_VER=$(cat /etc/os-release | grep VER_ID | awk -F'=' '{print $2}' | tr -d '\"')\na='2018.03' #AL is EOL and is in maintenance support which will end in mind 2023. 2018.03 is the last AL OS version released, hence not supporting older versions\n\nif ! modinfo ena > /dev/null 2>&1;\n    then\n    echo \"[WARNING] ENA Module is not available on your instance.\"\n    install_ena\nelif echo \"${NITRO_INSTANCE_TYPE}\" | grep -qE '^[cmr]6[ia]\\.[0-9]{0,2}[x]?large$'; then\n    if grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n        LINUX_DIST_VER=$(cat /etc/os-release | grep VER_ID | awk -F'=' '{print $2}' | tr -d '\"')\n        UBUNTU_MAJOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $1}')\n            if [ $UBUNTU_MAJOR_VER -eq 16 ]; then\n                unsupported_os\n            elif [ $UBUNTU_MAJOR_VER -gt 16 ]; then\n                ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n            else\n                ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n            fi\n    elif echo \"$LINUX_DIST_VER == $a\" > /dev/null | bc; then\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    elif grep Debian /etc/os-release 1>/dev/null 2>/dev/null; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk -F \"[a-z:.-]*\" '{gsub(/ /,\"\"); print $2}')\n    fi\n    if [ $ena_version -eq 1 ]\n       then\n        echo \"[INFO] Updating ENA version as instance type is 6th generation\"\n        install_ena\n    else\n     echo \"[INFO] No ena version update needed for 6th generation instance type. Already > 1.2.0\"\n    fi\n\nelif grep 'Ubuntu' /etc/os-release 1>/dev/null 2>/dev/null; then\n    LINUX_DIST_VER=$(cat /etc/os-release | grep VER_ID | awk -F'=' '{print $2}' | tr -d '\"')\n    UBUNTU_MAJOR_VER=$(echo $LINUX_DIST_VER | awk -F'.' '{print $1}')\n    if  [ $UBUNTU_MAJOR_VER -gt 16 ]; then\n        ena_version=$(modinfo ena|grep -Eo '^vermagic:.*' | awk '{print $2}')\n        echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\n    else\n        ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n        echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\n    fi\nelse \n    ena_version=$(modinfo ena|grep -Eo '^version:.*' | awk '{print $2}')\n    echo \"[INFO] ENA Module with version $ena_version is installed and available on your instance\"\nfi\n\nPersistent_rules\nfix_predictable_names\n"
         }
       }
     },
@@ -692,7 +665,7 @@
           "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
         ],
         "Parameters": {
-          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\n\ncheck_NVMe_omitted () {\n    lsinitrd /boot/initramfs-$(uname -r).img| grep -e \"--omit-drivers\" -e \"-o\" | grep nvme > /dev/null 2>&1\n    if [ $? -eq 0 ]; then \n        echo \"[ERROR] NVME module is ommited in initramfs image using parameter --omit-drivers or -o\"\n        exit 1\n    else\n        echo \"[INFO] NVME module is not ommited in initramfs image using parameter --omit-drivers or -o\"\n    fi\n}\n\nadd_nvme_driver(){\n    echo \"[ERROR] NVMe Module is not loaded in the initramfs image, recreating initramfs/initrd:\"\n    echo 'add_drivers+=\" nvme \"' >> /etc/dracut.conf.d/nvme.conf\n    echo 'add_drivers+=\" nvme_core \"' >> /etc/dracut.conf.d/nvme_core.conf\n    dracut -f -v\n    depmod -a\n}\n\ncheck_NVMe_in_initrd () {\n\nif [ -f /etc/redhat-release ] ; then\n    check_NVMe_omitted\n    lsinitrd /boot/initramfs-$(uname -r).img | grep -i nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then        \n        add_nvme_driver\n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module is not loaded in the newly built initramfs image\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"        \n        fi\n    else\n        Kernel_version=`uname -r`\n        echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n    fi\nelif grep 'Amazon Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    check_NVMe_omitted\n    lsinitrd /boot/initramfs-$(uname -r).img|grep nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        add_nvme_driver          \n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module is not loaded in the newly built initramfs image\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"        \n        fi\n    else\n        Kernel_version=`uname -r`\n        echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n    fi\nelif grep 'SUSE Linux' /etc/os-release 1>/dev/null 2>/dev/null; then     \n    check_NVMe_omitted\n    lsinitrd /boot/initrd|grep nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        add_nvme_driver        \n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module is not loaded in the newly built initramfs image\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n        fi\n    else \n        Kernel_version=`uname -r`\n        echo \"[INFO] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"     \n    fi\nelif [ -f /etc/debian_version ] ; then\n    lsinitramfs /boot/initrd.img-$(uname -r)|grep nvme > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        echo \"[ERROR] NVMe Module is not loaded in the initramfs image, recreating initrd:\"\n        update-initramfs -c -k all\n        lsinitramfs /boot/initrd.img-$(uname -r)| grep nvme > /dev/null 2>&1\n        if [ $? -ne 1 ]; then\n            echo \"[OK] NVME Module is installed in newly built initrd\"\n        else \n            echo \"[ERROR] NVME Module cannot be installed\"\n            exit 1\n        fi\n    else\n        Kernel_version=`uname -r`\n        echo \"[OK] NVME Module is loaded in initramfs/initrd for Kernel version $Kernel_version\"\n    fi\nelse\n    echo \"[ERROR] Unsupported OS for this script.\"\n    exit 1\nfi\n}\n\n(grep 'nvme' /boot/System.map-$(uname -r)) > /dev/null 2>&1\nif [ $? -ne 0 ]     # NVMe module is not built into the kernel\n    then\n    (modinfo nvme) > /dev/null 2>&1\n    if [ $? -ne 0 ]\n        then\n        # NVMe Module is not installed. \n        echo \"[ERROR] NVMe Module is not available on your instance. \\n\\t- Please install NVMe module before changing your instance type to Nitro. Look at the following link for further guidance:\"\n        echo \"\\t> https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvme-ebs-volumes.html\"\n        exit 1\n\n    else\n        Kernel_version=`uname -r`\n        echo \"[OK] NVMe module is installed on your instance for Kernel version $Kernel_version\"\n        echo \"[INFO] Checking if NVME module is loaded in initramfs/initrd\"\n        check_NVMe_in_initrd                # Calling function to check if NVMe module is loaded in initramfs. \n    fi\nelse\n    Kernel_version=`uname -r`\n    echo \"[OK]  NVMe module is installed and available on your instance for Kernel version $Kernel_version\"\nfi\n"
+          "commands": "#!/bin/bash\n\nINFO_MSG=\"[INFO] NVME Module loaded in initramfs/initrd for Kernel version\"\ncheck_NVMe_omitted () {\n    lsinitrd /boot/initramfs-$(uname -r).img| grep -e \"--omit-drivers\" -e \"-o\" | grep nvme > /dev/null 2>&1\n    if [ $? -eq 0 ]; then \n        echo \"[ERROR] NVME module ommited in initramfs img using parameter --omit-drivers or -o\"\n        exit 1\n    else\n        echo \"[INFO] NVME module not ommited in initramfs img using parameter --omit-drivers or -o\"\n    fi\n}\nadd_nvme_driver(){\n    echo \"[ERROR] NVMe Module not loaded in initramfs img, recreating initramfs/initrd:\"\n    echo 'add_drivers+=\" nvme \"' >> /etc/dracut.conf.d/nvme.conf\n    echo 'add_drivers+=\" nvme_core \"' >> /etc/dracut.conf.d/nvme_core.conf\n    dracut -f -v\n    depmod -a\n}\ncheck_NVMe_in_initrd () {\nif [ -f /etc/redhat-release ] ; then\n    check_NVMe_omitted\n    lsinitrd /boot/initramfs-$(uname -r).img | grep -i nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then        \n        add_nvme_driver\n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module not loaded in newly built initramfs img\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo $INFO_MSG       \n        fi\n    else\n        Kernel_version=`uname -r`\n        echo $INFO_MSG\n    fi\nelif grep 'Amazon Linux' /etc/os-release 1>/dev/null 2>/dev/null; then\n    check_NVMe_omitted\n    lsinitrd /boot/initramfs-$(uname -r).img|grep nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        add_nvme_driver          \n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module not loaded in newly built initramfs img\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo $INFO_MSG       \n        fi\n    else\n        Kernel_version=`uname -r`\n        echo $INFO_MSG\n    fi\nelif grep 'SUSE Linux' /etc/os-release 1>/dev/null 2>/dev/null; then     \n    check_NVMe_omitted\n    lsinitrd /boot/initrd|grep nvme| grep -v nvmem > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        add_nvme_driver        \n        lsinitrd /boot/initramfs-$(uname -r).img | grep nvme | grep -v nvmem > /dev/null 2>&1\n        if [ $? -ne 0 ]; then\n            echo \"[ERROR] NVMe Module not loaded in newly built initramfs img\"\n            exit 1\n        else\n            Kernel_version=`uname -r`\n            echo $INFO_MSG\n        fi\n    else \n        Kernel_version=`uname -r`\n        echo $INFO_MSG\n    fi\nelif [ -f /etc/debian_version ] ; then\n    lsinitramfs /boot/initrd.img-$(uname -r)|grep nvme > /dev/null 2>&1\n    if [ $? -ne 0 ]; then\n        echo \"[ERROR] NVMe Module not loaded in initramfs imge, recreating initrd:\"\n        update-initramfs -c -k all\n        lsinitramfs /boot/initrd.img-$(uname -r)| grep nvme > /dev/null 2>&1\n        if [ $? -ne 1 ]; then\n            echo \"[OK] NVME Module installed in new built initrd\"\n        else \n            echo \"[ERROR] NVME Module cannot be installed\"\n            exit 1\n        fi\n    else\n        Kernel_version=`uname -r`\n        echo \"[OK] NVME Module loaded in initramfs/initrd for Kernel version\"\n    fi\nelse\n    echo \"[ERROR] Unsupported OS for script.\"\n    exit 1\nfi\n}\n(grep 'nvme' /boot/System.map-$(uname -r)) > /dev/null 2>&1\nif [ $? -ne 0 ] \n    then\n    (modinfo nvme) > /dev/null 2>&1\n    if [ $? -ne 0 ]\n        then\n        # NVMe Module is not installed. \n        echo \"[ERROR] NVMe Module not available on instance. \\n\\t- Please install NVMe module before changing instance type to Nitro. View link for further guidance:\"\n        echo \"\\t> https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvme-ebs-volumes.html\"\n        exit 1\n\n    else\n        Kernel_version=`uname -r`\n        echo \"[OK] NVMe module installed on instance for Kernel version\"\n        echo \"[INFO] Checking if NVME module loaded in initramfs/initrd\"\n        check_NVMe_in_initrd    \n    fi\nelse\n    Kernel_version=`uname -r`\n    echo \"[OK]  NVMe module installed and available on instance for Kernel version\"\nfi\n"
         }
       }
     },
@@ -709,7 +682,7 @@
           "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
         ],
         "Parameters": {
-          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n#!/bin/bash\n\ntime_stamp=$(date +%F-%H:%M:%S)\ncp -p /etc/fstab /etc/fstab.backup.$time_stamp\ncp -p /etc/fstab /etc/fstab.modified.$time_stamp\nmkdir /var/lib/amazon/ssm/xen_to_nitro_automation\ncat /etc/fstab | grep '^/dev' | grep -E 'sd[a-z]|xvd[a-z]|nvme([0-9]|1[0-9]|2[0-7])n1p?' | awk -F '/' '{print $3}'>/var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n\nwhile read LINE; do # For each line in /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n        UUID=`ls -l /dev/disk/by-uuid | grep \"$LINE\" | sed -n 's/^.* \\([^ ]*\\) -> .*$/\\1/p'` # Gets the UUID name for that device\n        if [ ! -z \"$UUID\" ]\n        then\n            sed -i \"s|^/dev/${LINE}|UUID=${UUID}|\" /etc/fstab.modified.$time_stamp # Changes the entry in fstab to UUID form\n        fi\ndone </var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n\nif [ -s /var/lib/amazon/ssm/xen_to_nitro_automation/device_names ]; then\n    echo -e \"[WARNING] Your fstab file contains device names.\"\n    echo -e \"[INFO] Replacing device names with UUID in /etc/fstab file to make it compatible for NVMe block device names\"\n    echo -e \"[INFO] Writing changes to /etc/fstab\"\n    cp -p /etc/fstab.modified.$time_stamp /etc/fstab\n    echo -e \"[INFO] Device name entries converted to UUIDs\"\n    echo -e \"[INFO] Original fstab file is stored as /etc/fstab.backup.$time_stamp\"\n    rm -rf /etc/fstab.modified.$time_stamp\n    rm -rf /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n    rmdir /var/lib/amazon/ssm/xen_to_nitro_automation\n\n\nelse\n    rm -rf /etc/fstab.backup.$time_stamp\n    rm -rf /etc/fstab.modified.$time_stamp\n    rm -rf /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n    rmdir /var/lib/amazon/ssm/xen_to_nitro_automation\n    echo -e \"[INFO] fstab file looks fine and does not contain any entry with device names and are with UUID\"\nfi\n\n\n\n"
+          "commands": "#!/bin/bash\ntime_stamp=$(date +%F-%H:%M:%S)\ncp -p /etc/fstab /etc/fstab.backup.$time_stamp\ncp -p /etc/fstab /etc/fstab.modified.$time_stamp\nmkdir /var/lib/amazon/ssm/xen_to_nitro_automation\ncat /etc/fstab | grep '^/dev' | grep -E 'sd[a-z]|xvd[a-z]|nvme([0-9]|1[0-9]|2[0-7])n1p?' | awk -F '/' '{print $3}'>/var/lib/amazon/ssm/xen_to_nitro_automation/device_names\nwhile read LINE; do\n        UUID=`ls -l /dev/disk/by-uuid | grep \"$LINE\" | sed -n 's/^.* \\([^ ]*\\) -> .*$/\\1/p'` # Gets the UUID name\n        if [ ! -z \"$UUID\" ]\n        then\n            sed -i \"s|^/dev/${LINE}|UUID=${UUID}|\" /etc/fstab.modified.$time_stamp\n        fi\ndone </var/lib/amazon/ssm/xen_to_nitro_automation/device_names\nif [ -s /var/lib/amazon/ssm/xen_to_nitro_automation/device_names ]; then\n    echo -e \"[WARNING] fstab file contains device names.\"\n    echo -e \"[INFO] Replacing device names with UUID in /etc/fstab file so compatible for NVMe block device names\"\n    echo -e \"[INFO] Writing changes to /etc/fstab\"\n    cp -p /etc/fstab.modified.$time_stamp /etc/fstab\n    echo -e \"[INFO] Device name entries converted to UUIDs\"\n    echo -e \"[INFO] Original fstab file is stored as /etc/fstab.backup.$time_stamp\"\n    rm -rf /etc/fstab.modified.$time_stamp\n    rm -rf /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n    rmdir /var/lib/amazon/ssm/xen_to_nitro_automation\nelse\n    rm -rf /etc/fstab.backup.$time_stamp\n    rm -rf /etc/fstab.modified.$time_stamp\n    rm -rf /var/lib/amazon/ssm/xen_to_nitro_automation/device_names\n    rmdir /var/lib/amazon/ssm/xen_to_nitro_automation\n    echo -e \"[INFO] fstab file is fine and does not contain any UUID\"\nfi\n\n\n\n"
         }
       }
     },
@@ -833,7 +806,6 @@
       "action": "aws:createImage",
       "description": "Creates an Image from the new EC2 instance only if the new EC2 instance successfully boots on Nitro Platform",
       "maxAttempts": 1,
-      "nextStep": "endOfCloneAndMigrateBranch",
       "onFailure": "step:failureHandling",
       "isCritical": true,
       "inputs": {
@@ -841,17 +813,6 @@
         "ImageName": "CloneXenEC2InstanceAndMigrateToNitro_NitroImage_{{TargetInstanceId}}_{{global:DATE_TIME}}",
         "NoReboot": true,
         "ImageDescription": "Image created after driver installation - SSMAutomationID-{{automation:EXECUTION_ID}}"
-      }
-    },
-    {
-      "name": "endOfCloneAndMigrateBranch",
-      "action": "aws:sleep",
-      "description": "End of Clone & Migrate branch",
-      "onFailure": "Continue",
-      "nextStep": "cleanupTestImage",
-      "isCritical": false,
-      "inputs": {
-        "Duration": "PT5S"
       }
     },
     {
@@ -945,16 +906,16 @@
       }
     }
   ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "sha256": "f878b06a82e7bea6d31211d05414797677f67c493cde3c3bacc90e65a05a2f97"
+      }
+    }
+  },
   "outputs": [
     "launchInstanceInSameSubnet.ClonedInstanceId",
     "createBackupImage.ImageId",
     "createImageAfterDriversInstallation.ImageId"
-  ],
-  "files": {
-    "clone-xen-to-nitro-python.zip": {
-      "checksums": {
-        "sha256": "52f555c5cc6ce07a7f59b9ef76126e411b58fffe1dbe7bdef449a64b5a9f543b"
-      }
-    }
-  }
+  ]
 }

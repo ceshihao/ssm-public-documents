@@ -1,0 +1,268 @@
+{
+  "description": "Automation Document for installing the Crowdstike's Falcon Sensor .",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to run this runbook.",
+      "default": ""
+    },
+    "Action": {
+      "type": "String",
+      "allowedValues": [
+        "Install",
+        "Uninstall"
+      ],
+      "description": "(Required) Specify whether or not to install or uninstall the package.",
+      "default": "Install"
+    },
+    "InstallationType": {
+      "type": "String",
+      "allowedValues": [
+        "Uninstall and reinstall"
+      ],
+      "description": "(Optional) Specify the type of installation. Uninstall and reinstall: The application is taken offline until the reinstallation process completes. In-place update: The application is available while new or updated files are added to the installation.",
+      "default": "Uninstall and reinstall"
+    },
+    "LinuxPackageVersion": {
+      "type": "String",
+      "description": "(Optional) The version of the package to install or uninstall on Linux nodes. If you do not specify a version, the system installs the default version specified by the Distributor package.",
+      "default": ""
+    },
+    "LinuxInstallerParams": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) Enter CrowdStrike's install time params to be used on Linux nodes. For more information refer to the console."
+    },
+    "WindowsPackageVersion": {
+      "type": "String",
+      "description": "(Optional) The version of the package to install or uninstall on Windows nodes. If you do not specify a version, the system installs the default version specified by the Distributor package.",
+      "default": ""
+    },
+    "WindowsInstallerParams": {
+      "type": "String",
+      "default": "",
+      "description": "(Optional) Enter CrowdStrike's install time params to be used on Windows nodes. For more information refer to the console."
+    },
+    "FalconCloud": {
+      "type": "String",
+      "description": "(Required) SSM Parameter Store name that contains the Falcon Cloud URL for CrowdStrike APIs.",
+      "default": "/CrowdStrike/Falcon/Cloud"
+    },
+    "FalconClientId": {
+      "type": "String",
+      "default": "/CrowdStrike/Falcon/ClientId",
+      "description": "(Required) SSM Parameter Store name that contains the Falcon Client Id for CrowdStrike APIs."
+    },
+    "FalconClientSecret": {
+      "type": "String",
+      "description": "(Required) SSM Parameter Store name that contains the Falcon Client Secret for CrowdStrike APIs.",
+      "default": "/CrowdStrike/Falcon/ClientSecret"
+    },
+    "InstanceIds": {
+      "type": "StringList"
+    },
+    "Targets": {
+      "type": "MapList",
+      "default": []
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetSSMInstanceInformation",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ InstanceIds }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "instances",
+          "Selector": "$.InstanceInformationList",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "CompileInstanceList",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "instances": "{{ GetSSMInstanceInformation.instances }}"
+        },
+        "Script": "def script_handler(events, context):\n  window_instances = []\n  linux_instances = []\n\n  for instance in events['instances']:\n    if instance['PlatformType'] == 'Windows':\n      window_instances.append(instance['InstanceId'])\n    elif instance['PlatformType'] == 'Linux':\n      linux_instances.append(instance['InstanceId'])\n    else:\n      raise ValueError('Unsupported platform {}'.format(instance['PlatformType']))\n    \n  return {\n    'windows_instances': window_instances,\n    'linux_instances': linux_instances,\n    'contains_windows_instances': any(window_instances),\n    'contains_linux_instances': any(linux_instances)\n  }"
+      },
+      "outputs": [
+        {
+          "Name": "windows_instances",
+          "Selector": "$.Payload.windows_instances",
+          "Type": "StringList"
+        },
+        {
+          "Name": "linux_instances",
+          "Selector": "$.Payload.linux_instances",
+          "Type": "StringList"
+        },
+        {
+          "Name": "contains_windows_instances",
+          "Selector": "$.Payload.contains_windows_instances",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "contains_linux_instances",
+          "Selector": "$.Payload.contains_linux_instances",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "GetAuthenticationToken",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "Script": "import http.client\nimport mimetypes\nimport urllib.parse\nimport boto3\nimport json\n\ndef script_handler(events, context):\n  print('Configuring AWS region {}'.format(events['Region']))\n  ssm = boto3.client('ssm', region_name=events['Region'])\n\n  print('Fetching required configuration from Parameter Service')\n\n  print('... Fetching FalconCloud')\n  apiGateWayHostResponse = ssm.get_parameter(Name=events['FalconCloud'], WithDecryption=True)\n  if apiGateWayHostResponse['ResponseMetadata']['HTTPStatusCode'] != 200:\n    raise ValueError('Required property {} not found'.format(events['FalconCloud']))\n\n  print('... Fetching FalconClientId')\n  apiGatewayClientIDResponse = ssm.get_parameter(Name=events['FalconClientId'], WithDecryption=True)\n  if apiGatewayClientIDResponse['ResponseMetadata']['HTTPStatusCode'] != 200:\n    raise ValueError('Required property {} not found'.format(events['FalconClientId']))\n\n  print('... Fetching FalconClientSecret')\n  apiGatewayClientSecretResponse = ssm.get_parameter(Name=events['FalconClientSecret'], WithDecryption=True)\n  if apiGatewayClientSecretResponse['ResponseMetadata']['HTTPStatusCode'] != 200:\n    raise ValueError('Required property {} not found'.format(events['FalconClientSecret']))\n\n  apiGateWayHostValue = apiGateWayHostResponse['Parameter']['Value']\n  apiGateWayHostValue = apiGateWayHostValue.replace(\"https://\", \"\").replace(\"http://\", \"\")\n  apiGatewayClientIDValue = apiGatewayClientIDResponse['Parameter']['Value']\n  apiGatewayClientSecretValue = apiGatewayClientSecretResponse['Parameter']['Value']\n\n  try:\n    print('Requesting Authentication token from Crowdstrike backend.')\n    conn = http.client.HTTPSConnection(apiGateWayHostValue)\n    params = urllib.parse.urlencode({'client_id': apiGatewayClientIDValue, 'client_secret': apiGatewayClientSecretValue})\n    headers = {'Content-Type': 'application/x-www-form-urlencoded'}\n    conn.request('POST', '/oauth2/token', params, headers)\n    res = conn.getresponse()\n\n    if res.status != 201:\n      raise ValueError('Received non success response {}. Error {}'.format(res.status, res.reason))\n\n    data = res.read()\n    print('Successfully received OAuth token.')\n    return {'AuthToken': json.loads(data)['access_token'], 'ApiGatewayHost':apiGateWayHostValue}\n  except Exception as e:\n    raise ValueError('Failure while interacting with Crowdstrike backend. Error: {}'.format(e))",
+        "InputPayload": {
+          "FalconCloud": "{{FalconCloud}}",
+          "FalconClientId": "{{FalconClientId}}",
+          "FalconClientSecret": "{{FalconClientSecret}}",
+          "Region": "{{global:REGION}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "AuthToken",
+          "Selector": "$.Payload.AuthToken",
+          "Type": "String"
+        },
+        {
+          "Name": "ApiGatewayHost",
+          "Selector": "$.Payload.ApiGatewayHost",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetCustomerIdentifier",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "Script": "import http.client\nimport mimetypes\nimport urllib.parse\nimport json\ndef script_handler(events, context):\n  try:\n    print('Requesting Customer ID from Crowdstrike backend.')\n    conn = http.client.HTTPSConnection(events['ApiGatewayHost'])\n    headers = {\n      'Authorization': 'Bearer {}'.format(events['AuthToken'])\n    }\n\n    conn.request('GET', '/sensors/queries/installers/ccid/v1', '', headers)\n    res = conn.getresponse()\n\n    if res.status != 200:\n      raise ValueError('Received non success response {}. Error {}'.format(res.status, res.reason))\n\n    data = res.read()\n    print('Successfully received Customer ID.')\n    return {'CCID': json.loads(data)['resources'][0]}\n  except Exception as e:\n    raise ValueError('Failure while interacting with Crowdstrike backend. Error {}'.format(e))\n",
+        "InputPayload": {
+          "AuthToken": "{{GetAuthenticationToken.AuthToken}}",
+          "ApiGatewayHost": "{{GetAuthenticationToken.ApiGatewayHost}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CCID",
+          "Selector": "$.Payload.CCID",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetInstallationToken",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.6",
+        "Handler": "script_handler",
+        "Script": "import http.client\nimport mimetypes\nimport urllib.parse\nimport json\ndef script_handler(events, context):\n  try:\n    print('Requesting Installtion Token from Crowdstrike backend.')\n    conn = http.client.HTTPSConnection(events['ApiGatewayHost'])\n\n    headers = {\n      'Authorization': 'Bearer {}'.format(events['AuthToken'])\n    }\n\n    conn.request('GET', \"/installation-tokens/queries/tokens/v1?filter=status:'valid'\", '', headers)\n    queryRes = conn.getresponse()\n\n    if queryRes.status != 200:\n      raise ValueError('Received non success response {} while querying for token. Error {}'.format(queryRes.status, queryRes.reason))\n\n    queryResData = queryRes.read()\n    resources = json.loads(queryResData)['resources']\n    if len(resources) == 0:\n      print('No Installation token found, skipping')\n      return {'InstallationToken': \"\" }\n\n    resId = resources[0]\n    url ='/installation-tokens/entities/tokens/v1?ids={}'.format(resId)\n    conn.request('GET', url, '', headers)\n    entitiesRes = conn.getresponse()\n\n    if entitiesRes.status != 200:\n      raise ValueError('Received non success response {} while fetching token by id. Error {}'.format(entitiesRes.status, entitiesRes.reason))\n\n    entitiesResData = entitiesRes.read()\n    token = json.loads(entitiesResData)['resources'][0]['value']\n\n    print('Successfully received Installation token')\n    return {'InstallationToken': token }\n  except Exception as e:\n    raise ValueError('Failure while interacting with Crowdstrike backend. Error {}'.format(e))",
+        "InputPayload": {
+          "AuthToken": "{{GetAuthenticationToken.AuthToken}}",
+          "ApiGatewayHost": "{{GetAuthenticationToken.ApiGatewayHost}}"
+        }
+      },
+      "outputs": [
+        {
+          "Selector": "$.Payload.InstallationToken",
+          "Name": "InstallationToken",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchExecuteWindowsDistributorPackage",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ExecuteDistributorPackageWindows",
+            "Variable": "{{ CompileInstanceList.contains_windows_instances }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "BranchExecuteLinuxDistributorPackage"
+      }
+    },
+    {
+      "name": "ExecuteDistributorPackageWindows",
+      "action": "aws:runCommand",
+      "onFailure": "Continue",
+      "inputs": {
+        "Targets": "{{ Targets }}",
+        "InstanceIds": "{{ CompileInstanceList.windows_instances }}",
+        "DocumentName": "AWS-ConfigureAWSPackage",
+        "Parameters": {
+          "name": "FalconSensor-Windows",
+          "action": "{{Action}}",
+          "version": "{{WindowsPackageVersion}}",
+          "additionalArguments": {
+            "SSM_CS_INSTALLTOKEN": "{{GetInstallationToken.InstallationToken}}",
+            "SSM_CS_CCID": "{{GetCustomerIdentifier.CCID}}",
+            "SSM_CS_INSTALLPARAMS": "{{WindowsInstallerParams}}",
+            "SSM_CS_AUTH_TOKEN": "{{GetAuthenticationToken.AuthToken}}",
+            "SSM_CS_HOST": "{{GetAuthenticationToken.ApiGatewayHost}}"
+          }
+        }
+      }
+    },
+    {
+      "name": "BranchExecuteLinuxDistributorPackage",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ExecuteDistributorPackageLinux",
+            "Variable": "{{ CompileInstanceList.contains_linux_instances }}",
+            "BooleanEquals": true
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "ExecuteDistributorPackageLinux",
+      "action": "aws:runCommand",
+      "inputs": {
+        "Targets": "{{ Targets }}",
+        "InstanceIds": "{{ CompileInstanceList.linux_instances }}",
+        "DocumentName": "AWS-ConfigureAWSPackage",
+        "Parameters": {
+          "name": "FalconSensor-Linux",
+          "action": "{{Action}}",
+          "version": "{{LinuxPackageVersion}}",
+          "additionalArguments": {
+            "SSM_CS_INSTALLTOKEN": "{{GetInstallationToken.InstallationToken}}",
+            "SSM_CS_CCID": "{{GetCustomerIdentifier.CCID}}",
+            "SSM_CS_INSTALLPARAMS": "{{LinuxInstallerParams}}",
+            "SSM_CS_AUTH_TOKEN": "{{GetAuthenticationToken.AuthToken}}",
+            "SSM_CS_HOST": "{{GetAuthenticationToken.ApiGatewayHost}}"
+          }
+        }
+      }
+    }
+  ]
+}
