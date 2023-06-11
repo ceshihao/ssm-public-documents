@@ -1,0 +1,388 @@
+{
+  "schemaVersion": "1.0",
+  "templateBody": {
+    "Parameters": {
+      "QSType": {
+        "Type": "String",
+        "Description": "(Required) Specifies whether the Quick Setup applies to the local account or an AWS organization.",
+        "AllowedValues": [
+          "TA",
+          "MA"
+        ]
+      },
+      "QSConfigurationId": {
+        "Type": "String",
+        "Description": "(Required) Unique identifier of the deployed configuration."
+      },
+      "QSVersion": {
+        "Type": "String",
+        "Default": "1.0",
+        "Description": "(Required) Version of the deployed configuration."
+      },
+      "QSPrincipalOrgId": {
+        "Type": "String",
+        "Default": "",
+        "Description": "(Optional) The ID of the principal organization your management account operates in."
+      },
+      "QSGlobalResourcesRegion": {
+        "Type": "String",
+        "Description": "(Required) Name of the AWS Region to deploy global resources such as IAM Roles"
+      },
+      "DelegatedAccountId": {
+        "Type": "String",
+        "AllowedPattern": "^\\d{12}$",
+        "Description": "(Required) The ID of the member account in your organization you want to register as a delegated administrator."
+      }
+    },
+    "Conditions": {
+      "IsQSGlobalResourcesRegion": {
+        "Fn::Equals": [
+          {
+            "Ref": "AWS::Region"
+          },
+          {
+            "Ref": "QSGlobalResourcesRegion"
+          }
+        ]
+      }
+    },
+    "Resources": {
+      "OpsCenterAdminAccountLambdaFunction": {
+        "Condition": "IsQSGlobalResourcesRegion",
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+          "FunctionName": {
+            "Fn::Join": [
+              "-",
+              [
+                {
+                  "Fn::Sub": "AWS-QuickSetup-OpsCenterAdminAccountLambdaFunction-${QSConfigurationId}"
+                },
+                {
+                  "Fn::Select": [
+                    3,
+                    {
+                      "Fn::Split": [
+                        "-",
+                        {
+                          "Fn::Select": [
+                            2,
+                            {
+                              "Fn::Split": [
+                                "/",
+                                {
+                                  "Ref": "AWS::StackId"
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            ]
+          },
+          "Description": "Lambda Function that handles cross acount admin",
+          "Code": {
+            "ZipFile": "import boto3\nimport json\nimport os\nimport cfnresponse\nfrom botocore.exceptions import ClientError\n\nimport logging\n\nlogging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n# Events sent by CloudFormation\nCREATE = 'Create'\nUPDATE = 'Update'\nDELETE = 'Delete'\n\nsession = boto3.session.Session()\nregion = session.region_name\npartition = session.get_partition_for_region(region)\niam_client = boto3.client('iam', region_name=region)\n\nqs_config_id = os.environ['QSConfigId']\ndelegated_admin_account = os.environ['DelegatedAdminAccount']\naccount_id = os.environ['AccountId']\nqs_version = os.environ['QuickSetupVersion']\n\ntags = [{'Key': 'QuickSetupID', 'Value': qs_config_id},\n        {'Key': 'QuickSetupType', 'Value': 'OpsCenter'},\n        {'Key': 'QuickSetupVersion', 'Value': qs_version}]\n\n\n''' \nThis method creates role, attaches a managed policy and inline policy, if any.\nIf role already exists and is created by QuickSetup, we will update the policy document.\n'''\ndef setup_customer_role_with_policies(role_name, assume_role_policy_doc, role_desc, managed_policy_arn, role_tags=()):\n    try:\n        iam_client.create_role(AssumeRolePolicyDocument = assume_role_policy_doc, Description=role_desc, RoleName=role_name, Tags=role_tags)\n        logger.info(f'Successfully created the role {role_name} {account_id}')\n        if managed_policy_arn:\n            iam_client.attach_role_policy(RoleName=role_name, PolicyArn=managed_policy_arn)\n        logger.info(f'Successfully created the role policy {role_name} {account_id}')\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'EntityAlreadyExists':\n            logger.info(f'Role={role_name} already exists. Reusing the role and trying to update the role policy')\n            if is_role_created_by_qs(role_name):\n                try:\n                    if managed_policy_arn:\n                        iam_client.attach_role_policy(RoleName=role_name, PolicyArn=managed_policy_arn)\n                        logger.info(f'Successfully updated the role managed-policy for {role_name}')\n                    else:\n                        logger.info(f'No action taken as managed_policy_name to update is empty for {role_name}')\n\n                    if assume_role_policy_doc:\n                        iam_client.update_assume_role_policy(RoleName=role_name, PolicyDocument=assume_role_policy_doc)\n                        logger.info(f'Successfully updated the role assume-role-policy for {role_name}')\n                    else:\n                        logger.info('No action taken as assume_role_policy_doc to update is empty for {role_name}')\n\n                except ClientError as e:\n                    logger.exception(f'Encountered error:{ str(e)}')\n                    raise e\n        elif e.response['Error']['Code'] == 'UnmodifiableEntityException':\n            logger.info(f'Policy: {managed_policy_arn} already attached to role: {role_name} {account_id}, no action taken')\n        else:\n            logger.exception(f'Role={role_name} creation failed. Error is {str(e)}')\n            raise e\n\n\n'''\nThis method creates AWSServiceRoleForAmazonSSM_AccountDiscovery SLR.\n'''\ndef create_account_discovery_service_role():\n    try:\n        role_name = 'AWSServiceRoleForAmazonSSM_AccountDiscovery';\n        service_principal = 'accountdiscovery.ssm.amazonaws.com';\n        iam_client.create_service_linked_role(AWSServiceName=service_principal);\n        logger.info(f'Successfully created the role {role_name}')\n    except ClientError as e:\n        # Returns an InvalidInput error rather than EntityAlreadyExists\n        if e.response['Error']['Code'] == \"InvalidInput\":\n            logger.info(f'{role_name} already exists.')\n            return\n        logger.exception(f'Role={role_name} creation failed. Error is {str(e)}')\n        raise e\n\n'''\nChecks if given role_name is created by QS by validating the tags\n'''\ndef is_role_created_by_qs(role_name):\n    role_tags = iam_client.list_role_tags(RoleName=role_name)['Tags']\n    return any(tag['Key'] == 'QuickSetupID' for tag in role_tags)\n\n'''\nChecks if given policy is created by QS by validating the tags\n'''\ndef is_policy_created_by_qs(policy_arn):\n    policy_tags = iam_client.list_policy_tags(PolicyArn=policy_arn)['Tags']\n    return any(tag['Key'] == 'QuickSetupID' for tag in policy_tags)\n\n\n'''\nCreates customer managed policy. If policy already exists, we reuse the existing policy.\n'''\ndef create_customer_managed_policy(policy_name, policy_document, description, policy_tags):\n    try:\n        customer_managed_policy = iam_client.create_policy(PolicyName=policy_name, PolicyDocument=policy_document, Description=description,Tags=policy_tags)\n        return customer_managed_policy.get('Policy').get('Arn')\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'EntityAlreadyExists':\n            logger.info(f'Policy={policy_name} already exists. Reusing the role')\n            return 'arn:%s:iam::%s:policy/%s'%(partition, account_id, policy_name)\n        else:\n            logger.exception(f'Policy={policy_name} creation failed. Error is {str(e)}')\n            raise e\n\n'''\nThis method creates AWS-SystemsManager-AutomationAdministrationRole role\n'''\ndef setup_automation_administration_role():\n    role_name = 'AWS-SystemsManager-AutomationAdministrationRole'\n    desc = 'Configure the AWS-SystemsManager-AutomationAdministrationRole to enable use of AWS Systems Manager Cross Account/Region Automation execution.'\n    policy_doc = json.dumps({\n        'Version': '2012-10-17',\n        'Statement': [\n            {\n                'Effect': 'Allow',\n                'Principal': {\n                    'Service': 'ssm.amazonaws.com'\n                },\n                'Action': 'sts:AssumeRole'\n            }\n        ]\n    })\n    managed_policy_name = 'AssumeRole-AWSSystemsManagerAutomationExecutionRole'\n    managed_policy_doc = json.dumps({\n        'Version': '2012-10-17',\n        'Statement': [\n            {\n                'Effect': 'Allow',\n                'Resource': f'arn:{partition}:iam::*:role/AWS-SystemsManager-AutomationExecutionRole',\n                'Action': ['sts:AssumeRole']\n            },\n            {\n                'Effect': 'Allow',\n                'Resource': '*',\n                'Action': ['organizations:ListAccountsForParent']\n            }\n        ]\n    })\n\n    managed_policy_arn = create_customer_managed_policy(managed_policy_name, managed_policy_doc, '', tags)\n    setup_customer_role_with_policies(role_name, policy_doc, desc,managed_policy_arn, tags)\n\n'''\nThis method creates OpsItem-CrossAccountManagementRole role\n'''\ndef setup_opsitem_crossaccount_management_role():\n    role_name = 'OpsItem-CrossAccountManagementRole'\n    desc = 'AWS Systems Manager OpsCenter management account for cross-account OpsItem management.'\n    policy_doc = json.dumps({\n        'Version': '2012-10-17',\n        'Statement': [\n            {\n                'Effect': 'Allow',\n                'Principal': {\n                    'Service': 'ssm.amazonaws.com'\n                },\n                'Action': 'sts:AssumeRole'\n            }\n        ]\n    })\n    managed_policy_name = 'OpsItemCrossAccountManagementRolePolicy'\n    managed_policy_desc = 'Managed policy for the IAM OpsItemCrossAccountManagementRole.'\n    managed_policy_doc = json.dumps({\n        'Version': '2012-10-17',\n        'Statement': [\n            {\n                'Effect': 'Allow',\n                'Resource': f'arn:{partition}:iam::*:role/OpsItem-*Role*',\n                'Action': ['sts:AssumeRole']\n            },\n            {\n                'Effect': 'Allow',\n                'Resource': '*',\n                'Action': ['organizations:DescribeAccount']\n            }\n        ]\n    })\n\n    managed_policy_arn = create_customer_managed_policy(managed_policy_name, managed_policy_doc, managed_policy_desc, tags)\n    setup_customer_role_with_policies(role_name,policy_doc,desc,managed_policy_arn, tags)\n\n'''\nThis method deletes OpsItem-CrossAccountManagementRole role, if created by QS\n'''\ndef delete_opsitem_crossaccount_management_role():\n    role_name = 'OpsItem-CrossAccountManagementRole'\n    policy_name= 'OpsItemCrossAccountManagementRolePolicy'\n    policy_arn = f'arn:{partition}:iam::{account_id}:policy/{policy_name}'\n    try:\n        if is_role_created_by_qs(role_name):\n            logger.info(f'{role_name} Role is created by QS')\n            iam_client.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn);\n            if is_policy_created_by_qs(policy_arn):\n                iam_client.delete_policy(PolicyArn=policy_arn)\n            iam_client.delete_role(RoleName=role_name)\n            logger.info(f'{role_name} is deleted')\n        else:\n            logger.info(f'{role_name} is not created by QS')\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'NoSuchEntity':\n            logger.info(f'Role={role_name} is already deleted.')\n        elif e.response['Error']['Code'] == 'UnmodifiableEntity':\n            logger.info(f'Role: {role_name}  cannot be deleted or policy cannot be detached becuase of {str(e)}')\n        else:\n            logger.exception(f'Role={role_name} deletion failed. Error is {str(e)}')\n            raise e\n\n\ndef lambda_handler(event, context):\n    request_type = event.get('RequestType')\n    try:\n        # AutomationAdministrationRole will not be deleted or updated.\n        # This is because the role could be shared by other ssm services.\n        if request_type == CREATE:\n            # AccountDiscoverySLR is created in ManagementAccount as part of QS common code.\n            # Below code is added to create SLR in Delegated Admin\n            logger.info('Create Event is triggered')\n            #Check if current account is Delegated Admin\n            create_account_discovery_service_role()\n            setup_opsitem_crossaccount_management_role()\n            setup_automation_administration_role()\n        elif request_type == DELETE:\n            logger.info('Delete Event is triggered')\n            delete_opsitem_crossaccount_management_role()\n        elif request_type == UPDATE:\n            logger.info('Update Event is triggered')\n            #Currently we expect update scenarios during any bug fixes\n            setup_opsitem_crossaccount_management_role()\n            setup_automation_administration_role()\n        else:\n            logger.info(f'Unknown operation: {request_type}')\n        #CloudFormation compares the physical resource id returned by your Lambda function to the one you returned previously.\n        #If the IDs are different, CloudFormation assumes the resource has been replaced with a new resource.\n        #When the resource update logic completes successfully, a Delete request is sent with the old physical resource id.\n        #If the stack update fails and a rollback occurs, the new physical resource id is sent in the Delete event.\n        cfnresponse.send(event, context, cfnresponse.SUCCESS, None, 'OpsCenterAdminCustomResources')\n        return cfnresponse.SUCCESS\n    except Exception as e:\n        error_reason = f'{str(e)}. See the details in CloudWatch Log Stream: {context.log_stream_name} in Log Group {context.log_group_name}'\n        cfnresponse.send(event, context, cfnresponse.FAILED, None, 'OpsCenterAdminCustomResources', reason = error_reason)\n        raise e\n\n"
+          },
+          "Runtime": "python3.9",
+          "Handler": "index.lambda_handler",
+          "Role": {
+            "Fn::GetAtt": [
+              "OpsCenterAdminAccountLambdaRole",
+              "Arn"
+            ]
+          },
+          "Environment": {
+            "Variables": {
+              "QSConfigId": {
+                "Ref": "QSConfigurationId"
+              },
+              "AccountId": {
+                "Ref": "AWS::AccountId"
+              },
+              "DelegatedAdminAccount": {
+                "Ref": "DelegatedAccountId"
+              },
+              "QuickSetupVersion": {
+                "Ref": "QSVersion"
+              }
+            }
+          },
+          "Timeout": 300
+        }
+      },
+      "OpsCenterAdminAccountLambdaTrigger": {
+        "Condition": "IsQSGlobalResourcesRegion",
+        "Type": "Custom::OpsCenterAdminAccountLambdaTrigger",
+        "Properties": {
+          "ServiceToken": {
+            "Fn::GetAtt": [
+              "OpsCenterAdminAccountLambdaFunction",
+              "Arn"
+            ]
+          },
+          "VersionAttribute": {
+            "Ref": "QSVersion"
+          }
+        }
+      },
+      "OpCenterAdminAccountLambdaLogGroup": {
+        "Condition": "IsQSGlobalResourcesRegion",
+        "Type": "AWS::Logs::LogGroup",
+        "Properties": {
+          "LogGroupName": {
+            "Fn::Join": [
+              "-",
+              [
+                {
+                  "Fn::Sub": "/aws/lambda/AWS-QuickSetup-OpsCenterAdminAccountLambdaFunction-${QSConfigurationId}"
+                },
+                {
+                  "Fn::Select": [
+                    3,
+                    {
+                      "Fn::Split": [
+                        "-",
+                        {
+                          "Fn::Select": [
+                            2,
+                            {
+                              "Fn::Split": [
+                                "/",
+                                {
+                                  "Ref": "AWS::StackId"
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            ]
+          },
+          "RetentionInDays": 3653
+        },
+        "DeletionPolicy": "Retain"
+      },
+      "OpsCenterAdminAccountLambdaRole": {
+        "Condition": "IsQSGlobalResourcesRegion",
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": {
+            "Fn::Sub": "AWS-QuickSetup-OpsCenterAdminRole-${QSConfigurationId}-${AWS::Region}"
+          },
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "lambda.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "Path": "/",
+          "Policies": [
+            {
+              "PolicyName": "LambdaPolicy",
+              "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Sid": "AllowLambdaInvoke",
+                    "Effect": "Allow",
+                    "Resource": [
+                      {
+                        "Fn::Join": [
+                          "-",
+                          [
+                            {
+                              "Fn::Sub": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:AWS-QuickSetup-OpsCenterAdminAccountLambdaFunction-${QSConfigurationId}"
+                            },
+                            {
+                              "Fn::Select": [
+                                3,
+                                {
+                                  "Fn::Split": [
+                                    "-",
+                                    {
+                                      "Fn::Select": [
+                                        2,
+                                        {
+                                          "Fn::Split": [
+                                            "/",
+                                            {
+                                              "Ref": "AWS::StackId"
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        ]
+                      }
+                    ],
+                    "Action": [
+                      "lambda:InvokeFunction"
+                    ]
+                  },
+                  {
+                    "Sid": "CreateSLR",
+                    "Effect": "Allow",
+                    "Resource": [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/accountdiscovery.ssm.amazonaws.com/AWSServiceRoleForAmazonSSM_AccountDiscovery"
+                      }
+                    ],
+                    "Action": [
+                      "iam:CreateServiceLinkedRole"
+                    ]
+                  },
+                  {
+                    "Sid": "IAMRoleLimitedAccess",
+                    "Effect": "Allow",
+                    "Resource": [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWS-SystemsManager-AutomationAdministrationRole"
+                      },
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/OpsItem-CrossAccountManagementRole"
+                      }
+                    ],
+                    "Action": [
+                      "iam:CreateRole",
+                      "iam:DeleteRole",
+                      "iam:TagRole",
+                      "iam:UpdateAssumeRolePolicy",
+                      "iam:ListRoleTags"
+                    ]
+                  },
+                  {
+                    "Sid": "IAMPolicyLimitedAccess",
+                    "Effect": "Allow",
+                    "Resource": [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/OpsItemCrossAccountManagementRolePolicy"
+                      },
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/AssumeRole-AWSSystemsManagerAutomationExecutionRole"
+                      }
+                    ],
+                    "Action": [
+                      "iam:CreatePolicy",
+                      "iam:TagPolicy",
+                      "iam:DeletePolicy",
+                      "iam:ListPolicyTags"
+                    ]
+                  },
+                  {
+                    "Sid": "IAMRolePolicyLimitedAccess1",
+                    "Effect": "Allow",
+                    "Resource": [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/OpsItem-CrossAccountManagementRole"
+                      }
+                    ],
+                    "Condition": {
+                      "ArnEquals": {
+                        "iam:PolicyARN": {
+                          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/OpsItemCrossAccountManagementRolePolicy"
+                        }
+                      }
+                    },
+                    "Action": [
+                      "iam:AttachRolePolicy",
+                      "iam:DetachRolePolicy"
+                    ]
+                  },
+                  {
+                    "Sid": "IAMRolePolicyLimitedAccess2",
+                    "Effect": "Allow",
+                    "Resource": [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWS-SystemsManager-AutomationAdministrationRole"
+                      }
+                    ],
+                    "Condition": {
+                      "ArnEquals": {
+                        "iam:PolicyARN": {
+                          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/AssumeRole-AWSSystemsManagerAutomationExecutionRole"
+                        }
+                      }
+                    },
+                    "Action": [
+                      "iam:AttachRolePolicy",
+                      "iam:DetachRolePolicy"
+                    ]
+                  },
+                  {
+                    "Sid": "AllowLogging",
+                    "Effect": "Allow",
+                    "Action": [
+                      "logs:CreateLogGroup",
+                      "logs:CreateLogStream",
+                      "logs:PutLogEvents"
+                    ],
+                    "Resource": [
+                      {
+                        "Fn::Join": [
+                          "",
+                          [
+                            {
+                              "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/AWS-QuickSetup-OpsCenterAdminAccountLambdaFunction-${QSConfigurationId}-"
+                            },
+                            {
+                              "Fn::Select": [
+                                3,
+                                {
+                                  "Fn::Split": [
+                                    "-",
+                                    {
+                                      "Fn::Select": [
+                                        2,
+                                        {
+                                          "Fn::Split": [
+                                            "/",
+                                            {
+                                              "Ref": "AWS::StackId"
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            ":*"
+                          ]
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
