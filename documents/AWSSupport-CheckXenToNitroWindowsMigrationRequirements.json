@@ -1,0 +1,319 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The **AWSSupport-CheckXenToNitroWindowsMigrationRequirements** automation runbook checks for the pre-requisites to migrate a Xen-based Amazon Elastic Compute Cloud (Amazon EC2) Windows instance to the [EC2 Nitro platform](https://aws.amazon.com/ec2/nitro/) by performing the following checks:\n\n> * Checks if the root volume is an EBS device\n> * Checks if the [Enhanced networking (ENA) attribute](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html) is enabled.\n> * Verifies if the required ENA drivers are installed on your EC2 instance.\n> * Verifies if the NVMe driver is installed on your EC2 instance.\n> * Checks if the AWS PCI Serial Port Driver for bare metal instances is installed\n> * Checks if the required PowerShell and .NET Framework versions are installed\n> * Determines if the correct power management settings for graceful shutdown on the Nitro system are configured.\n\n### Supported Operating Systems:\n> * Windows Server 2022, Windows Server 2019, Windows Server 2016, Windows Server 2012 R2, Windows Server 2012, and Windows Server 2008 R2.\n\nPlease refer to [Migrate to latest generation instance types](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html) for more information.",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of the Xen-based Amazon EC2 instance you want to migrate to the Nitro platform."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the details of the EC2 instance.",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "maxAttempts": 3,
+      "nextStep": "getInstanceHypervisorType",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PlatformType",
+          "Selector": "$.Reservations[0].Instances[0].Platform",
+          "Type": "String"
+        },
+        {
+          "Name": "RootVolumeType",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceType",
+          "Type": "String"
+        },
+        {
+          "Name": "ENASupport",
+          "Selector": "$.Reservations[0].Instances[0].EnaSupport",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "getInstanceHypervisorType",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the Hypervisor information for the current EC2 Instance Type.",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "maxAttempts": 3,
+      "nextStep": "checkIfInstanceHypervisorIsNitroAlready",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceTypes",
+        "InstanceTypes": [
+          "{{ getInstanceProperties.InstanceType }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Hypervisor",
+          "Selector": "$.InstanceTypes[0].Hypervisor",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "checkIfInstanceHypervisorIsNitroAlready",
+      "action": "aws:branch",
+      "description": "Checks if the current Amazon EC2 instance is already running on Nitro platform.",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfPlatformIsWindows",
+            "Variable": "{{ getInstanceHypervisorType.Hypervisor }}",
+            "StringEquals": "xen"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfPlatformIsWindows",
+      "action": "aws:branch",
+      "description": "Checks if the current EC2 instance is based on Windows Operating System.",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "verifySSMConnectivity",
+            "Variable": "{{ getInstanceProperties.PlatformType }}",
+            "StringEquals": "windows"
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifySSMConnectivity",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Verifies if the EC2 instance is managed by AWS Systems Manager.",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": true,
+      "nextStep": "checkIfRootVolumeIsEBS"
+    },
+    {
+      "name": "checkIfRootVolumeIsEBS",
+      "action": "aws:branch",
+      "description": "Checks if EC2 instance's root volume type is EBS.",
+      "isCritical": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkENAAttribute",
+            "Variable": "{{ getInstanceProperties.RootVolumeType }}",
+            "StringEquals": "ebs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkENAAttribute",
+      "action": "aws:branch",
+      "description": "Checks if the Enhanced Networking Adapter (ENA) attribute is enabled on the EC2 instance.",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkAmazonDrivers",
+            "Variable": "{{ getInstanceProperties.ENASupport }}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkAmazonDrivers",
+      "action": "aws:runCommand",
+      "description": "Validates the availability of the required drivers on the Operating System (OS)",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n# Expected drivers hash table \n$driverMapping = @{\n     \"ena.inf\" = [PSCustomObject ]@{Name=\"Amazon Elastic Network Adapter\";Required=$true;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#auto-upgradee\"}\n     \"awsnvme.inf\" = [PSCustomObject ]@{Name=\"AWS NVMe Elastic Block Storage Adapter\";Required=$true;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#auto-upgrade\"}\n     \"aws_ser.inf\" = [PSCustomObject ]@{Name=\"AWS PCI Serial Port Driver\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#install-serial-port-bare-metal\"}\n}\n\n# Get the list of installed drivers using DSIM where ProviderName like Amazon Web Services, Inc. or Amazon Inc*\n$driversQueryResults = ((dism /online /get-drivers /format:table | Select-Object -Skip 14 | Select-Object -Last 9999 -Skip 1 |\nConvertFrom-Csv -Header \"PublishedName\", \"OriginalFileName\", \"Inbox\", \"ClassName\", \"ProviderName\", \"Date\", \"Version\" -Delimiter \"|\" |\nWhere-Object { $_.ProviderName -like \"Amazon Web Services, Inc.*\" -or $_.ProviderName -like \"Amazon Inc*\"  } |\nSelect-Object \"PublishedName\", \"OriginalFileName\", \"Inbox\", \"ClassName\", \"ProviderName\", \"Date\", @{ Name = \"Version\"; Expression = { $_.Version -as [version] } }))\n\n# Output the list of installed Amazon drivers\n# Write-Host ($driversQueryResults | Format-Table -Property OriginalFileName, ProviderName, Version -AutoSize | Out-String)\n\n$driverMissing = $false\nforeach ($driver in $driverMapping.Keys) {\n     \n     $driverFound = ($driversQueryResults | Where-Object { $_.OriginalFileName -like \"$driver*\" })\n\n     if ($driverFound) {\n          Write-Host \"[PASSED] $($driverMapping.$driver.Name) with version(s): $($driverFound.Version), installed and available on your EC2 instance`n\"\n     }\n     else\n     {\n          if ($driverMapping.$driver.Required) {\n               $driverMissing = $true\n               Write-Host \"[FAILED] $($driverMapping.$driver.Name) is not installed on your EC2 instance.\"\n               Write-Host \"         Please install the $($driverMapping.$driver.Name) driver before changing your EC2 instance type to Nitro.\"\n               Write-Host \"         Please look at the following link for further guidance: $($driverMapping.$driver.Link)`n\"\n          }\n          else {\n               Write-Host \"[WARNING] $($driverMapping.$driver.Name) is not installed on your EC2 instance.\"\n               Write-Host \"          It is recommended to install the latest $($driverMapping.$driver.Name) driver before changing your EC2 instance type to Nitro.\"\n               Write-Host \"          Please look at the following link for further guidance: $($driverMapping.$driver.Link)`n\"\n\n          }\n     }\n}\n\nif ($driverMissing) {\n$message = @\"\n`nAlternatively, you can use the AWSSupport-UpgradeWindowsAWSDrivers automation document\nto automate the procedures described in Part 1, Part 2, and Part 3 of the Migrate to latest generation \ninstance types guide: https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html.\nIf you choose to use the automated procedure, see (https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#auto-upgrade) \nthen continue with Part 4 and Part 5.\n\"@\nWrite-Host $message\n     exit 1\n}\nelse {\n     exit 0\n}\n"
+        }
+      },
+      "nextStep": "checkRecommendedAmazonDrivers"
+    },
+    {
+      "name": "checkRecommendedAmazonDrivers",
+      "action": "aws:runCommand",
+      "description": "Validates the availability of the recommended drivers on the Operating System (OS)",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n# Expected drivers hash table \n$driverMapping = @{\n     \"xenbus.inf\" = [PSCustomObject ]@{Name=\"AWS PV BUS\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#upgrade-pv\"}\n     \"xenvif.inf\" = [PSCustomObject ]@{Name=\"AWS PV Network Class\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#upgrade-pv\"}\n     \"xeniface.inf\" = [PSCustomObject ]@{Name=\"AWS Interface\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#upgrade-pv\"}\n     \"xenvbd.inf\" = [PSCustomObject ]@{Name=\"AWS PV Storage Host Adapter\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#upgrade-pv\"}\n     \"xennet.inf\" = [PSCustomObject ]@{Name=\"AWS PV Network Device\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#upgrade-pv\"}\n     \"vxn64x64.inf\" = [PSCustomObject ]@{Name=\"Intel 82599 VF interface\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/sriov-networking.html\"}\n}\n\n# Get the list of installed drivers using DSIM where ProviderName like Amazon Web Services, Inc. or Amazon Inc*\n$driversQueryResults = ((dism /online /get-drivers /format:table | Select-Object -Skip 14 | Select-Object -Last 9999 -Skip 1 |\nConvertFrom-Csv -Header \"PublishedName\", \"OriginalFileName\", \"Inbox\", \"ClassName\", \"ProviderName\", \"Date\", \"Version\" -Delimiter \"|\" |\nWhere-Object { $_.ProviderName -like \"Amazon Web Services, Inc.*\" -or $_.ProviderName -like \"Amazon Inc*\"  } |\nSelect-Object \"PublishedName\", \"OriginalFileName\", \"Inbox\", \"ClassName\", \"ProviderName\", \"Date\", @{ Name = \"Version\"; Expression = { $_.Version -as [version] } }))\n\n# Output the list of installed Amazon drivers\n# Write-Host ($driversQueryResults | Format-Table -Property OriginalFileName, ProviderName, Version -AutoSize | Out-String)\n\n$driverMissing = $false\nforeach ($driver in $driverMapping.Keys) {\n     \n     $driverFound = ($driversQueryResults | Where-Object { $_.OriginalFileName -like \"$driver*\" })\n\n     if ($driverFound) {\n          Write-Host \"[PASSED] $($driverMapping.$driver.Name) with version:$($driverFound.Version) is installed and available on your EC2 instance`n\"\n     }\n     else\n     {\n          if ($driverMapping.$driver.Required) {\n               $driverMissing = $true\n               Write-Host \"[FAILED] $($driverMapping.$driver.Name) is not installed on your EC2 instance.\"\n               Write-Host \"         Please install the $($driverMapping.$driver.Name) driver before changing your EC2 instance type to Nitro.\"\n               Write-Host \"         Please look at the following link for further guidance: $($driverMapping.$driver.Link)`n\"\n          }\n          else {\n               Write-Host \"[WARNING] $($driverMapping.$driver.Name) is not installed on your EC2 instance.\"\n               Write-Host \"          It is recommended to install the latest $($driverMapping.$driver.Name) driver before changing your EC2 instance type to Nitro.\"\n               Write-Host \"          Please look at the following link for further guidance: $($driverMapping.$driver.Link)`n\"\n\n          }\n     }\n}\n\n"
+        }
+      },
+      "nextStep": "checkNetFrameworkRequirements"
+    },
+    {
+      "name": "checkNetFrameworkRequirements",
+      "action": "aws:runCommand",
+      "description": "Validates the availability of the required .NET Framework and PowerShell versions on the Operating System (OS)",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n# Check minimum .NET Framework version required for AWS PV drivers\n$ExpectedVersion = \"4.6\"\n$NetFrameworkList = Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Full' -Recurse -ErrorAction SilentlyContinue |\nGet-ItemProperty -Name Version, Release -ErrorAction SilentlyContinue |\nSelect-Object @{ Name = \"Name\"; expression = { $_.PSChildName } }, Version, Release\n$NetFrameworkStatus = $false\nForEach ($Item in $NetFrameworkList)\n{\n    Write-Output \".NET Framework Installed $([Version]$Item.Version)\"\n    if (!($NetFrameworkStatus))\n    {\n        if ([Version]$Item.Version -gt [version]$ExpectedVersion)\n        {\n            $NetFrameworkStatus = $true\n\n        }\n        else\n        {\n            $NetFrameworkStatus = $false\n        }\n    }\n}\n\nif ($NetFrameworkStatus) {\n    Write-Output \"[PASSED] .NET Framework $ExpectedVersion or later is installed on your EC2 instance\"\n}\nelse\n{\n    Write-Output \"[WARNING] .NET Framework $ExpectedVersion or later not found on your EC2 instance\"\n    Write-Output \"         AWS Drivers packages require .NET Framework version $ExpectedVersion and later. If the default .NET Framework version is earlier than $ExpectedVersion and you must install version $ExpectedVersion or later using Windows Update.\"\n}\n\n# Check minimum version of Windows PowerShell AWS drivers\n[Version]$PSrequiredVersion = \"3.0\"\n$PSVersion = $PSVersionTable.PSVersion\n\nWrite-Output \"PowerShell Installed $PSVersion\"\n\n$PSrequiredVersionInstalled = $PSVersion.Major -ge $PSrequiredVersion.Major\n\nif ($PSrequiredVersionInstalled) {\n    Write-Output \"[PASSED] PowerShell $PSrequiredVersion or later is installed on your EC2 instance\"\n}\nelse\n{\n    Write-Output \"[WARNING] PowerShell $PSrequiredVersion or later not found on your EC2 instance\"\n    Write-Output \"         AWS Drivers packages require PowerShell version $PSrequiredVersion and later.\"\n}\n\nif ($PSrequiredVersionInstalled -and $NetFrameworkStatus)\n{\n    exit 0\n}\nelse\n{\n    exit 1\n}\n"
+        }
+      },
+      "nextStep": "checkPowerManagementSettings"
+    },
+    {
+      "name": "checkPowerManagementSettings",
+      "action": "aws:runCommand",
+      "description": "Determines if the correct power management settings for graceful shutdown on the Nitro system are configured",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": false,
+      "onFailure": "Continue",
+      "nextStep": "checkInstalledAgent",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n$PowerSetting = '7516b95f-f776-4464-8c53-06167f40cc99' # Display\n$PowerSettingGuid = '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' # Turn off display after\n$PoserSettingDetails = (Get-WmiObject -Namespace root\\cimv2\\power -Class Win32_PowerSettingSubgroup) | Where-Object InstanceID -eq \"Microsoft:PowerSettingSubgroup\\{$PowerSetting}\" | Select ElementName, Description\n$PoserSettingSubDetails = (Get-WmiObject -Namespace root\\cimv2\\power -Class Win32_PowerSetting) | Where-Object InstanceID -eq \"Microsoft:PowerSetting\\{$PowerSettingGuid}\"\n\nWrite-Output \"Checking Power Management settings for:\"\nWrite-Output (\"{0}\\{1}: {2}\" -f $PoserSettingDetails.ElementName, $PoserSettingSubDetails.ElementName, $PoserSettingSubDetails.Description)\n\n# For each power plan:\n#'8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' # High Performance\n#'381b4222-f694-41f0-9685-ff5bb260df2e' # Balanced\n#'a1841308-3541-4fab-bc81-f71556f20b4a' # Power Saver\n$powerSettingsMissing = $false\n(Get-WmiObject -Namespace root\\cimv2\\power -Class Win32_PowerPlan) | ForEach-Object {\n    $tmp = $_.InstanceID\n    $tmp = $tmp.Remove(0, $tmp.LastIndexOf(\"{\") + 1)\n    $tmp = $tmp.Remove($tmp.LastIndexOf(\"}\"))\n    $PowerPlanGuid = $tmp\n    $PowerPlanName = $_.ElementName\n    $SettingIndexValue = ((Get-WmiObject -Namespace root\\cimv2\\power -Class Win32_PowerSettingDataIndex) | Where-Object InstanceID -eq \"Microsoft:PowerSettingDataIndex\\{$PowerPlanGuid}\\AC\\{$PowerSettingGuid}\"| Select SettingIndexValue).SettingIndexValue\n    Write-Output (\"Power plan {0} for {1}: {2} is set to {3}\" -f $_.ElementName, $PoserSettingDetails.ElementName, $PoserSettingSubDetails.ElementName, $SettingIndexValue)\n    if ($SettingIndexValue -ne 0) {\n        $powerSettingsMissing = $true\n        Write-Output (\"[WARNING] The display Power Management settings is incorrect for {0}:{1}`n\" -f $PoserSettingDetails.ElementName, $PoserSettingSubDetails.ElementName)\n    }\n    else {\n        Write-Output  (\"[PASSED] The correct power management settings are applied for {0}:{1}`n\" -f $PoserSettingDetails.ElementName, $PoserSettingSubDetails.ElementName)\n    }\n}\n\nif ($powerSettingsMissing) {\n    Write-Output \"It is recommended to set the correct power management settings for graceful shutdowns on the Nitro system`nSee the following document for more guidance: https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#power-management`n\"\n         exit 1\n    }\n    else {\n         exit 0\n    }\n"
+        }
+      }
+    },
+    {
+      "name": "checkInstalledAgent",
+      "action": "aws:runCommand",
+      "description": "Determines if EC2Config, EC2Launch or EC2LaunchV2 is installed on the instance (recommended before migration to Nitro)",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Continue",
+      "nextStep": "checkOSVersion",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\ntry {\n    function CheckInstalledAgent \n    {\n        if(Test-ModuleManifest -Path \"${env:ProgramData}\\Amazon\\EC2-Windows\\Launch\\Module\\Ec2Launch.psd1\" -ErrorAction SilentlyContinue)\n        {\n            $Ec2LaunchVersion = (Test-ModuleManifest -Path \"${env:ProgramData}\\Amazon\\EC2-Windows\\Launch\\Module\\Ec2Launch.psd1\").Version\n            Write-Output \"EC2Launch $Ec2LaunchVersion\"\n            return \"EC2Launch\"\n        }\n        elseif (Get-WmiObject Win32_Product | Where-Object {$_.Name -eq \"EC2ConfigService\"})\n        {\n            $EC2ConfigVersion = Get-WmiObject Win32_Product | Where-Object {$_.Name -eq \"EC2ConfigService\"} | Select-Object Version\n            Write-Output \"EC2Config $EC2ConfigVersion\"\n            return \"EC2Config\"\n        }\n        elseif ((Get-Service -name \"Amazon EC2Launch\" -ErrorAction SilentlyContinue).Length -gt 0)\n        {\n            return \"EC2Launchv2\"\n        }\n        else \n        {\n            return \"No Agent\"\n        }\n    }\n\n    $installedAgent = CheckInstalledAgent\n\n    if ($installedAgent -eq 'EC2Launch' -or $installedAgent -eq 'EC2Config' -or $installedAgent -eq 'EC2Launchv2')\n    {\n        Write-host \"[PASSED] $installedAgent is installed on your instance\"\n    } \n    else\n    {\n        Write-Host \"[FAILED] Agent not found on your EC2 instance.`nIt is recommended to install a launch agent before changing your EC2 instance type to Nitro. Look at the following link for further guidance:`nhttps://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html\"\n    }\n\n}\ncatch {\n    Write-Host $_.Exception.Message\n    exit 1\n}\n"
+        }
+      }
+    },
+    {
+      "name": "checkOSVersion",
+      "action": "aws:runCommand",
+      "description": "Verifies if the target instance OS version is supported for migration",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "generateReport",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n[Version]$OSVersion = [System.Environment]::OSVersion.Version\n$NtOsKernelVer = (Get-Item $env:systemroot\\system32\\ntoskrnl.exe).VersionInfo.ProductVersion\n[Version]$ExpectedVersion = \"6.1\"\n$OsInfo = (Get-WmiObject -class Win32_OperatingSystem)\n\nWrite-Output \"Windows Version: $OSVersion - $($OsInfo.Caption)\"\nWrite-Output \"Kernel Version: $NtOsKernelVer\"\n\n# https://learn.microsoft.com/en-us/dotnet/api/microsoft.powershell.commands.producttype?view=powershellsdk-1.1.0\n# DomainController (2) System is a domain controller\n# Server (3) System is a server\n# Uknown (0\t) Product type is unknown\n# WorkStation (1) System is a workstation\n\nif ($OsInfo.ProductType -ne 3) {\n    Write-Host \"`n[FAILED] This automation does not supported Domain Controllers or Windows client versions.\"\n    exit 1\n}\n\nif ($OSVersion -ge $ExpectedVersion) {\n    Write-Output \"`n[PASSED] $($OsInfo.Caption)\"\n    exit 0\n}\nelse\n{\n    Write-Output \"`n[FAILED] This automation only supports Windows Server 2008 R2 or newer Windows versions.\"\n    exit 1\n}\n"
+        }
+      }
+    },
+    {
+      "name": "generateReport",
+      "action": "aws:executeScript",
+      "description": "Consolidates the results of all steps and generates a report on the passed and failed checks.",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "isEnd": "true",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "rootVolumeCheck": "{{ getInstanceProperties.RootVolumeType }}",
+          "checkENAattribute": "{{ getInstanceProperties.ENASupport }}",
+          "checkAmazonDrivers": "{{ checkAmazonDrivers.Output }}",
+          "checkRecommendedAmazonDrivers": "{{ checkRecommendedAmazonDrivers.Output }}",
+          "checkNetFrameworkRequirements": "{{ checkNetFrameworkRequirements.Output }}",
+          "checkPowerManagementSettingsOutput": "{{ checkPowerManagementSettings.Output }}",
+          "checkOSVersion": "{{ checkOSVersion.Output }}",
+          "checkInstalledAgent": "{{ checkInstalledAgent.Output }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\ndef script_handler(events, context):\n   footer = (\"\\n\\nFor more information about these checks, refer to:\\n\"\n   \"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html\")\n\n   # Checking Root Volume results\n   if events['rootVolumeCheck'] == \"ebs\":\n          check_root_volume_result = \"[PASSED] Root volume attached with the instance is an EBS device.\"\n   else:\n          check_root_volume_result = \"[FAILED] Root volume attached with the instance is not an EBS device.\"\n\n   # Checking Root Volume results\n   if events['checkENAattribute'] is True:\n          check_ena_output = \"[PASSED] Enhanced networking (ENA) attribute is ENABLED on the EC2 Instance\"\n   else:\n          check_ena_output = (\"[FAILED] Enhanced networking (ENA) attribute is NOT ENABLED on the EC2 Instance. Use the ModifyInstanceAttribute[1] API call or modify-instance-attribute[2] AWS CLI command to enable the enhanced networking enaSupport attribute.\\n For more details, refer to the Enhanced networking (ENA) documentation[3].\\n\"\n          \"\\n       [1] https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html\"\n          \"\\n       [2] https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html|\"\n          \"\\n       [3] https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html\")\n\n   steps_results = {\n       \"1. Checking if the root volume is EBS:\": check_root_volume_result,\n       \"2. Determining if ENA Attribute is enabled:\": check_ena_output,\n       \"3. Checking Amazon drivers status on the instance:\": events['checkAmazonDrivers'],\n       \"4. Checking recommended Amazon drivers status on the instance:\": events['checkRecommendedAmazonDrivers'],\n       \"5. Checking required .NET Framework version on the instance:\": events['checkNetFrameworkRequirements'],\n       \"6. Checking Power Management settings on the instance:\": events['checkPowerManagementSettingsOutput'],\n       \"7. Checking supported OS version:\": events['checkOSVersion'],\n       \"8. Checking installed startup agent:\": events['checkInstalledAgent']            \n   }\n\n   result = f\"Total number of tests: {len(steps_results)}\\n\"\n   for k, v in steps_results.items():\n       result += f\"\\n{k}\\n{v}\\n\"\n   result += footer\n   return {'output': result}\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "generateReport.output"
+  ]
+}

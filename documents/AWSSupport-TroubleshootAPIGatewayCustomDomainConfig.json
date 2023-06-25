@@ -1,0 +1,212 @@
+{
+  "description": "The AWSSupport-TroubleshootAPIGatewayCustomDomainConfig is designed to help you identify issues with your custom domain name configuration in API Gateway.\nThe runbook analyzes the following configuration steps:\n\n* A custom domain name is created in API Gateway.\n* A mapping exists between the custom domain name and the API in question.\n* A DNS record exists for the custom domain name and is pointing to the correct target.\n\n#### Note: ####\n1. This runbook does not help to troubleshoot mTLS issues with your custom domain name.\n2. Only publicly available custom domain names can be tested.\n3. The `AutomationAssumeRole` parameter is an optional parameter. This is the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook. Details on the required IAM permissions found below\n\n#### IAM Permissions ####\n- apigateway:GET\n- iam:ListRoles\n- iam:PassRole\n- route53:ListResourceRecordSets\n- ssm:DescribeAutomationExecutions\n- ssm:GetAutomationExecution\n- ssm:DescribeAutomationStepExecutions\n- ssm:StartAutomationExecution\n- ssm:DescribeDocument\n- ssm:GetDocument\n- ssm:ListDocuments",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "Results.message"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "DomainName": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9-.]*$",
+      "description": "(Required) Your API's custom domain name."
+    },
+    "ApiId": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9]{10}$",
+      "description": "(Required) Your API Id."
+    },
+    "DNSServerIp": {
+      "type": "String",
+      "default": "169.254.169.253",
+      "description": "(Optional) A DNS server to resolve the custom domain name and API Gateway domain name. The AWS DNS Server will be used if a value is not supplied.",
+      "allowedPattern": "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$"
+    },
+    "HostedZoneId": {
+      "type": "String",
+      "description": "(Optional) The Id for the Public Hosted Zone in where the DNS record for the custom domain name is created if Route53 is used.. Not required if Route53 is not used for DNS.",
+      "allowedPattern": "^(Z[A-Z0-9]{4,32})?$",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetDomainName",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "############################################################################\n# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n############################################################################\n# USAGE: GetDomainName.py checks if the custom domain name has been\n# created in API Gateway.\n############################################################################\n\nimport boto3\nimport botocore\nimport json\nimport sys\n\nsys.tracebacklimit=0\nclient = boto3.client('apigatewayv2')\n\ndef script_handler(events, context):\n  domain_name = events[\"DomainName\"]\n  try:\n    response = client.get_domain_name(DomainName=domain_name)    \n  except botocore.exceptions.ClientError as e:\n    if e.response['Error']['Code'] == 'NotFoundException':\n      raise ValueError(f\"\"\"Custom domain name {domain_name} does not exist in API Gateway. \nPlease see the following documentation to create a custom domain name in API Gateway: https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-custom-domains.html\"\"\")\n    \n    raise e\n\n  except Exception as error:\n    raise Exception(f\"\"\"An error occurred. Getting the custom domain name {domain_name} details failed.\nError details: {error}\"\"\")\n\n  return { \n    \"DomainName\": response[\"DomainName\"],\n    \"APIGatewayDomainName\": response[\"DomainNameConfigurations\"][0][\"ApiGatewayDomainName\"],\n    \"Status\": response[\"DomainNameConfigurations\"][0][\"DomainNameStatus\"],\n    \"EndpointType\": response[\"DomainNameConfigurations\"][0][\"EndpointType\"]\n  }\n",
+        "InputPayload": {
+          "DomainName": "{{DomainName}}"
+        }
+      },
+      "description": "Checks the custom domain name has been configured in API Gateway.",
+      "nextStep": "GetMappings",
+      "outputs": [
+        {
+          "Name": "DomainName",
+          "Selector": "$.Payload.DomainName",
+          "Type": "String"
+        },
+        {
+          "Name": "APIGatewayDomainName",
+          "Selector": "$.Payload.APIGatewayDomainName",
+          "Type": "String"
+        },
+        {
+          "Name": "EndpointType",
+          "Selector": "$.Payload.EndpointType",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "step:Results",
+      "timeoutSeconds": 60
+    },
+    {
+      "name": "GetMappings",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "############################################################################\n# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n############################################################################\n# USAGE: GetMappings.py returns a list of APIs mapped to the custom \n# domain name and the mapping details.\n############################################################################\nimport boto3\nimport sys\n\nsys.tracebacklimit=0\nclient = boto3.client('apigatewayv2')\n\ndef script_handler(events, context):\n    domain_name = events[\"DomainName\"]\n    try:\n      response = client.get_api_mappings(DomainName=domain_name)\n    except Exception:\n        raise Exception(f'Error: An error has occurred when getting the API mappings for {domain_name}.')\n    \n    if response[\"Items\"]:\n        return {\n          \"Items\": response[\"Items\"],\n          \"Status\": \"CustomDomainNameHasMappings\"\n        }\n        \n    raise Exception(f\"\"\"{domain_name} does not contain any mappings. \nPlease see the documentation to create one here: https://docs.aws.amazon.com/apigateway/latest/developerguide/rest-api-mappings.html\"\"\")\n",
+        "InputPayload": {
+          "DomainName": "{{DomainName}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Mappings",
+          "Selector": "$.Payload.Items",
+          "Type": "MapList"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "description": "Returns a list of APIs mapped to the custom domain name and the mapping details.",
+      "nextStep": "GetMappingsForAPI_ID",
+      "onFailure": "step:Results",
+      "timeoutSeconds": 60
+    },
+    {
+      "name": "GetMappingsForAPI_ID",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "############################################################################\n# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n############################################################################\n# USAGE: GetMappingsForAPI_ID.py checks the list of mappings returned \n# for the custom domain name for a mapping to the specified API Id.\n############################################################################\nimport boto3\nimport sys\nimport json\n\nsys.tracebacklimit=0\nclient = boto3.client('apigatewayv2')\n\ndef script_handler(events, context):\n    domain_name = events[\"DomainName\"]\n    api_id = events[\"ApiId\"]\n    api_mappings = []\n\n    for item in events[\"Mappings\"]:\n        if item[\"ApiId\"] == api_id:\n            api_mappings.append({\n                \"API\": item[\"ApiId\"],\n                \"MappingId\": item[\"ApiMappingId\"],\n                \"MappingKey\": item[\"ApiMappingKey\"],\n                \"Stage\": item[\"Stage\"],\n                \"Status\":\"ApiHasMappings\"\n            })\n\n    if api_mappings:\n        return {\"results\": json.dumps(api_mappings)}\n\n    raise Exception(f\"\"\"A base path mapping does not exist between ApiId: {api_id} and the custom domain name: {domain_name}. \nPlease see the documentation to create one here: https://docs.aws.amazon.com/apigateway/latest/developerguide/rest-api-mappings.html\"\"\")\n",
+        "InputPayload": {
+          "Mappings": "{{GetMappings.Mappings}}",
+          "DomainName": "{{DomainName}}",
+          "ApiId": "{{ApiId}}"
+        }
+      },
+      "nextStep": "CheckDNSRecordExists",
+      "onFailure": "step:Results",
+      "timeoutSeconds": 60,
+      "outputs": [
+        {
+          "Name": "Mappings",
+          "Selector": "$.Payload.results",
+          "Type": "String"
+        }
+      ],
+      "description": "Checks the list of mappings returned for the custom domain name for a mapping to the specified API Id."
+    },
+    {
+      "name": "CheckDNSRecordExists",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "############################################################################\n# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n############################################################################\n# USAGE: CheckDNSRecordExists.py runs a DNS query on the custom \n# domain name and returns the DNS record details.\n############################################################################\nimport socket\nimport ipaddress\nimport sys\nimport logging\nimport json\n\nsys.tracebacklimit=0\n\nclass StreamReader:\n    def __init__(self, data):\n        self.data = data\n        self.pos = 0\n        '''\n        Returns data from the stream up to len_ and save latest visited position in the stream until done reading.\n        '''\n    def read(self, len_):\n        pos = self.pos\n        if pos >= len(self.data):\n            raise\n\n        res = self.data[pos: pos+len_]\n        self.pos += len_\n        return res\n\n    def reuse(self, pos):\n        '''\n        If a structure of characters has been already found, \n        read them directly without calculating nor skipping additional positions in the stream\n        '''\n        pos = int.from_bytes(pos.encode(), 'big')\n        return parse_dns_string(None, self.data[pos:])\n\ndef check_dns_record_exists(domain_name, dns_server_ip):\n    '''\n    Initialize connection through Sockets and retrieve the DNS records of domain_name\n    '''\n    dns_query = create_dns_query(domain_name)\n    dq_len = len(dns_query)\n\n    req = create_dns_request_data(dns_query)\n    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    sock.settimeout(2)\n\n    try:\n        sock.sendto(req, (dns_server_ip, 53))\n        res, _ = sock.recvfrom(1024 * 4)\n        result = parse_dns_response(res, dq_len, req)\n    except Exception as e:\n        logging.error(f\"Error: DNS resolution Failed: {e}\")\n        return\n    finally:\n        sock.close()\n\n    return result\n\ndef create_dns_query(domain):\n    '''\n    Returns DNS Query request in HEX format\n    '''\n    def f(s):\n        return chr(len(s)) + s\n\n    parts = domain.split('.')\n    parts = list(map(f, parts))\n    return ''.join(parts).encode()\n\ndef create_dns_request_data(dns_query):\n    '''\n    Creates the payload to be sent to the DNS Server in Hexadecimal format, including Headers to start and close the transmission.\n    '''\n    req = b'\\xaa\\xbb\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00'\n    req += dns_query\n    req += b'\\x00\\x00\\x01\\x00\\x01'\n    return req\n\ndef parse_dns_response(res, dq_len, req):\n    reader = StreamReader(res)\n    def get_query(s):\n        return s[12:12+dq_len]\n\n    data = reader.read(len(req))\n    # Check that both DNS in the Request and Response are the same\n    assert(get_query(data) == get_query(req))\n\n    def to_int(bytes_):\n        return int.from_bytes(bytes_, 'big')\n\n    result = {}\n    res_num = to_int(data[6:8])\n    # Based on the amount of items required to read, iterate as N times.\n    for i in range(res_num):\n        # Advance 2 positions in the stream buffer.\n        reader.read(2)\n        # Check what kind of response has been received\n        type_num = to_int(reader.read(2))\n\n        type_ = None\n        if type_num == 1:\n            type_ = 'A'\n        elif type_num == 5:\n            type_ = 'CNAME'\n\n        # Advance to the end of the record type response block\n        reader.read(6)\n\n        # Reserve the response block that contains the record value\n        data = reader.read(2)\n        data = reader.read(to_int(data))\n        add_record_to_results(result, type_, data, reader)\n\n    return result\n\ndef add_record_to_results(result, type_, data, reader):\n    if type_ == 'A':\n        item = str(ipaddress.IPv4Address(data))\n    elif type_ == 'CNAME':\n        item = parse_dns_string(reader, data)\n    else:\n        return\n\n    result.setdefault(type_, []).append(item)\n\ndef parse_dns_string(reader, data):\n    '''\n    Transforms Binary data into readable characters.\n    '''\n    res = ''\n    to_resue = None\n    bytes_left = 0\n\n    for ch in data:\n        if not ch:\n            break\n\n        if to_resue is not None:\n            resue_pos = chr(to_resue) + chr(ch)\n            res += reader.reuse(resue_pos)\n            break\n\n        if bytes_left:\n            res += chr(ch)\n            bytes_left -= 1\n            continue\n\n        if (ch >> 6) == 0b11 and reader is not None:\n            to_resue = ch - 0b11000000\n        else:\n            bytes_left = ch\n\n        if res:\n            res += '.'\n\n    return res\n\ndef script_handler(events, context):\n    domain_name = events['DomainName']\n    dns_server_ip = events[\"DNSServerIp\"]\n    \n    response = check_dns_record_exists(domain_name=domain_name, dns_server_ip=dns_server_ip)\n    \n    if response:\n        return {\"results\": json.dumps(response)}\n    \n    raise Exception(f\"\"\"There is no DNS record for the domain name {domain_name} or the domain could not be resolved. \nPlease check your DNS server for a record for this domain and ensure it can be resolved.\"\"\")\n",
+        "InputPayload": {
+          "DomainName": "{{DomainName}}",
+          "DNSServerIp": "{{DNSServerIp}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Payload.results",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ValidateDNSResults",
+      "onFailure": "step:Results",
+      "timeoutSeconds": 60,
+      "description": "Checks if there is a DNS record for the custom domain name and returns its details."
+    },
+    {
+      "name": "ValidateDNSResults",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "############################################################################\n# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n############################################################################\n# USAGE: ValidateDNSResults.py Compares the previously returned DNS details \n# of the custom domain name to ensure the DNS record of the custom domain \n# name is pointing to the correct target value.\n############################################################################\nimport json\nimport boto3\nimport sys\n\nsys.tracebacklimit=0\nclient = boto3.client(\"route53\")\n\ndef script_handler(events, context):\n\n  custom_domain_name = json.loads(events[\"DNSRecord\"])\n  hosted_zone_id = events[\"HostedZoneId\"]\n  domain_name = events[\"DomainName\"] \n  apigw_domain_name_details = events[\"APIGWDomainName\"]\n\n  if \"CNAME\" in custom_domain_name:\n    custom_domain_name_details = custom_domain_name['CNAME'][0]\n  elif hosted_zone_id:\n    try:\n      result = client.list_resource_record_sets(\n        HostedZoneId=hosted_zone_id,\n        StartRecordName=domain_name,\n        StartRecordType= 'A',\n        MaxItems='1'\n      )\n    except Exception:\n      raise Exception(f\"\"\"The DNS record for the domain name {domain_name} may not be pointing to the correct target. \nThe API Gateway domain name generated for this custom domain is: {apigw_domain_name_details} which should be the target of the DNS record created for the custom domain name. \nPlease check your DNS record for this domain and ensure it is pointing to the API Gateway domain {apigw_domain_name_details}.\"\"\")\n\n    custom_domain_name_details = result[\"ResourceRecordSets\"][0][\"AliasTarget\"][\"DNSName\"].rstrip('.')\n  else:\n    custom_domain_name_details = custom_domain_name\n\n  \n  if custom_domain_name_details == apigw_domain_name_details:\n    return {\"results\": json.dumps({\n      \"customDomainNameDNSDetails\": custom_domain_name,\n      \"apigwDomainName\": apigw_domain_name_details,\n      \"result\": \"DNS record valid and configured correctly.\"\n    })}\n   \n  raise Exception (f'An issue occurred when validating the DNS record for {domain_name}')\n    \n",
+        "InputPayload": {
+          "DomainName": "{{DomainName}}",
+          "APIGWDomainName": "{{GetDomainName.APIGatewayDomainName}}",
+          "DNSRecord": "{{CheckDNSRecordExists.Result}}",
+          "HostedZoneId": "{{HostedZoneId}}",
+          "ApiId": "{{ApiId}}"
+        }
+      },
+      "nextStep": "Results",
+      "onFailure": "step:Results",
+      "timeoutSeconds": 60,
+      "description": "Compares the previously returned DNS details of the custom domain name to ensure the DNS record of the custom domain name is pointing to the correct target value.",
+      "outputs": [
+        {
+          "Name": "results",
+          "Selector": "$.Payload.results",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "Results",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "############################################################################\n# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n############################################################################\n# USAGE: Results.py Formats the overall output of the automation to \n# return the results of the analysis to the console.\n############################################################################\nimport json\nimport logging\n\ndef script_handler(events, context):\n  domain_name = events['DomainName']\n  api_id = events['ApiId']\n  try:\n    final_result= None\n    \n    try:\n      mappings = json.loads(events['Mappings'])\n    except json.decoder.JSONDecodeError:\n      mappings = {}\n      \n    try:\n      dns_details = json.loads(events['CheckDNSRecordExists'])\n    except json.decoder.JSONDecodeError:\n      dns_details = {}\n  \n\n    if not (events['Status'] == \"AVAILABLE\" or events['Status'] == \"UPDATING\" or events['Status'] == \"PENDING_CERTIFICATE_REIMPORT\" or events['Status'] == \"PENDING_OWNERSHIP_VERIFICATION\"):\n      final_result=f\"\"\" Check (1/5): Check custom domain name exists.\n  Status: Failed.\n  \n  Troubleshooting Recommendations:\n    - Custom domain name: {domain_name} is not configured in API gateway.\n    - Please see the link below for information on how to setup a custom domain for API Gateway:\n      > https://aws.amazon.com/premiumsupport/knowledge-center/custom-domain-name-amazon-api-gateway/ \n        \n    - The remaining checks have not been run at this point hence there may be other errors in the current configuration.\n    - After resovling the error above, please check that your custom domain name has:\n      > A mapping to the API you are trying to reach\n      > A DNS record pointing to the generated API Gateway domain name.\n      \n    - You can run this automation again to confirm the changes have been made correctly.\n    - More details for this particular error can be found within the individual step details.\n    \n  Check (2/5): List mappings.\n  Status: Skipped\n  \n  Check (3/5): Check mapping exists to API Id: {api_id}. \n  Status: Skipped\n  \n  Check (4/5): Check DNS record exists for custom domain name.\n  Status: Skipped\n  \n  Check (5/5): Validate DNS record.\n  Status: Skipped \"\"\"\n    \n    elif 'CustomDomainNameHasMappings' not in events['GetMappingsStatus']:\n      final_result=f\"\"\" Check (1/5): Check custom domain name exists.\n  Status: Complete\n  \n  Check (2/5): List mappings.\n  Status: Failed\n  \n  Troubleshooting Recommendations:\n    - {domain_name} does not contain any mappings. \n    - Please see the documentation to create one here: \n      > https://docs.aws.amazon.com/apigateway/latest/developerguide/rest-api-mappings.html \n       \n    - The remaining checks have not been run at this point hence there may be other errors in the current configuration.\n    - After resovling the error above, please check that your custom domain name has:\n      > A mapping to the API you are trying to reach\n      > A DNS record pointing to the generated API Gateway domain name.\n      \n    - You can run this automation again to confirm the changes have been made correctly.\n    - More details for this particular error can be found within the individual step details.\n  \n  Check (3/5): Check mapping exists to API Id: {api_id}. \n  Status: Skipped\n  \n  Check (4/5): Check DNS record exists for custom domain name.\n  Status: Skipped\n  \n  Check (5/5): Validate DNS record.\n  Status: Skipped \"\"\"\n      \n    elif not mappings:\n      final_result= f\"\"\" Check (1/5): Check custom domain name exists.\n  Status: Complete\n  \n  Check (2/5): List mappings.\n  Status: Complete\n  \n  Check (3/5): Check mapping exists to API Id: {api_id}. \n  Status: Failed\n  \n    Troubleshooting Recommendations:\n    - A base path mapping does not exist between API Id: {api_id} and custom domain name: {domain_name}. \n    - Please see the documentation to create one here: \n      > https://docs.aws.amazon.com/apigateway/latest/developerguide/rest-api-mappings.html \n       \n    - The remaining checks have not been run at this point hence there may be other errors in the current configuration.\n    - After resovling the error above, please check that your custom domain name has:\n      > A mapping to the API you are trying to reach\n      > A DNS record pointing to the generated API Gateway domain name.\n      \n    - You can run this automation again to confirm the changes have been made correctly.\n    - More details for this particular error can be found within the individual step details.\n  \n  Check (4/5): Check DNS record exists for custom domain name.\n  Status: Not Run\n  \n  Check (5/5): Validate DNS record.\n  Status: Skipped \"\"\"\n    \n    elif \"A\" not in events[\"CheckDNSRecordExists\"]:\n      final_result=f\"\"\" Check (1/5): Check custom domain name exists.\n  Status: Complete\n  \n  Check (2/5): List mappings.\n  Status: Complete\n  \n  Check (3/5): Check mapping exists to API Id: {api_id}. \n  Status: Complete\n  \n  Check (4/5): Check DNS record exists for custom domain name.\n  Status: Failed\n  \n  Troubleshooting Recommendations:\n    - There is no DNS record for the custom domain name: {domain_name} or the domain could not be resolved.\n    - Please check your DNS server for a record for this domain and ensure it can be resolved.\n      \n    - The remaining checks have not been run at this point hence there may be other errors in the current configuration.\n    - After resovling the error above, please check that your custom domain name has:\n      > A DNS record pointing to the generated API Gateway domain name.\n\n    - You can run this automation again to confirm the changes have been made correctly.\n    - More details for this particular error can be found within the individual step details.\n  \n  \n  Check (5/5): Validate DNS record.\n  Status: Skipped \"\"\"\n\n    elif \"DNS record valid and configured correctly.\" not in events['ValidResults']:\n      final_result=f\"\"\" Check (1/5): Check custom domain name exists.\n  Status: Complete\n\n  Check (2/5): List mappings.\n  Status: Complete\n\n  Check (3/5): Check mapping exists to API Id: {api_id}. \n  Status: Complete\n\n  Check (4/5): Check DNS record exists for custom domain name.\n  Status: Complete\n\n  Check (5/5): Validate DNS record.\n  Status: Failed\n\n  Troubleshooting Recommendations:\n    - The DNS record for the custom domain name: {domain_name} may not be pointing to the correct target.\n    - The API Gateway domain name generated for this custom domain name is: {events['APIGatewayDomainName']} which should be the target of the DNS record created for the custom domain name.\n    - Please check your DNS record for this domain and ensure it is pointing to the API Gateway domain name: {events['APIGatewayDomainName']}.\n     \n    - After resovling the error above, you can run this automation again to confirm the changes have been made correctly. \n    - More details for this particular error can be found within the individual step details.\"\"\"\n    else:\n      final_result={ \"Result\":\"The custom domain name is configured correctly\", \"DomainDetails\": { \"DomainName\": domain_name, \"APIGatewayDomainName\": events['APIGatewayDomainName'], \"Status\":events['Status'], \"EndpointType\": events['EndpointType'] }, \"MappingDetails\": mappings , \"DNSDetails\": dns_details }\n      \n  except Exception as e:\n    raise Exception(f\"An exception occurred when returning the troubleshooting advice: {e}\")\n\n  return {'message': json.dumps(final_result)}\n",
+        "InputPayload": {
+          "CheckDNSRecordExists": "{{CheckDNSRecordExists.Result}}",
+          "APIGatewayDomainName": "{{GetDomainName.APIGatewayDomainName}}",
+          "DomainName": "{{DomainName}}",
+          "EndpointType": "{{GetDomainName.EndpointType}}",
+          "Status": "{{GetDomainName.Status}}",
+          "Mappings": "{{GetMappingsForAPI_ID.Mappings}}",
+          "ValidResults": "{{ValidateDNSResults.results}}",
+          "ApiId": "{{ApiId}}",
+          "GetMappingsStatus": "{{GetMappings.Status}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true,
+      "description": "Formats the overall output of the automation to return the results of the analysis to the console.",
+      "timeoutSeconds": 60
+    }
+  ],
+  "files": {}
+}
