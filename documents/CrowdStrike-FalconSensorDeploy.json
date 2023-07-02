@@ -17,14 +17,6 @@
       "description": "(Required) Specify whether or not to install or uninstall the package.",
       "default": "Install"
     },
-    "InstallationType": {
-      "type": "String",
-      "allowedValues": [
-        "Uninstall and reinstall"
-      ],
-      "description": "(Optional) Specify the type of installation. Uninstall and reinstall: The application is taken offline until the reinstallation process completes. In-place update: The application is available while new or updated files are added to the installation.",
-      "default": "Uninstall and reinstall"
-    },
     "LinuxPackageVersion": {
       "type": "String",
       "description": "(Optional) The version of the package to install or uninstall on Linux nodes. If you do not specify a version, the system installs the default version specified by the Distributor package.",
@@ -45,20 +37,34 @@
       "default": "",
       "description": "(Optional) Enter CrowdStrike's install time params to be used on Windows nodes. For more information refer to the console."
     },
+    "SecretStorageMethod": {
+      "type": "String",
+      "default": "ParameterStore",
+      "description": "The method used to store the Falcon ClientId, ClientSecret, and Cloud for the CrowdStrike APIs.",
+      "allowedValues": [
+        "ParameterStore",
+        "SecretsManager"
+      ]
+    },
     "FalconCloud": {
       "type": "String",
-      "description": "(Required) SSM Parameter Store name that contains the Falcon Cloud URL for CrowdStrike APIs.",
+      "description": "SSM Parameter Store name that contains the Falcon Cloud URL for CrowdStrike APIs. Required if SecretStorageMethod is ParameterStore.",
       "default": "/CrowdStrike/Falcon/Cloud"
     },
     "FalconClientId": {
       "type": "String",
       "default": "/CrowdStrike/Falcon/ClientId",
-      "description": "(Required) SSM Parameter Store name that contains the Falcon Client Id for CrowdStrike APIs."
+      "description": "SSM Parameter Store name that contains the Falcon Client Id for CrowdStrike APIs. Required if SecretStorageMethod is ParameterStore."
     },
     "FalconClientSecret": {
       "type": "String",
-      "description": "(Required) SSM Parameter Store name that contains the Falcon Client Secret for CrowdStrike APIs.",
+      "description": "SSM Parameter Store name that contains the Falcon Client Secret for CrowdStrike APIs. Required if SecretStorageMethod is ParameterStore.",
       "default": "/CrowdStrike/Falcon/ClientSecret"
+    },
+    "SecretsManagerSecretName": {
+      "type": "String",
+      "description": "Secrets Manager Secret Name that contains the Falcon ClientId, ClientSecret, and Cloud for the CrowdStrike APIs. Required if SecretStorageMethod is SecretsManager. Refer to the user guide for required value format.",
+      "default": "/CrowdStrike/Falcon/Distributor"
     },
     "InstanceIds": {
       "type": "StringList"
@@ -93,103 +99,62 @@
       ]
     },
     {
-      "name": "CompileInstanceList",
+      "name": "HandlePreqrequisites",
       "action": "aws:executeScript",
       "inputs": {
         "Runtime": "python3.7",
         "Handler": "script_handler",
         "InputPayload": {
-          "instances": "{{ GetSSMInstanceInformation.instances }}"
+          "instances": "{{ GetSSMInstanceInformation.instances }}",
+          "region": "{{global:REGION}}",
+          "falconCloud": "{{FalconCloud}}",
+          "falconClientId": "{{FalconClientId}}",
+          "falconClientSecret": "{{FalconClientSecret}}",
+          "secretsManagerSecretName": "{{SecretsManagerSecretName}}",
+          "secretStorageMethod": "{{SecretStorageMethod}}"
         },
-        "Script": "def script_handler(events, context):\n  window_instances = []\n  linux_instances = []\n\n  for instance in events['instances']:\n    if instance['PlatformType'] == 'Windows':\n      window_instances.append(instance['InstanceId'])\n    elif instance['PlatformType'] == 'Linux':\n      linux_instances.append(instance['InstanceId'])\n    else:\n      raise ValueError('Unsupported platform {}'.format(instance['PlatformType']))\n    \n  return {\n    'windows_instances': window_instances,\n    'linux_instances': linux_instances,\n    'contains_windows_instances': any(window_instances),\n    'contains_linux_instances': any(linux_instances)\n  }"
+        "Script": "\"\"\"Module for handling prerequisites for CrowdStrike Falcon AWS Automation document\"\"\"\n\n\nimport http.client\n\nimport urllib.parse\n\nimport time\n\nfrom datetime import datetime\n\nimport json\n\nimport boto3\n\nimport botocore.exceptions\n\n\nclass CrowdStrikeAPIError(Exception):\n    \"\"\"Crowdstrike API error\"\"\"\n\n\nclass Falcon:\n    \"\"\"Crowdstrike Falcon API class\"\"\"\n\n    def __init__(self, cloud, client_id, client_secret, bearer_token=None):\n        \"\"\"Default constructor\n\n        Args:\n            cloud (str): Falcon API Gateway\n            client_id (str): Falcon OAuth2 Client ID\n            client_secret (str): Falcon OAuth2 Client Secret\n            bearer_token (str, optional): CrowdStrike API OAUTH2 Token. Defaults to None.\n        \"\"\"\n        self.cloud = cloud.replace(\"https://\", \"\").replace(\"http://\", \"\")\n        self.client_id = client_id\n        self.client_secret = client_secret\n        self.user_agent = \"crowdstrike-official-distributor-package/v1.0.0\"\n        self.bearer_token = bearer_token\n\n    def _handle_redirect(self, res):\n        \"\"\"Updates the cloud attribute with the new location received in the redirect\n        \n        Args:\n            res (HTTPResponse): HTTP response object\n        \n        Raises:\n            CrowdStrikeAPIError: If we are unable to handle the redirect\n        \"\"\"\n        location = res.getheader(\"Location\")\n        if location is None:\n            raise CrowdStrikeAPIError(\n                f\"Received redirect to {res.getheader('X-Cs-Region')}, but no location header was found. Ensure you are using the correct API Gateway.\"\n            )\n        new_cloud = urllib.parse.urlparse(location).netloc\n        print(f\"WARNING: While using {self.cloud}, received redirect to {new_cloud}. Please update the value used for the crowdstrike cloud to prevent future redirects.\")\n        self.cloud = new_cloud\n\n    def _handle_rate_limit(self, res):\n        \"\"\"Handles rate limit exceptions by sleeping 10 seconds or X-RateLimit-RetryAfter\n        whichever is largest\n\n        Args:\n            res (HTTPResponse): HTTP response object\n        \"\"\"\n        retry_after = int(res.getheader(\"X-RateLimit-RetryAfter\"))\n        retry_datetime = datetime.utcfromtimestamp(retry_after)\n        now = datetime.utcnow()\n        wait_duration = max((retry_datetime - now).total_seconds(), 10)\n        print(f\"Rate limit exceeded. Retrying after {wait_duration} seconds.\")\n        time.sleep(wait_duration)\n\n    def _oauth(self):\n        \"\"\"Creates OAuth bearer token\n\n\n        Returns:\n            token (str): OAuth bearer token\n\n        Raises:\n            CrowdStrikeAPIError: If the API call fails\n        \"\"\"\n        print(\"Requesting Authentication token from Crowdstrike backend.\")\n\n        params = urllib.parse.urlencode(\n            {\n                \"client_id\": self.client_id,\n                \"client_secret\": self.client_secret,\n            }\n        )\n        headers = {\n            \"Content-Type\": \"application/x-www-form-urlencoded\",\n            \"User-Agent\": self.user_agent,\n        }\n        conn = http.client.HTTPSConnection(self.cloud)\n        conn.request(\"POST\", \"/oauth2/token\", params, headers)\n        res = conn.getresponse()\n\n        if res.status == 429:\n            self._handle_rate_limit(res)\n            return self._oauth()\n\n        if res.status in [301, 302, 303, 307, 308]:\n            self._handle_redirect(res)\n            return self._oauth()\n\n        if res.status != 201:\n            raise CrowdStrikeAPIError(\n                f\"Received non success response {res.status} while fetching token. Error {res.reason}\"\n            )\n\n        data = res.read()\n        print(\"Successfully received OAuth token.\")\n        self.bearer_token = json.loads(data)[\"access_token\"]\n\n    def get_ccid(self):\n        \"\"\"Returns the Customer ID\n\n        Returns:\n            ccid (str): Customer ID\n\n        Raises:\n            CrowdStrikeAPIError: If the API call fails\n        \"\"\"\n        print(\"Requesting Customer ID from Crowdstrike backend.\")\n\n        if self.bearer_token is None:\n            self._oauth()\n\n        headers = {\n            \"Authorization\": f\"Bearer {self.bearer_token}\",\n            \"User-Agent\": self.user_agent,\n        }\n\n        conn = http.client.HTTPSConnection(self.cloud)\n        conn.request(\"GET\", \"/sensors/queries/installers/ccid/v1\", \"\", headers)\n        res = conn.getresponse()\n\n        if res.status == 429:\n            self._handle_rate_limit(res)\n            return self.get_ccid()\n        \n        if res.status in [301, 302, 303, 307, 308]:\n            self._handle_redirect(res)\n            return self.get_ccid()\n        \n        if res.status != 200:\n            raise CrowdStrikeAPIError(\n                f\"Received non success response {res.status} while fetching Customer ID. Error {res.reason}\"\n            )\n\n        data = res.read()\n        print(\"Successfully received Customer ID.\")\n\n        return json.loads(data)[\"resources\"][0]\n\n    def get_install_token(self):\n        \"\"\"Returns the Installation Token\n\n        Returns:\n            token (str): Installation Token\n\n        Raises:\n            CrowdStrikeAPIError: If the API call fails\n        \"\"\"\n        print(\"Requesting Installation Token from Crowdstrike backend.\")\n\n        if self.bearer_token is None:\n            self._oauth()\n\n        conn = http.client.HTTPSConnection(self.cloud)\n\n        headers = {\n            \"Authorization\": f\"Bearer {self.bearer_token}\",\n            \"User-Agent\": self.user_agent,\n        }\n\n        conn.request(\n            \"GET\",\n            \"/installation-tokens/queries/tokens/v1?filter=status:'valid'\",\n            \"\",\n            headers,\n        )\n        install_token_query_resp = conn.getresponse()\n\n        if install_token_query_resp.status == 429:\n            self._handle_rate_limit(install_token_query_resp)\n            return self.get_install_token()\n\n        if install_token_query_resp.status in [301, 302, 303, 307, 308]:\n            self._handle_redirect(install_token_query_resp)\n            return self.get_install_token()\n\n        if install_token_query_resp.status != 200:\n            raise CrowdStrikeAPIError(\n                f\"Received non success response {install_token_query_resp.status} while fetching token. Error {install_token_query_resp.reason}\"\n            )\n\n        install_token_query_data = install_token_query_resp.read()\n        resources = json.loads(install_token_query_data)[\"resources\"]\n        if len(resources) == 0:\n            print(\"No Installation token found, skipping\")\n            return \"\"\n\n        install_token_id = resources[0]\n        url = f\"/installation-tokens/entities/tokens/v1?ids={install_token_id}\"\n        conn.request(\"GET\", url, \"\", headers)\n        entities_resp = conn.getresponse()\n\n        if entities_resp.status == 429:\n            self._handle_rate_limit(entities_resp)\n            return self.get_install_token()\n\n        if entities_resp.status in [301, 302, 303, 307, 308]:\n            self._handle_redirect(install_token_query_resp)\n            return self.get_install_token()\n\n        if entities_resp.status != 200:\n            raise CrowdStrikeAPIError(\n                f\"Received non success response {entities_resp.status} while fetching token by id {install_token_id}. Error {entities_resp.reason}\"\n            )\n\n        entities_resp_data = entities_resp.read()\n        token = json.loads(entities_resp_data)[\"resources\"][0][\"value\"]\n\n        print(\"Successfully received Installation token\")\n        return token\n\n\ndef compile_instance_list(instances):\n    \"\"\"\n    Compiles a list of Windows and Linux instances from the SSM instance information\n\n    Args:\n        instances (list): List of SSM instance information\n    \"\"\"\n    window_instances = []\n    linux_instances = []\n\n    for instance in instances:\n        if instance[\"PlatformType\"] == \"Windows\":\n            window_instances.append(instance[\"InstanceId\"])\n        elif instance[\"PlatformType\"] == \"Linux\":\n            linux_instances.append(instance[\"InstanceId\"])\n        else:\n            print(f\"Unknown platform type {instance['PlatformType']}\")\n\n    return {\n        \"windowsInstances\": window_instances,\n        \"linuxInstances\": linux_instances,\n        \"containsWindowsInstances\": any(window_instances),\n        \"containsLinuxInstances\": any(linux_instances),\n    }\n\n\nclass SSMHelper:\n    \"\"\"A helper class for SSM\"\"\"\n\n    def __init__(self, region):\n        self.client = boto3.client(\"ssm\", region_name=region)\n\n    def get_parameter(self, path):\n        \"\"\"Get a SSM parameter by path and return value.\n\n        Handles throttling exceptions by backing off and retrying.\n\n        Args:\n            path (str): Path to the SSM parameter\n        \"\"\"\n\n        try:\n            response = self.client.get_parameter(\n                Name=path,\n                WithDecryption=True,\n            )\n            print(f\"Successfully received SSM parameter: {path}\")\n            return response[\"Parameter\"][\"Value\"]\n        except botocore.exceptions.ClientError as error:\n            if (\n                error.response.get(\"Error\", {}).get(\"Code\", None)\n                == \"ThrottlingException\"\n            ):\n                wait_time = 5\n                print(f\"Throttling exception, waiting {wait_time} seconds\")\n                time.sleep(wait_time)\n                return self.get_parameter(path)\n            else:\n                raise error\n\n\nclass SecretsManagerHelper:\n    \"\"\"A helper class for Secrets Manager\"\"\"\n\n    def __init__(self, region):\n        self.client = boto3.client(\"secretsmanager\", region_name=region)\n\n    def _validate_secret(self, secret_value):\n        \"\"\"Validate a Secrets Manager secret contains all required fields.\n\n        Args:\n            secret_value (dict): Secrets Manager secret value\n\n        Returns:\n            valid (bool): True if secret contains all required fields\n            fields: (list): List of missing fields\n        \"\"\"\n\n        required_fields = [\"clientid\", \"clientsecret\", \"cloud\"]\n        missing_fields = []\n\n        for field in required_fields:\n            if field not in secret_value:\n                missing_fields.append(field)\n\n        valid = len(missing_fields) == 0\n\n        return valid, missing_fields\n\n    def get_secret(self, secret_name):\n        \"\"\"Get a Secrets Manager secret by name and return value.\n\n        Validates the secret contains all required fields.\n\n        Handles throttling exceptions by backing off and retrying.\n\n        Args:\n            secret_name (str): secret name of the Secrets Manager secret\n\n        Returns:\n            secret_value (dict): Secrets Manager secret value\n\n        Raises:\n            botocore.exceptions.ClientError: If the API call fails\n            ValueError: If the secret does not contain all required fields\n        \"\"\"\n\n        try:\n            response = self.client.get_secret_value(SecretId=secret_name)\n            print(f\"Successfully received Secrets Manager secret: {secret_name}\")\n\n            secret_value = json.loads(response[\"SecretString\"])\n            # Instead of throwing an error if the secret contains fields with\n            # mismatching casing, we convert all keys to lowercase.\n            # This eliminates this error entirely.\n            secret_value = {k.lower(): v for k, v in secret_value.items()}\n\n            valid, missing_fields = self._validate_secret(secret_value)\n\n            if not valid:\n                raise ValueError(\n                    f\"Secret {secret_name} is missing required fields: {missing_fields}\"\n                )\n\n            return secret_value\n        except botocore.exceptions.ClientError as error:\n            if (\n                error.response.get(\"Error\", {}).get(\"Code\", None)\n                == \"ThrottlingException\"\n            ):\n                wait_time = 5\n                print(f\"Throttling exception, waiting {wait_time} seconds\")\n                time.sleep(wait_time)\n                return self.get_secret(secret_name)\n            else:\n                raise error\n\n\ndef script_handler(events, _):\n    \"\"\"Handler for executeScript action\n\n    Args:\n        events (dict): Input for the action\n        _ (dict): Context for the action\n\n    Returns:\n        dict: Output for the action\n    \"\"\"\n    instances = events[\"instances\"]\n    response = compile_instance_list(instances)\n    response[\"falconOauthToken\"] = \"\"\n    if len(instances) == 0:\n        print(\"No instances passed to the action\")\n        return response\n\n    region = events[\"region\"]\n\n    if events[\"secretStorageMethod\"] == \"ParameterStore\":\n        print(\"Using Parameter Store to retrieve secrets\")\n        ssm_helper = SSMHelper(region=region)\n        falcon_cloud = ssm_helper.get_parameter(events[\"falconCloud\"])\n        falcon_client_id = ssm_helper.get_parameter(events[\"falconClientId\"])\n        falcon_client_secret = ssm_helper.get_parameter(events[\"falconClientSecret\"])\n    else:\n        print(\"Using Secrets Manager to retrieve secrets\")\n        secret_helper = SecretsManagerHelper(region=region)\n        secret_value = secret_helper.get_secret(events[\"secretsManagerSecretName\"])\n        falcon_cloud = secret_value[\"cloud\"]\n        falcon_client_id = secret_value[\"clientid\"]\n        falcon_client_secret = secret_value[\"clientsecret\"]\n\n    falcon_client = Falcon(falcon_cloud, falcon_client_id, falcon_client_secret)\n\n    response[\"falconCcid\"] = falcon_client.get_ccid()\n    response[\"falconInstallToken\"] = falcon_client.get_install_token()\n    response[\"falconOauthToken\"] = falcon_client.bearer_token\n    response[\"falconCloud\"] = falcon_client.cloud\n    return response"
       },
       "outputs": [
         {
-          "Name": "windows_instances",
-          "Selector": "$.Payload.windows_instances",
+          "Name": "falconCloud",
+          "Selector": "$.Payload.falconCloud",
+          "Type": "String"
+        },
+        {
+          "Name": "falconCcid",
+          "Selector": "$.Payload.falconCcid",
+          "Type": "String"
+        },
+        {
+          "Name": "falconInstallToken",
+          "Selector": "$.Payload.falconInstallToken",
+          "Type": "String"
+        },
+        {
+          "Name": "falconOauthToken",
+          "Selector": "$.Payload.falconOauthToken",
+          "Type": "String"
+        },
+        {
+          "Name": "windowsInstances",
+          "Selector": "$.Payload.windowsInstances",
           "Type": "StringList"
         },
         {
-          "Name": "linux_instances",
-          "Selector": "$.Payload.linux_instances",
+          "Name": "linuxInstances",
+          "Selector": "$.Payload.linuxInstances",
           "Type": "StringList"
         },
         {
-          "Name": "contains_windows_instances",
-          "Selector": "$.Payload.contains_windows_instances",
+          "Name": "containsWindowsInstances",
+          "Selector": "$.Payload.containsWindowsInstances",
           "Type": "Boolean"
         },
         {
-          "Name": "contains_linux_instances",
-          "Selector": "$.Payload.contains_linux_instances",
+          "Name": "containsLinuxInstances",
+          "Selector": "$.Payload.containsLinuxInstances",
           "Type": "Boolean"
-        }
-      ]
-    },
-    {
-      "name": "GetAuthenticationToken",
-      "action": "aws:executeScript",
-      "inputs": {
-        "Runtime": "python3.7",
-        "Handler": "script_handler",
-        "Script": "import http.client\nimport mimetypes\nimport urllib.parse\nimport boto3\nimport json\n\ndef script_handler(events, context):\n  print('Configuring AWS region {}'.format(events['Region']))\n  ssm = boto3.client('ssm', region_name=events['Region'])\n\n  print('Fetching required configuration from Parameter Service')\n\n  print('... Fetching FalconCloud')\n  apiGateWayHostResponse = ssm.get_parameter(Name=events['FalconCloud'], WithDecryption=True)\n  if apiGateWayHostResponse['ResponseMetadata']['HTTPStatusCode'] != 200:\n    raise ValueError('Required property {} not found'.format(events['FalconCloud']))\n\n  print('... Fetching FalconClientId')\n  apiGatewayClientIDResponse = ssm.get_parameter(Name=events['FalconClientId'], WithDecryption=True)\n  if apiGatewayClientIDResponse['ResponseMetadata']['HTTPStatusCode'] != 200:\n    raise ValueError('Required property {} not found'.format(events['FalconClientId']))\n\n  print('... Fetching FalconClientSecret')\n  apiGatewayClientSecretResponse = ssm.get_parameter(Name=events['FalconClientSecret'], WithDecryption=True)\n  if apiGatewayClientSecretResponse['ResponseMetadata']['HTTPStatusCode'] != 200:\n    raise ValueError('Required property {} not found'.format(events['FalconClientSecret']))\n\n  apiGateWayHostValue = apiGateWayHostResponse['Parameter']['Value']\n  apiGateWayHostValue = apiGateWayHostValue.replace(\"https://\", \"\").replace(\"http://\", \"\")\n  apiGatewayClientIDValue = apiGatewayClientIDResponse['Parameter']['Value']\n  apiGatewayClientSecretValue = apiGatewayClientSecretResponse['Parameter']['Value']\n\n  try:\n    print('Requesting Authentication token from Crowdstrike backend.')\n    conn = http.client.HTTPSConnection(apiGateWayHostValue)\n    params = urllib.parse.urlencode({'client_id': apiGatewayClientIDValue, 'client_secret': apiGatewayClientSecretValue})\n    headers = {'Content-Type': 'application/x-www-form-urlencoded'}\n    conn.request('POST', '/oauth2/token', params, headers)\n    res = conn.getresponse()\n\n    if res.status != 201:\n      raise ValueError('Received non success response {}. Error {}'.format(res.status, res.reason))\n\n    data = res.read()\n    print('Successfully received OAuth token.')\n    return {'AuthToken': json.loads(data)['access_token'], 'ApiGatewayHost':apiGateWayHostValue}\n  except Exception as e:\n    raise ValueError('Failure while interacting with Crowdstrike backend. Error: {}'.format(e))",
-        "InputPayload": {
-          "FalconCloud": "{{FalconCloud}}",
-          "FalconClientId": "{{FalconClientId}}",
-          "FalconClientSecret": "{{FalconClientSecret}}",
-          "Region": "{{global:REGION}}"
-        }
-      },
-      "outputs": [
-        {
-          "Name": "AuthToken",
-          "Selector": "$.Payload.AuthToken",
-          "Type": "String"
-        },
-        {
-          "Name": "ApiGatewayHost",
-          "Selector": "$.Payload.ApiGatewayHost",
-          "Type": "String"
-        }
-      ]
-    },
-    {
-      "name": "GetCustomerIdentifier",
-      "action": "aws:executeScript",
-      "inputs": {
-        "Runtime": "python3.7",
-        "Handler": "script_handler",
-        "Script": "import http.client\nimport mimetypes\nimport urllib.parse\nimport json\ndef script_handler(events, context):\n  try:\n    print('Requesting Customer ID from Crowdstrike backend.')\n    conn = http.client.HTTPSConnection(events['ApiGatewayHost'])\n    headers = {\n      'Authorization': 'Bearer {}'.format(events['AuthToken'])\n    }\n\n    conn.request('GET', '/sensors/queries/installers/ccid/v1', '', headers)\n    res = conn.getresponse()\n\n    if res.status != 200:\n      raise ValueError('Received non success response {}. Error {}'.format(res.status, res.reason))\n\n    data = res.read()\n    print('Successfully received Customer ID.')\n    return {'CCID': json.loads(data)['resources'][0]}\n  except Exception as e:\n    raise ValueError('Failure while interacting with Crowdstrike backend. Error {}'.format(e))\n",
-        "InputPayload": {
-          "AuthToken": "{{GetAuthenticationToken.AuthToken}}",
-          "ApiGatewayHost": "{{GetAuthenticationToken.ApiGatewayHost}}"
-        }
-      },
-      "outputs": [
-        {
-          "Name": "CCID",
-          "Selector": "$.Payload.CCID",
-          "Type": "String"
-        }
-      ]
-    },
-    {
-      "name": "GetInstallationToken",
-      "action": "aws:executeScript",
-      "inputs": {
-        "Runtime": "python3.6",
-        "Handler": "script_handler",
-        "Script": "import http.client\nimport mimetypes\nimport urllib.parse\nimport json\ndef script_handler(events, context):\n  try:\n    print('Requesting Installtion Token from Crowdstrike backend.')\n    conn = http.client.HTTPSConnection(events['ApiGatewayHost'])\n\n    headers = {\n      'Authorization': 'Bearer {}'.format(events['AuthToken'])\n    }\n\n    conn.request('GET', \"/installation-tokens/queries/tokens/v1?filter=status:'valid'\", '', headers)\n    queryRes = conn.getresponse()\n\n    if queryRes.status != 200:\n      raise ValueError('Received non success response {} while querying for token. Error {}'.format(queryRes.status, queryRes.reason))\n\n    queryResData = queryRes.read()\n    resources = json.loads(queryResData)['resources']\n    if len(resources) == 0:\n      print('No Installation token found, skipping')\n      return {'InstallationToken': \"\" }\n\n    resId = resources[0]\n    url ='/installation-tokens/entities/tokens/v1?ids={}'.format(resId)\n    conn.request('GET', url, '', headers)\n    entitiesRes = conn.getresponse()\n\n    if entitiesRes.status != 200:\n      raise ValueError('Received non success response {} while fetching token by id. Error {}'.format(entitiesRes.status, entitiesRes.reason))\n\n    entitiesResData = entitiesRes.read()\n    token = json.loads(entitiesResData)['resources'][0]['value']\n\n    print('Successfully received Installation token')\n    return {'InstallationToken': token }\n  except Exception as e:\n    raise ValueError('Failure while interacting with Crowdstrike backend. Error {}'.format(e))",
-        "InputPayload": {
-          "AuthToken": "{{GetAuthenticationToken.AuthToken}}",
-          "ApiGatewayHost": "{{GetAuthenticationToken.ApiGatewayHost}}"
-        }
-      },
-      "outputs": [
-        {
-          "Selector": "$.Payload.InstallationToken",
-          "Name": "InstallationToken",
-          "Type": "String"
         }
       ]
     },
@@ -200,7 +165,7 @@
         "Choices": [
           {
             "NextStep": "ExecuteDistributorPackageWindows",
-            "Variable": "{{ CompileInstanceList.contains_windows_instances }}",
+            "Variable": "{{ HandlePreqrequisites.containsWindowsInstances }}",
             "BooleanEquals": true
           }
         ],
@@ -213,18 +178,19 @@
       "onFailure": "Continue",
       "inputs": {
         "Targets": "{{ Targets }}",
-        "InstanceIds": "{{ CompileInstanceList.windows_instances }}",
+        "InstanceIds": "{{ HandlePreqrequisites.windowsInstances }}",
         "DocumentName": "AWS-ConfigureAWSPackage",
         "Parameters": {
           "name": "FalconSensor-Windows",
           "action": "{{Action}}",
-          "version": "{{WindowsPackageVersion}}",
+          "installationType": "In-place update",
           "additionalArguments": {
-            "SSM_CS_INSTALLTOKEN": "{{GetInstallationToken.InstallationToken}}",
-            "SSM_CS_CCID": "{{GetCustomerIdentifier.CCID}}",
+            "SSM_CS_INSTALLTOKEN": "{{HandlePreqrequisites.falconInstallToken}}",
+            "SSM_CS_CCID": "{{HandlePreqrequisites.falconCcid}}",
             "SSM_CS_INSTALLPARAMS": "{{WindowsInstallerParams}}",
-            "SSM_CS_AUTH_TOKEN": "{{GetAuthenticationToken.AuthToken}}",
-            "SSM_CS_HOST": "{{GetAuthenticationToken.ApiGatewayHost}}"
+            "SSM_CS_AUTH_TOKEN": "{{HandlePreqrequisites.falconOauthToken}}",
+            "SSM_CS_HOST": "{{HandlePreqrequisites.falconCloud}}",
+            "SSM_CS_VERSION": "{{WindowsPackageVersion}}"
           }
         }
       }
@@ -236,32 +202,54 @@
         "Choices": [
           {
             "NextStep": "ExecuteDistributorPackageLinux",
-            "Variable": "{{ CompileInstanceList.contains_linux_instances }}",
+            "Variable": "{{ HandlePreqrequisites.containsLinuxInstances }}",
             "BooleanEquals": true
           }
-        ]
-      },
-      "isEnd": true
+        ],
+        "Default": "HandleCleanup"
+      }
     },
     {
       "name": "ExecuteDistributorPackageLinux",
       "action": "aws:runCommand",
+      "onFailure": "Continue",
       "inputs": {
         "Targets": "{{ Targets }}",
-        "InstanceIds": "{{ CompileInstanceList.linux_instances }}",
+        "InstanceIds": "{{ HandlePreqrequisites.linuxInstances }}",
         "DocumentName": "AWS-ConfigureAWSPackage",
         "Parameters": {
           "name": "FalconSensor-Linux",
           "action": "{{Action}}",
-          "version": "{{LinuxPackageVersion}}",
+          "installationType": "In-place update",
           "additionalArguments": {
-            "SSM_CS_INSTALLTOKEN": "{{GetInstallationToken.InstallationToken}}",
-            "SSM_CS_CCID": "{{GetCustomerIdentifier.CCID}}",
+            "SSM_CS_INSTALLTOKEN": "{{HandlePreqrequisites.falconInstallToken}}",
+            "SSM_CS_CCID": "{{HandlePreqrequisites.falconCcid}}",
             "SSM_CS_INSTALLPARAMS": "{{LinuxInstallerParams}}",
-            "SSM_CS_AUTH_TOKEN": "{{GetAuthenticationToken.AuthToken}}",
-            "SSM_CS_HOST": "{{GetAuthenticationToken.ApiGatewayHost}}"
+            "SSM_CS_AUTH_TOKEN": "{{HandlePreqrequisites.falconOauthToken}}",
+            "SSM_CS_HOST": "{{HandlePreqrequisites.falconCloud}}",
+            "SSM_CS_VERSION": "{{LinuxPackageVersion}}"
           }
         }
+      }
+    },
+    {
+      "name": "HandleCleanup",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.7",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "region": "{{global:REGION}}",
+          "falconOauthToken": "{{HandlePreqrequisites.falconOauthToken}}",
+          "falconCloud": "{{HandlePreqrequisites.falconCloud}}",
+          "falconClientId": "{{FalconClientId}}",
+          "falconClientSecret": "{{FalconClientSecret}}",
+          "secretsManagerSecretName": "{{SecretsManagerSecretName}}",
+          "secretStorageMethod": "{{SecretStorageMethod}}",
+          "windowsPackageStatus": "{{ExecuteDistributorPackageWindows.Status}}",
+          "linuxPackageStatus": "{{ExecuteDistributorPackageLinux.Status}}"
+        },
+        "Script": "\"\"\"Module for handling cleanup for CrowdStrike Falcon AWS Automation document\"\"\"\n\n\nimport http.client\n\nimport urllib.parse\n\nimport time\n\nfrom datetime import datetime\n\nimport json\n\nimport base64\n\nimport boto3\n\nimport botocore.exceptions\n\n\nclass CrowdStrikeAPIError(Exception):\n    \"\"\"Crowdstrike API error\"\"\"\n\n\nclass Falcon:\n    \"\"\"Crowdstrike Falcon API class\"\"\"\n\n    def __init__(self, cloud, client_id, client_secret, bearer_token=None):\n        \"\"\"Default constructor\n\n        Args:\n            cloud (str): Falcon API Gateway\n            client_id (str): Falcon OAuth2 Client ID\n            client_secret (str): Falcon OAuth2 Client Secret\n            bearer_token (str, optional): CrowdStrike API OAUTH2 Token. Defaults to None.\n        \"\"\"\n        self.cloud = cloud.replace(\"https://\", \"\").replace(\"http://\", \"\")\n        self.client_id = client_id\n        self.client_secret = client_secret\n        self.user_agent = \"crowdstrike-official-distributor-package/v1.0.0\"\n        self.bearer_token = bearer_token\n\n    def _handle_redirect(self, res):\n        \"\"\"Updates the cloud attribute with the new location received in the redirect\n        \n        Args:\n            res (HTTPResponse): HTTP response object\n        \n        Raises:\n            CrowdStrikeAPIError: If we are unable to handle the redirect\n        \"\"\"\n        location = res.getheader(\"Location\")\n        if location is None:\n            raise CrowdStrikeAPIError(\n                f\"Received redirect to {res.getheader('X-Cs-Region')}, but no location header was found. Ensure you are using the correct API Gateway.\"\n            )\n        new_cloud = urllib.parse.urlparse(location).netloc\n        print(f\"WARNING: While using {self.cloud}, received redirect to {new_cloud}. Please update the value used for the crowdstrike cloud to prevent future redirects.\")\n        self.cloud = new_cloud\n\n    def _handle_rate_limit(self, res):\n        \"\"\"Handles rate limit exceptions by sleeping 10 seconds or X-RateLimit-RetryAfter\n        whichever is largest\n\n        Args:\n            res (HTTPResponse): HTTP response object\n        \"\"\"\n        retry_after = int(res.getheader(\"X-RateLimit-RetryAfter\"))\n        retry_datetime = datetime.utcfromtimestamp(retry_after)\n        now = datetime.utcnow()\n        wait_duration = max((retry_datetime - now).total_seconds(), 10)\n        print(f\"Rate limit exceeded. Retrying after {wait_duration} seconds.\")\n        time.sleep(wait_duration)\n\n    def revoke_oauth_token(self):\n        \"\"\"Revokes a OAuth bearer token\n\n        Raises:\n            CrowdStrikeAPIError: If the API call fails\n        \"\"\"\n        print(\"Revoking Authentication token\")\n\n        credentials = base64.b64encode(f\"{self.client_id}:{self.client_secret}\".encode()).decode()\n\n        params = urllib.parse.urlencode(\n            {\n                \"client_id\": self.client_id,\n                \"token\": self.bearer_token,\n            }\n        )\n\n        headers = {\n            \"Content-Type\": \"application/x-www-form-urlencoded\",\n            \"Authorization\": f\"Basic {credentials}\",\n            \"User-Agent\": self.user_agent,\n        }\n        conn = http.client.HTTPSConnection(self.cloud)\n        conn.request(\"POST\", \"/oauth2/revoke\", params, headers)\n        res = conn.getresponse()\n\n        if res.status == 429:\n            self._handle_rate_limit(res)\n            return self.revoke_oauth_token()\n\n        if res.status in [301, 302, 303, 307, 308]:\n            self._handle_redirect(res)\n            return self.revoke_oauth_token()\n\n        if res.status != 200:\n            print(f\"Received non success response {res.status} while revoking token. Error {res.reason}\")\n            return\n        \n        print(\"Successfully revoked Authentication token\")\n\nclass SSMHelper:\n    \"\"\"A helper class for SSM\"\"\"\n\n    def __init__(self, region):\n        self.client = boto3.client(\"ssm\", region_name=region)\n\n    def get_parameter(self, path):\n        \"\"\"Get a SSM parameter by path and return value.\n\n        Handles throttling exceptions by backing off and retrying.\n\n        Args:\n            path (str): Path to the SSM parameter\n        \"\"\"\n\n        try:\n            response = self.client.get_parameter(\n                Name=path,\n                WithDecryption=True,\n            )\n            print(f\"Successfully received SSM parameter: {path}\")\n            return response[\"Parameter\"][\"Value\"]\n        except botocore.exceptions.ClientError as error:\n            if (\n                error.response.get(\"Error\", {}).get(\"Code\", None)\n                == \"ThrottlingException\"\n            ):\n                wait_time = 5\n                print(f\"Throttling exception, waiting {wait_time} seconds\")\n                time.sleep(wait_time)\n                return self.get_parameter(path)\n            else:\n                raise error\n\n\nclass SecretsManagerHelper:\n    \"\"\"A helper class for Secrets Manager\"\"\"\n\n    def __init__(self, region):\n        self.client = boto3.client(\"secretsmanager\", region_name=region)\n\n    def _validate_secret(self, secret_value):\n        \"\"\"Validate a Secrets Manager secret contains all required fields.\n\n        Args:\n            secret_value (dict): Secrets Manager secret value\n\n        Returns:\n            valid (bool): True if secret contains all required fields\n            fields: (list): List of missing fields\n        \"\"\"\n\n        required_fields = [\"clientid\", \"clientsecret\", \"cloud\"]\n        missing_fields = []\n\n        for field in required_fields:\n            if field not in secret_value:\n                missing_fields.append(field)\n\n        valid = len(missing_fields) == 0\n\n        return valid, missing_fields\n\n    def get_secret(self, secret_name):\n        \"\"\"Get a Secrets Manager secret by name and return value.\n\n        Validates the secret contains all required fields.\n\n        Handles throttling exceptions by backing off and retrying.\n\n        Args:\n            secret_name (str): secret name of the Secrets Manager secret\n\n        Returns:\n            secret_value (dict): Secrets Manager secret value\n\n        Raises:\n            botocore.exceptions.ClientError: If the API call fails\n            ValueError: If the secret does not contain all required fields\n        \"\"\"\n\n        try:\n            response = self.client.get_secret_value(SecretId=secret_name)\n            print(f\"Successfully received Secrets Manager secret: {secret_name}\")\n\n            secret_value = json.loads(response[\"SecretString\"])\n            # Instead of throwing an error if the secret contains fields with\n            # mismatching casing, we convert all keys to lowercase.\n            # This eliminates this error entirely.\n            secret_value = {k.lower(): v for k, v in secret_value.items()}\n\n            valid, missing_fields = self._validate_secret(secret_value)\n\n            if not valid:\n                raise ValueError(\n                    f\"Secret {secret_name} is missing required fields: {missing_fields}\"\n                )\n\n            return secret_value\n        except botocore.exceptions.ClientError as error:\n            if (\n                error.response.get(\"Error\", {}).get(\"Code\", None)\n                == \"ThrottlingException\"\n            ):\n                wait_time = 5\n                print(f\"Throttling exception, waiting {wait_time} seconds\")\n                time.sleep(wait_time)\n                return self.get_secret(secret_name)\n            else:\n                raise error\n\n\ndef script_handler(events, _):\n    \"\"\"Handler for executeScript action\n\n    Args:\n        events (dict): Input for the action\n        _ (dict): Context for the action\n\n    Returns:\n        dict: Output for the action\n    \"\"\"\n    if events[\"falconOauthToken\"]:\n        region = events[\"region\"]\n\n        if events[\"secretStorageMethod\"] == \"ParameterStore\":\n            print(\"Using Parameter Store to retrieve secrets\")\n            ssm_helper = SSMHelper(region=region)\n            falcon_cloud = events[\"falconCloud\"]\n            falcon_client_id = ssm_helper.get_parameter(events[\"falconClientId\"])\n            falcon_client_secret = ssm_helper.get_parameter(events[\"falconClientSecret\"])\n        else:\n            print(\"Using Secrets Manager to retrieve secrets\")\n            secret_helper = SecretsManagerHelper(region=region)\n            secret_value = secret_helper.get_secret(events[\"secretsManagerSecretName\"])\n            falcon_cloud = events[\"falconCloud\"]\n            falcon_client_id = secret_value[\"clientid\"]\n            falcon_client_secret = secret_value[\"clientsecret\"]\n\n        falcon_client = Falcon(falcon_cloud, falcon_client_id, falcon_client_secret, events[\"falconOauthToken\"])\n        falcon_client.revoke_oauth_token()\n\n    windows_status = events[\"windowsPackageStatus\"]\n    linux_status = events[\"linuxPackageStatus\"]\n    possible_states = [\"success\", \"pending\", \"inprogress\", \"failed\", \"waiting\", \"timedout\", \"cancelled\", \"cancelling\"]\n    valid_states = [\"success\", \"pending\"]\n    failed_run = False\n\n    failed_steps = []\n\n    if windows_status.lower() in possible_states:\n        if windows_status.lower() not in valid_states:\n            failed_steps.append(\"ExecuteDistributorPackageWindows\")\n            failed_run = True\n        \n    if linux_status.lower() in possible_states:\n        if linux_status.lower() not in valid_states:\n            failed_steps.append(\"ExecuteDistributorPackageLinux\")\n            failed_run = True\n\n    if failed_run:\n        raise Exception(f\"Failed to execute distributor package. Failed steps: {failed_steps} check the step's logs for more details\")"
       }
     }
   ]

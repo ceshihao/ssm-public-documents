@@ -1,0 +1,151 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## Intent\n  Test that the application correctly alerts if Amazon EC2 ASG network is unavailable.\n\n## Type\n  Test\n\n## Risk\n  High\n\n## Requirements\n  * ASG has more than 1 instances\n  * EC2 instance with Linux OS\n  * Multiple Unhealthy Hosts Alarm is setup for ASG\n\n## Permissions required for AutomationAssumeRole\n  * ssm:GetParameters\n  * ssm:DescribeInstanceInformation\n  * ssm:SendCommand\n  * ssm:ListCommands\n  * ssm:ListCommandInvocations\n  * cloudwatch:DescribeAlarms\n  * cloudwatch:DescribeAlarmHistory\n  * autoscaling:DescribeAutoScalingGroups\n\n## Supports Rollback\n  No.\n\n## Cancellation behavior\n  Abort execution.\n\n## Inputs\n### (Required) AutomationAssumeRole:\n  * type: String\n  * description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf\n  * allowedPattern: arn:aws:iam::\\d+:\\S+\n\n### (Required) AutoScalingGroupName:\n  * type: String\n  * description: (Required) Name of auto scaling group\n\n### (Required) UnhealthyHostsCountAlarmName:\n  * type: String\n  * description: (Required) An alarm for your Amazon Elastic Load Balancer that should be triggered when a new host becomes unhealthy. This alarm should be based on the UnHealthyHostCount metric, \n    and its namespace will depend on the type of load balancer used.\n\n### (Optional) PercentageOfInstances:\n  * type: Integer\n  * description: (Optional) Percentage of ASG EC2 instances to be impacted, default is 1 percent to put minimum impact on EC2 instances in case if not provided\n  * default: 1\n\n### (Optional) DurationInMinutes:\n  * type: String\n  * description: (Optional) The expected recovery time after process dies (default 10)\n  * default: '10'\n  * allowedPattern: ^\\d+$\n\n## Details\n  * Drop all outgoing/incoming network traffic on instance for X minutes\n  * Verify that the UnhealthyHostsCountAlarmName alarm is triggered\n  * After the test's duration, the UnhealthyHostsCountAlarmName alarm should go back to green\n\n## Steps executed in normal flow\n  * AssertAlarmToBeGreenBeforeTest\n  * GetAsgInstanceIds\n  * GetInstancesByPercentage\n  * SimulateNetworkUnavailable\n  * WaitForRecoveryTime\n  * AssertAlarmTriggered\n  * AssertAlarmToBeGreen\n\n## Outputs\n  None",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf",
+      "allowedPattern": "arn:aws:iam::\\d+:\\S+"
+    },
+    "AutoScalingGroupName": {
+      "type": "String",
+      "description": "(Required) Name of auto scaling group"
+    },
+    "UnhealthyHostsCountAlarmName": {
+      "type": "String",
+      "description": "(Required) An alarm for your Amazon Elastic Load Balancer that should be triggered when a new host becomes unhealthy. This alarm should be based on the UnHealthyHostCount metric, and its namespace will depend on the type of load balancer used."
+    },
+    "PercentageOfInstances": {
+      "type": "Integer",
+      "description": "(Optional) Percentage of ASG EC2 instances to be impacted, default is 1 percent to put minimum impact on EC2 instances in case if not provided",
+      "default": 1
+    },
+    "DurationInMinutes": {
+      "type": "String",
+      "description": "(Optional) The duration of the attack in minutes (default 5)",
+      "default": "5",
+      "allowedPattern": "^\\d+$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "description": "Ensure alarm is green before starting test. Fail if alarm is not green within expected time.",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{UnhealthyHostsCountAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "GetAsgInstanceIds",
+      "description": "Get all healthy instances in ASG.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceIds",
+          "Selector": "$.Payload.InstanceIds",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_healthy_instance_ids_in_asg",
+        "InputPayload": {
+          "AutoScalingGroupName": "{{AutoScalingGroupName}}"
+        },
+        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef get_healthy_instance_ids_in_asg(events, context):\n    if 'AutoScalingGroupName' not in events:\n        raise KeyError('Requires AutoScalingGroupName in events')\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    autoscaling = boto3.client('autoscaling', config=config)\n\n    auto_scaling_groups = autoscaling.describe_auto_scaling_groups(\n        AutoScalingGroupNames=[\n            events['AutoScalingGroupName']\n        ]\n    )\n\n    # Take all healthy ASG EC2 instances\n    asg_healthy_instances = []\n    for instance in auto_scaling_groups['AutoScalingGroups'][0]['Instances']:\n        if instance['HealthStatus'] == 'Healthy' and instance['LifecycleState'] == 'InService':\n            asg_healthy_instances.append(instance['InstanceId'])\n\n    output = {}\n    output['InstanceIds'] = asg_healthy_instances\n    return output"
+      }
+    },
+    {
+      "name": "GetInstancesByPercentage",
+      "description": "Get instances based on input parameters",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceIds",
+          "Selector": "$.Payload.InstanceIds",
+          "Type": "StringList"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_instance_ids_by_percentage",
+        "InputPayload": {
+          "InstanceIds": "{{GetAsgInstanceIds.InstanceIds}}",
+          "Percentage": "{{PercentageOfInstances}}"
+        },
+        "Script": "import logging\nimport random\nimport time\nfrom math import ceil\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef get_instance_ids_by_percentage(events, context):\n    if 'InstanceIds' not in events or 'Percentage' not in events:\n        raise KeyError('Requires InstanceIds and Percentage in events')\n    instanceIds = events['InstanceIds']\n    percentage = events['Percentage']\n    instance_count = len(instanceIds)\n    output = {}\n    output['InstanceIds'] = []\n    if instance_count < 1:\n        raise Exception('No given EC2 instances')\n    if percentage < 1:\n        raise Exception('Given percentage should not be lower than 1%')\n    instance_count = ceil(instance_count / 100 * percentage)\n    for i in range(instance_count):\n        output['InstanceIds'].append(instanceIds[i])\n    return output"
+      }
+    },
+    {
+      "name": "SimulateNetworkUnavailable",
+      "description": "Run command document to inject network unavailable.",
+      "action": "aws:runCommand",
+      "onFailure": "Continue",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "DocumentName": "AWSResilienceHub-NetworkUnavailableCommand_2020-07-23",
+        "InstanceIds": [
+          "{{GetInstancesByPercentage.InstanceIds}}"
+        ],
+        "Parameters": {
+          "DurationInMinutes": "{{DurationInMinutes}}"
+        },
+        "TimeoutSeconds": 60
+      }
+    },
+    {
+      "name": "WaitForTestDuration",
+      "description": "Wait for test duration.",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT{{DurationInMinutes}}M"
+      }
+    },
+    {
+      "name": "AssertAlarmTriggered",
+      "description": "Verify multiple unhealthy instance alarm to be red during network unavailable.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "verify_alarm_triggered",
+        "InputPayload": {
+          "AlarmName": "{{UnhealthyHostsCountAlarmName}}",
+          "DurationInMinutes": "{{DurationInMinutes}}"
+        },
+        "Script": "import logging\nimport time\nfrom datetime import datetime, timedelta, timezone\nfrom typing import Any, Callable, Iterator, List\n\nimport boto3\nfrom botocore.config import Config\n\nboto3_config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n\nPUT_METRIC_ALARM_PARAMS = ['AlarmName', 'AlarmDescription', 'ActionsEnabled', 'OKActions',\n                           'AlarmActions', 'InsufficientDataActions', 'MetricName', 'Namespace', 'Statistic',\n                           'ExtendedStatistic',\n                           'Dimensions', 'Period', 'Unit', 'EvaluationPeriods', 'DatapointsToAlarm',\n                           'Threshold', 'ComparisonOperator', 'TreatMissingData', 'EvaluateLowSampleCountPercentile',\n                           'Metrics', 'Tags', 'ThresholdMetricId']\n\n\n\n\ndef verify_alarm_triggered(events, context):\n    \"\"\"\n    Verify if alarm triggered\n    \"\"\"\n    if 'AlarmName' not in events or ('DurationInMinutes' not in events and 'DurationInSeconds' not in events):\n        raise KeyError('Requires AlarmName and either DurationInMinutes or DurationInSeconds in events')\n\n    cw = boto3.client('cloudwatch', config=boto3_config)\n\n    if 'DurationInMinutes' in events:\n        start_date = datetime.now() - timedelta(minutes=int(events['DurationInMinutes']))\n    else:\n        start_date = datetime.now() - timedelta(seconds=int(events['DurationInSeconds']))\n\n    response = cw.describe_alarm_history(\n        AlarmName=events['AlarmName'],\n        HistoryItemType='StateUpdate',\n        MaxRecords=5,\n        ScanBy='TimestampDescending',\n        StartDate=start_date)\n\n    for alarm_history_item in response['AlarmHistoryItems']:\n        if alarm_history_item['HistorySummary'] == \"Alarm updated from OK to ALARM\":\n            return\n\n    raise Exception('Alarm was not triggered')"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "description": "Verify multiple unhealthy instance alarm to be ok",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{UnhealthyHostsCountAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}

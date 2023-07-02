@@ -1,0 +1,1043 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The **AWSSupport-CloneXenEC2WinInstanceAndMigrateToNitro** runbook prepares, and migrate a clone of your Amazon Elastic Compute Cloud (Amazon EC2) Windows instance, currently running on EC2 Xen platform, to run on [EC2 Nitro platform](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html#ec2-nitro-instances). This automation performs the following actions:\n\n### 1. Preliminary Checks\nIn this section, the automation evaluates all of the following pre-requisites to proceed with the migration. If any of the steps fails, the automation ends.\n> * Checks if the target EC2 instance is already running on Nitro platform.\n> * Determines if the [lifecycle](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-purchasing-options.html#check-instance-lifecycle) of the target EC2 instance is Spot.\n> * Checks if any [instance-store-volumes](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/InstanceStorage.html#instance-store-volumes) with data are attached to the target EC2 instance.\n> * Validates if the operating system is Windows Server and checks if the edition is compatible.\n> * Determines if the target EC2 instance is a part of an Amazon EC2 Auto Scaling group. If true, the EC2 instance should be in the [Standby state](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html).\n> * Checks if the target EC2 instance is managed by Systems Manager and configured to use AWS Systems Manager Run Command.\n\n### 2. Tests \nThe automation uses this phase as sanity test by creating a test Amazon Machine Image (AMI) from the target EC2 instance and launching a test EC2 instance using this AMI. If the target instance is domain-joined, an isolated security group is created in the target instance VPC which does not allow outbound traffic to the domain controller(s). This security group is only attached to the Test and Clone instances. The original target instance is not affected.\n> * If the test EC2 instance passes the status checks, the automation is temporarily paused and approval from the designated principal's is requested via Amazon Simple Notification Service (SNS) notification. If approval is provided, automation stops the target EC2 instance.\n*Note:* Before providing approval, ensure that all the application(s) running on the target EC2 instance are gracefully closed. If the EC2 does not have an Elastic IP address associated, the automatic public IPv4 address will change once the instance is stopped and started.\n> * The test AMI and the test EC2 instance are deleted at the end of this section.\n\n### 3. CloneAndMigrate \nIn this section, the automation creates a clone of your target EC2 instance in the same subnet and migrates the EC2 instance using the following steps:\n> * Enables the [Enhanced networking (ENA) attribute](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enhanced-networking-ena.html#enable-enhanced-networking-ena-AL).\n> * Installs the latest version of ENA drivers.\n> * Installs the latest version of NVMe drivers.\n> * Verifies the correct Power Management settings are applied for graceful shutdowns on the Nitro system.\n> * Installs the AWS PCI Serial Port Driver for bare metal instance types on the Nitro system.\nAfter validating all the requirements, the cloned EC2 instance type is changed to the desired Nitro type. Once the cloned instance passes status checks on Nitro platform, automation seeks for designated principal's approval to create an AMI. If approval is denied, the automation ends, leaving the cloned EC2 instance.\n\n### Prerequisites:\n> * The target EC2 instance requires outbound access to Amazon Simple Storage Service (Amazon S3) in order to install the drivers.\n\n### Supported Operating Systems:\n> * Windows Server 2022, Windows Server 2019, Windows Server 2016, Windows Server 2012 R2, Windows Server 2012, and Windows Server 2008 R2.\n\n### Important:\n> * Running this runbook, may incur extra charges to your account for the EC2 instance, EBS Volumes, and Amazon Machine Images (AMIs). Please refer to the [Amazon EC2 Pricing](https://aws.amazon.com/ec2/pricing/) and [Amazon EBS pricing](https://aws.amazon.com/ebs/pricing/) for more details.\n\nPlease refer to [Migrate to latest generation instance types](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html) for more information.",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "TargetInstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of the Xen-based Amazon EC2 instance you want to migrate to the Nitro platform."
+    },
+    "NitroInstanceType": {
+      "type": "String",
+      "default": "m5.xlarge",
+      "description": "(Required) Enter the destination Nitro instance type. Note: Only Nitro M5, M6, C5, C6, R5, R6 and T3 instances are supported (e.g. t3.small). For more details about the available Nitro instance types, please refer to the link: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html",
+      "allowedPattern": "^(m5a?z?d?n?|c5a?d?n?|r5a?d?n?b?|(c|m|r)6(a|i)?d?)\\.(2|4|6|8|9|12|16|18|24|32)?x?large$|^t3a?\\.((x|2x)?large|nano|micro|small|medium)$"
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) Provide the ARN of the SNS Topic for Approval notification. This SNS topic is used to send approval notifications during required during the automation execution.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso(\\-[a-z])?):sns:.*:[0-9]{12}:.*$"
+    },
+    "ApproverIAM": {
+      "type": "StringList",
+      "description": "(Required) Provide a list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of these formats, 1) An AWS Identity and Access Management (IAM) user name 2) An IAM user ARN 3) An IAM role ARN 4) An IAM assume role user ARN",
+      "allowedPattern": "^[a-zA-Z0-9_+=,.@\\-\\/]{1,128}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(\\-[a-z])?):(iam|sts):.*:[0-9]{12}:[a-zA-Z0-9_+=,.@\\-\\/]{1,256}$"
+    },
+    "MinimumRequiredApprovals": {
+      "type": "Integer",
+      "default": 1,
+      "description": "(Optional) The minimum number of approvals required to resume the automation. If you don't specify a value, the system defaults to one. The value for this parameter must be a positive number. The value for this parameter can't exceed the number of approvers defined by the ApproverIAM parameter.",
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    "DeleteResourcesOnFailure": {
+      "type": "Boolean",
+      "default": true,
+      "description": "(Optional) Whether to terminate the cloned EC2 instance and Amazon Machine Image (AMI) if the automation fails.",
+      "allowedValues": [
+        false,
+        true
+      ]
+    },
+    "Acknowledgement": {
+      "type": "String",
+      "description": "(Required) Please read the complete details of the actions performed by this automation runbook and write 'Yes, I understand and acknowledge' if you acknowledge the steps.",
+      "allowedPattern": "^Yes, I understand and acknowledge$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "checkConcurrency",
+      "action": "aws:executeScript",
+      "description": "Ensures there is only one execution of this runbook targeting the current EC2 instance. If the runbook finds another in progress execution targeting the same instance ID, it returns an error and ends.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkConcurrency.check_concurrency_handler",
+        "InputPayload": {
+          "TargetInstanceId": "{{TargetInstanceId}}"
+        },
+        "Attachment": "clone-xen-to-nitro-python.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getTargetInstanceProperties"
+    },
+    {
+      "name": "getTargetInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the details of the target EC2 instance",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "nextStep": "checkIfNitroInstanceTypeIsSupportedInAZ",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PlatformType",
+          "Selector": "$.Reservations[0].Instances[0].Platform",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceVPCID",
+          "Selector": "$.Reservations[0].Instances[0].VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceSubnetID",
+          "Selector": "$.Reservations[0].Instances[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstancePrivateIP",
+          "Selector": "$.Reservations[0].Instances[0].PrivateIpAddress",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroup",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups[0].GroupId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileArn",
+          "Selector": "$.Reservations[0].Instances[0].IamInstanceProfile.Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileName",
+          "Selector": "$.Reservations[0].Instances[0].IamInstanceProfile.Name",
+          "Type": "String"
+        },
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "RootDeviceName",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+          "Type": "String"
+        },
+        {
+          "Name": "RootVolumeType",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceType",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "ENAAttrib",
+          "Selector": "$.Reservations[0].Instances[0].EnaSupport",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "InstanceLifecycle",
+          "Selector": "$.Reservations[0].Instances[0].InstanceLifecycle",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceState",
+          "Selector": "$.Reservations[0].Instances[0].State.Name",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "checkIfNitroInstanceTypeIsSupportedInAZ",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Determines if the target Nitro instance type is supported in the same Availability Zone as the Target EC2 instance ",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "maxAttempts": 3,
+      "nextStep": "getXenInstanceTypeDetails",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceTypeOfferings",
+        "LocationType": "availability-zone",
+        "Filters": [
+          {
+            "Name": "instance-type",
+            "Values": [
+              "{{NitroInstanceType}}"
+            ]
+          },
+          {
+            "Name": "location",
+            "Values": [
+              "{{getTargetInstanceProperties.AvailabilityZone}}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceTypeOfferings[0].Location",
+        "DesiredValues": [
+          "{{getTargetInstanceProperties.AvailabilityZone}}"
+        ]
+      }
+    },
+    {
+      "name": "getXenInstanceTypeDetails",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the details of the Xen (source) instance type",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "nextStep": "checkIfInstanceHypervisorIsNitroAlready",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceTypes",
+        "InstanceTypes": [
+          "{{getTargetInstanceProperties.InstanceType}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Hypervisor",
+          "Selector": "$.InstanceTypes[0].Hypervisor",
+          "Type": "String"
+        },
+        {
+          "Name": "NVMeSupport",
+          "Selector": "$.InstanceTypes[0].InstanceStorageInfo.NvmeSupport",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceStorageSupported",
+          "Selector": "$.InstanceTypes[0].InstanceStorageSupported",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "checkIfInstanceHypervisorIsNitroAlready",
+      "action": "aws:branch",
+      "description": "Checks if the target EC2 instance is already running on Nitro platform",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfTargetInstanceLifecycleIsSpot",
+            "Variable": "{{getXenInstanceTypeDetails.Hypervisor}}",
+            "StringEquals": "xen"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfTargetInstanceLifecycleIsSpot",
+      "action": "aws:branch",
+      "description": "Checks if the Lifecycle of the target EC2 instance is Spot",
+      "isCritical": true,
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfOperatingSystemIsWindows",
+            "Not": {
+              "Variable": "{{getTargetInstanceProperties.InstanceLifecycle}}",
+              "StringEquals": "spot"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfOperatingSystemIsWindows",
+      "action": "aws:branch",
+      "description": "Checks if the target EC2 instance is based on the Windows Operating System",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "verifySSMConnectivityForTargetInstance",
+            "Variable": "{{getTargetInstanceProperties.PlatformType}}",
+            "StringEquals": "windows"
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifySSMConnectivityForTargetInstance",
+      "action": "aws:runCommand",
+      "description": "Verifies if the target EC2 instance is connected with AWS Systems Manager and configured to use RunCommand",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "checkOSVersion",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "Write-Host \"EC2 instance is connected with AWS Systems Manager and configured to use RunCommand\"\n"
+        }
+      }
+    },
+    {
+      "name": "checkOSVersion",
+      "action": "aws:runCommand",
+      "description": "Verifies if the target instance OS version is supported for migration",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "checkIfEphemeralVolumeAreSupported",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n[Version]$OSVersion = [System.Environment]::OSVersion.Version\n$NtOsKernelVer = (Get-Item $env:systemroot\\system32\\ntoskrnl.exe).VersionInfo.ProductVersion\n[Version]$ExpectedVersion = \"6.1\"\n$OsInfo = (Get-WmiObject -class Win32_OperatingSystem)\n\nWrite-Output \"Windows Version: $OSVersion - $($OsInfo.Caption)\"\nWrite-Output \"Kernel Version: $NtOsKernelVer\"\n\n$NetFrameworkList = Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Full' -Recurse -ErrorAction SilentlyContinue |\nGet-ItemProperty -Name Version, Release -ErrorAction SilentlyContinue |\nSelect-Object @{ Name = \"Name\"; expression = { $_.PSChildName } }, Version, Release\n$NetFrameworkStatus = $false\nForEach ($Item in $NetFrameworkList)\n{\n    Write-Output \".NET Framework Installed $([Version]$Item.Version)\"\n}\n\n[Version]$PSrequiredVersion = \"3.0\"\n$PSVersion = $PSVersionTable.PSVersion\n\nWrite-Output \"Microsoft PowerShell Installed $PSVersion\"\n\n# https://learn.microsoft.com/en-us/dotnet/api/microsoft.powershell.commands.producttype?view=powershellsdk-1.1.0\n# DomainController (2) System is a domain controller\n# Server (3) System is a server\n# Uknown (0\t) Product type is unknown\n# WorkStation (1) System is a workstation\n\nif ($OsInfo.ProductType -ne 3) {\n    Write-Host \"`n[FAILED] This automation does not supported Domain Controllers or Windows client versions.\"\n    exit 1\n}\n\nif ($OSVersion -ge $ExpectedVersion) {\n    Write-Output \"`n[PASSED] $($OsInfo.Caption)\"\n    exit 0\n}\nelse\n{\n    Write-Output \"`n[FAILED] This automation only supports Windows Server 2008 R2 or newer Windows versions.\"\n    exit 1\n}\n"
+        }
+      }
+    },
+    {
+      "name": "checkIfEphemeralVolumeAreSupported",
+      "action": "aws:branch",
+      "description": "Checks if the target EC2 instance supports the Instance Store (Ephemeral) volumes",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "verifyIfTargetInstanceHasEphemeralVolumesAttached",
+            "Variable": "{{getXenInstanceTypeDetails.InstanceStorageSupported}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "checkIfRootVolumeIsEBS"
+      }
+    },
+    {
+      "name": "verifyIfTargetInstanceHasEphemeralVolumesAttached",
+      "action": "aws:runCommand",
+      "description": "Verifies if the target EC2 instance has Instance Store (Ephemeral) Volumes attached",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "checkIfRootVolumeIsEBS",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n# Check if Instance Storage is attached or not through known instance store physical disk locations from AWS documentation\n# Note that EC2Config will configure Instance Store disks automatically on Windows 2012 R2 and below\n# https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/ec2-windows-volumes.html#instance-store-volume-map\n\n[String[]]$instance_store_target_ids = \"78\",\"79\",\"80\",\"81\",\"82\",\"83\",\"84\",\"85\",\"86\",\"87\",\"88\",\"89\"\n\n$INSTANCE_STORE_FOUND_ERROR=\"[FAILED] Unsupported Instance: Instance has Instance Store with data. Please delete all data from instance store volumes and retry. Exiting the automation...\"\n$INSTANCE_STORE_NOT_FOUND_INFO=\"[INFO] No Online instance store volumes with data are attached to the EC2 instance\"\n$INSTANCE_STORE_FOUND = $false\n#$WINDOWS_VERSION_LTE_2012R2 = [Environment]::OSVersion.Version -lt (new-object 'Version' 6,3)\n\n[Int[]]$INSTANCE_STORE_DISK_NUMBERS = @()\n\n\n#Check for attached Instance Storage and created partitions\nforeach ($disk in Get-WmiObject -Class Win32_DiskDrive)\n{\n    if($instance_store_target_ids.Contains($disk.SCSITargetId.ToString()) -and $disk.Partitions -gt 0){\n        $INSTANCE_STORE_DISK_NUMBERS += $disk.Index\n        #$INSTANCE_STORE_FOUND = $true\n        \"Disk ID #\" + $disk.Index + \", number of partitions: \" + $disk.Partitions        \n    }\n}\n\n#Check partitions in Instance Store disks for any files (ignore default Important.txt file in 2012R2 and below)\nforeach($partition in Get-CimInstance Win32_DiskPartition | Where-Object {$_.DiskIndex -In $INSTANCE_STORE_DISK_NUMBERS})\n{\n    $driveLetter= ($partition | Get-CimAssociatedInstance -ResultClassName Win32_LogicalDisk).DeviceID\n    if(((Get-Childitem ($driveLetter) -Name -Exclude Important.txt) | Measure-Object).Count -gt 0)\n    {\n        $accessPaths= \"${driveletter} \" + (Get-CimInstance Win32_Volume | Where-Object {$_.DriveLetter -match $driveLetter}).DeviceId\n        Write-Host (((Get-Childitem ($driveLetter) -Name -Exclude Important.txt) | Measure-Object).Count).ToString() \"File(s) found on Online Instance Store\" $accessPaths\n        $INSTANCE_STORE_FOUND = $true\n    }\n}\n\nif ($INSTANCE_STORE_FOUND)\n{\n    Write-Host $INSTANCE_STORE_FOUND_ERROR\n    exit 1\n}\nelse\n{\n    $INSTANCE_STORE_NOT_FOUND_INFO\n}\n"
+        }
+      }
+    },
+    {
+      "name": "checkIfRootVolumeIsEBS",
+      "action": "aws:branch",
+      "description": "Checks if target EC2 instance's root volume type is EBS",
+      "isCritical": true,
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "checkIfTargetInstanceIsInASG",
+            "Variable": "{{getTargetInstanceProperties.RootVolumeType}}",
+            "StringEquals": "ebs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "checkIfTargetInstanceIsInASG",
+      "action": "aws:executeScript",
+      "description": "Checks if the target EC2 instance is a part of any Amazon AutoScaling Group (ASG)",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "nextStep": "createTestImage",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkAutoScaling.checkAutoScaling_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "TargetInstanceId": "{{TargetInstanceId}}"
+        }
+      }
+    },
+    {
+      "name": "createTestImage",
+      "action": "aws:createImage",
+      "description": "Creates a test Amazon Machine Image (AMI) from the provided instance",
+      "maxAttempts": 1,
+      "nextStep": "checkIfInstanceIsDomainJoined",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceId": "{{TargetInstanceId}}",
+        "ImageName": "CloneXenEC2WindowsInstanceAndMigrateToNitro_TestImage_{{TargetInstanceId}}_{{global:DATE_TIME}}",
+        "NoReboot": false,
+        "ImageDescription": "SSMAutomationID-{{automation:EXECUTION_ID}}"
+      }
+    },
+    {
+      "name": "checkIfInstanceIsDomainJoined",
+      "action": "aws:runCommand",
+      "description": "Checks if the target EC2 instance is domain joined",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "branchOnDomainJoinStatus",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n$domainInfo = (Get-WmiObject -Class Win32_ComputerSystem)\n\nif ($domainInfo.PartOfDomain){\n    Write-Host \"This server is part of domain $($domainInfo.Domain)\"\n    return @{DomainJoined=$true}\n}\nelse {\n    Write-Host \"This server is not joined to a domain\"\n    return @{DomainJoined=$false}\n}\n"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "DomainJoined",
+          "Selector": "$.Payload.DomainJoined",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "branchOnDomainJoinStatus",
+      "action": "aws:branch",
+      "description": "If the target EC2 instance is joined to a domain, use an isolated VPC to avoid SID conflict in Active Directory",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "createIsolatedSecurityGroup",
+            "Variable": "{{checkIfInstanceIsDomainJoined.DomainJoined}}",
+            "BooleanEquals": true
+          },
+          {
+            "NextStep": "launchTestInstanceInSameSubnet",
+            "Variable": "{{checkIfInstanceIsDomainJoined.DomainJoined}}",
+            "BooleanEquals": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "createIsolatedSecurityGroup",
+      "action": "aws:executeScript",
+      "description": "Creates a security group which allows only outbound TCP 443 and TCP 53 access for access to Systems Manager for a domain-joined scenario. Only used for domain-joined scenarios and only attached to the cloned EC2 instance.",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "nextStep": "launchTestInstanceInSameSubnet",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "createIsolatedSecurityGroup.createIsolatedSecurityGroup_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "InstanceVPCID": "{{getTargetInstanceProperties.InstanceVPCID}}",
+          "InstanceSubnetID": "{{getTargetInstanceProperties.InstanceSubnetID}}",
+          "InstancePrivateIP": "{{getTargetInstanceProperties.InstancePrivateIP}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroupID",
+          "Selector": "$.Payload.securityGroupID",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "launchTestInstanceInSameSubnet",
+      "action": "aws:executeScript",
+      "description": "Launches a test EC2 instance from the test AMI using the same configuration as target EC2 instance",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "step:cleanupTestInstance",
+      "nextStep": "waitForTestInstanceStatusChecks",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "launchEC2Instance.launchInstanceInSameSubnet_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "ImageId": "{{createTestImage.ImageId}}",
+          "InstanceType": "{{getTargetInstanceProperties.InstanceType}}",
+          "IamInstanceProfileArn": "{{getTargetInstanceProperties.InstanceProfileArn}}",
+          "SubnetId": "{{getTargetInstanceProperties.InstanceSubnetID}}",
+          "SecurityGroupIds": [
+            "{{getTargetInstanceProperties.SecurityGroup}}"
+          ],
+          "TargetInstanceId": "{{TargetInstanceId}}",
+          "DomainJoinedStatus": "{{checkIfInstanceIsDomainJoined.Output}}",
+          "IsolatedSecurityGroupID": [
+            "{{createIsolatedSecurityGroup.SecurityGroupID}}"
+          ],
+          "BranchType": "Test"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "TestInstanceId",
+          "Selector": "$.Payload.launchedInstanceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "waitForTestInstanceStatusChecks",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the test EC2 instance to pass the 2/2 Status Checks",
+      "onFailure": "step:cleanupTestInstance",
+      "isCritical": "true",
+      "timeoutSeconds": 1200,
+      "nextStep": "cleanupTestInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{launchTestInstanceInSameSubnet.TestInstanceId}}"
+        ],
+        "PropertySelector": "$.InstanceStatuses..InstanceStatus.Status",
+        "DesiredValues": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "name": "cleanupTestInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Terminates the test EC2 instance",
+      "maxAttempts": 3,
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "onFailure": "step:onFailureCleanupIsolatedSecurityGroup",
+      "nextStep": "checkIfTestingBranchSucceeded",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchTestInstanceInSameSubnet.TestInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "checkIfTestingBranchSucceeded",
+      "action": "aws:executeScript",
+      "description": "Checks the status of testing branch",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "nextStep": "approvalToStopTargetInstance",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkStepStatus.checkStepStatus_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "StepName": "waitForTestInstanceStatusChecks"
+        }
+      }
+    },
+    {
+      "name": "approvalToStopTargetInstance",
+      "action": "aws:approve",
+      "description": "Waits for designated principals approval to stop the target instance",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "stopTargetEC2Instance",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Test EC2 instance launched from the target EC2 instance successfully passed the 2/2 status checks. Provide approval to stop the target EC2 instance {{TargetInstanceId}} in order to proceed with the automation. If approved, target EC2 instance will be stopped. Before providing approval, make sure 1) Elastic IP address is assigned to the EC2 instance, if not Public IP will be changed, once the instance is stopped. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "stopTargetEC2Instance",
+      "action": "aws:changeInstanceState",
+      "description": "Stops the target EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:forceStopTargetEC2Instance",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "createBackupImage"
+    },
+    {
+      "name": "forceStopTargetEC2Instance",
+      "action": "aws:changeInstanceState",
+      "description": "Force stops the target EC2 instance, only if the step 'stopTargetEC2Instance' fails to stop",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      },
+      "nextStep": "createBackupImage"
+    },
+    {
+      "name": "createBackupImage",
+      "action": "aws:createImage",
+      "description": "Creates an Amazon Machine Image (AMI) from the provided instance for backup",
+      "maxAttempts": 1,
+      "nextStep": "launchInstanceInSameSubnet",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceId": "{{TargetInstanceId}}",
+        "ImageName": "CloneXenEC2WindowsInstanceAndMigrateToNitro_BackupImage_{{TargetInstanceId}}_{{global:DATE_TIME}}",
+        "NoReboot": true,
+        "ImageDescription": "SSMAutomationID-{{automation:EXECUTION_ID}}"
+      }
+    },
+    {
+      "name": "launchInstanceInSameSubnet",
+      "action": "aws:executeScript",
+      "description": "Launches a new EC2 instance from the backup AMI using the same configuration as source EC2 instance",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "onFailure": "step:failureHandling",
+      "nextStep": "waitForClonedInstanceToPassStatusChecks",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "launchEC2Instance.launchInstanceInSameSubnet_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "ImageId": "{{createBackupImage.ImageId}}",
+          "InstanceType": "{{getTargetInstanceProperties.InstanceType}}",
+          "IamInstanceProfileArn": "{{getTargetInstanceProperties.InstanceProfileArn}}",
+          "SubnetId": "{{getTargetInstanceProperties.InstanceSubnetID}}",
+          "SecurityGroupIds": [
+            "{{getTargetInstanceProperties.SecurityGroup}}"
+          ],
+          "TargetInstanceId": "{{TargetInstanceId}}",
+          "DomainJoinedStatus": "{{checkIfInstanceIsDomainJoined.Output}}",
+          "IsolatedSecurityGroupID": [
+            "{{createIsolatedSecurityGroup.SecurityGroupID}}"
+          ],
+          "BranchType": "CloneAndMigrate"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ClonedInstanceId",
+          "Selector": "$.Payload.launchedInstanceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "waitForClonedInstanceToPassStatusChecks",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the cloned EC2 instance to pass the 2/2 Status Checks",
+      "onFailure": "step:failureHandling",
+      "isCritical": "true",
+      "timeoutSeconds": 1200,
+      "nextStep": "verifySSMConnectivityForClonedInstance",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "PropertySelector": "$.InstanceStatuses..InstanceStatus.Status",
+        "DesiredValues": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "name": "verifySSMConnectivityForClonedInstance",
+      "action": "aws:runCommand",
+      "description": "Verifies if the cloned EC2 instance is connected with AWS Systems Manager and configured to use RunCommand",
+      "onFailure": "step:failureHandling",
+      "isCritical": "true",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "nextStep": "checkAndInstallENADrivers",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": [
+            "%WINDOWSSCRIPT%"
+          ]
+        }
+      }
+    },
+    {
+      "name": "checkAndInstallENADrivers",
+      "action": "aws:runCommand",
+      "description": "Determines the availability of Enhanced Networking Adapter (ENA) drivers on the EC2 instance and installs, if missing",
+      "isCritical": true,
+      "nextStep": "checkAndAddNVMEDrivers",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "DocumentName": "AWS-RunPowerShellScript",
+        "TimeoutSeconds": 3600,
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\ntry {\n    if (Test-Path -Path \"ena-state-{{ automation:EXECUTION_ID }}\") {\n        if (Select-String -Path \"ena-state-{{ automation:EXECUTION_ID }}\" -Pattern \"success\") {\n            Write-Host \"Installer has already run. Skipping installation\"\n            exit 0\n        }\n        else {\n            Write-Host \"Previous run of installer marked as failure. Skipping installation\"\n            exit 1\n        }\n    }\n    else {\n        $OSVersion = [System.Environment]::OSVersion.Version\n        $version = $OSVersion.Major.ToString() + \".\" + $OSVersion.Minor.ToString()\n        # Get Version of ntoskernel.exe to check for KB3033929\n        $ntoskrnlver = (Get-Item $env:systemroot\\system32\\ntoskrnl.exe).VersionInfo.ProductVersion\n        $KB3033929 = [System.Version]\"6.1.7601.22948\"\n        switch -regex ($version) {\n            \"6.1\" {\n                if ([System.Version]$ntoskrnlver -lt $KB3033929) {\n                    # 2.1.4 is the highest version that supports Windows Server 2008 R2 without KB3033929\n                    $url = \"https://s3.amazonaws.com/ec2-windows-drivers-downloads/ENA/2.1.4/AwsEnaNetworkDriver.zip\"\n                }\n                else {\n                    # 2.2.3 is the latest version that supports Windows Server 2008 R2\n                    $url = \"https://s3.amazonaws.com/ec2-windows-drivers-downloads/ENA/2.2.3/AwsEnaNetworkDriver.zip\"\n                }\n            } \n            \"6.2|6.3|10.*\" {\n                $url = \"https://s3.amazonaws.com/ec2-windows-drivers-downloads/ENA/Latest/AwsEnaNetworkDriver.zip\"\n            }\n        }\n        $tempPath = (Resolve-Path ${env:temp}).Path\n        $tempFile = \"${tempPath}\\AwsEnaNetworkDriver.zip\"\n        $tempDir = \"${tempPath}\\AwsEnaNetworkDriver\"\n\n        [System.Net.ServicePointManager]::SecurityProtocol = ([int][system.net.SecurityProtocolType]::Tls13 -bor [int][system.net.SecurityProtocolType]::Tls12)\n        $wc = New-Object System.Net.WebClient\n        $attemptCount = 1\n        $attemptMax = 5\n        Do {\n        Write-Host \"Downloading AWS ENA drivers, attempt: $attemptCount/5...\"\n        $attemptCount++\n        $wc.DownloadFile($url, $tempFile)\n        Start-Sleep -Seconds (1 * $attemptCount)\n        } While (((Test-Path $tempFile) -eq $false) -and ($attemptCount -le 6))\n        \n        if (Test-Path $tempDir) {\n            Remove-Item -Path $tempDir -Recurse -Force\n        }\n\n        # Extract drivers\n        try {\n            # Unpacking the file this way is not supported in PowerShell 2\n            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue\n            [System.IO.Compression.ZipFile]::ExtractToDirectory($tempFile, $tempDir)\n        }\n        catch [System.InvalidOperationException] {\n            # Legacy unpacking method using COM Object\n            # Works with PowerShell 2\n            New-Item -Path $tempDir -ItemType \"directory\" -Force | Out-Null\n            ((New-Object -com shell.application).NameSpace($tempDir)).CopyHere(((New-Object -com shell.application).NameSpace($tempFile)).Items())\n        }\n\n        # Run install.ps1\n        Write-Host \"Running install script\"\n        $output = & \"${tempDir}\\install.ps1\" -NoReboot\n        Write-Host $output\n\n        # Evaluate output\n        New-Item \"ena-state-{{ automation:EXECUTION_ID }}\" -ItemType file | Out-Null\n        if ($output -match \"successful\") {\n            if ($output -match \"reboot\") {\n                Write-Host \"Rebooting to complete installation\"\n                Write-Output \"success\" | Set-Content -Path \"ena-state-{{ automation:EXECUTION_ID }}\"\n                exit 3010\n            }\n            Write-Output \"success\" | Set-Content -Path \"ena-state-{{ automation:EXECUTION_ID }}\"\n            exit 0\n        }\n        else {\n            Write-Output \"failure\" | Set-Content -Path \"ena-state-{{ automation:EXECUTION_ID }}\"\n            exit 1\n        }\n    }\n}\ncatch {\n    Write-Host $_.Exception.Message\n    exit 255\n}\n"
+        }
+      }
+    },
+    {
+      "name": "checkAndAddNVMEDrivers",
+      "action": "aws:runCommand",
+      "description": "Determines the availability of NVMe drivers on the cloned EC2 instance and installs, if missing",
+      "timeoutSeconds": 3600,
+      "nextStep": "checkAndAddSerialPortDriver",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\ntry {\n    if (Test-Path -Path \"nvme-state-{{ automation:EXECUTION_ID }}\") {\n        if (Select-String -Path \"nvme-state-{{ automation:EXECUTION_ID }}\" -Pattern \"success\") {\n            Write-Host \"Installer has already run. Skipping installation\"\n            exit 0\n        }\n        else {\n            Write-Host \"Previous run of installer marked as failure. Skipping installation\"\n            exit 1\n        }\n    }\n    else {\n        $OSVersion = [System.Environment]::OSVersion.Version\n        $version = $OSVersion.Major.ToString() + \".\" + $OSVersion.Minor.ToString()\n        switch -regex ($version) {\n            \"6.1\" {\n                # 1.3.2 is the latest version that supports Windows Server 2008 R2\n                $url = \"https://s3.amazonaws.com/ec2-windows-drivers-downloads/NVMe/1.3.2/AWSNVMe.zip\"\n            } \n            \"6.2|6.3|10.*\" {\n                $url = \"https://s3.amazonaws.com/ec2-windows-drivers-downloads/NVMe/Latest/AWSNVMe.zip\"\n            }\n        }\n        $tempPath = (Resolve-Path ${env:temp}).Path\n        $tempFile = \"${tempPath}\\AWSNVMe.zip\"\n        $tempDir = \"${tempPath}\\AWSNVMe\"\n        \n        [System.Net.ServicePointManager]::SecurityProtocol = ([int][system.net.SecurityProtocolType]::Tls13 -bor [int][system.net.SecurityProtocolType]::Tls12)\n        $wc = New-Object System.Net.WebClient\n        $attemptCount = 1\n        \n        Do {\n        Write-Host \"Downloading AWS NVMe drivers, attempt: $attemptCount/5...\"\n        $attemptCount++\n        $wc.DownloadFile($url, $tempFile)\n        Start-Sleep -Seconds (1 * $attemptCount)\n        } While (((Test-Path $tempFile) -eq $false) -and ($attemptCount -le 6))\n        \n        if (Test-Path $tempDir) {\n            Remove-Item -Path $tempDir -Recurse -Force\n        }\n\n        # Extract drivers\n        try {\n            # Unpacking the file this way is not supported in PowerShell 2\n            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue\n            [System.IO.Compression.ZipFile]::ExtractToDirectory($tempFile, $tempDir)\n        }\n        catch [System.InvalidOperationException] {\n            # Legacy unpacking method using COM Object\n            # Works with PowerShell 2\n            New-Item -Path $tempDir -ItemType \"directory\" -Force | Out-Null\n            ((New-Object -com shell.application).NameSpace($tempDir)).CopyHere(((New-Object -com shell.application).NameSpace($tempFile)).Items())\n        }\n\n        # Run install.ps1\n        Write-Host \"Running install script\"\n        $output = & \"${tempDir}\\install.ps1\" -NoReboot\n        Write-Host $output\n\n        # Handling drivers reflection: https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#upgrade-nvme\n        # Driver reflection is required only for Windows Server 2008 R2 and Windows Server 2012 instances\n        $allowedWinVer = $false\n        $osVer = [System.Environment]::OSVersion.Version\n        if ($osVer.Major -eq 6) {\n            $allowedMinor = @(1, 2)\n            if ($allowedMinor -contains $osVer.Minor) {\n                $allowedWinVer = $true\n            }\n        }\n        if ($allowedWinVer) {\n            # Checking instance type architecture to ensure it is not a Nitro instance type\n            $allowedInstanceType = $false\n            $ErrorActionPreference = \"stop\"\n            try {\n                $systemVersion = (Get-ItemProperty -Path \"HKLM:\\HARDWARE\\DESCRIPTION\\System\\BIOS\" -Name SystemVersion).SystemVersion\n                $systemManufacturer = (Get-ItemProperty -Path \"HKLM:\\HARDWARE\\DESCRIPTION\\System\\BIOS\" -Name SystemManufacturer).SystemManufacturer\n            }\n            catch [System.Management.Automation.PSArgumentException] {}\n            finally { $ErrorActionPreference = \"Continue\" }\n            if (($systemVersion -match \"amazon\") -and ($systemManufacturer -match \"Xen\")) {\n                $allowedInstanceType = $true\n            }\n            if ($allowedInstanceType) {\n                Write-Host \"Reflecting Boot Critical drivers\"\n                Start-Process -PassThru -Wait -FilePath \"$env:systemroot\\System32\\rundll32.exe\" -ArgumentList \"sppnp.dll,Sysprep_Generalize_Pnp\" | Out-Null\n            }\n        }\n\n        # Evaluate output\n        [System.Int32]$retSuccess = 0\n        [System.Int32]$retSuccessRebootRequired = 3010\n        \n        New-Item \"nvme-state-{{ automation:EXECUTION_ID }}\" -ItemType file | Out-Null\n\n        if ($output -eq $retSuccess) {\n            Write-Output \"success\" | Set-Content -Path \"nvme-state-{{ automation:EXECUTION_ID }}\"\n            exit 0\n        }\n        elseif ($output -eq $retSuccessRebootRequired) {\n            Write-Host \"Rebooting to complete installation\"\n            Write-Output \"success\" | Set-Content -Path \"nvme-state-{{ automation:EXECUTION_ID }}\"\n            exit 3010\n        }\n        else {\n            Write-Output \"failure\" | Set-Content -Path \"nvme-state-{{ automation:EXECUTION_ID }}\"\n            exit 1\n        }\n    }\n}\ncatch {\n    Write-Host $_.Exception.Message\n    exit 255\n}\n"
+        }
+      }
+    },
+    {
+      "name": "checkAndAddSerialPortDriver",
+      "action": "aws:runCommand",
+      "description": "Installs the Serial Port driver required for bare metal instance types to use serial console features such as Console Output",
+      "timeoutSeconds": 3600,
+      "nextStep": "updatePowerManagementSettings",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "Parameters": {
+          "commands": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n#\n\ntry {\n    $successOutput = \"Successfully installed the driver\"\n    if (Test-Path -Path \"serial-driver-state-{{ automation:EXECUTION_ID }}\") {\n        if (Select-String -Path \"serial-driver-state-{{ automation:EXECUTION_ID }}\" -Pattern $successOutput) {\n            Write-Host \"Installer has already run. Skipping installation\"\n            exit 0\n        }\n        else {\n            Write-Host \"Previous run of installer marked as failure. Skipping installation\"\n            exit 1\n        }\n    }\n    else {\n\n        $driverMapping = @{\n            \"aws_ser.inf\" = [PSCustomObject ]@{Name=\"AWS PCI Serial Driver\";Required=$false;Link=\"https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html#install-serial-port-bare-metal\"}\n       }\n\n        # Get the list of installed drivers using DSIM where ProviderName like Amazon Web Services, Inc. or Amazon Inc*\n        $driversQueryResults = ((dism /online /get-drivers /format:table | Select-Object -Skip 14 | Select-Object -Last 9999 -Skip 1 |\n        ConvertFrom-Csv -Header \"PublishedName\", \"OriginalFileName\", \"Inbox\", \"ClassName\", \"ProviderName\", \"Date\", \"Version\" -Delimiter \"|\" |\n        Where-Object { $_.ProviderName -like \"Amazon Web Services, Inc.*\" -or $_.ProviderName -like \"Amazon Inc*\"  } |\n        Select-Object \"PublishedName\", \"OriginalFileName\", \"Inbox\", \"ClassName\", \"ProviderName\", \"Date\", @{ Name = \"Version\"; Expression = { $_.Version -as [version] } }))\n\n        $driverMissing = $false\n        foreach ($driver in $driverMapping.Keys) {\n             \n             $driverFound = ($driversQueryResults | Where-Object { $_.OriginalFileName -like \"$driver*\" })\n        \n             if ($driverFound) {\n                  Write-Host \"[PASSED] $($driverMapping.$driver.Name) with version(s): $($driverFound.Version), installed and available on your EC2 instance`n\"\n             }\n             else\n             {\n                Write-Host \"[INFO] $($driverMapping.$driver.Name) is not installed on your EC2 instance.\"\n\n                $tempPath = (Resolve-Path ${env:temp}).Path\n                $tempFile = \"${tempPath}\\AWSPCISerialDriver.zip\"\n                $tempDir = \"${tempPath}\\AWSPCISerialDriver\"\n                $url = \"https://s3.amazonaws.com/ec2-windows-drivers-downloads/AWSPCISerialDriver/Latest/AWSPCISerialDriver.zip\"\n\n                [System.Net.ServicePointManager]::SecurityProtocol = ([int][system.net.SecurityProtocolType]::Tls13 -bor [int][system.net.SecurityProtocolType]::Tls12)\n                $wc = New-Object System.Net.WebClient\n                $attemptCount = 1\n                \n                Do {\n                Write-Host \"Downloading AWS PCI Serial Port Driver, attempt: $attemptCount/5...\"\n                $attemptCount++\n                $wc.DownloadFile($url, $tempFile)\n                Start-Sleep -Seconds (1 * $attemptCount)\n                } While (((Test-Path $tempFile) -eq $false) -and ($attemptCount -le 6))\n\n                if (Test-Path $tempDir) {\n                    Remove-Item -Path $tempDir -Recurse -Force\n                }\n        \n                # Extract drivers\n                try {\n                    # Unpacking the file this way is not supported in PowerShell 2\n                    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue\n                    [System.IO.Compression.ZipFile]::ExtractToDirectory($tempFile, $tempDir)\n                }\n                catch [System.InvalidOperationException] {\n                    # Legacy unpacking method using COM Object\n                    # Works with PowerShell 2\n                    New-Item -Path $tempDir -ItemType \"directory\" -Force | Out-Null\n                    ((New-Object -com shell.application).NameSpace($tempDir)).CopyHere(((New-Object -com shell.application).NameSpace($tempFile)).Items())\n                }\n        \n                # Install the inf file\n                Write-Host \"Installing serial port driver\"\n                $output = Get-ChildItem $tempDir -Recurse -Filter \"*inf\" | ForEach-Object {PNPUtil.exe -a $_.FullName; PNPUtil.exe -i -a $_.FullName}\n                Write-Host $output\n        \n                # Evaluate output\n                New-Item \"serial-driver-state-{{ automation:EXECUTION_ID }}\" -ItemType file | Out-Null\n                if ($output -match $successOutput) {\n                    Write-Output $output | Set-Content -Path \"serial-driver-state-{{ automation:EXECUTION_ID }}\"\n                    Write-Host \"Success\"            \n                    exit 0\n                }\n                else {\n                    exit 1\n                }\n             }\n        }\n\n\n\n\n    }\n}\ncatch {\n    Write-Host $_.Exception.Message\n    exit 255\n}\n"
+        }
+      }
+    },
+    {
+      "name": "updatePowerManagementSettings",
+      "action": "aws:runCommand",
+      "description": "Updates the power management display settings to ensure graceful shutdowns on the nitro hypervisor",
+      "timeoutSeconds": 3600,
+      "nextStep": "stopClonedInstance",
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "Parameters": {
+          "commands": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n# Power Plans schemes\n$SCHEME_BALANCED = \"381b4222-f694-41f0-9685-ff5bb260df2e\"\n$SCHEME_POWER_SAVER = \"381b4222-f694-41f0-9685-ff5bb260df2e\"\n$SCHEME_HIGH_PERFORMANCE = \"8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c\"\n\n$DISPLAY_SETTING = \"7516b95f-f776-4464-8c53-06167f40cc99\"\n$TURN_OFF_DISPLAY = \"3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e\"\n$VALUE = 0\n\n#Need to apply the following power management settings to ensure a graceful shutdown on the nitro hypervisor\ntry {\n    Write-Host \"[INFO] Updating Power Management settings for graceful shutdown on the Nitro hypervisor..\"\n    powercfg /SETDCVALUEINDEX $SCHEME_BALANCED $DISPLAY_SETTING $TURN_OFF_DISPLAY $VALUE\n    powercfg /SETDCVALUEINDEX $SCHEME_POWER_SAVER $DISPLAY_SETTING $TURN_OFF_DISPLAY $VALUE\n    powercfg /SETDCVALUEINDEX $SCHEME_HIGH_PERFORMANCE $DISPLAY_SETTING $TURN_OFF_DISPLAY $VALUE\n    Write-Host \"Complete\"\n} catch {\n    Write-Host \"[FAILED] Unable to update power management settings\"\n    Write-Host $_\n    exit 1\n}\n"
+        }
+      }
+    },
+    {
+      "name": "stopClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Stops the cloned EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:forceStopClonedInstance",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "checkENAAttributeForClonedInstance"
+    },
+    {
+      "name": "forceStopClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Force stops the cloned EC2 instance, only if the step 'stopClonedInstance' fails to stop",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      },
+      "nextStep": "checkENAAttributeForClonedInstance"
+    },
+    {
+      "name": "checkENAAttributeForClonedInstance",
+      "action": "aws:branch",
+      "description": "Checks if the Enhanced Networking Adapter (ENA) attribute is enabled on the cloned EC2 instance",
+      "isCritical": true,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "setNitroInstanceTypeForClonedInstance",
+            "Variable": "{{getTargetInstanceProperties.ENAAttrib}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "enableENAAttributeForClonedInstance"
+      }
+    },
+    {
+      "name": "enableENAAttributeForClonedInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Enables the Enhanced Networking Adapter (ENA) attribute for the cloned instance, if not enabled already",
+      "nextStep": "setNitroInstanceTypeForClonedInstance",
+      "onFailure": "step:failureHandling",
+      "maxAttempts": 1,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{launchInstanceInSameSubnet.ClonedInstanceId}}",
+        "EnaSupport": {
+          "Value": true
+        }
+      }
+    },
+    {
+      "name": "setNitroInstanceTypeForClonedInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Sets the provided Target EC2 instance type for the cloned EC2 instance",
+      "onFailure": "step:failureHandling",
+      "nextStep": "startClonedInstance",
+      "maxAttempts": 1,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{launchInstanceInSameSubnet.ClonedInstanceId}}",
+        "InstanceType": {
+          "Value": "{{NitroInstanceType}}"
+        }
+      }
+    },
+    {
+      "name": "startClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Starts the cloned EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "isCritical": true,
+      "onFailure": "step:failureHandling",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      },
+      "nextStep": "approvalForCreatingImageAfterDriversInstallation"
+    },
+    {
+      "name": "approvalForCreatingImageAfterDriversInstallation",
+      "action": "aws:approve",
+      "description": "Waits for user approval if the cloned EC2 instance successfully boots on Nitro platform. If provided, creates an Amazon Machine Image (AMI) taken after the required drivers have been installed for the Nitro system",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "createImageAfterDriversInstallation",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Cloned EC2 Instance {{launchInstanceInSameSubnet.ClonedInstanceId}}, created from target EC2 instance {{TargetInstanceId}}, has been successfully migrated to {{NitroInstanceType}}. Provide approval to create an Amazon Machine Image (AMI) which can be used as a backup taken after driver installation. In case of 'Reject/Deny', the Automation will stop with Failed status. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "createImageAfterDriversInstallation",
+      "action": "aws:createImage",
+      "description": "Creates an Amazon Machine Image (AMI) from the new EC2 instance only if the new EC2 instance successfully boots on Nitro Platform",
+      "maxAttempts": 1,
+      "nextStep": "cleanupTestImage",
+      "onFailure": "step:failureHandling",
+      "isCritical": true,
+      "inputs": {
+        "InstanceId": "{{launchInstanceInSameSubnet.ClonedInstanceId}}",
+        "ImageName": "CloneXenEC2WindowsInstanceAndMigrateToNitro_NitroImage_{{TargetInstanceId}}_{{global:DATE_TIME}}",
+        "NoReboot": true,
+        "ImageDescription": "Image created after driver installation - SSMAutomationID-{{automation:EXECUTION_ID}}"
+      }
+    },
+    {
+      "name": "cleanupTestImage",
+      "action": "aws:deleteImage",
+      "description": "De-registers the Amazon Machine Image (AMI) created for testing",
+      "maxAttempts": 3,
+      "isEnd": true,
+      "onFailure": "Continue",
+      "isCritical": true,
+      "inputs": {
+        "ImageId": "{{createTestImage.ImageId}}"
+      }
+    },
+    {
+      "name": "failureHandling",
+      "action": "aws:branch",
+      "description": "Checks if the user has chosen to terminate resources on failure",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "onFailureTerminateClonedInstance",
+            "Variable": "{{DeleteResourcesOnFailure}}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "onFailureTerminateClonedInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Terminates the cloned EC2 instance, in case of automation failure",
+      "maxAttempts": 1,
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "nextStep": "onFailurecleanupTestImage",
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceIds": [
+          "{{launchInstanceInSameSubnet.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "onFailurecleanupTestImage",
+      "action": "aws:deleteImage",
+      "description": "De-registers the Amazon Machine Image (AMI) created for testing",
+      "maxAttempts": 3,
+      "onFailure": "Continue",
+      "nextStep": "onFailureCleanupIsolatedSecurityGroup",
+      "isCritical": true,
+      "inputs": {
+        "ImageId": "{{createTestImage.ImageId}}"
+      }
+    },
+    {
+      "name": "onFailureCleanupIsolatedSecurityGroup",
+      "action": "aws:executeScript",
+      "description": "Deletes the isolated security group if it was made for handling domain-joined instances",
+      "onFailure": "Continue",
+      "nextStep": "onFailureApprovalToStartTargetInstance",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "createIsolatedSecurityGroup.deleteCreatedSecurityGroup_handler",
+        "Attachment": "clone-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "StepName": "createIsolatedSecurityGroup"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Output_Message",
+          "Selector": "$.Payload.output_message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "onFailureApprovalToStartTargetInstance",
+      "action": "aws:approve",
+      "description": "If automation fails, waits for designated principal's approval to start the target EC2 instance",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "onFailureStartTargetInstance",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Automation failed while migrating cloned EC2 Xen based instance to Nitro platform. Provide approval to start the target EC2 instance. In case of 'Reject/Deny', the Automation will stop with Failed status. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "onFailureStartTargetInstance",
+      "action": "aws:changeInstanceState",
+      "description": "If automation fails, starts the target EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      }
+    }
+  ],
+  "outputs": [
+    "launchInstanceInSameSubnet.ClonedInstanceId",
+    "createBackupImage.ImageId",
+    "createImageAfterDriversInstallation.ImageId"
+  ],
+  "files": {
+    "clone-xen-to-nitro-python.zip": {
+      "checksums": {
+        "sha256": "5de16a952408bfded5d07045b8ddddd5ef41d2aab7986448c715ddf57a06f76d"
+      }
+    }
+  }
+}

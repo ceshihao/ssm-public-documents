@@ -1,0 +1,770 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The *AWSSupport-MigrateXenToNitroWindows* runbook prepares, and migrate a clone of your Amazon Elastic Compute Cloud (Amazon EC2) Windows instance, to run on [EC2 Nitro platform](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html#ec2-nitro-instances). This automation runbook provides two different Operation Types as input parameter: ```Clone&Migrate``` and ```FullMigration```. For the ```Clone&Migrate``` option, the automation performs **Preliminary Checks**, **Tests**, and **CloneAndMigrate** while ```FullMigration``` has an additional step **Replace root EBS volumes** section. Details are as follows::\n\n### 1. Preliminary Checks\nIn this section, the automation evaluates all of the following pre-requisites to proceed with the migration. If any of the steps fails, the automation ends.\n> * Checks if the target EC2 instance is already running on Nitro platform.\n> * Determines if the [lifecycle](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-purchasing-options.html#check-instance-lifecycle) of the target EC2 instance is Spot.\n> * Checks if any [instance-store-volumes](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/InstanceStorage.html#instance-store-volumes) with data are attached to the target EC2 instance.\n> * Validates if the operating system is Windows Server and checks if the edition is compatible.\n> * Determines if the target EC2 instance is a part of an Amazon EC2 Auto Scaling group. If true, the EC2 instance should be in the [Standby state](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html).\n> * Checks if the target EC2 instance is managed by Systems Manager and configured to use AWS Systems Manager Run Command.\n\n### 2. Tests \nThe automation uses this phase as sanity test by creating a test Amazon Machine Image (AMI) from the target EC2 instance and launching a test EC2 instance using this AMI. If the target instance is domain-joined, an isolated security group is created in the target instance VPC which does not allow outbound traffic to the domain controller(s). This security group is only attached to the Test and Clone instances. The original target instance is not affected.\n> * If the test EC2 instance passes the status checks, the automation is temporarily paused and approval from the designated principal's is requested via Amazon Simple Notification Service (SNS) notification. If approval is provided, automation stops the target EC2 instance.\n*Note:* Before providing approval, ensure that all the application(s) running on the target EC2 instance are gracefully closed. If the EC2 does not have an Elastic IP address associated, the automatic public IPv4 address will change once the instance is stopped and started.\n> * The test AMI and the test EC2 instance are deleted at the end of this section.\n\n### 3. CloneAndMigrate \nIn this section, the automation creates a clone of your target EC2 instance in the same subnet and migrates the EC2 instance using the following steps:\n> * Enables the [Enhanced networking (ENA) attribute](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enhanced-networking-ena.html#enable-enhanced-networking-ena-AL).\n> * Installs the latest version of ENA drivers.\n> * Installs the latest version of NVMe drivers.\n> * Verifies the correct Power Management settings are applied for graceful shutdowns on the Nitro system.\n> * Installs the AWS PCI Serial Port Driver for bare metal instance types on the Nitro system.\nAfter validating all the requirements, the cloned EC2 instance type is changed to the desired Nitro type. Once the cloned instance passes status checks on Nitro platform, automation seeks for designated principal's approval to create an AMI. If approval is denied, the automation ends, leaving the cloned EC2 instance.\n\n### 4. Replace root EBS volumes\nIf you choose ```FullMigration``` as Operation Type, the automation migrates the target EC2 instance to the required Nitro instance type.\n > * The automation requests approval from the designated principals to replace the root EBS volume of the target EC2 instance with the cloned EC2 instance.\n> * Once the migration is successful, the cloned EC2 instance is deleted. In case of failure, the automation re-attaches the original EBS root volume back to the target EC2 instance.\n> * **Note:** If the root EBS volume attached to the target EC2 instance contains AWS Reserved Tags or tags with the 'aws:' prefix, then ```FullMigration``` **is not supported**.\n\n### Prerequisites:\n> * The target EC2 instance requires outbound access to Amazon Simple Storage Service (Amazon S3) in order to install the drivers.\n\n### Supported Operating Systems:\n> * Windows Server 2022, Windows Server 2019, Windows Server 2016, Windows Server 2012 R2, Windows Server 2012, and Windows Server 2008 R2.\n\n### Important:\n> * Running this runbook, may incur extra charges to your account for the EC2 instance, EBS Volumes, and Amazon Machine Images (AMIs). Please refer to the [Amazon EC2 Pricing](https://aws.amazon.com/ec2/pricing/) and [Amazon EBS pricing](https://aws.amazon.com/ebs/pricing/) for more details.\n\nPlease refer to [Migrate to latest generation instance types](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/migrating-latest-types.html) for more information.",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "TargetInstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of the Xen-based Amazon EC2 instance you want to migrate to the Nitro platform."
+    },
+    "NitroInstanceType": {
+      "type": "String",
+      "default": "m5.xlarge",
+      "description": "(Required) Enter the destination Nitro instance type. Note: Only Nitro M5, M6, C5, C6, R5, R6 and T3 instances are supported (e.g. t3.small). For more details about the available Nitro instance types, please refer to the link: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html",
+      "allowedPattern": "^(m5a?z?d?n?|c5a?d?n?|r5a?d?n?b?|(c|m|r)6(a|i)?d?)\\.(2|4|6|8|9|12|16|18|24|32)?x?large$|^t3a?\\.((x|2x)?large|nano|micro|small|medium)$"
+    },
+    "OperationType": {
+      "type": "String",
+      "description": "(Required) If you choose 'Clone&Migrate', this automation will clone the target EC2 instance & migrate it to the Nitro platform. If you choose 'FullMigration', this automation will clone the target EC2 instance, migrate it to the Nitro platform and replace the root volume of the target EC2 instance with the cloned(New) EC2 instance, only if the root partition is not based on Logical Volume Manager(LVM). ",
+      "allowedValues": [
+        "Clone&Migrate",
+        "FullMigration"
+      ]
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) Provide the ARN of the SNS Topic for Approval notification. This SNS topic is used to send approval notifications during required during the automation execution.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso(\\-[a-z])?):sns:.*:[0-9]{12}:.*$"
+    },
+    "ApproverIAM": {
+      "type": "StringList",
+      "description": "(Required) Provide a list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of these formats, 1) An AWS Identity and Access Management (IAM) user name 2) An IAM user ARN 3) An IAM role ARN 4) An IAM assume role user ARN",
+      "allowedPattern": "^[a-zA-Z0-9_+=,.@\\-\\/]{1,128}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(\\-[a-z])?):(iam|sts):.*:[0-9]{12}:[a-zA-Z0-9_+=,.@\\-\\/]{1,256}$"
+    },
+    "MinimumRequiredApprovals": {
+      "type": "Integer",
+      "default": 1,
+      "description": "(Optional) The minimum number of approvals required to resume the automation. If you don't specify a value, the system defaults to one. The value for this parameter must be a positive number. The value for this parameter can't exceed the number of approvers defined by the ApproverIAM parameter.",
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    "DeleteResourcesOnFailure": {
+      "type": "Boolean",
+      "default": true,
+      "description": "(Required) Whether to terminate the cloned EC2 instance and Amazon Machine Image (AMI) if the automation fails. Not applicable for Test & ReplaceRootVolume branches.",
+      "allowedValues": [
+        false,
+        true
+      ]
+    },
+    "Acknowledgement": {
+      "type": "String",
+      "description": "(Required) Please read the complete details of the actions performed by this automation runbook and write 'Yes, I understand and acknowledge' if you acknowledge the steps.",
+      "allowedPattern": "^Yes, I understand and acknowledge$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "checkConcurrency",
+      "action": "aws:executeScript",
+      "description": "Ensures there is only one execution of this runbook targeting the current EC2 instance. If the runbook finds another in progress execution targeting the same instance ID, it returns an error and ends.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkConcurrency.check_concurrency_handler",
+        "InputPayload": {
+          "TargetInstanceId": "{{TargetInstanceId}}"
+        },
+        "Attachment": "migrate-xen-to-nitro-python.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getTargetInstanceProperties"
+    },
+    {
+      "name": "getTargetInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the details of the target EC2 instance",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "nextStep": "checkRootVolumeTags",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PlatformType",
+          "Selector": "$.Reservations[0].Instances[0].Platform",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceSubnetId",
+          "Selector": "$.Reservations[0].Instances[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroup",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups[0].GroupId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileArn",
+          "Selector": "$.Reservations[0].Instances[0].IamInstanceProfile.Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceProfileName",
+          "Selector": "$.Reservations[0].Instances[0].IamInstanceProfile.Name",
+          "Type": "String"
+        },
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "RootDeviceName",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+          "Type": "String"
+        },
+        {
+          "Name": "RootVolumeType",
+          "Selector": "$.Reservations[0].Instances[0].RootDeviceType",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "ENAAttrib",
+          "Selector": "$.Reservations[0].Instances[0].EnaSupport",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "InstanceLifecycle",
+          "Selector": "$.Reservations[0].Instances[0].InstanceLifecycle",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceState",
+          "Selector": "$.Reservations[0].Instances[0].State.Name",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "checkRootVolumeTags",
+      "action": "aws:executeScript",
+      "description": "Determines if the root volume of the target EC2 instance contains any AWS reserved tags",
+      "isCritical": true,
+      "nextStep": "cloneTargetInstanceAndMigrateToNitro",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkRootVolumetags.checkRootVolumetags_handler",
+        "Attachment": "migrate-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "TargetInstanceId": "{{TargetInstanceId}}",
+          "RootDeviceName": "{{getTargetInstanceProperties.RootDeviceName}}",
+          "OperationType": "{{OperationType}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RootVolumeTags",
+          "Selector": "$.Payload.volume_tags",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "cloneTargetInstanceAndMigrateToNitro",
+      "action": "aws:executeAutomation",
+      "description": "Starts child automation execution that clones the Target EC2 instance and migrates it to the Nitro platform by completing all the requirements.",
+      "onFailure": "Abort",
+      "maxAttempts": 1,
+      "isCritical": true,
+      "nextStep": "branchOnTheOperationType",
+      "inputs": {
+        "DocumentName": "AWSSupport-CloneXenEC2WinInstanceAndMigrateToNitro",
+        "RuntimeParameters": {
+          "TargetInstanceId": [
+            "{{ TargetInstanceId }}"
+          ],
+          "NitroInstanceType": [
+            "{{ NitroInstanceType }}"
+          ],
+          "SNSTopicArn": [
+            "{{ SNSTopicArn }}"
+          ],
+          "ApproverIAM": [
+            "{{ ApproverIAM }}"
+          ],
+          "Acknowledgement": [
+            "{{ Acknowledgement }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "MinimumRequiredApprovals": "{{MinimumRequiredApprovals}}",
+          "DeleteResourcesOnFailure": "{{DeleteResourcesOnFailure}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ClonedEC2InstanceId",
+          "Selector": "$.Output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "branchOnTheOperationType",
+      "action": "aws:branch",
+      "description": "Branches on the value of Operation Type",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "getClonedInstanceId",
+            "Variable": "{{OperationType}}",
+            "StringEquals": "FullMigration"
+          }
+        ]
+      }
+    },
+    {
+      "name": "getClonedInstanceId",
+      "action": "aws:executeScript",
+      "description": "Retrieves the Cloned EC2 Instance Id from the child Automation",
+      "isCritical": true,
+      "nextStep": "startOfReplaceRootEBSVolumeBranch",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkStepDetails.checkStepDetails_handler",
+        "Attachment": "migrate-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "ChildAutomationId": "{{cloneTargetInstanceAndMigrateToNitro.ExecutionId}}",
+          "StepName": "launchInstanceInSameSubnet"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ClonedInstanceId",
+          "Selector": "$.Payload.cloned_instance_id",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "startOfReplaceRootEBSVolumeBranch",
+      "action": "aws:sleep",
+      "description": "Start of Replace Root EBS Volume branch",
+      "onFailure": "Continue",
+      "nextStep": "checkIfTargetInstanceIsManagedByCFN",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "checkIfTargetInstanceIsManagedByCFN",
+      "action": "aws:executeScript",
+      "description": "Determines if the Target EC2 instance is managed by any AWS CloudFormation Stack",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkCloudFormationResources.checkCloudFormationResources_handler",
+        "InputPayload": {
+          "TargetInstanceId": "{{TargetInstanceId}}"
+        },
+        "Attachment": "migrate-xen-to-nitro-python.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Output_Message",
+          "Selector": "$.Payload.output_message",
+          "Type": "String"
+        },
+        {
+          "Name": "IspartOfCFNStack",
+          "Selector": "$.Payload.is_part_of_cfn_stack",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "StackName",
+          "Selector": "$.Payload.stack_name",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnCFNStackStatus"
+    },
+    {
+      "name": "branchOnCFNStackStatus",
+      "action": "aws:branch",
+      "description": "Decides which approval step to execute based on the AWS CloudFormation Stack status",
+      "isEnd": true,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "approvalForRootVolumesReplacementWithCFN",
+            "Variable": "{{checkIfTargetInstanceIsManagedByCFN.IspartOfCFNStack}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "approvalForRootVolumesReplacement"
+      }
+    },
+    {
+      "name": "approvalForRootVolumesReplacementWithCFN",
+      "action": "aws:approve",
+      "description": "If the target EC2 instance is managed by AWS CloudFormation (CFN), automation waits for user approval if the cloned EC2 instance successfully boots on Nitro platform. If provided, replaces the EBS volumes of the target EC2 instance with the cloned EC2 instance",
+      "timeoutSeconds": 3600,
+      "nextStep": "assertIfTargetEC2InstanceIsStillStopped",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Cloned EC2 Instance {{getClonedInstanceId.ClonedInstanceId}}, created from {{TargetInstanceId}}, has been successfully migrated to {{NitroInstanceType}}. Provide approval to replace the volumes of the target EC2 instance with the cloned EC2 instance. If approved, both of the EC2 instances(Target & Cloned) will be stopped to replace the volumes. Target EC2 instance is a part of AWS CloudFormation Stack {{checkIfTargetInstanceIsManagedByCFN.StackName}}, migrating the Target EC2 instance using this automation may cause a drift from the stack's actual configuration. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "approvalForRootVolumesReplacement",
+      "action": "aws:approve",
+      "description": "Waits for user approval if the cloned EC2 instance successfully boots on Nitro platform. If provided, replaces the EBS volumes of the target EC2 instance with the cloned EC2 instance",
+      "timeoutSeconds": 3600,
+      "nextStep": "assertIfTargetEC2InstanceIsStillStopped",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Cloned EC2 Instance {{getClonedInstanceId.ClonedInstanceId}}, created from {{TargetInstanceId}}, has been successfully migrated to {{NitroInstanceType}}. Provide approval to replace the volumes of the target EC2 instance with the cloned EC2 instance. If approved, both of the EC2 instances(Target & Cloned) will be stopped to replace the volumes.This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "assertIfTargetEC2InstanceIsStillStopped",
+      "description": "Validates if target EC2 instance is still in Stopped state before proceeding for volume replacement",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "step:stopTargetInstanceForRootVolumeReplacement",
+      "isCritical": "true",
+      "maxAttempts": 3,
+      "nextStep": "stopClonedInstanceForRootVolumeReplacement",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "IncludeAllInstances": true,
+        "PropertySelector": "$.InstanceStatuses[0].InstanceState.Name",
+        "DesiredValues": [
+          "stopped"
+        ]
+      }
+    },
+    {
+      "name": "stopTargetInstanceForRootVolumeReplacement",
+      "action": "aws:changeInstanceState",
+      "description": "Stops target (Xen based) EC2 instance before replacing EBS volumes",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "step:forceStopTargetInstanceForRootVolumeReplacement",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "stopClonedInstanceForRootVolumeReplacement"
+    },
+    {
+      "name": "forceStopTargetInstanceForRootVolumeReplacement",
+      "action": "aws:changeInstanceState",
+      "description": "Force stops the target (Xen based) EC2 instance, only if the step 'stopTargetInstanceForRootVolumeReplacement' fails",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      },
+      "nextStep": "stopClonedInstanceForRootVolumeReplacement"
+    },
+    {
+      "name": "stopClonedInstanceForRootVolumeReplacement",
+      "action": "aws:changeInstanceState",
+      "description": "Stops the cloned EC2 instance before replacing EBS volumes",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "step:forceStopClonedInstanceForRootVolumeReplacement",
+      "inputs": {
+        "InstanceIds": [
+          "{{getClonedInstanceId.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "getBlockDeviceMappings"
+    },
+    {
+      "name": "forceStopClonedInstanceForRootVolumeReplacement",
+      "action": "aws:changeInstanceState",
+      "description": "Force stops the cloned EC2 instance, only if the step 'stopClonedInstanceForRootVolumeReplacement' fails",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{getClonedInstanceId.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      },
+      "nextStep": "getBlockDeviceMappings"
+    },
+    {
+      "name": "getBlockDeviceMappings",
+      "action": "aws:executeScript",
+      "description": "Retrieves the block device mappings for both the EC2 instances",
+      "isCritical": true,
+      "nextStep": "replaceRootEbsVolumes",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "getblockdevicemappings.getBlockDeviceMappings_handler",
+        "Attachment": "migrate-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "ClonedInstance": "{{getClonedInstanceId.ClonedInstanceId}}",
+          "TargetInstance": "{{TargetInstanceId}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "root_device_mapping_target_instance",
+          "Selector": "$.Payload.root_device_mapping_target_instance",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "table_block_dev_mapping_target_instance",
+          "Selector": "$.Payload.table_block_dev_mapping_target_instance",
+          "Type": "String"
+        },
+        {
+          "Name": "root_device_mapping_cloned_instance",
+          "Selector": "$.Payload.root_device_mapping_cloned_instance",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "table_block_dev_mapping_cloned_instance",
+          "Selector": "$.Payload.table_block_dev_mapping_cloned_instance",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "replaceRootEbsVolumes",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "description": "Replaces the EBS volumes of the Target (Xen-based) EC2 instance with the cloned EC2 instance. Also prints the block device mappings tables for both the instances before EBS volume's replacement",
+      "isCritical": true,
+      "onFailure": "step:onFailureRollbackRootVolumeReplacement",
+      "nextStep": "EndOfReplaceRootEBSVolumeBranch",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "replaceRootVolumes.replaceRootVolumes_handler",
+        "Attachment": "migrate-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "clonedInstance": "{{getClonedInstanceId.ClonedInstanceId}}",
+          "targetInstance": "{{TargetInstanceId}}",
+          "rootDevMappingTargetInstance": "{{getBlockDeviceMappings.root_device_mapping_target_instance}}",
+          "rootDevMappingClonedInstance": "{{getBlockDeviceMappings.root_device_mapping_cloned_instance}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Disclaimer",
+          "Selector": "$.Payload.Disclaimer",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "EndOfReplaceRootEBSVolumeBranch",
+      "action": "aws:sleep",
+      "description": "End of Replace Root EBS Volume branch",
+      "onFailure": "Continue",
+      "nextStep": "checkENAAttributeForTargetInstance",
+      "isCritical": false,
+      "inputs": {
+        "Duration": "PT5S"
+      }
+    },
+    {
+      "name": "checkENAAttributeForTargetInstance",
+      "action": "aws:branch",
+      "description": "Checks if the Enhanced Networking Adapter (ENA) attribute is enabled on the target EC2 instance",
+      "isCritical": true,
+      "onFailure": "step:onFailureRollbackRootVolumeReplacement",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "setNitroInstanceTypeForTargetInstance",
+            "Variable": "{{getTargetInstanceProperties.ENAAttrib}}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "enableENAAttributeForTargetInstance"
+      }
+    },
+    {
+      "name": "enableENAAttributeForTargetInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Enables the Enhanced Networking Adapter (ENA) attribute for the target EC2 instance, if not enabled already",
+      "nextStep": "setNitroInstanceTypeForTargetInstance",
+      "onFailure": "step:onFailureRollbackRootVolumeReplacement",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{TargetInstanceId}}",
+        "EnaSupport": {
+          "Value": true
+        }
+      }
+    },
+    {
+      "name": "setNitroInstanceTypeForTargetInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Sets the provided Target EC2 instance type for the target EC2 instance",
+      "onFailure": "step:onFailureRevertOriginalInstanceType",
+      "isCritical": "true",
+      "nextStep": "replicateRootVolumeTags",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{TargetInstanceId}}",
+        "InstanceType": {
+          "Value": "{{NitroInstanceType}}"
+        }
+      }
+    },
+    {
+      "name": "replicateRootVolumeTags",
+      "action": "aws:executeScript",
+      "description": "Replicates the tags on the root EBS volume from the target EC2 instance",
+      "isCritical": true,
+      "nextStep": "startTargetInstance",
+      "onFailure": "step:onFailureStopTargetEC2Instance",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "replicateRootVolumeTags.replicateRootVolumeTags_handler",
+        "Attachment": "migrate-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "rootDevMappingTargetInstance": "{{getBlockDeviceMappings.root_device_mapping_target_instance}}",
+          "rootDevMappingClonedInstance": "{{getBlockDeviceMappings.root_device_mapping_cloned_instance}}"
+        }
+      }
+    },
+    {
+      "name": "startTargetInstance",
+      "action": "aws:changeInstanceState",
+      "description": "Starts target EC2 instance after changing instance type to Nitro",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "step:onFailureStopTargetEC2Instance",
+      "nextStep": "terminateClonedEC2Instance",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      }
+    },
+    {
+      "name": "onFailureStopTargetEC2Instance",
+      "action": "aws:changeInstanceState",
+      "description": "Stops target EC2 instance if it fails to start on Nitro platform",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "step:onFailureForceStopTargetEC2Instance",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped"
+      },
+      "nextStep": "onFailureRevertOriginalInstanceType"
+    },
+    {
+      "name": "onFailureForceStopTargetEC2Instance",
+      "action": "aws:changeInstanceState",
+      "description": "Stops target EC2 instance if it fails to start on Nitro platform, only if the step 'onFailureStopTargetEC2Instance' fails",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "stopped",
+        "Force": true
+      },
+      "nextStep": "onFailureRevertOriginalInstanceType"
+    },
+    {
+      "name": "onFailureRevertOriginalInstanceType",
+      "action": "aws:executeAwsApi",
+      "description": "Reverts the target EC2 instance to the original instance type, if the target instance fails to start on Nitro platform",
+      "onFailure": "Abort",
+      "isCritical": "true",
+      "nextStep": "onFailureRollbackRootVolumeReplacement",
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceAttribute",
+        "InstanceId": "{{TargetInstanceId}}",
+        "InstanceType": {
+          "Value": "{{getTargetInstanceProperties.InstanceType}}"
+        }
+      }
+    },
+    {
+      "name": "onFailureRollbackRootVolumeReplacement",
+      "action": "aws:executeScript",
+      "description": "Reverts all the changes made by the 'replaceRootEbsVolumes' step, in case of any failure",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "nextStep": "onFailureApprovalToStartTargetInstance",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "ebsRollback.ebsrollback_handler",
+        "Attachment": "migrate-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "clonedInstance": "{{getClonedInstanceId.ClonedInstanceId}}",
+          "targetInstance": "{{TargetInstanceId}}",
+          "rootDevMappingTargetInstance": "{{getBlockDeviceMappings.root_device_mapping_target_instance}}",
+          "rootDevMappingClonedInstance": "{{getBlockDeviceMappings.root_device_mapping_cloned_instance}}"
+        }
+      }
+    },
+    {
+      "name": "onFailureApprovalToStartTargetInstance",
+      "action": "aws:approve",
+      "description": "If automation fails, waits for designated principal's approval to start the target EC2 instance",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "onFailureStartTargetInstance",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "Automation failed while migrating the target instance to the Nitro platform. Provide approval to start the target EC2 instance. In case of 'Reject/Deny', the Automation will stop with Failed status. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "onFailureStartTargetInstance",
+      "action": "aws:changeInstanceState",
+      "description": "If automation fails, starts the target EC2 instance",
+      "maxAttempts": 1,
+      "timeoutSeconds": 900,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "InstanceIds": [
+          "{{TargetInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "running"
+      }
+    },
+    {
+      "name": "terminateClonedEC2Instance",
+      "action": "aws:changeInstanceState",
+      "description": "Terminates the cloned EC2 instance after replacing root EBS volume",
+      "nextStep": "cleanupCreatedIsolatedSecurityGroup",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InstanceIds": [
+          "{{getClonedInstanceId.ClonedInstanceId}}"
+        ],
+        "CheckStateOnly": false,
+        "DesiredState": "terminated"
+      }
+    },
+    {
+      "name": "cleanupCreatedIsolatedSecurityGroup",
+      "action": "aws:executeScript",
+      "description": "Deletes the isolated security group if it was made for handling domain-joined instances",
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "checkStepDetails.deleteCreatedSecurityGroup_handler",
+        "Attachment": "migrate-xen-to-nitro-python.zip",
+        "InputPayload": {
+          "ChildAutomationId": "{{cloneTargetInstanceAndMigrateToNitro.ExecutionId}}",
+          "StepName": "createIsolatedSecurityGroup"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Output_Message",
+          "Selector": "$.Payload.output_message",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "replaceRootEbsVolumes.Disclaimer",
+    "getClonedInstanceId.ClonedInstanceId",
+    "getBlockDeviceMappings.table_block_dev_mapping_cloned_instance",
+    "getBlockDeviceMappings.table_block_dev_mapping_target_instance"
+  ],
+  "files": {
+    "migrate-xen-to-nitro-python.zip": {
+      "checksums": {
+        "sha256": "5158fd7811b6b59153ad075e2642a8e8569c3452d3b57175c1b02d4d9e72425f"
+      }
+    }
+  }
+}

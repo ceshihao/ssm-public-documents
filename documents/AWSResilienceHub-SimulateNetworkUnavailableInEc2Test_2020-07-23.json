@@ -1,0 +1,216 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## Intent\nTest that the application correctly alerts if an Amazon EC2 instance's network is unavailable.\n\n## Type\nTest\n\n## Risk\nMedium\n\n## Requirements\n* EC2 instance with Linux OS \n* There is a synthetic alarm setup for application\n\n## Permission required for AutomationAssumeRole\n* ssm:SendCommand\n* ssm:ListCommands\n* ssm:ListCommandInvocations\n* ssm:DescribeInstanceInformation\n* ssm:GetAutomationExecution\n* ssm:CancelCommand\n* cloudwatch:DescribeAlarms\n* ec2:RebootInstances\n\n## Supports Rollback\nYes. Reboots instance to cancel impact\n\n## Inputs\n### AutomationAssumeRole:\n  * type: String\n  * description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf\n  * allowedPattern: arn:aws:iam::\\d+:\\S+\n### InstanceId:\n  * type: String\n  * description: (Required) EC2 instance id\n  * allowedPattern: ^i-[a-z0-9]{8,17}$\n### HealthCheckAlarmName:\n  * type: String\n  * description: (Required) An alarm which should be triggered when the EC2 instance's network becomes unavailable\n### DurationInMinutes:\n  * type: String\n  * description: (Optional) The duration of the attack in seconds (default/recommended 300)\n  * default: '300'\n  * allowedPattern: ^\\d+$\n### IsRollback:\n  * type: String\n  * description: (Optional) Provide true to rollback previous execution\n  * default: 'false'\n### PreviousExecutionId:\n  * type: String\n  * description: (Optional) Previous execution id for which test should be rolled back (need in case of rollback)\n  * default: ''\n\n## Steps executed in normal flow\n  * SelectExecutionMode\n  * AssertAlarmToBeGreenBeforeTest\n  * SimulateNetworkUnavailable\n  * WaitForTestDuration\n  * AssertAlarmToBeRed\n  * AssertAlarmToBeGreen\n\n## Steps executed in rollback flow\n  * SelectExecutionMode\n  * GetPreviousExecutionInstanceId\n  * AssertInstanceId\n  * RebootInstancePreviousExecution\n\n## Details\n  * Drop all outgoing/incoming network traffic on instance for X minutes\n  * Verify alarm is triggered\n  * After test duration, alarm should go back to green\n\n## Outputs\nThe automation execution has no outputs",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf",
+      "allowedPattern": "arn:aws:iam::\\d+:\\S+"
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "(Required) EC2 instance id",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$"
+    },
+    "HealthCheckAlarmName": {
+      "type": "String",
+      "description": "(Required) An alarm which should be triggered when the EC2 instance's network becomes unavailable"
+    },
+    "DurationInMinutes": {
+      "type": "String",
+      "description": "(Optional) The duration of the attack in minutes (default 5)",
+      "default": "5",
+      "allowedPattern": "^\\d+$"
+    },
+    "IsRollback": {
+      "type": "String",
+      "description": "(Optional) Provide true to rollback instances in previous execution",
+      "default": "false"
+    },
+    "PreviousExecutionId": {
+      "type": "String",
+      "description": "(Optional) Previous execution id for which rollback should be performed (need in case of rollback)",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "SelectExecutionMode",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AssertAlarmToBeGreenBeforeTest",
+            "Variable": "{{IsRollback}}",
+            "StringEquals": "false"
+          }
+        ],
+        "Default": "GetPreviousExecutionInstanceId"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreenBeforeTest",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{HealthCheckAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "name": "SimulateNetworkUnavailable",
+      "action": "aws:runCommand",
+      "onFailure": "Continue",
+      "onCancel": "step:TriggerRollback",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "DocumentName": "AWSResilienceHub-NetworkUnavailableCommand_2020-07-23",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "Parameters": {
+          "DurationInMinutes": "{{DurationInMinutes}}"
+        },
+        "TimeoutSeconds": 60
+      }
+    },
+    {
+      "name": "AssertAlarmToBeRed",
+      "description": "Wait for expected alarm to be red after failure is injected",
+      "action": "aws:waitForAwsResourceProperty",
+      "onFailure": "step:RebootInstance",
+      "onCancel": "step:TriggerRollback",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{HealthCheckAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "ALARM"
+        ]
+      }
+    },
+    {
+      "name": "WaitForTestDuration",
+      "action": "aws:sleep",
+      "onFailure": "step:RebootInstance",
+      "onCancel": "step:TriggerRollback",
+      "inputs": {
+        "Duration": "PT{{DurationInMinutes}}M"
+      }
+    },
+    {
+      "name": "AssertAlarmToBeGreen",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "step:RebootInstance",
+      "onCancel": "step:TriggerRollback",
+      "timeoutSeconds": 900,
+      "inputs": {
+        "Service": "cloudwatch",
+        "Api": "DescribeAlarms",
+        "AlarmNames": [
+          "{{HealthCheckAlarmName}}"
+        ],
+        "PropertySelector": "$.MetricAlarms[0].StateValue",
+        "DesiredValues": [
+          "OK"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "RebootInstance",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "RebootInstances",
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetPreviousExecutionInstanceId",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Payload.InstanceIds[0]",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_inputs_from_ssm_step_execution",
+        "InputPayload": {
+          "ExecutionId": "{{PreviousExecutionId}}",
+          "StepName": "SimulateNetworkUnavailable",
+          "ResponseField": "InstanceIds"
+        },
+        "Script": "import json\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef get_inputs_from_ssm_step_execution(events, context):\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or 'StepName' not in events or 'ResponseField' not in events:\n        raise KeyError('Requires ExecutionId, StepName and ResponseField in events')\n\n    ssm_response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n    for step in ssm_response['AutomationExecution']['StepExecutions']:\n        if step['StepName'] == events['StepName']:\n            response_fields = events['ResponseField'].split(',')\n            output = {}\n            for response_field in response_fields:\n                step_output = step['Inputs'][response_field]\n                output[response_field] = json.loads(step_output)\n            return output\n\n    # Could not find step name\n    raise Exception('Can not find step name % in ssm execution response', events['StepName'])"
+      }
+    },
+    {
+      "name": "AssertInstanceId",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RebootInstancePreviousExecution",
+            "Variable": "{{ GetPreviousExecutionInstanceId.InstanceId }}",
+            "StringEquals": "{{ InstanceId }}"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "RebootInstancePreviousExecution",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "RebootInstances",
+        "InstanceIds": [
+          "{{GetPreviousExecutionInstanceId.InstanceId}}"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "TriggerRollback",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "RollbackExecutionId",
+          "Selector": "$.Payload.RollbackExecutionId",
+          "Type": "String"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "start_rollback_execution",
+        "InputPayload": {
+          "ExecutionId": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "import json\n\nimport boto3\nfrom botocore.config import Config\n\n\n\n\ndef start_rollback_execution(events, context):\n    output = {}\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ssm = boto3.client('ssm', config=config)\n\n    if 'ExecutionId' not in events or not events['ExecutionId']:\n        raise KeyError('Requires not empty ExecutionId')\n\n    response = ssm.get_automation_execution(AutomationExecutionId=events['ExecutionId'])\n\n    # Get parameters for current execution and add IsRollback and PreviousExecutionId\n    response_parameters = response['AutomationExecution']['Parameters']\n    response_parameters['IsRollback'] = ['true']\n    response_parameters['PreviousExecutionId'] = [events['ExecutionId']]\n\n    rollback_execution_response = ssm.start_automation_execution(\n        DocumentName=response['AutomationExecution']['DocumentName'],\n        DocumentVersion=response['AutomationExecution']['DocumentVersion'],\n        Parameters=response_parameters\n    )\n    output['RollbackExecutionId'] = rollback_execution_response['AutomationExecutionId']\n    return output"
+      },
+      "isEnd": true
+    }
+  ]
+}
