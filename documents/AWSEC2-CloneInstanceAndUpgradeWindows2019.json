@@ -67,7 +67,6 @@
       "name": "describeOriginalInstanceDetails",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
-      "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstances",
@@ -112,7 +111,6 @@
     {
       "name": "assertRootVolumeIsEbs",
       "action": "aws:assertAwsResourceProperty",
-      "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstances",
@@ -125,35 +123,11 @@
         ]
       },
       "isCritical": "true",
-      "nextStep": "assertSubnetHasAutoAssignIPV4"
-    },
-    {
-      "name": "assertSubnetHasAutoAssignIPV4",
-      "action": "aws:assertAwsResourceProperty",
-      "onFailure": "Abort",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeSubnets",
-        "Filters": [
-          {
-            "Name": "subnet-id",
-            "Values": [
-              "{{ SubnetId }}"
-            ]
-          }
-        ],
-        "PropertySelector": "$.Subnets[0].MapPublicIpOnLaunch",
-        "DesiredValues": [
-          "True"
-        ]
-      },
-      "isCritical": "true",
       "nextStep": "branchOnRebootInstanceBeforeTakingImage"
     },
     {
       "name": "branchOnRebootInstanceBeforeTakingImage",
       "action": "aws:branch",
-      "onFailure": "Abort",
       "inputs": {
         "Choices": [
           {
@@ -255,7 +229,6 @@
     {
       "name": "branchUseAlternativeKeyPair",
       "action": "aws:branch",
-      "onFailure": "Abort",
       "inputs": {
         "Choices": [
           {
@@ -264,6 +237,11 @@
               "Variable": "{{ AlternativeKeyPairName }}",
               "StringEquals": ""
             }
+          },
+          {
+            "NextStep": "serverUpgradeInstanceWithoutKeyPair",
+            "Variable": "{{ describeOriginalInstanceDetails.KeyName }}",
+            "Contains": "describeOriginalInstanceDetails.KeyName"
           }
         ],
         "Default": "serverUpgradeInstanceWithOriginalKeyPair"
@@ -271,11 +249,41 @@
       "isCritical": "true"
     },
     {
+      "name": "serverUpgradeInstanceWithoutKeyPair",
+      "action": "aws:runInstances",
+      "timeoutSeconds": 7200,
+      "maxAttempts": 3,
+      "inputs": {
+        "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
+        "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
+        "MinInstanceCount": 1,
+        "MaxInstanceCount": 1,
+        "IamInstanceProfileName": "{{ IamInstanceProfile }}",
+        "SubnetId": "{{ SubnetId }}",
+        "SecurityGroupIds": [
+          "{{ describeOriginalInstanceDetails.SecurityGroupIds }}"
+        ],
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "AWSEC2_UpgradeInstance_{{ automation:EXECUTION_ID }}"
+              }
+            ]
+          }
+        ],
+        "UserData": "PHBvd2Vyc2hlbGw+CiRzZXJ2aWNlTmFtZSA9ICJBbWF6b25TU01BZ2VudCIKJHNlcnZpY2VEb3dubG9hZFBhdGggPSAiQzpcdGVtcFxBbWF6b25TU01BZ2VudFNldHVwLmV4ZSIKCklmIChHZXQtU2VydmljZSAkc2VydmljZU5hbWUgLUVycm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUgLVdhcm5pbmdBY3Rpb24gU2lsZW50bHlDb250aW51ZSkgewogICAgSWYgKChHZXQtU2VydmljZSAkc2VydmljZU5hbWUpLlN0YXR1cyAtbmUgIlJ1bm5pbmciKSB7CiAgICAgICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgICAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgZm91bmQsIGJ1dCBpdCBpcyBub3QgcnVubmluZywgc28gc3RhcnRlZCBpdC4iCiAgICB9Cn0gRWxzZSB7CiAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgbm90IGZvdW5kLCB0cnlpbmcgdG8gaW5zdGFsbC4iCiAgICAgTmV3LUl0ZW0gLUl0ZW1UeXBlIERpcmVjdG9yeSAtRm9yY2UgLVBhdGggIkM6XHRlbXAiICAKICAgIChOZXctT2JqZWN0IFN5c3RlbS5OZXQuV2ViQ2xpZW50KS5Eb3dubG9hZEZpbGUoImh0dHBzOi8vczMuYW1hem9uYXdzLmNvbS9lYzItZG93bmxvYWRzLXdpbmRvd3MvU1NNQWdlbnQvbGF0ZXN0L3dpbmRvd3NfYW1kNjQvQW1hem9uU1NNQWdlbnRTZXR1cC5leGUiLCAiJHNlcnZpY2VEb3dubG9hZFBhdGgiKQogICAgU3RhcnQtUHJvY2VzcyAtRmlsZVBhdGggIiRzZXJ2aWNlRG93bmxvYWRQYXRoIiAgLUFyZ3VtZW50TGlzdCBAKCIvcXVpZXQiLCAiL25vcmVzdGFydCIsICIvbG9nIiwgInNzbS1pbnN0YWxsLmxvZyIsICJBTExPV0VDMklOU1RBTEw9WUVTIikgLVdhaXQKICAgIFN0YXJ0LVNsZWVwIC1zIDEwCiAgICBTdGFydC1TZXJ2aWNlICRzZXJ2aWNlTmFtZQogICAgV3JpdGUtSG9zdCAiJHNlcnZpY2VOYW1lIGluc3RhbGxlZCBhbmQgc3RhcnRlZC4iCn0KPC9wb3dlcnNoZWxsPgo8cGVyc2lzdD50cnVlPC9wZXJzaXN0Pg=="
+      },
+      "isCritical": "true",
+      "nextStep": "getServerUpgradeInstance"
+    },
+    {
       "name": "serverUpgradeInstanceWithAlternativeKeyPair",
       "action": "aws:runInstances",
       "timeoutSeconds": 7200,
       "maxAttempts": 3,
-      "onFailure": "Abort",
       "inputs": {
         "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
         "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
@@ -308,7 +316,6 @@
       "action": "aws:runInstances",
       "timeoutSeconds": 7200,
       "maxAttempts": 3,
-      "onFailure": "Abort",
       "inputs": {
         "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
         "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
@@ -627,7 +634,10 @@
             "",
             "Check-OSUpgradeCompatibility",
             "$WindowSnapShotId = \"{{ BYOLWindowsMediaSnapshotId }}\"",
-            "Validate-InstanceLicensing($WindowSnapShotId)"
+            "if (-not ([string]::IsNullOrEmpty($WindowSnapShotId)))",
+            "{",
+            "\\tValidate-InstanceLicensing($WindowSnapShotId)",
+            "}"
           ]
         }
       }
@@ -1201,7 +1211,6 @@
     {
       "name": "branchUpgradeSleep",
       "action": "aws:branch",
-      "onFailure": "Abort",
       "inputs": {
         "Choices": [
           {
