@@ -4,11 +4,21 @@
   "parameters": {},
   "mainSteps": [
     {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "name": "UpdateEC2WindowsLaunchAgents",
+      "action": "aws:runPowerShellScript",
       "maxAttempts": 3,
+      "onFailure": "Abort",
+      "timeoutSeconds": 36000,
       "inputs": {
         "timeoutSeconds": "36000",
         "runCommand": [
-          "$Region = '{{aws:region}'",
+          "$Region = \"{{aws:region}}\"",
           "# We want all errors to be fatal",
           "$ErrorActionPreference = 'Stop'",
           "$ModuleName = 'AWSUpdateWindowsInstance'",
@@ -92,8 +102,8 @@
           "",
           "function Get-InstalledSoftware {",
           "    $Apps = @(",
-          "        Get-ItemProperty \"HKLM:\\\\SOFTWARE\\\\Wow6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*\" # 32 Bit",
-          "        Get-ItemProperty \"HKLM:\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*\\\"             # 64 Bit",
+          "        Get-ItemProperty \"HKLM:\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*\"  # 32 Bit",
+          "        Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*\\\"             # 64 Bit",
           "    )",
           "    return $Apps",
           "}",
@@ -778,26 +788,95 @@
           "        exit 0",
           "    }",
           "",
-          "    try {",
-          "        $localParam = Get-LocalParam",
-          "        $startProcess = @{",
-          "            FilePath     = \"$env:SystemRoot\\System32\\msiexec.exe\"",
-          "            ArgumentList = @(\"ADDLOCAL=$localParam\", '/quiet', '/i', $ec2LaunchV2Msi)",
-          "            Wait         = $true",
-          "            PassThru     = $true",
-          "        }",
-          "        Start-Process @startProcess",
-          "    } catch {",
-          "        Write-Host 'The msiexec process failed with the following error: '$_'.'",
-          "        Exit -1",
+          "    function WriteStandardError {",
+          "        param (",
+          "            [string]$Message",
+          "        )",
+          "        $Host.UI.WriteErrorLine($Message)",
           "    }",
+          "",
+          "    # Constant exit code values",
+          "    $exitWithReboot = 3010",
+          "",
+          "    # Exit codes for msiexec that indicate the installation can be retried",
+          "    $retryableCodes = @{",
+          "        1618 = 'ERROR_INSTALL_ALREADY_RUNNING: Another installation is already in progress. Retrying installation in \"{0}\" seconds.'",
+          "    }",
+          "",
+          "    # Exit codes for msiexec that require a system reboot",
+          "    $rebootCodes = @{",
+          "        1641 = 'SUCCESS_REBOOT_INITIATED: The installer has started a reboot.'",
+          "        3010 = 'SUCCESS_REBOOT_REQUIRED: A restart is required to complete the installation.'",
+          "    }",
+          "",
+          "    $successCodes = @{",
+          "        0 = 'SUCCESS: Action completed successfully.'",
+          "    }",
+          "",
+          "    # Exit codes for msiexec that are relevant for this installation",
+          "    $knownCodes = @{",
+          "        1602 = 'ERROR_INSTALL_USEREXIT: User canceled installation.'",
+          "        1603 = 'ERROR_INSTALL_FAILURE: Fatal error during installation.'",
+          "        1618 = 'ERROR_INSTALL_ALREADY_RUNNING: Another installation is already in progress. Complete that installation before proceeding with this install.'",
+          "        1619 = 'ERROR_INSTALL_PACKAGE_OPEN_FAILED: Error opening the installation package. Verify that the package exists and that you can access it, or contact the application vendor to verify that this is a valid Windows Installer package.'",
+          "        1620 = 'ERROR_INSTALL_PACKAGE_INVALID: Error opening the installation package. Contact the application vendor to verify that this is a valid Windows Installer package.'",
+          "        1622 = 'ERROR_INSTALL_LOG_FAILURE: Error opening installation log file. Verify that the specified log file location exists and is writable.'",
+          "    }",
+          "",
+          "    Function InstallWithRetry {",
+          "        param(",
+          "            [Parameter(Mandatory = $false)]",
+          "            [int]$MaximumRetry = 5,",
+          "",
+          "            [Parameter(Mandatory = $false)]",
+          "            [int]$WaitSeconds = 60",
+          "        )",
+          "",
+          "        $count = 0",
+          "        do {",
+          "            $count++",
+          "            $localParam = Get-LocalParam",
+          "            $startProcess = @{",
+          "                FilePath     = \"$env:SystemRoot\\System32\\msiexec.exe\"",
+          "                ArgumentList = @(\"ADDLOCAL=$localParam\", '/quiet', '/i', $ec2LaunchV2Msi)",
+          "                Wait         = $true",
+          "                PassThru     = $true",
+          "            }",
+          "            $cmd = Start-Process @startProcess",
+          "",
+          "            if (($cmd.ExitCode -in $retryableCodes.Keys) -and ($count -lt $maximumRetry)) {",
+          "                Write-Host $($retryableCodes[$cmd.ExitCode] -f $WaitSeconds)",
+          "                Start-Sleep -Seconds $WaitSeconds",
+          "                continue",
+          "            }",
+          "            if ($cmd.ExitCode -in $rebootCodes.Keys) {",
+          "                Write-Host $rebootCodes[$cmd.ExitCode]",
+          "                [System.Environment]::Exit($exitWithReboot)",
+          "            }",
+          "            if ($cmd.ExitCode -in $successCodes.Keys) {",
+          "                Write-Host $successCodes[$cmd.ExitCode]",
+          "                return",
+          "            }",
+          "            elseif ($cmd.ExitCode -in $knownCodes.Keys) {",
+          "                WriteStandardError -Message $knownCodes[$cmd.ExitCode]",
+          "            }",
+          "            else {",
+          "                WriteStandardError -Message  \"UNKNOWN: Unknown exit code '$($cmd.ExitCode)'\"",
+          "            }",
+          "            return",
+          "        } while ($count -lt $MaximumRetry)",
+          "    }",
+          "",
+          "    Write-Host 'Starting installation of EC2Launch v2'",
+          "    InstallWithRetry",
+          "",
           "    $launchv2 = Get-InstalledSoftware | where-object { $_.DisplayName -eq 'Amazon EC2Launch' }",
           "    $version = $launchv2.version",
           "    if (-not ($version -match $VersionRegex)) {",
           "        Write-Host 'Version is not valid.'",
           "        exit -1",
           "    }",
-          "    Write-Host \"EC2Launch v2 was updated to version '$latestBinaryVersion'.\"",
+          "    Write-Host \"EC2Launch v2 was updated to version '$($launchv2.DisplayVersion)'.\"",
           "    Write-Host \"The latest EC2Launch v2 version is '$latestBinaryVersion'.\"",
           "    Exit 0",
           "}",
@@ -841,20 +920,20 @@
           "Write-Host 'No launch agent was found.'",
           "exit -1"
         ]
-      },
-      "name": "UpdateEC2WindowsLaunchAgents",
-      "action": "aws:runPowerShellScript",
-      "onFailure": "Abort",
-      "timeoutSeconds": 36000,
-      "precondition": {
-        "StringEquals": [
-          "platformType",
-          "Windows"
-        ]
       }
     },
     {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "name": "UpdateEC2CloudInit",
+      "action": "aws:runShellScript",
       "maxAttempts": 3,
+      "onFailure": "Abort",
+      "timeoutSeconds": 36000,
       "inputs": {
         "timeoutSeconds": "36000",
         "runCommand": [
@@ -895,25 +974,26 @@
           "    exit",
           "  ;;",
           "  *)",
-          "    echo \"Automatic updates are not supported on $NAME.\"",
+          "    echo 'Automatic updates are not supported on $NAME.'",
           "    exit 1",
           "  ;;",
-          "esac"
-        ]
-      },
-      "name": "UpdateEC2CloudInit",
-      "action": "aws:runShellScript",
-      "onFailure": "Abort",
-      "timeoutSeconds": 36000,
-      "precondition": {
-        "StringEquals": [
-          "platformType",
-          "Linux"
+          "esac",
+          ""
         ]
       }
     },
     {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "MacOS"
+        ]
+      },
+      "name": "UpdateEC2MacOSInit",
+      "action": "aws:runShellScript",
       "maxAttempts": 3,
+      "onFailure": "Abort",
+      "timeoutSeconds": 36000,
       "inputs": {
         "timeoutSeconds": "36000",
         "runCommand": [
@@ -939,16 +1019,6 @@
           "  echo 'Failure.'",
           "  exit",
           "fi"
-        ]
-      },
-      "name": "UpdateEC2MacOSInit",
-      "action": "aws:runShellScript",
-      "onFailure": "Abort",
-      "timeoutSeconds": 36000,
-      "precondition": {
-        "StringEquals": [
-          "platformType",
-          "MacOS"
         ]
       }
     }

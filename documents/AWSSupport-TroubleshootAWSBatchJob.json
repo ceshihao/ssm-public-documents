@@ -1,0 +1,343 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The **AWSSupport-TroubleshootAWSBatchJob** runbook helps you troubleshoot an AWS Batch Job that is stuck in `RUNNABLE` status. This automation checks the resources in the AWS Batch Compute Environments that are mapped to the job's queue by verifying the following prerequisites:\n\n1. Check if the Compute Environment is configured with enough CPU, memory, or GPU resources to run the job\n2. Check if the Compute Environment has instances and the instances are available to run the job\n3. Check if the Compute Environment service role has sufficient permissions to make calls to other AWS services on your behalf\n\n## Notes:\n\n- You must run this runbook in the same AWS Region as your job that is stuck in `RUNNABLE` status.\n- This runbook can be executed for AWS Batch jobs scheduled on Amazon Elastic Container Service (Amazon ECS), either Fargate or EC2 instances. If the automation is executed for an AWS Batch job on Amazon Elastic Kubernetes Service (Amazon EKS), the execution stops.\n- If instances are available to run the job but fail to register the Amazon ECS cluster, this runbook executes the `AWSSupport-TroubleshootECSContainerInstance` automation runbook to help you troubleshoot the issue. For more information, see the [AWSSupport-TroubleshootECSContainerInstance](https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-aws-troubleshoot-ecs-container-instance.html) runbook reference.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "JobId": {
+      "type": "String",
+      "description": "(Required) The ID of the AWS Batch Job that is stuck in RUNNABLE status.",
+      "allowedPattern": "^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}(:[0-9]+)?(#[0-9]+)?$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "PreflightPermissionChecks",
+      "onFailure": "step:ExecutionResults",
+      "onCancel": "step:ExecutionResults",
+      "action": "aws:executeScript",
+      "description": "Performs preflight IAM permission checks against the executing user/role. Incase of any missing permissions this step provides the API Actions missing in the global output section",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "iam_permission_handler",
+        "InputPayload": {
+          "JobId": "{{ JobId }}"
+        },
+        "Attachment": "attachment.zip",
+        "Script": "import lib.iam.simulation as permission_evaluation\nfrom lib.iam.iam_const import REQUIRED_PERMISSIONS\nfrom lib.job.job import Job\nfrom lib.clients.client_init import client_init\nimport logging\n\n\nsts_client = client_init(\"sts\")\n\nlog = logging.getLogger(__name__)\n\n\ndef iam_permission_handler(events, context):\n    results = \"FAILED\"\n    info_codes = []\n    info_message = []\n    execution_id = context[\"automation:EXECUTION_ID\"].split(\"-\")[-1]\n\n    get_caller_identity_response = sts_client.get_caller_identity()\n    user_id = get_caller_identity_response.get(\"UserId\").split(\":\")[0]\n\n    info_codes, info_message, results = permission_evaluation.simulate_caller_policy(user_id, execution_id, REQUIRED_PERMISSIONS)\n    try:\n        job = Job(events[\"JobId\"])\n        if job._share_id != \"\":\n            info_message.append(\"DISCLAIMER: The automation found out that the job {0} is using Fair-Share Scheduling.\\nIn this context, the automation execution may take some time. If it runs into any issues, please reach out to AWS Support for further assistance.\\n\".format(job.job_id))\n    except Exception as e:\n        log.debug(f\"Failed creating object: {e!r}\")\n\n    return {\n        \"results\": results,\n        \"message\": \"\".join(info_message),\n        \"info_codes\": info_codes,\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "Permission_check_results",
+          "Selector": "$.Payload.results",
+          "Type": "String"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "info_codes",
+          "Selector": "$.Payload.info_codes",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "ProceedOnlyIfUserHasPermission"
+    },
+    {
+      "name": "ProceedOnlyIfUserHasPermission",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "description": "Branches based on whether the user or role being used to run this automartion has permissions to all required actions for the runbook.",
+      "inputs": {
+        "Choices": [
+          {
+            "Not": {
+              "Variable": "{{ PreflightPermissionChecks.Permission_check_results }}",
+              "StringEquals": "FAILED"
+            },
+            "NextStep": "AWSBatchJobEvaluation"
+          }
+        ],
+        "Default": "ExecutionResults"
+      }
+    },
+    {
+      "name": "AWSBatchJobEvaluation",
+      "onFailure": "step:ExecutionResults",
+      "onCancel": "step:ExecutionResults",
+      "action": "aws:executeScript",
+      "description": "Performs checks against the AWS Batch Job, Job Queue, and Compute Environment resources, verifying the job exists and is in RUNNABLE state.",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "job_checks_handler",
+        "InputPayload": {
+          "JobId": "{{ JobId }}"
+        },
+        "Attachment": "attachment.zip",
+        "Script": "from lib.job.job import Job\nfrom lib.job.job_const import INFO_MESSAGE, HIGHEST_POSSIBLE_CPU_FOR_BATCH, HIGHEST_POSSIBLE_MEMORY_FOR_BATCH_MB\n\n\ndef job_checks_handler(events, context):\n    results = \"\"\n    message = []\n    info_codes = []\n\n    job = Job(events[\"JobId\"])\n    if not job.does_job_exist():\n        message.append(INFO_MESSAGE.get(\"JOB_I000\").format(job.job_id, context[\"global:REGION\"]))\n        info_codes.append(\"JOB_I000\")\n        results = \"FAILED\"\n    elif job.job_vcpu > HIGHEST_POSSIBLE_CPU_FOR_BATCH:\n        message.append(INFO_MESSAGE.get(\"JOB_I006\").format(int(job.job_vcpu), HIGHEST_POSSIBLE_CPU_FOR_BATCH))\n        info_codes.append(\"JOB_I006\")\n        results = \"FAILED\"\n    elif job.job_memory_mb > HIGHEST_POSSIBLE_MEMORY_FOR_BATCH_MB:\n        message.append(INFO_MESSAGE.get(\"JOB_I007\").format(int(job.job_memory_mb), HIGHEST_POSSIBLE_MEMORY_FOR_BATCH_MB, int(HIGHEST_POSSIBLE_MEMORY_FOR_BATCH_MB/1024)))\n        info_codes.append(\"JOB_I007\")\n        results = \"FAILED\"\n    elif job.platform == \"EKS\":\n        message.append(INFO_MESSAGE.get(\"JOB_I003\").format(job.job_id))\n        info_codes.append(\"JOB_I003\")\n        results = \"FAILED\"\n    elif not job.is_job_runnable():\n        partition = context['global:AWS_PARTITION']\n        job_console_url = f\"https://{job.job_region}.console.{partition}.amazon.com/batch/home?region={job.job_region}#jobs/detail/{job.job_id}\"\n        message.append(INFO_MESSAGE.get(\"JOB_I001\").format(job.job_id, job.job_status, job_console_url))\n        info_codes.append(\"JOB_I001\")\n        results = \"FAILED\"\n    elif job.first_runnable_in_jq() != job.job_id:\n        message.append(INFO_MESSAGE.get(\"JOB_I005\").format(job.job_id, job.first_runnable_in_jq()))\n        info_codes.append(\"JOB_I005\")\n        results = \"FAILED\"\n    else:\n        if job.platform == \"FARGATE\":\n            message.append(INFO_MESSAGE.get(\"JOB_I004\").format(job.job_id))\n            info_codes.append(\"JOB_I004\")\n\n        message.append(INFO_MESSAGE.get(\"JOB_I002\").format(job.job_id))\n        info_codes.append(\"JOB_I002\")\n        results = \"SUCCESS\"\n    return {\n        \"results\": results,\n        \"message\": \"\".join(message),\n        \"info_codes\": info_codes,\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "Job_check_results",
+          "Selector": "$.Payload.results",
+          "Type": "String"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "info_codes",
+          "Selector": "$.Payload.info_codes",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "ProceedOnlyIfBatchJobExistsAndIsinRunnableState"
+    },
+    {
+      "name": "ProceedOnlyIfBatchJobExistsAndIsinRunnableState",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "description": "Branches based on whether the job exists and it is in RUNNABLE status.",
+      "inputs": {
+        "Choices": [
+          {
+            "Not": {
+              "Variable": "{{ AWSBatchJobEvaluation.Job_check_results }}",
+              "StringEquals": "FAILED"
+            },
+            "NextStep": "BatchComputeEnvironmentEvaluation"
+          }
+        ],
+        "Default": "ExecutionResults"
+      }
+    },
+    {
+      "name": "BatchComputeEnvironmentEvaluation",
+      "onFailure": "step:ExecutionResults",
+      "onCancel": "step:ExecutionResults",
+      "action": "aws:executeScript",
+      "description": "Performs checks against the AWS Batch Compute Environment.",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "ce_checks_handler",
+        "InputPayload": {
+          "JobId": "{{ JobId }}"
+        },
+        "Attachment": "attachment.zip",
+        "Script": "from lib.job.job import Job\nfrom lib.computeEnvironment.compenv import ComputeEnv\nfrom lib.computeEnvironment.compenv_const import INFO_MESSAGE\nfrom batch_permissions_checks_handler import batch_permissions_checks_handler\nfrom spotfleet_permissions_checks_handler import spotfleet_permissions_checks_handler\n\n\ndef ce_checks_handler(events, context):\n    job = Job(events[\"JobId\"])\n    message = []\n    info_codes = []\n    result = []\n    results = \"\"\n    failed_all_checks = False\n    compute_environment_list = job.get_compute_environment_list()\n    compute_env_to_check_infra = \"\"\n\n    if compute_environment_list == []:\n        message.append(INFO_MESSAGE.get(\"CE_I008\"))\n        info_codes.append(\"CE_I008\")\n        results = \"FAILED\"\n    else:\n        for compenv in compute_environment_list:\n            result = []\n            ce = ComputeEnv(compenv)\n            message.append(INFO_MESSAGE.get(\"CE_I007\").format(ce.ce_name))\n\n            if ce.ce_type == \"UNMANAGED\":\n                message.append(INFO_MESSAGE.get(\"CE_I006\").format(ce.ce_name))\n                info_codes.append(\"CE_I006\")\n\n            if ce.ce_status == 'INVALID' or ce.ce_status == 'UPDATING':\n\n                if \"CLIENT_ERROR - User\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    slr_result, slr_message, slr_info_codes = batch_permissions_checks_handler(ce, context)\n                    message.extend(slr_message)\n                    info_codes.extend(slr_info_codes)\n                    result.append(slr_result)\n\n                elif \"SpotFleetRequestConfig.IamFleetRole\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    sfr_result, sfr_message, sfr_info_codes = spotfleet_permissions_checks_handler(ce, context)\n                    message.extend(sfr_message)\n                    info_codes.extend(sfr_info_codes)\n                    result.append(sfr_result)\n\n                elif \"CLIENT_ERROR - Launch template name already\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I009\"))\n                    info_codes.append(\"CE_I009\")\n\n                elif \"CLIENT_ERROR - The specified launch template, with template ID\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I010\"))\n                    info_codes.append(\"CE_I010\")\n\n                elif \"CLIENT_ERROR - Access denied\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I011\"))\n                    info_codes.append(\"CE_I011\")\n\n                elif \"Internal Error\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I012\").format(ce.ce_name))\n                    info_codes.append(\"CE_I012\")\n\n                elif \"INVALID CLIENT_ERROR - null\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I012\").format(ce.ce_name))\n                    info_codes.append(\"CE_I012\")\n\n                elif \"CLIENT_ERROR - The request uses the same client token as previous, but non-identical request\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I012\").format(ce.ce_name))\n                    info_codes.append(\"CE_I012\")\n\n                elif \"CLIENT_ERROR - You are not authorized to use launch template\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    slr_result, slr_message, slr_info_codes = batch_permissions_checks_handler(ce, context)\n                    message.extend(slr_message)\n                    info_codes.extend(slr_info_codes)\n                    result.append(slr_result)\n                    message.append(INFO_MESSAGE.get(\"CE_I013\"))\n                    info_codes.append(\"CE_I013\")\n\n                elif \"CLIENT_ERROR - Client token already used before\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I014\"))\n                    info_codes.append(\"CE_I014\")\n\n                elif \"CLIENT_ERROR - Unable to delete\" in ce.ce_status_reason:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n                    message.append(INFO_MESSAGE.get(\"CE_I015\").format(ce.ce_name))\n                    info_codes.append(\"CE_I015\")\n\n                else:\n                    message.append(INFO_MESSAGE.get(\"CE_I000\").format(ce.ce_name, ce.ce_status_reason))\n                    info_codes.append(\"CE_I000\")\n                    result.append(\"FAILED\")\n\n            if ce.ce_state == 'DISABLED':\n                message.append(INFO_MESSAGE.get(\"CE_I001\").format(ce.ce_name))\n                info_codes.append(\"CE_I001\")\n                result.append(\"FAILED\")\n\n            if job.job_vcpu > ce.max_vcpus and ce.ce_type == \"MANAGED\":\n                message.append(INFO_MESSAGE.get(\"CE_I019\").format(ce.ce_name))\n                info_codes.append(\"CE_I019\")\n                result.append(\"FAILED\")\n\n            elif job.job_vcpu > float(ce.get_availalble_vcpus()) and ce.ce_type == \"MANAGED\":\n                message.append(INFO_MESSAGE.get(\"CE_I002\").format(ce.ce_name))\n                info_codes.append(\"CE_I002\")\n                result.append(\"WARNING\")\n\n            if not ce.ecs_cluster_has_instances() and ce.ce_type == \"UNMANAGED\":\n                message.append(INFO_MESSAGE.get(\"CE_I016\").format(ce.ecs_cluster_arn, ce.ce_type, ce.ce_name))\n                info_codes.append(\"CE_I016\")\n                result.append(\"FAILED\")\n\n            if not ce.can_instance_types_host_job(job) and ce.ce_type == \"MANAGED\" and not job.platform == \"FARGATE\":\n                result.append(\"FAILED\")\n                if ce.has_optimal:\n                    message.append(INFO_MESSAGE.get(\"CE_I004\").format(ce.ce_name, events[\"JobId\"], int(job._job_vcpu), int(job._job_memory_mb), int(job._job_gpu)))\n                    info_codes.append(\"CE_I004\")\n                else:\n                    message.append(INFO_MESSAGE.get(\"CE_I020\").format(events[\"JobId\"], int(job._job_vcpu), int(job._job_memory_mb), int(job._job_gpu), ce.ce_name))\n                    info_codes.append(\"CE_I020\")\n\n            if ce.allocation_strategy == \"BEST_FIT\" or ce.allocation_strategy == \"\":\n                message.append(INFO_MESSAGE.get(\"CE_I021\").format(ce.ce_name))\n                info_codes.append(\"CE_I021\")\n\n            if \"FAILED\" not in result:\n                if \"WARNING\" in result:\n                    message.append(INFO_MESSAGE.get(\"CE_I017\").format(ce.ce_name, events[\"JobId\"]))\n                    info_codes.append(\"CE_I017\")\n                else:\n                    if not job.platform == \"FARGATE\":\n                        message.append(INFO_MESSAGE.get(\"CE_I003\").format(ce.ce_name, events[\"JobId\"]))\n                        info_codes.append(\"CE_I003\")\n                    else:\n                        message.append(INFO_MESSAGE.get(\"CE_I018\").format(ce.ce_name, events[\"JobId\"]))\n                        info_codes.append(\"CE_I018\")\n                results = \"SUCCESS\"\n                failed_all_checks = True\n                compute_env_to_check_infra = ce.ce_name\n                break\n\n        if not failed_all_checks:\n            message.append(INFO_MESSAGE.get(\"CE_I005\"))\n            info_codes.append(\"CE_I005\")\n            results = \"FAILED\"\n\n    return {\n        \"results\": results,\n        \"message\": \"\".join(message),\n        \"info_codes\": info_codes,\n        \"is_fargate_job\": str(job.platform == \"FARGATE\"),\n        \"compute_env_to_check_infra\": compute_env_to_check_infra\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "compute_env_results",
+          "Selector": "$.Payload.results",
+          "Type": "String"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "info_codes",
+          "Selector": "$.Payload.info_codes",
+          "Type": "StringList"
+        },
+        {
+          "Name": "is_fargate_job",
+          "Selector": "$.Payload.is_fargate_job",
+          "Type": "String"
+        },
+        {
+          "Name": "compute_env_to_check_infra",
+          "Selector": "$.Payload.compute_env_to_check_infra",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ProceedOnlyIfComputeEnvironmentChecksAreOK"
+    },
+    {
+      "name": "ProceedOnlyIfComputeEnvironmentChecksAreOK",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "description": "Branches based on whether the Compute Environments checks succeeded or not.",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ BatchComputeEnvironmentEvaluation.compute_env_results }}",
+                "StringEquals": "SUCCESS"
+              },
+              {
+                "Variable": "{{ BatchComputeEnvironmentEvaluation.is_fargate_job }}",
+                "StringEquals": "True"
+              }
+            ],
+            "NextStep": "ExecutionResults"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ BatchComputeEnvironmentEvaluation.compute_env_results }}",
+                "StringEquals": "SUCCESS"
+              },
+              {
+                "Variable": "{{ BatchComputeEnvironmentEvaluation.is_fargate_job }}",
+                "StringEquals": "False"
+              }
+            ],
+            "NextStep": "UnderlyingInfraEvaluation"
+          }
+        ],
+        "Default": "ExecutionResults"
+      }
+    },
+    {
+      "name": "UnderlyingInfraEvaluation",
+      "onFailure": "step:ExecutionResults",
+      "onCancel": "step:ExecutionResults",
+      "action": "aws:executeScript",
+      "description": "Performs checks against the underlying Auto Scaling Group or Spot Fleet Request.",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "asg_sfr_checks_handler",
+        "InputPayload": {
+          "JobId": "{{ JobId }}",
+          "ComputeEnvToCheckInfra": "{{BatchComputeEnvironmentEvaluation.compute_env_to_check_infra}}"
+        },
+        "Attachment": "attachment.zip",
+        "Script": "from lib.clients.client_init import client_init\nfrom lib.autoscaling.asg_consts import INFO_MESSAGE as ASG_INFO_MESSAGE\nfrom lib.autoscaling.AutoScalingGroup import AutoScalingGroup, get_asg_name\nfrom lib.computeEnvironment.compenv import ComputeEnv\nfrom lib.job.job import Job\nfrom lib.ecsAutomation.ecsAutomation import get_non_joining_instances_asg, get_non_joining_instances_sfr, select_instances, format_non_joining_instances, format_target_maps\nfrom lib.ecsAutomation.ecs_const import INFO_MESSAGE as ASG_SFR_INFO_MESSAGE\nfrom lib.spotFleet.spotfleet import SpotFleet, get_sfr_ids, check_ctrail_for_sfr_error\nfrom lib.spotFleet.spotfleet_const import INFO_MESSAGE as SFR_INFO_MESSAGES\nfrom spotfleet_permissions_checks_handler import spotfleet_permissions_checks_handler\n\nec2_client = client_init('ec2')\n\n\ndef asg_sfr_checks_handler(events, context):\n\n    results = \"\"\n    message = []\n    info_codes = []\n    job = Job(events[\"JobId\"])\n    compute_environment = ComputeEnv(events[\"ComputeEnvToCheckInfra\"])\n    non_joining_instances = {}\n    non_joining_asgs = {}\n    non_joining_sfrs = {}\n    non_joining_clusters = {}\n\n    if (compute_environment.is_ce_infra_asg()):\n        asg_name = get_asg_name(compute_environment.ce_name)\n        if asg_name is not None:\n            asg = AutoScalingGroup(asg_name)\n            # Check ASG errors\n            internal_err, other_asg_err, status_message = asg.check_asg_errors(job._created_at)\n            if internal_err:\n\n                message.append(ASG_INFO_MESSAGE.get(\"ASG_I000\").format(asg.asg_name, status_message))\n                info_codes.append(\"ASG_I000\")\n                results = \"FAILED\"\n\n            if other_asg_err:\n                message.append(ASG_INFO_MESSAGE.get(\"ASG_I001\").format(asg.asg_name, status_message))\n                info_codes.append(\"ASG_I001\")\n                results = \"FAILED\"\n\n            cluster_name = compute_environment.ecs_cluster_arn.split(\"/\")[-1]\n            is_non_joining, instances = get_non_joining_instances_asg(cluster_name, asg)\n            if is_non_joining:\n                non_joining_instances[cluster_name] = instances\n                non_joining_clusters[compute_environment] = cluster_name\n                non_joining_asgs[compute_environment] = asg\n\n        else:\n            message.append(ASG_INFO_MESSAGE.get(\"ASG_I002\").format(compute_environment.ce_name))\n            info_codes.append(\"ASG_I002\")\n            results = \"FAILED\"\n\n    else:\n        sfr_ids = get_sfr_ids(compute_environment.ce_name)\n        if len(sfr_ids) == 1:\n            sfr = SpotFleet(sfr_ids[0])\n            cluster_name = compute_environment.ecs_cluster_arn.split(\"/\")[-1]\n            is_non_joining, instances = get_non_joining_instances_sfr(cluster_name, sfr)\n\n            if is_non_joining:\n                non_joining_instances[cluster_name] = instances\n                non_joining_clusters[compute_environment] = cluster_name\n                non_joining_sfrs[compute_environment] = sfr\n\n            else:\n                partition = context[\"global:AWS_PARTITION\"]\n                region = context[\"global:REGION\"]\n                sfr_console_url = f\"https://{region}.console.{partition}.amazon.com/ec2/home?region={region}#SpotInstancesDetails:id={sfr_ids[0]}\"\n                extracted_sfr_events = sfr.fetch_sfr_history_events(job.created_at)\n                if extracted_sfr_events:\n                    message.append(SFR_INFO_MESSAGES.get(\"SFR_I002\").format(compute_environment.ce_name, str(extracted_sfr_events), sfr_ids[0], sfr_console_url))\n                    info_codes.append(\"SFR_I002\")\n                    results = \"FAILED\"\n                else:\n                    results = \"SUCCESS\"\n\n        elif len(sfr_ids) >= 2:\n            message.append(SFR_INFO_MESSAGES.get(\"SFR_I001\").format(compute_environment.ce_name))\n            info_codes.append(\"SFR_I001\")\n            results = \"SUCCESS\"\n\n        else:\n            message.append(SFR_INFO_MESSAGES.get(\"SFR_I000\").format(compute_environment.ce_name))\n            info_codes.append(\"SFR_I000\")\n            check_sfr_errors = check_ctrail_for_sfr_error(job.created_at, compute_environment.ce_name)\n            if check_sfr_errors:\n                if \"not have permission\" in check_sfr_errors:\n                    sfr_result, sfr_message, sfr_info_codes = spotfleet_permissions_checks_handler(compute_environment, context)\n                    message.extend(sfr_message)\n                    info_codes.extend(sfr_info_codes)\n                    results = \"FAILED\"\n                else:\n                    message.append(SFR_INFO_MESSAGES.get(\"SFR_I003\").format(check_sfr_errors))\n                    info_codes.append(\"SFR_I003\")\n                    results = \"FAILED\"\n            else:\n                message.append(SFR_INFO_MESSAGES.get(\"SFR_I004\"))\n                info_codes.append(\"SFR_I004\")\n                results = \"SUCCESS\"\n\n    # execute the automation\n    instances_to_run_automation = {}  # empty dict if we are not going to run the automation\n    run_ecs_automation = \"No\"\n    target_maps = []\n    if len(non_joining_instances.keys()) != 0:  # We will run the automation\n        num_non_joining_instances, instances_to_run_automation, selected_instances_list = select_instances(ec2_client, non_joining_instances)\n        message.append(ASG_SFR_INFO_MESSAGE.get(\"ASG_SFR_I000\").format(num_non_joining_instances, format_non_joining_instances(non_joining_instances, non_joining_clusters), str(selected_instances_list)))\n        info_codes.append(\"ASG_SFR_I000\")\n        results = \"FAILED\"\n        run_ecs_automation = \"Yes\"\n\n        target_maps = format_target_maps(instances_to_run_automation)\n\n    elif results == \"FAILED\":\n        pass\n    else:\n        results = \"SUCCESS\"\n        message.append(ASG_SFR_INFO_MESSAGE.get(\"ASG_SFR_I001\").format(compute_environment.ce_name))\n        info_codes.append(\"ASG_SFR_I001\")\n    return {\n        \"results\": results,\n        \"message\": \"\".join(message),\n        \"info_codes\": info_codes,\n        \"instances\": target_maps,\n        \"run_ecs_automation\": run_ecs_automation\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "underlying_infra_results",
+          "Selector": "$.Payload.results",
+          "Type": "String"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "info_codes",
+          "Selector": "$.Payload.info_codes",
+          "Type": "StringList"
+        },
+        {
+          "Name": "instances",
+          "Selector": "$.Payload.instances",
+          "Type": "MapList"
+        },
+        {
+          "Name": "run_ecs_automation",
+          "Selector": "$.Payload.run_ecs_automation",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ProceedOnlyIfInstancesNotJoiningEcsCluster"
+    },
+    {
+      "name": "ProceedOnlyIfInstancesNotJoiningEcsCluster",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "description": "Branches based on whether there are instances not joining to the Amazon ECS cluster.",
+      "inputs": {
+        "Choices": [
+          {
+            "Not": {
+              "Variable": "{{ UnderlyingInfraEvaluation.run_ecs_automation }}",
+              "StringEquals": "No"
+            },
+            "NextStep": "EcsAutomationRunner"
+          }
+        ],
+        "Default": "ExecutionResults"
+      }
+    },
+    {
+      "name": "EcsAutomationRunner",
+      "onFailure": "step:ExecutionResults",
+      "onCancel": "step:ExecutionResults",
+      "action": "aws:executeAutomation",
+      "description": "Runs the AWSSupport-TroubleshootECSContainerInstance automation for the instances not joining to the Amazon ECS cluster.",
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "inputs": {
+        "DocumentName": "AWSSupport-TroubleshootECSContainerInstance",
+        "TargetMaps": "{{ UnderlyingInfraEvaluation.instances }}",
+        "RuntimeParameters": {
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        }
+      },
+      "nextStep": "ExecutionResults"
+    },
+    {
+      "name": "ExecutionResults",
+      "action": "aws:executeScript",
+      "description": "Generates output based on previous steps.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "results_report_handler",
+        "Script": "from consts import INFO_ICON\nfrom lib.ecsAutomation.ecsAutomation import get_automation_execution\nfrom lib.clients.client_init import client_init\n\nEXECUTION_MESSAGE = {\n    \"RES_I100\": (\n        \"\\n\\n\\n#######################\"\n        \"\\nRUNBOOK EXECUTION LOGS\"\n        \"\\n#######################\\n\"\n    ),\n    \"RES_I101\": (\n        \"#########################\"\n        \"\\nEXECUTION RESULT SUMMARY\"\n        \"\\n#########################\\n\"\n        \"Here is the summary of the execution of this runbook:\\n\\n\"\n    ),\n    \"RES_I000\": (\n        \"\\n+++++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:PreflightPermissionChecks\"\n        \"\\n+++++++++++++++++++++++++++++++++\\n\"\n        \"{0}\"\n    ),\n    \"RES_I001\": (\n        \"\\n++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:AWSBatchJobEvaluation\"\n        \"\\n++++++++++++++++++++++++++++++\\n\"\n        \"{0}\"\n    ),\n    \"RES_I002\": (\n        \"\\n++++++++++++++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:BatchComputeEnvironmentEvaluation\"\n        \"\\n++++++++++++++++++++++++++++++++++++++++++\\n\"\n        \"{0}\"\n    ),\n    \"RES_I003\": (\n        \"\\n++++++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:UnderlyingInfraEvaluation\"\n        \"\\n++++++++++++++++++++++++++++++++++\\n\"\n        \"{0}\"\n    ),\n    \"RES_I004\": (\n        \"\\n+++++++++++++++++++++++++++\"\n        \"\\nSTEP:EcsAutomationRunner\"\n        \"\\n+++++++++++++++++++++++++++\\n\"\n        \"{0}\"\n    ),\n    \"RES_I005\": (\n        INFO_ICON + \"The automation could not find the reason for the job to be stuck in RUNNABLE status.\"\n        \"\\nPlease open a Support case with AWS Support to help troubleshooting this issue.\\n\\n\"\n    )\n}\n\n\ndef results_report_handler(events, context):\n\n    execution_message = []\n    info_codes = []\n    permission_analysis = events[\"PreflightPermissionChecks\"]\n    permission_analysis_results = events[\"PreflightPermissionChecksResults\"]\n\n    job_analysis = events[\"AWSBatchJobEvaluation\"]\n    job_analysis_results = events[\"AWSBatchJobEvaluationResults\"]\n\n    compute_env_analysis = events[\"BatchComputeEnvironmentEvaluation\"]\n    compute_env_analysis_results = events[\"BatchComputeEnvironmentEvaluationResults\"]\n    is_fargate_job = events[\"BatchComputeEnvironmentEvaluationFargate\"]\n\n    underlying_infra_analysis = events[\"UnderlyingInfraEvaluation\"]\n    underlying_infra_analysis_results = events[\"UnderlyingInfraEvaluationResults\"]\n\n    ecs_automation_exec_id = events[\"EcsAutomationExecutionId\"]\n\n    ecs_automation_analysis = ''\n    if ecs_automation_exec_id:\n        ssm_client = client_init('ssm')\n        ecs_automation_analysis_results, ecs_automation_analysis = get_automation_execution(ssm_client, ecs_automation_exec_id)\n\n    execution_message.append(EXECUTION_MESSAGE.get(\"RES_I101\"))\n    info_codes.append(\"RES_I101\")\n\n    if is_fargate_job == \"TRUE\":\n        if permission_analysis_results == \"SUCCESS\" and job_analysis_results == \"SUCCESS\" and compute_env_analysis_results == \"SUCCESS\":\n            execution_message.append(compute_env_analysis)\n            execution_message.append(EXECUTION_MESSAGE.get(\"RES_I005\"))\n            info_codes.append(\"RES_I005\")\n\n        elif compute_env_analysis_results == \"FAILED\":\n            execution_message.append(compute_env_analysis)\n\n        elif job_analysis_results == \"FAILED\":\n            execution_message.append(job_analysis)\n\n        elif permission_analysis_results == \"FAILED\":\n            execution_message.append(permission_analysis)\n\n    else:\n        if permission_analysis_results == \"SUCCESS\" and job_analysis_results == \"SUCCESS\" and compute_env_analysis_results == \"SUCCESS\" and underlying_infra_analysis_results == \"SUCCESS\" and ecs_automation_analysis_results == \"SUCCESS\":\n            execution_message.append(underlying_infra_analysis)\n            execution_message.append(ecs_automation_analysis)\n            execution_message.append(EXECUTION_MESSAGE.get(\"RES_I005\"))\n            info_codes.append(\"RES_I005\")\n\n        elif permission_analysis_results == \"SUCCESS\" and job_analysis_results == \"SUCCESS\" and compute_env_analysis_results == \"SUCCESS\" and underlying_infra_analysis_results == \"SUCCESS\" and ecs_automation_analysis_results != \"SUCCESS\":\n            execution_message.append(underlying_infra_analysis)\n            execution_message.append(EXECUTION_MESSAGE.get(\"RES_I005\"))\n            info_codes.append(\"RES_I005\")\n\n        elif ecs_automation_analysis_results == \"FAILED\":\n            execution_message.append(underlying_infra_analysis)\n            execution_message.append(ecs_automation_analysis)\n\n        elif underlying_infra_analysis_results == \"FAILED\":\n            execution_message.append(underlying_infra_analysis)\n\n        elif compute_env_analysis_results == \"FAILED\":\n            execution_message.append(compute_env_analysis)\n\n        elif job_analysis_results == \"FAILED\":\n            execution_message.append(job_analysis)\n\n        elif permission_analysis_results == \"FAILED\":\n            execution_message.append(permission_analysis)\n\n    execution_message.append(EXECUTION_MESSAGE.get(\"RES_I100\"))\n    info_codes.append(\"RES_I100\")\n\n    if permission_analysis_results in [\"FAILED\", \"SUCCESS\"]:\n        execution_message.append(EXECUTION_MESSAGE.get(\"RES_I000\").format(permission_analysis))\n        info_codes.append(\"RES_I000\")\n\n    if job_analysis_results in [\"FAILED\", \"SUCCESS\"]:\n        execution_message.append(EXECUTION_MESSAGE.get(\"RES_I001\").format(job_analysis))\n        info_codes.append(\"RES_I001\")\n\n    if compute_env_analysis_results in [\"FAILED\", \"SUCCESS\"]:\n        execution_message.append(EXECUTION_MESSAGE.get(\"RES_I002\").format(compute_env_analysis))\n        info_codes.append(\"RES_I002\")\n\n    if underlying_infra_analysis_results in [\"FAILED\", \"SUCCESS\"]:\n        execution_message.append(EXECUTION_MESSAGE.get(\"RES_I003\").format(underlying_infra_analysis))\n        info_codes.append(\"RES_I003\")\n\n    if ecs_automation_analysis_results in [\"FAILED\", \"SUCCESS\"]:\n        execution_message.append(EXECUTION_MESSAGE.get(\"RES_I004\").format(ecs_automation_analysis))\n        info_codes.append(\"RES_I004\")\n\n    return {\n        \"info_codes\": info_codes,\n        \"ExecutionLogs\": \"\".join(execution_message)\n    }\n",
+        "InputPayload": {
+          "PreflightPermissionChecks": "{{PreflightPermissionChecks.message}}",
+          "PreflightPermissionChecksResults": "{{PreflightPermissionChecks.Permission_check_results}}",
+          "AWSBatchJobEvaluation": "{{AWSBatchJobEvaluation.message}}",
+          "AWSBatchJobEvaluationResults": "{{AWSBatchJobEvaluation.Job_check_results}}",
+          "BatchComputeEnvironmentEvaluation": "{{BatchComputeEnvironmentEvaluation.message}}",
+          "BatchComputeEnvironmentEvaluationResults": "{{BatchComputeEnvironmentEvaluation.compute_env_results}}",
+          "BatchComputeEnvironmentEvaluationFargate": "{{BatchComputeEnvironmentEvaluation.is_fargate_job}}",
+          "UnderlyingInfraEvaluation": "{{UnderlyingInfraEvaluation.message}}",
+          "UnderlyingInfraEvaluationResults": "{{UnderlyingInfraEvaluation.underlying_infra_results}}",
+          "EcsAutomationExecutionId": "{{EcsAutomationRunner.ExecutionId}}"
+        },
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "message",
+          "Selector": "$.Payload.ExecutionLogs",
+          "Type": "String"
+        },
+        {
+          "Name": "info_codes",
+          "Selector": "$.Payload.info_codes",
+          "Type": "StringList"
+        }
+      ],
+      "isEnd": true
+    }
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "sha256": "63719202825de45803e73419c17a2c66009e24578fe5c18d928e03751283a4ef"
+      }
+    }
+  },
+  "outputs": [
+    "ExecutionResults.message"
+  ]
+}
