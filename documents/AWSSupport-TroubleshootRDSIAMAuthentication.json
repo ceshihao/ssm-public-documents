@@ -1,0 +1,251 @@
+{
+  "description": "The **AWSSupport-TroubleshootRDSIAMAuthentication** runbook helps troubleshoot Identity Access Management (IAM) database authentication issues for Amazon Relational Database Service (RDS) DB instances or an Amazon Aurora DB clusters. The runbook verifies the DB configuration and provides recommendations that could help you fix the configuration required for RDS IAM-based authentication. If a source EC2 Instance ID is provided, and the target database is an Amazon RDS DB instance, the [AWSSupport-TroubleshootConnectivityToRDS](https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-troubleshootconnectivitytords.html) automation is invoked to diagnose connectivity issues between an EC2 instance and an Amazon RDS instance. The output also provides commands you can run on your EC2 instance or local machine to connect to the RDS instances using IAM authentication.\n### Important:\nThis runbook only supports MySQL, PostgreSQL, and MariaDB database engines.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the role that allows the Automation runbook to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your current IAM user permissions context to execute this runbook.",
+      "default": ""
+    },
+    "RDSType": {
+      "type": "String",
+      "allowedValues": [
+        "Amazon RDS",
+        "Amazon Aurora Cluster"
+      ],
+      "description": "(Required) The type of Relational Database."
+    },
+    "DBInstanceIdentifier": {
+      "type": "String",
+      "description": "(Required) The identifier of the target Amazon RDS DB instance or Amazon Aurora DB cluster.",
+      "allowedPattern": "^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$",
+      "maxChars": 63
+    },
+    "SourceEc2InstanceIdentifier": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Optional) The Amazon EC2 Instance ID if you are connecting to the RDS DB instance from an EC2 Instance running in the same account and region. Do not specify this parameter if the source is not an EC2 instance or if the target RDS type is an Aurora DB cluster.",
+      "default": ""
+    },
+    "DBIAMRoleName": {
+      "type": "String",
+      "description": "(Optional) The IAM role name being used for IAM-based authentication. Provide only if the parameter `DBIAMUserName` is not provided, otherwise leave it empty. Either `DBIAMRoleName` or `DBIAMUserName` must be provided.",
+      "maxChars": 64,
+      "default": "",
+      "allowedPattern": "^[a-zA-Z0-9+=,.@_-]{1,64}$|^$"
+    },
+    "DBIAMUserName": {
+      "type": "String",
+      "description": "(Optional) The IAM user name used for IAM-based authentication. Provide only if the `DBIAMRoleName` parameter is not provided, otherwise leave it empty. Either `DBIAMRoleName` or `DBIAMUserName` must be provided.",
+      "maxChars": 64,
+      "default": "",
+      "allowedPattern": "^[a-zA-Z0-9+=,.@_-]{1,64}$|^$"
+    },
+    "DBUserName": {
+      "type": "String",
+      "description": "(Optional) The database user name mapped to an IAM role/user for IAM-based authentication within the database. The default option '*' evaluates if the 'rds-db:connect' permission is allowed for all users in the DB.",
+      "default": "*",
+      "allowedPattern": "^[a-zA-Z0-9+=,.@*_-]{1,64}$",
+      "maxChars": 64
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "validateInputs",
+      "description": "Validates if the Amazon RDS DB instance or Amazon Aurora DB cluster is supported and in `Available` status. Also if the `DBIAMRoleName` or `DBIAMUserName` required parameters were specified.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "validate_inputs.script_handler",
+        "Attachment": "AWSSupport-TroubleshootRDSIAMAuthentication.zip",
+        "InputPayload": {
+          "DBInstanceIdentifier": "{{ DBInstanceIdentifier }}",
+          "DBIAMRoleName": "{{ DBIAMRoleName }}",
+          "DBIAMUserName": "{{ DBIAMUserName }}",
+          "RDSType": "{{ RDSType }}",
+          "SourceEc2InstanceIdentifier": "{{ SourceEc2InstanceIdentifier }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "RDSEngine",
+          "Selector": "$.Payload.Engine",
+          "Type": "String"
+        },
+        {
+          "Name": "RDS_endpoint",
+          "Selector": "$.Payload.RDS_endpoint",
+          "Type": "String"
+        },
+        {
+          "Name": "Port",
+          "Selector": "$.Payload.Port",
+          "Type": "Integer"
+        },
+        {
+          "Name": "branchOnSourceEC2Provided",
+          "Selector": "$.Payload.Isec2provided",
+          "Type": "String"
+        },
+        {
+          "Name": "DBIAMRoleArn",
+          "Selector": "$.Payload.DBIAMRoleArn",
+          "Type": "String"
+        },
+        {
+          "Name": "DBIAMUserArn",
+          "Selector": "$.Payload.DBIAMUserArn",
+          "Type": "String"
+        },
+        {
+          "Name": "DBInstance",
+          "Selector": "$.Payload.DBInstance",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "branchOnSourceEC2Provided"
+    },
+    {
+      "name": "branchOnSourceEC2Provided",
+      "action": "aws:branch",
+      "description": "Branches on wether a source Amazon EC2 instance ID and the target selected is `Amazon RDS`.",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{validateInputs.branchOnSourceEC2Provided}}",
+                "StringEquals": "True"
+              },
+              {
+                "Variable": "{{RDSType}}",
+                "StringEquals": "Amazon RDS"
+              }
+            ],
+            "NextStep": "validateRDSConnectivity"
+          }
+        ],
+        "Default": "validateRDSIAMAuthentication"
+      }
+    },
+    {
+      "name": "validateRDSConnectivity",
+      "description": "Runs the automation `AWSSupport-TroubleshootConnectivityToRDS` to validate connectivity from the EC2 source instance.",
+      "action": "aws:executeAutomation",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWSSupport-TroubleshootConnectivityToRDS",
+        "RuntimeParameters": {
+          "DBInstanceIdentifier": "{{ DBInstanceIdentifier }}",
+          "SourceInstance": "{{ SourceEc2InstanceIdentifier }}"
+        }
+      },
+      "nextStep": "validateRDSIAMAuthentication"
+    },
+    {
+      "name": "validateRDSIAMAuthentication",
+      "description": "Validates if IAM authentication is enabled on the RDS DB instance or Amazon Aurora DB cluster.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "AWSSupport-TroubleshootRDSIAMAuthentication.zip",
+        "Handler": "validate_rds_iam_authentication.script_handler",
+        "InputPayload": {
+          "DBInstance": "{{ DBInstanceIdentifier }}",
+          "RDSType": "{{ RDSType }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.IAMDatabaseAuthenticationEnabled",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "validateIAMPolicies"
+    },
+    {
+      "name": "validateIAMPolicies",
+      "description": "Validates the IAM policies for the IAM user or IAM role provided.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "validate_iam_policies.script_handler",
+        "Attachment": "AWSSupport-TroubleshootRDSIAMAuthentication.zip",
+        "InputPayload": {
+          "DBIAMRoleArn": "{{ validateInputs.DBIAMRoleArn }}",
+          "DBIAMUserArn": "{{ validateInputs.DBIAMUserArn }}",
+          "DBInstance": "{{ validateInputs.DBInstance}}",
+          "DBUserName": "{{ DBUserName }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.EvaluationResults",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "generateReport"
+    },
+    {
+      "name": "generateReport",
+      "description": "Returns details of the runbook steps outputs, and recommendations to connect to the database using IAM authentication.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "generate_report.script_handler",
+        "Attachment": "AWSSupport-TroubleshootRDSIAMAuthentication.zip",
+        "InputPayload": {
+          "AutomationID": "{{automation:EXECUTION_ID}}",
+          "Region": "{{global:REGION}}",
+          "EvaluationResults": "{{ validateIAMPolicies.Output }}",
+          "IAMDatabaseAuthenticationEnabled": "{{ validateRDSIAMAuthentication.Output }}",
+          "Engine": "{{ validateInputs.RDSEngine }}",
+          "DBInstance": "{{ validateInputs.DBInstance }}",
+          "Isec2provided": "{{ validateInputs.branchOnSourceEC2Provided }}",
+          "Port": "{{ validateInputs.Port }}",
+          "RDS_endpoint": "{{ validateInputs.RDS_endpoint }}",
+          "SourceEc2InstanceIdentifier": "{{SourceEc2InstanceIdentifier}}",
+          "DBUserName": "{{ DBUserName }}",
+          "RDSType": "{{ RDSType }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "generateReport.Output"
+  ],
+  "files": {
+    "AWSSupport-TroubleshootRDSIAMAuthentication.zip": {
+      "checksums": {
+        "sha256": "3729bfe9ebc29a5749c58c1e1c0990f8fb1c9575b3a7cea38f283a2655a9369e"
+      }
+    }
+  }
+}
