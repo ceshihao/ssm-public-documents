@@ -1,0 +1,108 @@
+{
+  "schemaVersion": "2.2",
+  "description": "This document runs action on SSAF client on appliance.",
+  "parameters": {
+    "Action": {
+      "description": "(Required) The action name that will be executed on the SSAF client.",
+      "type": "String",
+      "allowedValues": [
+        "verify-agent-installation-prerequisites",
+        "install-mgn-agent"
+      ]
+    },
+    "Region": {
+      "description": "(Required) AWS Region into which you are replicating.",
+      "type": "String",
+      "allowedValues": [
+        "us-gov-east-1",
+        "us-gov-west-1",
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-southeast-3",
+        "ap-southeast-4",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "ap-northeast-3",
+        "eu-central-1",
+        "eu-central-2",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-west-3",
+        "ca-central-1",
+        "ap-south-1",
+        "ap-south-2",
+        "eu-south-2",
+        "sa-east-1",
+        "me-central-1",
+        "eu-north-1",
+        "me-south-1",
+        "af-south-1",
+        "ap-east-1",
+        "eu-south-1",
+        "il-central-1"
+      ]
+    },
+    "Account": {
+      "description": "(Optional) AWS Account into which you are replicating.",
+      "type": "String",
+      "allowedPattern": "^$|^[0-9]{12}$",
+      "default": ""
+    },
+    "SourceServerID": {
+      "description": "(Optional) User provided Source Server ID.",
+      "type": "String",
+      "allowedPattern": "^$|^s-[0-9a-zA-Z]{17}$",
+      "default": ""
+    },
+    "FQDN": {
+      "description": "(Required) A fully qualified domain name of the server you are installing Replication Agent.",
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9_](([a-zA-Z0-9_\\-]{0,61}[a-zA-Z0-9_])?\\.)+[a-zA-Z]{2,63}$"
+    },
+    "Platform": {
+      "description": "(Required) Platform of the server you are installing Replication Agent.",
+      "type": "String",
+      "allowedValues": [
+        "windows",
+        "linux"
+      ]
+    },
+    "CredentialsSecretArn": {
+      "description": "(Required) ARN of the secret in SecretsManager which contains the credentials of the server you are installing Replication Agent.",
+      "type": "String",
+      "allowedPattern": "^arn:[\\w-]+:secretsmanager:([a-z]{2}-(gov-)?[a-z]+-\\d{1})?:(\\d{12})?:secret:[a-zA-Z0-9/_+=.@-]+$"
+    },
+    "ClientSignature": {
+      "description": "(Required) RS256 client signature (Base64 format)",
+      "type": "String",
+      "allowedPattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$"
+    },
+    "ClientPublicKey": {
+      "description": "(Required) RS256 client public key (Base64 format)",
+      "type": "String",
+      "allowedPattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "RunAction",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "3600",
+        "runCommand": [
+          "#!/bin/bash\n\npublic_key='{{ClientPublicKey}}'\nsignature='{{ClientSignature}}'\n\nclient_path=\"/var/lib/aws-migration-connector/ssaf_client\"\nlock_file_path=\"/var/lock/ssaf.lock\"\nlock_timeout=300   # Timeout in seconds\n\nclient_download_url='https://aws-application-migration-service-{{Region}}.s3.{{Region}}.amazonaws.com/latest/source-automation-client/linux/ssaf-client/ssaf_client'\n\nlock_file() {\n  echo \"Locking file\"\n  exec {lock_fd}<> \"$lock_file_path\" || { echo \"Error: Failed to open file descriptor\"; return 1; }\n  flock -w \"$lock_timeout\" \"$lock_fd\" || { echo \"Error: Failed to acquire lock within the timeout period\"; return 1; }\n  echo \"File locked\"\n  return 0\n}\n\nunlock_file() {\n  echo \"Unlocking file\"\n  flock -u \"$lock_fd\" || { echo \"Error: Failed to release lock\"; return 1; }\n  exec {lock_fd}>&- || { echo \"Error: Failed to close file descriptor\"; return 1; }\n  echo \"Lock released\"\n  return 0\n}\n\ndownload_update() {\n  echo \"Downloading update\"\n  if ! sudo curl -o \"$client_path\" \"$client_download_url\"; then\n    echo \"Error: Download failed\"\n    return 1\n  fi\n  echo \"Downloaded\"\n  return 0\n}\n\nvalidate_signature() {\n  openssl pkeyutl -verify \\\n    -pubin \\\n    -keyform PEM \\\n    -inkey <(echo \"$public_key\" | base64 -d) \\\n    -pkeyopt digest:sha256 \\\n    -pkeyopt rsa_padding_mode:pss \\\n    -in <(openssl dgst -sha256 -binary \"$client_path\") \\\n    -sigfile <(echo \"$signature\" | base64 -d) >/dev/null 2>&1\n\n  if [ $? -ne 0 ]; then\n    echo \"Error: Signature validation failed\"\n    return 1\n  fi\n  echo \"Signature validation passed\"\n  return 0\n}\n\nvalidate_and_update() {\n lock_file || return 1\n validate_signature && unlock_file && return 0\n download_update && validate_signature && unlock_file && return 0\n return 1\n}\n\nif ! validate_and_update; then\n  echo \"Error: Please perform a manual re-installation\"\n  exit 1\nfi\n\n\"$client_path\" \\\n  --action '{{Action}}' \\\n  --region '{{Region}}' \\\n  --account '{{Account}}' \\\n  --fqdn '{{FQDN}}' \\\n  --platform '{{Platform}}' \\\n  --credentials-secret-arn '{{CredentialsSecretArn}}' \\\n  --source-server-id '{{SourceServerID}}'\n\nexit $?\n"
+        ]
+      }
+    }
+  ]
+}
