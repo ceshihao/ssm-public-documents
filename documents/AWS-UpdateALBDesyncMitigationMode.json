@@ -1,0 +1,86 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# Document name - AWS-UpdateALBDesyncMitigationMode\n\n## What does this document do?\nThe AWS-UpdateALBDesyncMitigationMode runbook will update the desync mitigation mode on an Application Load Balancer\n(ALB) to the specified mitigation mode using\n[ModifyLoadBalancerAttributes](https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_ModifyLoadBalancerAttributes.html)\nAPI. The desync mitigation mode determines how the load balancer handles requests that might pose a\nsecurity risk to your application.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role\n  that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\n  Systems Manager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* LoadBalancerArn: (Required) The Amazon Resource Name (ARN) of the load balancer that you want to modify the\n  desync mitigation mode.\n* DesyncMitigationMode: (Required) The mode that the Application Load Balancer will operate in.  For information about\n  the desync mitigation modes, see\n  [Desync mitigation modes](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html#desync-mitigation-mode)\n  documentation.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that\nallows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\nSystems Manager Automation uses the permissions of the user that starts this runbook.\n",
+      "default": ""
+    },
+    "LoadBalancerArn": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the load balancer that you want to modify the desync mitigation mode.\n",
+      "allowedPattern": "^arn:aws[a-z0-9\\-]*:elasticloadbalancing:[a-z0-9\\-]+:\\d{12}:loadbalancer/[\\w\\-\\/]{1,1977}$"
+    },
+    "DesyncMitigationMode": {
+      "type": "String",
+      "description": "(Required) The mode that the Application Load Balancer will operate in.  For information about the desync\nmitigation modes, see\n[Desync mitigation modes](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html#desync-mitigation-mode)\ndocumentation.\n",
+      "allowedValues": [
+        "defensive",
+        "strictest",
+        "monitor"
+      ]
+    }
+  },
+  "outputs": [
+    "VerifyLoadBalancerDesyncMitigationMode.ModificationResult"
+  ],
+  "mainSteps": [
+    {
+      "name": "VerifyLoadBalancerType",
+      "description": "## VerifyLoadBalancerType\nVerifies that the specified LoadBalancerArn is for an application load balancer,\nbefore proceeding to the next step.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "elbv2",
+        "Api": "DescribeLoadBalancers",
+        "LoadBalancerArns": [
+          "{{ LoadBalancerArn }}"
+        ],
+        "PropertySelector": "LoadBalancers[0].Type",
+        "DesiredValues": [
+          "application"
+        ]
+      }
+    },
+    {
+      "name": "ModifyLoadBalancerDesyncMode",
+      "description": "## ModifyLoadBalancerDesyncMode\nUpdate Application Load Balancer Attribute to input parameter DesyncMitigationMode.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "elbv2",
+        "Api": "ModifyLoadBalancerAttributes",
+        "LoadBalancerArn": "{{ LoadBalancerArn }}",
+        "Attributes": [
+          {
+            "Key": "routing.http.desync_mitigation_mode",
+            "Value": "{{ DesyncMitigationMode }}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VerifyLoadBalancerDesyncMitigationMode",
+      "description": "## VerifyLoadBalancerDesyncMitigationMode\nVerifies that desync mitigation mode was updated for the target resource.\n## ModificationResult\nMessage payload of the script.\n",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "LoadBalancerArn": "{{ LoadBalancerArn }}",
+          "DesyncMitigationMode": "{{ DesyncMitigationMode }}"
+        },
+        "Script": "import boto3\n\ndef get_alb_attributes(load_balancer_arn):\n  elbv2_client = boto3.client(\"elbv2\")\n  response = elbv2_client.describe_load_balancer_attributes(\n    LoadBalancerArn=load_balancer_arn\n  )\n  return response[\"Attributes\"]\n\ndef handler(event, context):\n  load_balancer_arn = event[\"LoadBalancerArn\"]\n  desync_mitigation_mode = event[\"DesyncMitigationMode\"]\n\n  alb_attributes = get_alb_attributes(load_balancer_arn)\n\n  attribute_modified = False\n  for attribute in alb_attributes:\n    mode_string = \"routing.http.desync_mitigation_mode\"\n    if attribute[\"Key\"] == mode_string and attribute[\"Value\"] == desync_mitigation_mode:\n      attribute_modified = True\n      break\n\n  if attribute_modified == False:\n    raise ValueError(f\"VERIFICATION FAILED. DESYNC MITIGATION MODE MODIFICATION TO {desync_mitigation_mode} WAS UNSUCCESSFUL.\")\n\n  return {\"ModificationResult\": f\"Verification of Desync Mitigation Mode was successfully modified to be {desync_mitigation_mode}.\"}\n"
+      },
+      "outputs": [
+        {
+          "Name": "ModificationResult",
+          "Selector": "$.Payload.ModificationResult",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

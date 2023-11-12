@@ -1,0 +1,160 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-DisableSageMakerNotebookRootAccess\n\n## What does this document do?\nThe AWS-DisableSageMakerNotebookRootAccess runbook disables root access privileges on Amazon SageMaker Notebook \nInstances using the \n[UpdateNotebookInstance](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_UpdateNotebookInstance.html) \nAPI. The notebook instance will be stopped as it is required to apply the update. Note that this runbook does not \napply to SageMaker Studio Notebook Instances.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role \n  that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, \n  Systems Manager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* NotebookInstanceName: (Required) The name of the sagemaker notebook to update the root access setting to disabled.\n* StartInstanceAfterUpdate: (Optional) Specify if notebook instance should be started after disabling root access. \n  The default setting for this parameter is `true`. If set to `true` the instance will start after the update is \n  applied. If set to `false` the instance will be left in the `Stopped` state.\n  * Default: \"True\"\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that\nallows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\nSystems Manager Automation uses the permissions of the user that starts this runbook.\n",
+      "default": ""
+    },
+    "NotebookInstanceName": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9](-*[a-zA-Z0-9]){1,1024}$",
+      "description": "The name of the sagemaker notebook to update the root access setting to disabled."
+    },
+    "StartInstanceAfterUpdate": {
+      "type": "Boolean",
+      "description": "Specify if notebook instance should be started after disabling root access. \nThe default setting for this parameter is `true`. If set to `true` the instance will start after the update is \napplied. If set to `false` the instance will be left in the `Stopped` state.\n",
+      "default": true
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "VerifyNotebookInstanceStatus",
+      "description": "## WaitForNotebookInstanceStatus\nVerifies if SageMaker Notebook Instance is available before disabling root access.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "DescribeNotebookInstance",
+        "PropertySelector": "$.NotebookInstanceStatus",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}",
+        "DesiredValues": [
+          "Stopped",
+          "InService"
+        ]
+      }
+    },
+    {
+      "name": "CheckNotebookStatus",
+      "description": "## CheckNotebookStatus\nCheck the current status of the notebook instance.\n## Outputs\n* NotebookStatus: Response of the API call at the selected data point for \"NotebookInstanceStatus\"\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "DescribeNotebookInstance",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}"
+      },
+      "outputs": [
+        {
+          "Name": "NotebookStatus",
+          "Selector": "$.NotebookInstanceStatus",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "StopOrUpdateNotebookStatus",
+      "description": "## StopOrUpdateNotebookStatus\nDetermine the next step of the runbook based on the CheckNotebookInstanceStatus step.\n",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "UpdateNotebookInstance",
+            "Variable": "{{ CheckNotebookStatus.NotebookStatus }}",
+            "StringEquals": "Stopped"
+          }
+        ],
+        "Default": "StopNotebookInstance"
+      }
+    },
+    {
+      "name": "StopNotebookInstance",
+      "description": "## StopNotebookInstance\nThis step will stop a running notebook instance.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "StopNotebookInstance",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}"
+      }
+    },
+    {
+      "name": "WaitForInstanceToStop",
+      "description": "## WaitForInstanceToStop\nThis step will wait for the instance to enter the stopped state.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "DescribeNotebookInstance",
+        "PropertySelector": "$.NotebookInstanceStatus",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}",
+        "DesiredValues": [
+          "Stopped"
+        ]
+      }
+    },
+    {
+      "name": "UpdateNotebookInstance",
+      "description": "## UpdateNotebookInstance\nThis step will update the notebook root access to disabled.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "UpdateNotebookInstance",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}",
+        "RootAccess": "Disabled"
+      }
+    },
+    {
+      "name": "WaitForNotebookUpdate",
+      "description": "## WaitForNotebookUpdate\nVerifies the instance has completed updating and has reached the stopped state again.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "DescribeNotebookInstance",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}",
+        "PropertySelector": "$.NotebookInstanceStatus",
+        "DesiredValues": [
+          "Stopped"
+        ]
+      }
+    },
+    {
+      "name": "ChooseInstanceStart",
+      "description": "## ChooseInstanceStart\nSpecify if the notebook instance should be started.\n",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "VerifyNotebookInstanceRootAccess",
+            "Variable": "{{ StartInstanceAfterUpdate }}",
+            "BooleanEquals": false
+          }
+        ],
+        "Default": "StartNotebookInstance"
+      }
+    },
+    {
+      "name": "StartNotebookInstance",
+      "description": "## StartNotebookInstance\nThis step will start a stopped notebook instance.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "StartNotebookInstance",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}"
+      }
+    },
+    {
+      "name": "VerifyNotebookInstanceRootAccess",
+      "description": "## VerifyNotebookInstanceRootAccess\nVerifies the notebook instance root access setting was successfully disabled.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "sagemaker",
+        "Api": "DescribeNotebookInstance",
+        "NotebookInstanceName": "{{ NotebookInstanceName }}",
+        "PropertySelector": "$.RootAccess",
+        "DesiredValues": [
+          "Disabled"
+        ]
+      }
+    }
+  ]
+}
