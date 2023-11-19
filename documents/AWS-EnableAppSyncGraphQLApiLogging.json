@@ -1,0 +1,243 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-EnableAppSyncGraphQLApiLogging\n\n## What does this document do?\nThe AWS-EnableAppSyncGraphQLApiLogging runbook enables field-level logging and request-level logging on the specified \nAppSync GraphQL API using the \nspecified [logging configuration](https://docs.aws.amazon.com/appsync/latest/devguide/monitoring.html#cwl). The \n[UpdateGraphqlApi](https://docs.aws.amazon.com/appsync/latest/APIReference/API_UpdateGraphqlApi.html) \ncall will apply changes to the designated GraphQL API even if the designated GraphQL API already has logging enabled.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) \n  role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\n  Systems Manager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* ApiId: (Required) The API ID.\n* FieldLogLevel: (Required) The field logging level. Values can be ERROR, or ALL.\n* CloudWatchLogsRoleArn: (Required) The service role that AppSync assumes to publish to CloudWatch logs in your \n  account.\n* ExcludeVerboseContent: (Optional) Set to TRUE to exclude sections that contain information such as headers, \n  context, and evaluated mapping templates, regardless of logging level.\n  * Default: False\n\n## Output Parameters\n* EnableApiLoggingWithApiKeyOrAwsIamAuthorization.UpdateGraphQLApiResponse: Response from the Update GraphQLApi call.\n* EnableApiLoggingWithLambdaAuthorization.UpdateGraphQLApiResponse: Response from the Update GraphQLApi call.\n* EnableApiLoggingWithCognitoAuthorization.UpdateGraphQLApiResponse: Response from the Update GraphQLApi call.\n* EnableApiLoggingWithOpenIdAuthorization.UpdateGraphQLApiResponse: Response from the Update GraphQLApi call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that\nallows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\nSystems Manager Automation uses the permissions of the user that starts this runbook.\n"
+    },
+    "ApiId": {
+      "type": "String",
+      "description": "(Required) The API ID.",
+      "allowedPattern": "^[a-zA-Z0-9-]{1,1024}$"
+    },
+    "FieldLogLevel": {
+      "type": "String",
+      "description": "(Required) The field logging level. Values can be ERROR, or ALL.",
+      "allowedValues": [
+        "ERROR",
+        "ALL"
+      ]
+    },
+    "CloudWatchLogsRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The service role that AppSync assumes to publish to CloudWatch logs in your account."
+    },
+    "ExcludeVerboseContent": {
+      "type": "Boolean",
+      "description": "(Optional) Set to TRUE to exclude sections that contain information such as headers, context, and \nevaluated mapping templates, regardless of logging level.\n",
+      "default": false
+    }
+  },
+  "outputs": [
+    "EnableApiLoggingWithApiKeyOrAwsIamAuthorization.UpdateGraphQLApiResponse",
+    "EnableApiLoggingWithLambdaAuthorization.UpdateGraphQLApiResponse",
+    "EnableApiLoggingWithCognitoAuthorization.UpdateGraphQLApiResponse",
+    "EnableApiLoggingWithOpenIdAuthorization.UpdateGraphQLApiResponse"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetGraphQLApiInformation",
+      "description": "## GetGraphQLApiInformation\nThis step retrieves a GraphqlApi object. The AppSync GraphQL API name and Authentication Type. In addition to the \nAuthentication Type, this step will gather configuration information relevant for the primary Authentication Type. \n## Outputs\n* GetGraphQLApiResponse: Response from the `GetGraphqlApi` API call.\n* ApiName: The GraphQL API name referenced by the given API Id that will be used to enable API logging.\n* AuthenticationType: The GraphQL API authentication type referenced by the given API Id to enable API logging.\n* AuthorizeUri: Part of the configuration for a Lambda Authorizer, if used as the primary authentication type.\n* AwsRegion: Part of the configuration for a Lambda Authorizer if used as the primary authentication type.\n* UserPoolId: Part of the configuration for Amazon Cognito, if used as the primary authentication type.\n* DefaultAction: Part of the configuration for Amazon Cognito, if used as the primary authentication type.\n* Issuer: Part of the configuration for openID Connect Config, if used as the primary authentication type.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "appsync",
+        "Api": "GetGraphqlApi",
+        "apiId": "{{ ApiId }}"
+      },
+      "outputs": [
+        {
+          "Name": "GetGraphQLApiResponse",
+          "Selector": "$.graphqlApi",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "ApiName",
+          "Selector": "$.graphqlApi.name",
+          "Type": "String"
+        },
+        {
+          "Name": "AuthenticationType",
+          "Selector": "$.graphqlApi.authenticationType",
+          "Type": "String"
+        },
+        {
+          "Name": "AuthorizeUri",
+          "Selector": "$.graphqlApi.lambdaAuthorizerConfig.authorizerUri",
+          "Type": "String"
+        },
+        {
+          "Name": "AwsRegion",
+          "Selector": "$.graphqlApi.userPoolConfig.awsRegion",
+          "Type": "String"
+        },
+        {
+          "Name": "UserPoolId",
+          "Selector": "$.graphqlApi.userPoolConfig.userPoolId",
+          "Type": "String"
+        },
+        {
+          "Name": "DefaultAction",
+          "Selector": "$.graphqlApi.userPoolConfig.defaultAction",
+          "Type": "String"
+        },
+        {
+          "Name": "Issuer",
+          "Selector": "$.graphqlApi.openIDConnectConfig.issuer",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ChooseApiAuthenticationType",
+      "description": "## ChooseApiAuthenticationType\nDetermine the AppSync API Authentication Type used to determine how to properly call `UpdateGraphqlApi`.\n",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EnableApiLoggingWithLambdaAuthorization",
+            "Variable": "{{ GetGraphQLApiInformation.AuthenticationType }}",
+            "StringEquals": "AWS_LAMBDA"
+          },
+          {
+            "NextStep": "EnableApiLoggingWithCognitoAuthorization",
+            "Variable": "{{ GetGraphQLApiInformation.AuthenticationType }}",
+            "StringEquals": "AMAZON_COGNITO_USER_POOLS"
+          },
+          {
+            "NextStep": "EnableApiLoggingWithOpenIdAuthorization",
+            "Variable": "{{ GetGraphQLApiInformation.AuthenticationType }}",
+            "StringEquals": "OPENID_CONNECT"
+          }
+        ],
+        "Default": "EnableApiLoggingWithApiKeyOrAwsIamAuthorization"
+      }
+    },
+    {
+      "name": "EnableApiLoggingWithApiKeyOrAwsIamAuthorization",
+      "description": "## EnableApiLoggingWithApiKeyOrAwsIamAuthorization\nThis step updates the AppSync GraphQL API with the specified logging level and whether verbose content should be \nexcluded.\n## Outputs\n* UpdateGraphQLApiResponse: Response from the `UpdateGraphqlApi` call.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "appsync",
+        "Api": "UpdateGraphqlApi",
+        "apiId": "{{ ApiId }}",
+        "name": "{{ GetGraphQLApiInformation.ApiName }}",
+        "authenticationType": "{{ GetGraphQLApiInformation.AuthenticationType }}",
+        "logConfig": {
+          "fieldLogLevel": "{{ FieldLogLevel }}",
+          "cloudWatchLogsRoleArn": "{{ CloudWatchLogsRoleArn }}",
+          "excludeVerboseContent": "{{ ExcludeVerboseContent }}"
+        }
+      },
+      "nextStep": "VerifyApiLoggingEnabled",
+      "outputs": [
+        {
+          "Name": "UpdateGraphQLApiResponse",
+          "Selector": "$.graphqlApi",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "EnableApiLoggingWithLambdaAuthorization",
+      "description": "## EnableApiLoggingWithLambdaAuthorization\nThis step updates the AppSync GraphQL API with the specified logging level, whether verbose content should be\nexcluded, and includes the Lambda Authorization Configuration.\n## Outputs\n* UpdateGraphQLApiResponse: Response from the `UpdateGraphqlApi` call.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "appsync",
+        "Api": "UpdateGraphqlApi",
+        "apiId": "{{ ApiId }}",
+        "name": "{{ GetGraphQLApiInformation.ApiName }}",
+        "authenticationType": "{{ GetGraphQLApiInformation.AuthenticationType }}",
+        "logConfig": {
+          "fieldLogLevel": "{{ FieldLogLevel }}",
+          "cloudWatchLogsRoleArn": "{{ CloudWatchLogsRoleArn }}",
+          "excludeVerboseContent": "{{ ExcludeVerboseContent }}"
+        },
+        "lambdaAuthorizerConfig": {
+          "authorizerUri": "{{ GetGraphQLApiInformation.AuthorizeUri }}"
+        }
+      },
+      "nextStep": "VerifyApiLoggingEnabled",
+      "outputs": [
+        {
+          "Name": "UpdateGraphQLApiResponse",
+          "Selector": "$.graphqlApi",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "EnableApiLoggingWithCognitoAuthorization",
+      "description": "## EnableApiLoggingWithCognitoAuthorization\nThis step updates the AppSync GraphQL API with the specified logging level and whether verbose content should be \nexcluded and includes the Cognito Authorization Configuration.\n## Outputs\n* UpdateGraphQLApiResponse: Response from the `UpdateGraphqlApi` call.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "appsync",
+        "Api": "UpdateGraphqlApi",
+        "apiId": "{{ ApiId }}",
+        "name": "{{ GetGraphQLApiInformation.ApiName }}",
+        "authenticationType": "{{ GetGraphQLApiInformation.AuthenticationType }}",
+        "logConfig": {
+          "fieldLogLevel": "{{ FieldLogLevel }}",
+          "cloudWatchLogsRoleArn": "{{ CloudWatchLogsRoleArn }}",
+          "excludeVerboseContent": "{{ ExcludeVerboseContent }}"
+        },
+        "userPoolConfig": {
+          "userPoolId": "{{ GetGraphQLApiInformation.UserPoolId }}",
+          "awsRegion": "{{ GetGraphQLApiInformation.AwsRegion }}",
+          "defaultAction": "{{ GetGraphQLApiInformation.DefaultAction }}"
+        }
+      },
+      "nextStep": "VerifyApiLoggingEnabled",
+      "outputs": [
+        {
+          "Name": "UpdateGraphQLApiResponse",
+          "Selector": "$.graphqlApi",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "EnableApiLoggingWithOpenIdAuthorization",
+      "description": "## EnableApiLoggingWithOpenIdAuthorization\nThis step updates the AppSync GraphQL API with the specified logging level and whether verbose content should be \nexcluded and includes the OpenID Connect Authorization Configuration.\n## Outputs\n* UpdateGraphQLApiResponse: Response from the `UpdateGraphqlApi` call.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "appsync",
+        "Api": "UpdateGraphqlApi",
+        "apiId": "{{ ApiId }}",
+        "name": "{{ GetGraphQLApiInformation.ApiName }}",
+        "authenticationType": "{{ GetGraphQLApiInformation.AuthenticationType }}",
+        "logConfig": {
+          "fieldLogLevel": "{{ FieldLogLevel }}",
+          "cloudWatchLogsRoleArn": "{{ CloudWatchLogsRoleArn }}",
+          "excludeVerboseContent": "{{ ExcludeVerboseContent }}"
+        },
+        "openIDConnectConfig": {
+          "issuer": "{{ GetGraphQLApiInformation.Issuer }}"
+        }
+      },
+      "nextStep": "VerifyApiLoggingEnabled",
+      "outputs": [
+        {
+          "Name": "UpdateGraphQLApiResponse",
+          "Selector": "$.graphqlApi",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyApiLoggingEnabled",
+      "description": "## VerifyApiLoggingEnabled\nThis step verifies the AppSync API Logging has been enabled.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "inputs": {
+        "Service": "appsync",
+        "Api": "GetGraphqlApi",
+        "apiId": "{{ ApiId }}",
+        "PropertySelector": "$.graphqlApi.logConfig.fieldLogLevel",
+        "DesiredValues": [
+          "{{ FieldLogLevel }}"
+        ]
+      }
+    }
+  ]
+}

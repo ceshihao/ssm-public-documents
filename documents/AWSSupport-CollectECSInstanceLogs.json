@@ -1,30 +1,31 @@
 {
-  "description": "This document will collect ECS logs from a specified ECS instance and upload it to a specified S3 bucket.",
+  "description": "The **AWSSupport-CollectECSInstanceLogs** runbook collects operating system and Amazon Elastic Container Service (Amazon ECS) related log files from an Amazon Elastic Compute Cloud (Amazon EC2) instance to help you troubleshoot common Amazon ECS issues. While the automation is collecting the associated log files, changes are made to the file system. These changes include the creation of temporary directories and a log directory, the copying of log files to these directories, and compressing the log files into an archive.\n\nIf you specify a value for the `LogDestination` parameter, the automation evaluates the policy status of the Amazon Simple Storage Service (Amazon S3) bucket you specify. To help with the security of the logs gathered from your Amazon EC2 instance, if the policy status isPublic is set to true , or if the access control list (ACL) grants READ|WRITE permissions to the All Users Amazon S3 predefined group, the logs are not uploaded. Additionaly, if the provided bucket is not available in your account, the logs are not uploaded. For more information about Amazon S3 predefined groups, see [Amazon S3 predefined groups](https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#specifying-grantee-predefined-groups) in the *Amazon Simple Storage Service User Guide*.",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "ECSInstanceId": {
-      "type": "String",
-      "allowedPattern": "^[i|mi]-[a-z0-9]{8,17}$",
-      "description": "(Required) The ID of the ECS EC2 instance you want to collect logs from."
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of the instance you want to collect logs from. The instance you specify must be managed by Systems Manager."
     },
     "LogDestination": {
-      "type": "String",
-      "description": "(Optional) The Amazon Simple Storage Service (S3) bucket in your account to upload the logs to. Please make sure the bucket policy does not grant unnecessary read/write permissions to parties that do not need access to the collected logs.",
-      "allowedPattern": "^$|^(?!(^(([0-9]{1,3}[.]){3}[0-9]{1,3}$)))^((?!xn--)(?!.*-s3alias))[a-z0-9][-.a-z0-9]{1,61}[a-z0-9]$",
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Optional) The Amazon S3 bucket in your AWS account to upload the archived logs to. Please make sure the bucket policy does not grant unnecessary read/write permissions to parties that do not need access to the collected logs.",
       "default": ""
     },
     "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that runs this document.",
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
       "default": ""
     }
   },
   "mainSteps": [
     {
-      "name": "assertInstanceIsManaged",
+      "name": "AssertInstanceIsManaged",
+      "description": "Verifies whether the instance you specify in the `ECSInstanceId` parameter is managed by Systems Manager.",
       "action": "aws:assertAwsResourceProperty",
       "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 120,
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -41,13 +42,16 @@
           "Online"
         ]
       },
-      "isCritical": "true",
-      "nextStep": "getInstancePlatform"
+      "isCritical": true,
+      "nextStep": "GetInstancePlatform"
     },
     {
-      "name": "getInstancePlatform",
+      "name": "GetInstancePlatform",
       "action": "aws:executeAwsApi",
+      "description": "Gets information about the operating system (OS) platform of the instance specified in the `ECSInstanceId` parameter.",
       "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 120,
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -55,7 +59,7 @@
           {
             "Key": "InstanceIds",
             "Values": [
-              "{{ECSInstanceId}}"
+              "{{ ECSInstanceId }}"
             ]
           }
         ]
@@ -67,35 +71,39 @@
           "Type": "String"
         }
       ],
-      "isCritical": "true",
-      "nextStep": "verifyInstancePlatform"
+      "isCritical": true,
+      "nextStep": "BranchOnInstancePlatformForLogCollection"
     },
     {
-      "name": "verifyInstancePlatform",
+      "name": "BranchOnInstancePlatformForLogCollection",
       "action": "aws:branch",
+      "description": "Branches the automation step based on the OS platform.",
+      "isEnd": true,
       "inputs": {
         "Choices": [
           {
-            "NextStep": "runLogCollectionScriptOnWindows",
-            "Variable": "{{getInstancePlatform.platformType}}",
+            "NextStep": "RunLogCollectionScriptOnWindows",
+            "Variable": "{{ GetInstancePlatform.platformType }}",
             "StringEquals": "Windows"
           },
           {
-            "NextStep": "runLogCollectionScriptOnLinux",
-            "Variable": "{{getInstancePlatform.platformType}}",
+            "NextStep": "RunLogCollectionScriptOnLinux",
+            "Variable": "{{ GetInstancePlatform.platformType }}",
             "StringEquals": "Linux"
           }
         ]
       }
     },
     {
-      "name": "runLogCollectionScriptOnLinux",
+      "name": "RunLogCollectionScriptOnLinux",
       "action": "aws:runCommand",
       "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds": [
-          "{{ECSInstanceId}}"
+          "{{ ECSInstanceId }}"
         ],
         "Parameters": {
           "commands": [
@@ -657,18 +665,20 @@
           ]
         }
       },
-      "description": "Run the Log collection script on the provided ECS Linux instance",
-      "isCritical": "true",
-      "nextStep": "verifyIfS3BucketProvided"
+      "description": "Gathers operating system and Amazon ECS related log files on Linux instances and creates an archive file in the `/var/log/collectECSlogs` directory.",
+      "isCritical": true,
+      "nextStep": "BranchOnIfS3BucketProvided"
     },
     {
-      "name": "runLogCollectionScriptOnWindows",
+      "name": "RunLogCollectionScriptOnWindows",
       "action": "aws:runCommand",
       "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
         "InstanceIds": [
-          "{{ECSInstanceId}}"
+          "{{ ECSInstanceId }}"
         ],
         "Parameters": {
           "commands": [
@@ -699,12 +709,13 @@
             "    )",
             "",
             "# Common options",
-            "$basepath = \"C:\\ProgramData\"",
-            "$infodir=\"$basepath\\collectECSlogs_{{ECSInstanceId}}\"",
+            "$basepath = $env:ProgramData",
+            "$infodir=\"$basepath\\collectECSlogs_{{ ECSInstanceId }}\"",
             "$logdir=\"$basepath\\collectECSlogs\"",
             "$info_system=\"$infodir\\system\"",
             "$s3BucketName = \"{{ LogDestination }}\"",
             "",
+            "$ErrorActionPreference = \"Continue\"",
             "# Common functions",
             "# ---------------------------------------------------------------------------------------",
             "",
@@ -744,7 +755,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to collect system information\" ",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }  ",
             "        ",
             "}",
@@ -760,11 +771,11 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to Determine Free Disk Space\" ",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "    if ($percent -lt $threshold){",
             "        Write-Error \"C: drive only has $percent% free space, please ensure there is at least $threshold% free disk space to collect and store the log files\" ",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -776,7 +787,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to Collect System Logs\"",
-            "        break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -788,7 +799,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to Collect Application Logs\"",
-            "        break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -800,7 +811,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to Collect Volume information\"",
-            "        break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -819,7 +830,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to Collect Windows Firewall information\"",
-            "        break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -832,7 +843,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to collect installed applications list\"",
-            "        break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -844,7 +855,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to collect Services list\"",
-            "        break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -859,19 +870,19 @@
             "    }",
             "    catch{",
             "        Write-Error \"Unable to collect Docker daemon information\"",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
             "Function get_ecs_agent_logs{",
             "    try {",
             "        Write-Host \"Collecting ECS Agent logs\"",
-            "        copy C:\\programdata\\amazon\\ecs\\log\\* $info_system\\ecs\\",
+            "        copy $env:ProgramData\\amazon\\ecs\\log\\* $info_system\\ecs\\",
             "        Write-Host \"OK\" -foregroundcolor \"green\"",
             "    }",
             "    catch{",
             "        Write-Error \"Unable to collect ECS Agent logs\"",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -889,7 +900,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to collect Docker containers data\"",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -901,7 +912,7 @@
             "    }",
             "    catch {",
             "        Write-Error \"Unable to collect Docker daemon logs\"",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "}",
             "",
@@ -912,7 +923,7 @@
             "    }",
             "    else {",
             "        Write-Error \"Unable to cleanup $infodir, Please cleanup manually!\" ",
-            "        Break",
+            "        $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "    }",
             "    ",
             "}",
@@ -929,7 +940,7 @@
             "            Write-Host \"Unable to create log directory\"",
             "            Write-Host \"Please ensure you have enough permissions to create directories\"",
             "            Write-Error \"Failed to create log directory\"",
-            "            Break",
+            "            $_.Exception | Out-File $info_system\\log-collector.log -Append",
             "        }",
             "    }",
             "}",
@@ -938,7 +949,7 @@
             "    try {",
             "        Write-Host \"Archiving gathered data\"",
             "        create_log_dir",
-            "        Compress-Archive -Path $infodir -CompressionLevel Optimal -DestinationPath $logdir\\ecs_{{ECSInstanceId}}_{{automation:EXECUTION_ID}}.zip",
+            "        Compress-Archive -Path $infodir -CompressionLevel Optimal -DestinationPath $logdir\\ecs_{{ ECSInstanceId }}_{{ automation:EXECUTION_ID }}.zip",
             "        Write-Host \"OK\" -foregroundcolor \"green\"",
             "    }",
             "    catch {",
@@ -983,62 +994,95 @@
           ]
         }
       },
-      "description": "Run the Log collection script on the provided ECS Windows instance",
-      "isCritical": "true",
-      "nextStep": "verifyIfS3BucketProvided"
+      "description": "Gathers operating system and Amazon ECS related log files on Windows instances and creates an archive file in the `%ProgramData%\\collectECSlogs` directory.",
+      "isCritical": true,
+      "nextStep": "BranchOnIfS3BucketProvided"
     },
     {
-      "name": "verifyIfS3BucketProvided",
+      "name": "BranchOnIfS3BucketProvided",
       "action": "aws:branch",
+      "description": "Branch on whether the `LogDestination` input parameter was provided or not.",
       "inputs": {
         "Choices": [
           {
             "Not": {
-              "Variable": "{{LogDestination}}",
+              "Variable": "{{ LogDestination }}",
               "StringEquals": ""
             },
-            "NextStep": "runUploadScript"
+            "NextStep": "GetS3BucketPublicStatus"
           }
         ]
       },
-      "description": "Checks if S3 bucket was provided in the invocation to upload the logs",
       "onFailure": "Abort",
       "isCritical": true,
       "isEnd": true
     },
     {
-      "name": "runUploadScript",
+      "name": "GetS3BucketPublicStatus",
+      "description": "Checks if the Amazon S3 bucket specified in the \"LogDestination\" allows anonymous, or public read or write access permissions.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "S3BucketName": "{{ LogDestination }}"
+        },
+        "Handler": "get_bucket_public_status.is_bucket_public",
+        "Runtime": "python3.8",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "S3BucketLocation",
+          "Selector": "$.Payload.location",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnInstancePlatformForUpload",
+      "isCritical": true
+    },
+    {
+      "name": "BranchOnInstancePlatformForUpload",
       "action": "aws:branch",
+      "isEnd": true,
+      "description": "Branches the automation step based on the OS platform.",
       "inputs": {
         "Choices": [
           {
-            "NextStep": "runUploadScriptOnWindows",
-            "Variable": "{{getInstancePlatform.platformType}}",
+            "NextStep": "RunUploadScriptOnWindows",
+            "Variable": "{{ GetInstancePlatform.platformType }}",
             "StringEquals": "Windows"
           },
           {
-            "NextStep": "runUploadScriptOnLinux",
-            "Variable": "{{getInstancePlatform.platformType}}",
+            "NextStep": "RunUploadScriptOnLinux",
+            "Variable": "{{ GetInstancePlatform.platformType }}",
             "StringEquals": "Linux"
           }
         ]
       }
     },
     {
-      "name": "runUploadScriptOnLinux",
+      "name": "RunUploadScriptOnLinux",
       "action": "aws:runCommand",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
       "onFailure": "Abort",
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds": [
-          "{{ECSInstanceId}}"
+          "{{ ECSInstanceId }}"
         ],
         "Parameters": {
           "commands": [
+            "#!/bin/bash",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
             "logfile=\"ecs_{{ECSInstanceId}}_{{automation:EXECUTION_ID}}.tgz\"",
-            "bucketStatus=True",
             "accountId=\"{{ global:ACCOUNT_ID }}\"",
             "filepath=\"/var/log/collectECSlogs/${logfile}\"",
+            "log_destination_bucket=\"{{LogDestination}}\"",
+            "bucket_location=\"{{GetS3BucketPublicStatus.S3BucketLocation}}\"",
             "",
             "function cleanup()",
             "{",
@@ -1047,88 +1091,30 @@
             "fi",
             "}",
             "",
-            "function eval_bucket_policy(){",
-            "    policy_status=$($awspath s3api get-bucket-policy-status --bucket {{LogDestination}} --query PolicyStatus.IsPublic --output text 2>&1)",
-            "    command_status=$?",
-            "    if [ $command_status -eq 0 ] ; then",
-            "        if [ \"$policy_status\" = \"False\" ] ; then",
-            "            bucketStatus=False    ",
-            "        else",
-            "            echo \"Verifying bucket policy: Bucket is public, cannot Upload to a public bucket!\"",
-            "        fi",
-            "    elif [[ $(echo \"$policy_status\" | grep NoSuchBucketPolicy) ]]; then",
-            "        bucketStatus=False",
-            "    else",
-            "        echo \"There was an error while verifying S3 bucket policy, $policy_status\"",
-            "        bucketStatus=True",
-            "    fi",
-            "}",
-            "",
-            "function eval_bucket_acl(){",
-            "    PUBLIC_ACL_INDICATOR='http://acs.amazonaws.com/groups/global/AllUsers'",
-            "    acl_status=$($awspath s3api get-bucket-acl --output text --bucket {{LogDestination}} 2>&1)",
-            "    command_status=$?",
-            "    if [ $command_status -eq 0 ] ; then",
-            "        if `echo $acl_status | grep -A1 'READ\\|WRITE' | grep -q \"${PUBLIC_ACL_INDICATOR}\"`",
-            "        then",
-            "            bucketStatus=True",
-            "            echo \"Verifying bucket ACL: Bucket is public, cannot Upload to a public bucket!\"",
-            "        else",
-            "            bucketStatus=False",
-            "        fi",
-            "    else",
-            "        echo \"There was an error while verifying S3 bucket ACL, $acl_status\"",
-            "        bucketStatus=True",
-            "    fi",
-            "}",
-            "",
             "echo \"Uploading ECS logs collected. Checking if AWS CLI is installed.\"",
             "if command -v aws &> /dev/null",
             "then",
             "    echo \"AWS CLI is Installed..\" ",
             "    awspath=$(command -v aws)",
-            "    ${awspath} s3api head-bucket --bucket {{LogDestination}} --expected-bucket-owner $accountId &>/dev/null",
-            "    if [ $? -ne 0 ];",
+            "    echo \"Bucket name $log_destination_bucket\" ",
+            "    echo \"Bucket location $bucket_location\" ",
+            "    if ! (${awspath} s3api head-bucket --bucket \"$log_destination_bucket\" --region \"$bucket_location\" --expected-bucket-owner \"$accountId\");",
             "    then",
-            "        echo \"No S3 bucket called {{LogDestination}} found in the current AWS account, or access denied. Please specify a S3 bucket you own and this instance has access to.\"",
+            "        echo \"No S3 bucket called $log_destination_bucket found in the current AWS account, or access denied.\"",
+            "        echo \"Please specify a S3 bucket you own and this instance has access to.\"",
             "        cleanup",
             "        exit 1",
             "    else",
-            "        echo \"Checking if bucket {{LogDestination}} is public or not.\"",
-            "        eval_bucket_policy  ",
-            "        if [ \"$bucketStatus\" = \"False\" ]",
-            "        then ",
-            "            eval_bucket_acl ",
-            "            if [ \"$bucketStatus\" = \"False\" ]",
-            "            then",
-            "                echo \"Bucket {{LogDestination}} is not public. Starting log upload..\"",
-            "                if [ -f $filepath ]; then",
-            "                    ${awspath} s3 cp $filepath s3://{{LogDestination}} --no-progress",
-            "                    if [ $? -eq 0 ];",
-            "                    then",
-            "                        echo \"Log file $logfile uploaded to S3 bucket {{LogDestination}}.\"",
-            "                    else ",
-            "                        echo \"Failed to upload log file to S3 bucket {{LogDestination}}.\"",
-            "                        cleanup",
-            "                        exit 1",
-            "                    fi",
-            "                else",
-            "                    echo \"Log file $filepath doesn't exist, Failed to upload the logs to S3 bucket {{LogDestination}}.\"",
-            "                    cleanup",
-            "                    exit 1",
-            "                fi",
-            "            else",
-            "                echo \"The operation to upload logs has been cancelled. Exiting!\"",
-            "                cleanup",
-            "                exit 1",
-            "            fi   ",
+            "        echo \"Starting log upload to $log_destination_bucket...\"",
+            "        if [ -f $filepath ]; then",
+            "            ${awspath} s3 cp $filepath s3://$log_destination_bucket --region \"$bucket_location\" --no-progress --only-show-errors;",
             "            cleanup",
             "        else",
-            "            echo \"The operation to upload logs has been cancelled. Exiting!\"",
+            "            echo \"Log file $filepath doesn't exist, Failed to upload the logs to S3 bucket $log_destination_bucket.\"",
             "            cleanup",
             "            exit 1",
             "        fi",
-            "fi",
+            "    fi",
             "else",
             "    echo \"AWS CLI Not Installed. Quitting Upload WorkFlow.\"",
             "    cleanup",
@@ -1137,114 +1123,70 @@
           ]
         }
       },
-      "isCritical": "true",
+      "isCritical": true,
       "isEnd": true,
-      "description": "Upload logs to S3"
+      "description": "Uploads the log archive to the Amazon S3 bucket specified in the `LogDestination` parameter and deletes the archived log file from OS."
     },
     {
-      "name": "runUploadScriptOnWindows",
+      "name": "RunUploadScriptOnWindows",
       "action": "aws:runCommand",
       "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
         "InstanceIds": [
-          "{{ECSInstanceId}}"
+          "{{ ECSInstanceId }}"
         ],
         "Parameters": {
           "commands": [
             "$s3BucketName = \"{{ LogDestination }}\"",
             "$curdir = (Get-Item -Path \".\\\" -Verbose).FullName",
-            "$basepath = \"C:\\ProgramData\"",
-            "$logFile = \"ecs_{{ECSInstanceId}}_{{ automation:EXECUTION_ID }}.zip\"",
-            "$logdir=\"$basepath\\collectECSlogs\"",
+            "$basepath = $env:ProgramData",
+            "$logFile = \"ecs_{{ ECSInstanceId }}_{{ automation:EXECUTION_ID }}.zip\"",
+            "$logdir = \"$basepath\\collectECSlogs\"",
             "$filepath = \"$logdir\\$logfile\"",
             "$accountId = \"{{ global:ACCOUNT_ID }}\"",
             "",
             "",
-            "Function cleanup{",
+            "Function CleanupFolder{",
             "    if (Test-Path $filepath -PathType leaf)",
             "    {",
             "    Remove-Item $filepath",
             "    }",
             "}",
             "",
-            "Function evalBucketPolicy{",
-            "    try {",
-            "        $bucketPolicy = Get-S3BucketPolicyStatus -BucketName $S3bucketName -ExpectedBucketOwner $accountId",
-            "    } ",
-            "    catch {",
-            "        if($_.Exception.Message -eq \"The bucket policy does not exist\") {",
-            "            return $False",
-            "        }",
-            "        else",
-            "        {",
-            "            Write-Host \"There was an error while verifying S3 bucket policy:\" $_.Exception.Message",
-            "            return $True",
-            "        }",
-            "    }",
-            "    if($bucketPolicy.IsPublic) {",
-            "        Write-Host \"Verifying bucket Policy: Bucket is public, cannot Upload to a public bucket!\"",
-            "        return $True",
-            "        }",
-            "    return $False",
-            "}",
-            "",
-            "Function evalBucketAcl{",
-            "    try{",
-            "        $bucketAcl = Get-S3ACL -Bucketname $s3BucketName",
-            "        foreach ($grant in $bucketAcl.Grants)",
-            "        {",
-            "            if ($grant.Grantee.URI -eq \"http://acs.amazonaws.com/groups/global/AllUsers\")",
-            "            {",
-            "                Write-Host \"Verifying bucket ACL: Bucket is public, cannot Upload to a public bucket!\"",
-            "                return $True",
-            "            }",
-            "        }",
-            "    }catch{",
-            "            Write-Host \"There was an error while verifying S3 bucket ACL:\" $_.Exception.Message",
-            "            return $True",
-            "    }",
-            "    return $False",
-            "}",
-            "",
             "try{",
             "    if(Get-Module -ListAvailable -Name AWSPowershell){",
             "        Import-Module AWSPowershell",
             "        if(Test-S3Bucket -BucketName $s3BucketName){",
-            "            Write-Host \"Checking if bucket $s3BucketName is public or not.\"",
-            "            if((evalBucketPolicy) -or (evalBucketAcl)){",
-            "                cleanup",
-            "                throw \"The operation to upload logs has been cancelled. Exiting!\"",
-            "            }else{",
-            "                Write-Host \"Bucket $s3BucketName is not public. Starting log upload..\"",
-            "                if (Test-Path $filepath -PathType leaf)",
-            "                {",
-            "                    try{",
-            "                        Write-S3Object  -BucketName $s3BucketName -File $filepath",
-            "                        Write-Host \"Log file $logfile uploaded to S3 bucket $s3BucketName.\"",
-            "                    }",
-            "                    catch{",
-            "                        Write-Host \"Failed to upload Log file to S3 bucket $s3BucketName.\"",
-            "                        cleanup",
-            "                        Exit 1",
-            "                    }",
+            "            if (Test-Path $filepath -PathType leaf)",
+            "            {",
+            "                try{",
+            "                    Write-S3Object -BucketName $s3BucketName -File $filepath",
+            "                    Write-Host \"Log file $logfile uploaded to S3 bucket $s3BucketName.\"",
             "                }",
-            "                else",
-            "                {",
-            "                    Write-Host \"Log file $filepath doesn't exist, Failed to upload the logs to S3 bucket $s3BucketName.\"",
-            "                    cleanup",
+            "                catch{",
+            "                    Write-Host \"Failed to upload Log file to S3 bucket $s3BucketName.\"",
+            "                    CleanupFolder",
             "                    Exit 1",
             "                }",
-            "                cleanup          ",
-            "            }    ",
+            "            }",
+            "            else",
+            "            {",
+            "                Write-Host \"Log file $filepath doesn't exist, Failed to upload the logs to S3 bucket $s3BucketName.\"",
+            "                CleanupFolder",
+            "                Exit 1",
+            "            }",
+            "            CleanupFolder",
             "        }else{",
-            "            cleanup",
+            "            CleanupFolder",
             "            throw (\"No S3 bucket called \" + $s3BucketName + \" found in the current AWS account, or access denied. Please specify a S3 bucket you own and this instance has access to.\")",
             "        }",
             "    }else{",
             "        Write-Host \"AWS Tools for Windows PowerShell not installed. Please install the latest version of the AWS Tools for Windows PowerShell and try again.\"",
             "        Write-Host \"Download location: https://aws.amazon.com/powershell/\"",
-            "        cleanup",
+            "        CleanupFolder",
             "        Exit 255",
             "    }",
             "}catch{",
@@ -1254,9 +1196,16 @@
           ]
         }
       },
-      "isCritical": "true",
+      "isCritical": true,
       "isEnd": true,
-      "description": "Upload logs to S3"
+      "description": "Uploads the log archive to the Amazon S3 bucket specified in the `LogDestination` parameter and deletes the archived log file from OS."
     }
-  ]
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "319e0be3f3c19e5ef7e6943b2da170887632128fa6e8a56f2d2af12cc3b2cb2a"
+      }
+    }
+  }
 }

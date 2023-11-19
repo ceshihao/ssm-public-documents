@@ -1,0 +1,274 @@
+{
+  "description": "The **AWSSupport-EmptyS3Bucket** automation runbook empties an existing Amazon Simple Storage Service (Amazon S3) bucket by using a [lifecycle expiration configuration rule](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html). The automation performs the following actions on the Amazon S3 bucket:\n> * Suspends bucket [versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/versioning-workflows.html), if enabled.\n> * Updates the bucket policy to deny any `s3:PutObject` API calls (to prevent new uploads while it is being emptied).\n> * Updates the lifecycle rules to delete all the objects according to the expiration days specified in the input parameters.\n\n### Important:\n\n> * If any failure occurs during the execution, the automation tries to restore the modified settings to their original state. If the rollback also fails, the automation goes to a terminal **FAILED** state.\n> * Objects deletion is performed asynchronously, so it takes time for the objects to be permanently deleted after the runbook execution is completed.\n> * The lifecycle rules modified by this runbook permanently deletes all the objects and its versions in the specified Amazon S3 bucket. You cannot recover permanently removed objects. For more information please review [Expiring objects](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html). The object versions in the bucket which are protected with [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-overview.html), are not deleted or overwritten by a lifecycle configuration.\n> * This automation does not support Amazon S3 buckets with [Multi-factor Authentication (MFA)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/MultiFactorAuthenticationDelete.html) enabled.\n> * This runboook uses the automation action `aws:approve`, which temporarily pauses the automation until the designated principals either approve or deny before making any change to the bucket's configuration. Please see [Running an automation with approvers](https://docs.aws.amazon.com/systems-manager/latest/userguide/running-automations-require-approvals.html) for more information.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": "",
+      "allowedPattern": "^|arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):iam::[0-9]{12,14}:role/.*$"
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the Amazon S3 bucket you want to empty.",
+      "allowedPattern": "^[0-9a-z][a-z0-9\\-\\.]{3,63}$"
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) The ARN of the Amazon Simple Notification Service (Amazon SNS) Topic for approval notification. This SNS topic is used to send the approval notifications required during the automation execution.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):sns:[a-z]{2}(-gov)?(-iso[a-z]?)?-[a-z]{2,10}-[0-9]{1,2}:[0-9]{12,14}:[0-9a-zA-Z-_]{1,256}(.fifo)?$"
+    },
+    "ApproverIAM": {
+      "type": "StringList",
+      "description": "(Required) The list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of these formats, 1) An AWS Identity and Access Management (IAM) user name 2) An IAM user ARN 3) An IAM role ARN 4) An IAM assume role user ARN.",
+      "allowedPattern": "^[a-z0-9A-Z+=,.@_-]{1,64}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):iam::[0-9]{12,14}:(role/|user/|assumed-role/)[a-z0-9A-Z+=,.@_-]{1,64}(/[a-z0-9A-Z+=,.@_-]{1,64})?$"
+    },
+    "MinimumRequiredApprovals": {
+      "type": "Integer",
+      "default": 1,
+      "description": "(Optional) The minimum number of approvals required to resume the automation. If you don't specify a value, the system defaults to one. The value for this parameter must be a positive number. The value for this parameter can't exceed the number of approvers defined in the `ApproverIAM` parameter.",
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    "NoncurrentVersionExpirationDays": {
+      "type": "Integer",
+      "description": "(Optional) Specify the number of days when noncurrent object versions expire. Upon expiration, Amazon S3 permanently deletes the noncurrent object versions. Default value is 1 and max value is 365.",
+      "allowedPattern": "^\\b(?:[1-9]|[1-9][0-9]|[1-2][0-9]{2}|3[0-5][0-9]|36[0-5])\\b$",
+      "default": 1
+    },
+    "ExpirationDays": {
+      "type": "Integer",
+      "description": "(Optional) Specify the expiration for the lifecycle of the object in days. Default value is 1 and max value is 365.",
+      "allowedPattern": "^\\b(?:[1-9]|[1-9][0-9]|[1-2][0-9]{2}|3[0-5][0-9]|36[0-5])\\b$",
+      "default": 1
+    },
+    "AbortIncompleteMultipartUpload": {
+      "type": "Integer",
+      "description": "(Optional) Specify the days since the initiation of an incomplete multipart upload that Amazon S3 will wait before permanently removing all parts of the upload. Default value is 1 and max value is 365.",
+      "allowedPattern": "^\\b(?:[1-9]|[1-9][0-9]|[1-2][0-9]{2}|3[0-5][0-9]|36[0-5])\\b$",
+      "default": 1
+    },
+    "Acknowledgement": {
+      "type": "String",
+      "allowedPattern": "^Yes, I understand and acknowledge$",
+      "description": "(Required) Please read the complete details of the actions performed by this automation runbook and write 'Yes, I understand and acknowledge' if you acknowledge the steps. **Important:** You cannot recover permanently removed objects. For more information please review [Expiring objects](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "checkConcurrency",
+      "action": "aws:executeScript",
+      "description": "Ensures there is only one execution of this runbook targeting the specified Amazon S3 bucket. If the runbook finds another in progress execution targeting the same bucket name, it returns an error and ends.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "TargetResourceId": "{{ S3BucketName }}",
+          "ParameterName": "S3BucketName"
+        },
+        "Handler": "checkConcurrency.check_concurrency_handler",
+        "Runtime": "python3.8",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getBucketVersioningConfiguration"
+    },
+    {
+      "name": "getBucketVersioningConfiguration",
+      "action": "aws:executeAwsApi",
+      "description": "Fetches the versioning status of the specified S3 bucket.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "s3",
+        "Api": "GetBucketVersioning",
+        "Bucket": "{{ S3BucketName }}",
+        "ExpectedBucketOwner": "{{ global:ACCOUNT_ID }}"
+      },
+      "outputs": [
+        {
+          "Name": "BucketVersioningStatus",
+          "Selector": "$.Status",
+          "Type": "String"
+        },
+        {
+          "Name": "BucketMFADeleteStatus",
+          "Selector": "$.MFADelete",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnStoppingIfMFADeleteEnabled"
+    },
+    {
+      "name": "branchOnStoppingIfMFADeleteEnabled",
+      "action": "aws:branch",
+      "description": "Stops the automation if `MFADelete` is enabled on the specified S3 bucket.",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "approvalToMakeChangesToTheProvidedS3Bucket",
+            "Not": {
+              "Variable": "{{ getBucketVersioningConfiguration.BucketMFADeleteStatus }}",
+              "StringEquals": "Enabled"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "approvalToMakeChangesToTheProvidedS3Bucket",
+      "action": "aws:approve",
+      "description": "Waits for designated principals approval to disable bucket versioning and update the bucket policy and lifecycle rules configuration for the specified S3 bucket.",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "nextStep": "branchOnBucketVersioningStatus",
+      "inputs": {
+        "NotificationArn": "{{SNSTopicArn}}",
+        "Message": "AWSSupport-EmptyS3Bucket runbook is invoked against the Amazon S3 Bucket {{ S3BucketName }} and is awaiting approval to make changes to the S3 bucket. Once approval is provided, automation will DISABLE bucket versioning (if enabled), update bucket policy to deny 's3:PutObject' action and update lifecycle configuration to expire existing objects. This step will automatically timeout after 3600s if no action is taken.",
+        "MinRequiredApprovals": "{{MinimumRequiredApprovals}}",
+        "Approvers": [
+          "{{ApproverIAM}}"
+        ]
+      }
+    },
+    {
+      "name": "branchOnBucketVersioningStatus",
+      "action": "aws:branch",
+      "description": "If versioning is enabled on the specified S3 bucket, disable it, otherwise continue to update bucket policy and lifecycle configuration",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "suspendBucketVersioning",
+            "Variable": "{{ getBucketVersioningConfiguration.BucketVersioningStatus }}",
+            "StringEquals": "Enabled"
+          }
+        ],
+        "Default": "updateBucketPolicyAndLifeCycleConfiguration"
+      }
+    },
+    {
+      "name": "suspendBucketVersioning",
+      "action": "aws:executeAwsApi",
+      "description": "Suspends the versioning state of the specified S3 bucket.",
+      "isCritical": true,
+      "onFailure": "step:branchOnFailureOriginalVersioningStatus",
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutBucketVersioning",
+        "Bucket": "{{ S3BucketName }}",
+        "ExpectedBucketOwner": "{{ global:ACCOUNT_ID }}",
+        "VersioningConfiguration": {
+          "Status": "Suspended"
+        }
+      },
+      "nextStep": "updateBucketPolicyAndLifeCycleConfiguration"
+    },
+    {
+      "name": "updateBucketPolicyAndLifeCycleConfiguration",
+      "action": "aws:executeScript",
+      "description": "Adds/Updates the bucket policy to deny all `s3:PutObject` requests and updates the lifecycle configuration to expire objects based on the user provided inputs parameters.",
+      "timeoutSeconds": 600,
+      "nextStep": "branchOnFailingIfBucketPropertiesNotUpdated",
+      "onFailure": "step:branchOnFailureOriginalVersioningStatus",
+      "inputs": {
+        "InputPayload": {
+          "BucketName": "{{ S3BucketName }}",
+          "NoncurrentVersionExpirationDays": "{{ NoncurrentVersionExpirationDays }}",
+          "AbortIncompleteMultipartUpload": "{{ AbortIncompleteMultipartUpload }}",
+          "ExpirationDays": "{{ ExpirationDays }}"
+        },
+        "Handler": "configure_s3_bucket.script_handler",
+        "Runtime": "python3.8",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ExecutionStatus",
+          "Selector": "$.Payload.executionStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "branchOnFailingIfBucketPropertiesNotUpdated",
+      "action": "aws:branch",
+      "description": "Checks the status of the `updateBucketPolicyAndLifeCycleConfiguration` step and tries to revert the original bucket versioning state if changed by automation.",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "branchOnFailureOriginalVersioningStatus",
+            "Variable": "{{ updateBucketPolicyAndLifeCycleConfiguration.ExecutionStatus }}",
+            "StringEquals": "FAILED"
+          }
+        ]
+      }
+    },
+    {
+      "name": "branchOnFailureOriginalVersioningStatus",
+      "action": "aws:branch",
+      "description": "On failure, branches to determine the original versioning status. If was enabled and suspended by this automation, tries to enable it again",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "onFailureRestoreBucketVersioning",
+            "Variable": "{{ getBucketVersioningConfiguration.BucketVersioningStatus }}",
+            "StringEquals": "Enabled"
+          }
+        ]
+      }
+    },
+    {
+      "name": "onFailureRestoreBucketVersioning",
+      "action": "aws:executeAwsApi",
+      "description": "Restores the enabled versioning state of the specified S3 bucket.",
+      "isCritical": true,
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutBucketVersioning",
+        "Bucket": "{{ S3BucketName }}",
+        "ExpectedBucketOwner": "{{ global:ACCOUNT_ID }}",
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        }
+      }
+    }
+  ],
+  "outputs": [
+    "updateBucketPolicyAndLifeCycleConfiguration.Message"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "524eecb5cd5f5b138b685d2eb5a870fe0db55cf6ad1140b767d3b9452c1fa4bf"
+      }
+    }
+  }
+}

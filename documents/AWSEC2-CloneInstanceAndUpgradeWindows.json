@@ -82,11 +82,6 @@
           "Type": "String"
         },
         {
-          "Name": "AvailabilityZone",
-          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
-          "Type": "String"
-        },
-        {
           "Name": "RootDeviceName",
           "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
           "Type": "String"
@@ -441,7 +436,7 @@
         ]
       },
       "isCritical": "false",
-      "nextStep": "checkForSSMAgent"
+      "nextStep": "rebootToMakeItReady"
     },
     {
       "name": "rebootToMakeItReady",
@@ -773,30 +768,18 @@
     },
     {
       "name": "getAmazonOwnedWindowsServerSnapShotId",
-      "action": "aws:executeAwsApi",
-      "maxAttempts": 3,
+      "action": "aws:shareSQLMedia",
       "onFailure": "step:deleteServerUpgradeInstance",
       "timeoutSeconds": 600,
       "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeSnapshots",
-        "OwnerIds": [
-          "amazon"
-        ],
-        "Filters": [
-          {
-            "Name": "description",
-            "Values": [
-              "{{ runScriptBeforeWindowServerUpgrade.Output }}"
-            ]
-          }
-        ]
+        "SQLServerVersion": "{{ runScriptBeforeWindowServerUpgrade.Output }}",
+        "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
+        "SQLServerEdition": "None"
       },
       "outputs": [
         {
-          "Name": "SnapShotId",
-          "Selector": "$.Snapshots[0].SnapshotId",
-          "Type": "String"
+          "Name": "SnapshotId",
+          "Selector": "$.EBSSnapshotId"
         }
       ],
       "nextStep": "branchOnLicensingToGetWindowMediaSnapshot"
@@ -815,7 +798,7 @@
               },
               {
                 "Variable": "{{ BYOLWindowsMediaSnapshotId }}",
-                "StringEquals": "{{ getAmazonOwnedWindowsServerSnapShotId.SnapShotId }}"
+                "StringEquals": "{{ getAmazonOwnedWindowsServerSnapShotId.EBSSnapshotId }}"
               }
             ],
             "NextStep": "assertFailBecauseSameSnapshotOwnedByAmazon"
@@ -881,7 +864,7 @@
         "Service": "ec2",
         "Api": "CreateVolume",
         "AvailabilityZone": "{{ getUpgradeServerInstanceDetails.AvailabilityZone }}",
-        "SnapshotId": "{{ getAmazonOwnedWindowsServerSnapShotId.SnapShotId }}",
+        "SnapshotId": "{{ getAmazonOwnedWindowsServerSnapShotId.EBSSnapshotId }}",
         "VolumeType": "gp2",
         "TagSpecifications": [
           {
@@ -1194,6 +1177,8 @@
             "[Parameter(Mandatory = $true)] [string] $tmpLocation",
             ")",
             "Write-Log \"About to download answer file to $tmpLocation\" \"Green\"",
+            "Add-Type -AssemblyName System.Security",
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
             "$remoteURI = \"https://awsec2-server-upgrade-prod.s3.us-west-1.amazonaws.com/\"",
             "$attemptCount = 0",
             "$osInfo = (Get-WmiObject -class Win32_OperatingSystem)",
