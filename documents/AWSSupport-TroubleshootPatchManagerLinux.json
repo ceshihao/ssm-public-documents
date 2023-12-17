@@ -1,0 +1,372 @@
+{
+  "description": "The **AWSSupport-TroubleshootPatchManagerLinux** runbook helps in evaluating and diagnosing failed executions of the **AWS-RunPatchBaseline** AWS Systems Manager document against Linux based AWS Systems Manager Managed Instances. AWS-RunPatchBaseline is the default SSM Document used by the Patch Manager. The runbook analyze the Patching logs present on the instance to find the cause of the failure and provide remediation steps for the errors found.\n\n### Supported Operating Systems:\n - Amazon Linux 2 and 2023\n - Red Hat Enterprise Linux 8.X and 9.X\n - Centos 8.X and 9.X\n - Ubuntu 18.04,20.04,22.04\n - SUSE 15.X\n### Prerequisites:\n\n- Instance must be Linux and SSM Managed.\n- Following packages must be available on the instance : **python3.7 or later, wget or curl, unzip.** Note: We recommend upgrading to Python 3.8 or later to minimize impact of future update campaigns. Refer to this [public documentation](https://aws.amazon.com/blogs/developer/python-support-policy-updates-for-aws-sdks-and-tools/) for more info on this. \n- Instance can connect to S3 service endpoints to download the code from AWS owned bucket **arn:aws:s3:::aws-ssm-document-attachments-region/***.\n\n**Note**: The input parameter **RunCommandId** is optional. If you do not provide a specific Command ID to evaluate, automation looks for last unsuccessful execution of AWS-RunPatchBaseline for the instance. If you provide a command ID as the input, the Command ID must have been executed in last **30 days**. This is because the Run Command history retention period is 30 days.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "GenerateReport.output"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) Provide the ID of the linux based SSM managed Node (EC2 or Hybrid Activated on-premise server) for which AWS-RunPatchBaseline document execution failed."
+    },
+    "RunCommandId": {
+      "type": "String",
+      "description": "(Optional) Failed Run Command ID of AWS-RunPatchBaseline. If not provided, automation looks for the latest unsuccessful execution of AWS-RunPatchBaseline for the instance and evaluate it. To confirm the command ID, look under Command History tab in the Run Command Console under AWS Systems Manager.",
+      "default": "",
+      "allowedPattern": "^(?:|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
+      "maxChars": 36
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckConcurrency",
+      "action": "aws:executeScript",
+      "description": "Ensures there is only one execution of this runbook targeting the same Instance. If the runbook finds another in progress execution targeting the same Instance, it returns an error and ends.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "TargetResourceId": "{{ InstanceId }}",
+          "ParameterName": "InstanceId"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.8",
+        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nfrom datetime import datetime, timedelta, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nERROR_ICON = \" \\u274C [ERROR]:\"\n\ntry:\n    ssm_client = boto3.client(\"ssm\")\nexcept ClientError as e:\n    raise Exception(f\"{ERROR_ICON} Failed to initialize boto3 client for service ssm. {str(e)}\")\n\n\ndef script_handler(events, context):\n    try:\n        # Get the current execution details\n        current_execution = ssm_client.describe_automation_executions(\n            Filters=[{\"Key\": \"ExecutionId\", \"Values\": [context[\"automation:EXECUTION_ID\"]]}]\n        )[\"AutomationExecutionMetadataList\"][0]\n\n        # Check for other previous/older running automation for the same current document that are not in a final status\n        current_execution_start_time = datetime.fromtimestamp(\n            current_execution[\"ExecutionStartTime\"].timestamp(), timezone.utc\n        )\n\n        # Add 5 seconds to 'StartTimeBefore' to capture executions that started exactly at the same time\n        current_execution_start_time += timedelta(seconds=10)\n\n        # Describe executions that are not in terminal status\n        document_executions = ssm_client.describe_automation_executions(\n            Filters=[\n                {\"Key\": \"DocumentNamePrefix\", \"Values\": [current_execution[\"DocumentName\"]]},\n                {\"Key\": \"ExecutionStatus\", \"Values\": [\"InProgress\", \"Pending\", \"Cancelling\", \"Waiting\"]},\n                {\"Key\": \"StartTimeBefore\", \"Values\": [current_execution_start_time.strftime(\"%Y-%m-%dT%H:%M:%SZ\")]},\n            ]\n        )[\"AutomationExecutionMetadataList\"]\n\n        # Check for other previous executions targeting the same resource ID. If any, return an error\n        for execution in document_executions:\n            execution_id = execution[\"AutomationExecutionId\"]\n            if execution_id != current_execution[\"AutomationExecutionId\"]:\n                if execution.get(\"Target\", \"\") == events.get(\"TargetResourceId\"):\n                    raise Exception(\n                        f\"There is another execution of this document already in progress for {events.get('TargetResourceId')} with id {execution['AutomationExecutionId']}\",\n                    ) from None\n\n                execution_details = (\n                    ssm_client.get_automation_execution(AutomationExecutionId=execution_id)[\"AutomationExecution\"]\n                    .get(\"Parameters\", [])\n                    .get(events.get(\"ParameterName\"), [])\n                )\n                execution_resource_id = next(iter(execution_details), \"\")\n                if execution_resource_id == events.get(\"TargetResourceId\"):\n                    raise Exception(\n                        f\"There is another execution of this document already in progress for {events.get('TargetResourceId')} with id {execution['AutomationExecutionId']}\",\n                    ) from None\n\n    except ClientError as e:\n        c = e.response[\"Error\"][\"Code\"]\n        m = e.response[\"Error\"][\"Message\"]\n        raise Exception(f\"An error occurred when checking concurrent executions: {c}:{m}\")\n\n    return {\n        \"NoExecutionFound\": f\"No Automation executions were found in progress for {current_execution.get('DocumentName')} runbook targeting {events.get('TargetResourceId')}\"\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ValidateCommandID"
+    },
+    {
+      "name": "ValidateCommandID",
+      "description": "Validates if RunCommandId is provided as input parameter. If not, finds the latest execution of AWS-RunPatchBaseline for the Instance which is in Failed status.",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnCommandStatus",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Attachment": "attachment.zip",
+        "InputPayload": {
+          "Instance": "{{ InstanceId }}",
+          "CommandID": "{{ RunCommandId }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nERROR_ICON = \" \\u274C [ERROR]:\"\nINFO_ICON = \" \\u2705 [INFO]:\"\nWARN_ICON = \" \\u274E [WARNING]:\"\n\ntry:\n    ssm_client = boto3.client(\"ssm\")\nexcept ClientError as e:\n    raise Exception(f\"{ERROR_ICON} Failed to initialize boto3 client for service ssm. {str(e)}\")\n\n\ndef script_handler(events, context=None):\n    instance_id = events[\"Instance\"]\n    command_id = events[\"CommandID\"]\n\n    if command_id:\n        try:\n            response = ssm_client.get_command_invocation(CommandId=command_id, InstanceId=instance_id)\n            documentname = response[\"DocumentName\"]\n            if documentname != \"AWS-RunPatchBaseline\":\n                raise Exception(\n                    f\"{ERROR_ICON} Command ID {command_id} was not executed for AWS-RunPatchBaseline SSM Document.Exiting..\"\n                ) from None\n            status = response[\"StatusDetails\"]\n            if status in [\n                \"AccessDenied\",\n                \"ExecutionTimedOut\",\n                \"DeliveryTimedOut\",\n                \"Undeliverable\",\n                \"Failed\",\n                \"Success\",\n                \"Terminated\",\n                \"Cancelled\",\n            ]:\n                return {\"command\": command_id, \"status\": status}\n            else:\n                raise Exception(f\"{ERROR_ICON} Command ID {command_id} has an Unknown Failed Status..\") from None\n        except ClientError as e:\n            raise Exception(f\"{ERROR_ICON} Failed to call the GetCommandInvocation API: {str(e)}\")\n\n    try:\n        print(\n            f\"{INFO_ICON} No RunCommandID provided. Looking for Latest execution of AWS-RunPatchBaseline SSM Document for the instance.\\n \"\n        )\n        response = ssm_client.list_command_invocations(\n            InstanceId=instance_id,\n            Filters=[{\"key\": \"DocumentName\", \"value\": \"AWS-RunPatchBaseline\"}],\n        )\n\n        commandslist = response.get(\"CommandInvocations\", [])\n        status_filter = [\n            \"Failed\",\n            \"AccessDenied\",\n            \"ExecutionTimedOut\",\n            \"DeliveryTimedOut\",\n            \"Undeliverable\",\n            \"Terminated\",\n        ]\n        filtered_commandslist = [item for item in commandslist if item.get(\"Status\") in status_filter]\n\n        if filtered_commandslist:\n            latestcommand_id_dict = max(filtered_commandslist, key=lambda x: x[\"RequestedDateTime\"])\n            latest_command_id = latestcommand_id_dict[\"CommandId\"]\n            status = latestcommand_id_dict[\"StatusDetails\"]\n            print(\n                f\"{INFO_ICON} Found unsuccessful latest execution of AWS-RunPatchBaseline SSM Document for {instance_id} with {status} status with command ID:{latest_command_id}\\n\"\n            )\n            return {\"command\": latest_command_id, \"status\": status}\n        else:\n            raise Exception(\n                f\"{ERROR_ICON} No failed patch command id found for {instance_id}. Rerun this Automation and provide the Run Command ID associated with Failed execution of AWS-RunPatchBaseline to debug.\"\n            ) from None\n    except ClientError as e:\n        raise Exception(f\"{ERROR_ICON} Failed to list commands for {instance_id} : {str(e)}\")\n"
+      },
+      "outputs": [
+        {
+          "Name": "commandId",
+          "Selector": "$.Payload.command",
+          "Type": "String"
+        },
+        {
+          "Name": "status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnCommandStatus",
+      "description": "Branches depending on the status of the Command.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "VerifyPrerequisites",
+            "Variable": "{{ ValidateCommandID.status }}",
+            "StringEquals": "Failed"
+          }
+        ],
+        "Default": "GenerateReport"
+      }
+    },
+    {
+      "name": "VerifyPrerequisites",
+      "action": "aws:runCommand",
+      "description": "Verifies if the target EC2 instance is connected with AWS Systems Manager and if prerequisites softwares are present on the Instance.",
+      "onFailure": "step:GenerateReport",
+      "nextStep": "GetPlatformDetails",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "TimeoutSeconds": 180,
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "prerequiste_failed=\"false\"",
+            "",
+            "command_exists() {",
+            "    $(which \"$1\" > /dev/null 2>&1 )",
+            "    return $?",
+            "}",
+            "",
+            "check_s3_access() {",
+            "    httpclient=\"$1\"",
+            "    S3_ENDPOINT_URL=\"https://s3.{{global:REGION}}.amazonaws.com\"",
+            "    if [ $httpclient = \"curl\" ];then",
+            "        curl -s -f -o /dev/null $S3_ENDPOINT_URL",
+            "        if [ $? -eq 0 ]; then",
+            "            echo \"Check2: [PASSED] Connectivity to the S3 endpoint is established.\"",
+            "        else",
+            "            echo \"Check2: [FAILED] Connectivity to the S3 endpoint could not be established. This is required for Patch Manager to work and also for this automation to continue. Ensure the S3 connectivity is present on the Instance.\"",
+            "            prerequiste_failed=\"true\"",
+            "        fi",
+            "    else",
+            "        wget -q -O /dev/null $S3_ENDPOINT_URL",
+            "        if [ $? -eq 0 ]; then",
+            "            echo \"Check2: [PASSED] Connectivity to the S3 endpoint is established.\"",
+            "        else",
+            "            echo \"Check2: [FAILED] Connectivity to the S3 endpoint could not be established. This is required for Patch Manager to work and also for this automation to continue. Ensure the S3 connectivity is present on the Instance.\"",
+            "            prerequiste_failed=\"true\"",
+            "        fi",
+            "    fi",
+            "}",
+            "",
+            "check_http_client() {",
+            "    if command_exists curl; then",
+            "        echo \"Check1: [PASSED] curl is present on the System.\"",
+            "        check_s3_access curl",
+            "    elif command_exists wget; then",
+            "        echo \"Check1: [PASSED] wget is present on the System.\"",
+            "        check_s3_access wget",
+            "    else",
+            "        echo \"Check1: [FAILED] Neither curl nor wget is installed.\"",
+            "        echo \"Check2: [FAILED] Unable to check S3 Connectivity as neither curl or wget is installed on the instance.\"",
+            "        prerequiste_failed=\"true\"",
+            "    fi",
+            "",
+            "}",
+            "",
+            "",
+            "check_unzip() {",
+            "    if command_exists unzip; then",
+            "        echo \"Check3: [PASSED] unzip is present on the System.\"",
+            "    else",
+            "        echo \"Check3: [FAILED] unzip is not present.\"",
+            "        prerequiste_failed=\"true\"",
+            "    fi",
+            "",
+            "}",
+            "",
+            "check_python3() {",
+            "    # Check if python3 is available",
+            "    if command_exists python3; then",
+            "        python3_version=$(python3 --version 2>&1 | cut -d \" \" -f 2)",
+            "        major_version=$(echo \"$python3_version\" | cut -d. -f1)",
+            "        minor_version=$(echo \"$python3_version\" | cut -d. -f2)",
+            "        if [ \"$major_version\" -ge 3 ] && [ \"$minor_version\" -ge 7 ]; then",
+            "            echo \"Check4: [PASSED] Python $python3_version is present on the System.\\n\\n\"",
+            "        else",
+            "            echo \"Check4: [FAILED] Installed Python version is $python3_version. Minimum version required for the runbook to work is 3.7. We recommend upgrading to Python 3.8 or later to minimize impact of future update campaigns. Refer to this public documentation for more info on this : https://aws.amazon.com/blogs/developer/python-support-policy-updates-for-aws-sdks-and-tools/ \"",
+            "        fi",
+            "",
+            "    else",
+            "        echo \"Check4: [FAILED] Python3 is not present on the System.\\n\\n\"",
+            "        prerequiste_failed=\"true\"",
+            "    fi",
+            "}",
+            "",
+            "# Run Checks sequentially",
+            "echo \"---------------------------\"",
+            "echo \"Prerequisites Checks Summary\"",
+            "echo \"---------------------------\"",
+            "echo \"\"",
+            "check_http_client",
+            "check_unzip",
+            "check_python3",
+            "",
+            "#Check if any prerequiste are not met.",
+            "if [ $prerequiste_failed = \"true\" ];",
+            "then",
+            "    echo \"\"",
+            "    echo \"One or more Prerequisites failed for this Automation to continue. Aborting.\"",
+            "    exit 1",
+            "else",
+            "    echo \"\"",
+            "    echo \"All Prerequisites are met for this Automation to continue.\"",
+            "    exit 0",
+            "fi"
+          ]
+        }
+      }
+    },
+    {
+      "name": "GetPlatformDetails",
+      "description": "Gets the platform details of the Instance.",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "timeoutSeconds": 180,
+      "nextStep": "GetDownloadURL",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "OperatingSystem",
+          "Selector": "$.InstanceInformationList[0].PlatformName",
+          "Type": "String"
+        },
+        {
+          "Name": "PlatformVersion",
+          "Selector": "$.InstanceInformationList[0].PlatformVersion",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetDownloadURL",
+      "description": "Gathers the download URL for the PatchManagerLogAnalyzer package. ",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "nextStep": "EvaluatePatchManagerLogs",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetDocument",
+        "Name": "AWSSupport-TroubleshootPatchManagerLinux"
+      },
+      "outputs": [
+        {
+          "Name": "URL",
+          "Selector": "$.AttachmentsContent[0].Url",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "EvaluatePatchManagerLogs",
+      "action": "aws:runCommand",
+      "description": "Downloads and executes the PatchManagerLogAnalyzer python package on the instance to evaluate the log file.",
+      "onFailure": "Abort",
+      "nextStep": "GenerateReport",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "InstanceIds": [
+          "{{InstanceId}}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "TimeoutSeconds": 300,
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "command_exists() {",
+            "    $(which \"$1\" > /dev/null 2>&1 )",
+            "    return $?",
+            "}",
+            "",
+            "OS=\"{{GetPlatformDetails.OperatingSystem}}\"",
+            "PLATFORM=\"{{GetPlatformDetails.PlatformVersion}}\"",
+            "URL=\"{{GetDownloadURL.URL}}\"  # The URL to download",
+            "INSTANCE_ID=\"{{InstanceId}}\"",
+            "RUNCOMMAND_ID=\"{{ValidateCommandID.commandId}}\"",
+            "",
+            "TMP_DIRECTORY=\"/var/lib/amazon/ssm/PatchManagerLogAnalyzer\"",
+            "# Check if the PatchManagerLogAnalyzer exists",
+            "if [ ! -d \"$TMP_DIRECTORY\" ]; then",
+            "    # Create the PatchManagerLogAnalyzer dir",
+            "    mkdir -p /var/lib/amazon/ssm/PatchManagerLogAnalyzer",
+            "fi",
+            "",
+            "cd $TMP_DIRECTORY",
+            "UnzippedDirectory=\"/var/lib/amazon/ssm/PatchManagerLogAnalyzer/Automation-{{automation:EXECUTION_ID}}\"",
+            "",
+            "# Check if curl or wget is available",
+            "if command_exists curl; then",
+            "    curl -s \"$URL\" --output attachments.zip",
+            "elif command_exists wget; then",
+            "    wget -q \"$URL\" -O attachments.zip",
+            "else",
+            "    echo \"Error: Neither curl nor wget is installed. Unable to download file.\" >&2",
+            "    exit 1",
+            "fi",
+            "",
+            "unzip -qq -o -d $UnzippedDirectory attachments.zip",
+            "[ $? -ne 0 ] && echo \"Error unzipping the file\" >&2 && exit 1",
+            "",
+            "cd $UnzippedDirectory",
+            "echo \"Starting 'python3 main.py $INSTANCE_ID $RUNCOMMAND_ID $OS $PLATFORM' \"",
+            "python3 main.py \"$INSTANCE_ID\" \"$RUNCOMMAND_ID\" \"$OS\" \"$PLATFORM\"",
+            "",
+            "",
+            "# Clean up directory. Wait for 5 seconds in case of file locks.",
+            "sleep 5",
+            "rm -rf $TMP_DIRECTORY"
+          ]
+        }
+      }
+    },
+    {
+      "name": "GenerateReport",
+      "description": "Creates the final output for the Automation Execution.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "Instance": "{{ InstanceId }}",
+          "FailedCommandStatus": "{{ValidateCommandID.status}}",
+          "FailedCommandID": "{{ValidateCommandID.commandId}}",
+          "EvaluatePatchManagerLogsCommandID": "{{ EvaluatePatchManagerLogs.CommandId }}",
+          "EvaluatePatchManagerLogsOutput": "{{ EvaluatePatchManagerLogs.Output }}",
+          "VerifyPrerequisitesCommandStatus": "{{ VerifyPrerequisites.Status }}",
+          "VerifyPrerequisitesCommandOutput": "{{ VerifyPrerequisites.Output }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\nimport boto3\nfrom botocore.exceptions import ClientError\n\nERROR_ICON = \" \\u274C [ERROR]:\"\nINFO_ICON = \" \\u2705 [INFO]:\"\nWARN_ICON = \" \\u274E [WARNING]:\"\n\nConnectionLost_info = f\"{ERROR_ICON} VerifyPrerequisites step status is Timed Out. The Instance is currently in Connection Lost state and therefore not SSM Managed. For this Automation to proceed, the Instance should to be SSM Managed. \\nAlso, for AWS-RunPatchBaseline document to successfully patch the instance, the Instance must be SSM managed.\\n\\nTo Troubleshoot why the instance is not SSM managed, you can use the below resources:\\n\\n1.From your instance, run the below command to verify the status of ssm agent prerequisites:\\nssm-cli get-diagnostics\\n\\nTo understand the output of this command, refer to https://docs.aws.amazon.com/systems-manager/latest/userguide/ssm-cli.html\\n\\n2. Run the AWSSupport-TroubleshootManagedInstance Systems Manager Automation document.\\n\\nFor more details on this Automation document, refer to https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-troubleshoot-managed-instance.html\\n\\n3. Repost Article : https://repost.aws/knowledge-center/systems-manager-ec2-instance-not-appear\"\n\nCommandNotAccepting_info = f\"{ERROR_ICON} VerifyPrerequisites step status is timed out. Failed to deliver commands to Instance. Check if the Instance is SSM Managed and the PingStatus is Online. Next, verify if all the prerequisites are met on the instance for ssm agent to work properly by running the below commands:\\n\\nssm-cli get-diagnostics \\n\\nTo understand the output of this command, refer to https://docs.aws.amazon.com/systems-manager/latest/userguide/ssm-cli.html\"\n\nAccessDenied_info = f\"{INFO_ICON} The Command failed with Status Access Denied. The AWS Identity and Access Management (IAM) user or role initiating the command doesn't have access to the targeted managed node. Ensure the user or role have necessary permissions to use the Run Command feature. For more details, see https://docs.aws.amazon.com/systems-manager/latest/userguide/security-iam.html\"\n\nExecutionTimedOut_info = f\"{INFO_ICON} The Command failed with Execution Timed Out. Command started on the managed node, but the command wasn’t completed before the execution timeout expired. \\n You can check the Agent logs for more information on the delay or alternatively, you can increase the Execution Time Out value. For more details on command statuses, see https://docs.aws.amazon.com/systems-manager/latest/userguide/monitor-commands.html#monitor-about-status-timeouts\"\n\nDeliveryTimedOut_info = f\"{INFO_ICON} The Command failed with Delivery Timed Out. The command wasn't delivered to the managed node before the total timeout expired. \\n\\nPossible reason would be the Instance is not available or the SSM agent running on the instance is not able to receive the Command. The later can be due to SSM agent not working properly or network issues. Check the SSM agent Logs and confirm SSM agent was running at the time of Command Invocation.  For more details about command statuses, see https://docs.aws.amazon.com/systems-manager/latest/userguide/monitor-commands.html#monitor-about-status-timeouts\"\n\nUndeliverable_info = f\"{INFO_ICON} The Command failed with Undeliverable Status. The command couldn't be delivered to the managed node. The node might not exist or it might not be responding. \\n\\nPossible reason would be the Instance is not available, stopped or terminated. This can also happen if the Instance was in Connection Lost when command was attempted to send to the Instance. \\n Other possibles reasons are SSM agent is not working properly or network issues on the instance. Check the SSM agent Logs at /var/log/amazon/ssm and confirm SSM agent was running at the time of Command Invocation.  For more details, see https://docs.aws.amazon.com/systems-manager/latest/userguide/monitor-commands.html#monitor-about-status-timeouts\"\n\nSuccess_info = f\"{INFO_ICON} The Command Status is Success.\"\n\nCancelled_info = f\"{INFO_ICON} The Command Status is Cancelled. The command was cancelled before it was completed.\"\n\nTerminated_info = f\"{INFO_ICON} The command invocation is in Terminated status. This happens when the parent command exceeded its max-errors limit and subsequent command invocations were canceled by the system. To understand more about error controls, refer https://docs.aws.amazon.com/systems-manager/latest/userguide/send-commands-multiple.html#send-commands-rate\"\n\nNoexec_info = f\"{ERROR_ICON} VerifyPrerequisites step status failed. Permission denied occurred when accessing the _script.sh file under /var/lib/amazon/. This can happen if /var/lib/amazon/ is mounted with noexec permissions. SSM Agent requires access to /var/lib/amazon directory to successfully execute Run Command scripts.\\n\\nFore more details, see https://docs.aws.amazon.com/systems-manager/latest/userguide/patch-manager-troubleshooting.html#patch-manager-troubleshooting-linux-3\"\n\n\ndef get_command_invocation_output(command, instance):\n    \"\"\"\n    This function initializes calls the GetCommandInvocation API to get the stdout content of the Run Command.\n    ARGS:\n        command: string : Run Command ID\n        instance: string: Instance ID\n    returns :\n        stdout_content of the command. Type:String\n    \"\"\"\n    try:\n        client = boto3.client(\"ssm\")\n        response = client.get_command_invocation(CommandId=command, InstanceId=instance)\n        stdout_content = response.get(\"StandardOutputContent\")\n        return stdout_content\n    except ClientError as e:\n        raise Exception(f\"{ERROR_ICON} {str(e)}\")\n\n\ndef get_instance_pingstatus(instance):\n    \"\"\"\n    This function checks for the SSM Ping status of the Instance.\n    ARGS:\n        instance: string: Instance ID\n    returns :\n         Text as Online or ConnectionLost.Type:String.\n    \"\"\"\n    try:\n        client = boto3.client(\"ssm\")\n        response = client.describe_instance_information(\n            InstanceInformationFilterList=[\n                {\n                    \"key\": \"InstanceIds\",\n                    \"valueSet\": [\n                        instance,\n                    ],\n                },\n            ]\n        )\n        if \"InstanceInformationList\" in response:\n            instance_info_list = response[\"InstanceInformationList\"]\n            if instance_info_list and len(instance_info_list) > 0:\n                ping_status = instance_info_list[0].get(\"pingstatus\")\n            else:\n                # Handle the case where the list is empty\n                ping_status = None\n        else:\n            # Handle the case where \"InstanceInformationList\" is not in the response\n            ping_status = None\n\n        if ping_status == \"Online\":\n            return \"Online\"\n        else:\n            return \"ConnectionLost\"\n\n    except ClientError as e:\n        raise Exception(f\"{ERROR_ICON}\", e)\n\n\ndef script_handler(events, context=None):\n    instanceid = events[\"Instance\"]\n    failed_patching_command_id = events[\"FailedCommandID\"]\n    failed_patching_command_status = events[\"FailedCommandStatus\"]\n    evaluate_patchmanager_logs_command_id = events[\"EvaluatePatchManagerLogsCommandID\"]\n    verify_prerequisites_command_status = events[\"VerifyPrerequisitesCommandStatus\"]\n    verify_prerequisites_command_output = events[\"VerifyPrerequisitesCommandOutput\"]\n    text_remove_output = \"----------ERROR-------\\nfailed to run commands: exit status 1\"\n    pre_output_text = f\"=======================\\nTROUBLESHOOTING RESULTS\\n=======================\\n\\nChecking Command ID {failed_patching_command_id} for Instance {instanceid} :\\n\\n\"\n\n    # Validates Command ID Status.\n    if failed_patching_command_status == \"AccessDenied\":\n        return {\"Output\": pre_output_text + AccessDenied_info}\n    elif failed_patching_command_status == \"Undeliverable\":\n        return {\"Output\": pre_output_text + Undeliverable_info}\n    elif failed_patching_command_status == \"DeliveryTimedOut\":\n        return {\"Output\": pre_output_text + DeliveryTimedOut_info}\n    elif failed_patching_command_status == \"ExecutionTimedOut\":\n        return {\"Output\": pre_output_text + ExecutionTimedOut_info}\n    elif failed_patching_command_status == \"Success\":\n        return {\"Output\": pre_output_text + Success_info}\n    elif failed_patching_command_status == \"Terminated\":\n        return {\"Output\": pre_output_text + Terminated_info}\n    elif failed_patching_command_status == \"Cancelled\":\n        return {\"Output\": pre_output_text + Cancelled_info}\n\n    # Validates the VerifyPrerequisites step output\n    if \"VerifyPrerequisites.Status\" in verify_prerequisites_command_status:\n        pingstatus = get_instance_pingstatus(instanceid)\n        if pingstatus == \"ConnectionLost\":\n            return {\"Output\": ConnectionLost_info}\n        else:\n            return {\"Output\": CommandNotAccepting_info}\n    # In progress, this will mostly happen when the status has not changed to connection Lost but the agent is offline. It takes 15 minutes for it reflect as Connection Lost.\n    elif verify_prerequisites_command_status == \"InProgress\":\n        return {\"Output\": CommandNotAccepting_info}\n    elif \"One or more Prerequisites failed for this Automation to continue.\" in verify_prerequisites_command_output:\n        return {\n            \"Output\": verify_prerequisites_command_output.replace(text_remove_output, \"\").replace(\n                \"One or more Prerequisites failed for this Automation to continue.\",\n                \"\\u274C One or more Prerequisites failed for this Automation to continue.\",\n            )\n        }\n    elif (\n        \"_script.sh: Permission denied\" in verify_prerequisites_command_output\n        and \"failed to run commands: exit status 126\" in verify_prerequisites_command_output\n    ):\n        return {\"Output\": Noexec_info}\n\n    if \"Failed\" in verify_prerequisites_command_status:\n        return {\n            \"Output\": \"\\u274C VerifyPrerequisites step failed with unknown error. Check if Instance is online and managed by Systems Manager. Run the following command on the instance to confirm:\\n\\n ssm-cli get-diagnostics --output table\"\n        }\n    # Getting full evaluate_patchmanager_logs_command_id output. There is limitation in the the output characters of aws:runCommand Automation Action to 2K.\n    output = get_command_invocation_output(evaluate_patchmanager_logs_command_id, instanceid)\n    return {\"Output\": output}\n"
+      },
+      "outputs": [
+        {
+          "Name": "output",
+          "Selector": "$.Payload.Output",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "16c110ee88c4dcba8fb95fa745fa1daa6d4c4495338a4979d79fa3cdd2ee90d9"
+      }
+    }
+  }
+}

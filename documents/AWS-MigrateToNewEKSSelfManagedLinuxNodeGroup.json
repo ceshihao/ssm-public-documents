@@ -1,0 +1,442 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# Document name - AWS-MigrateToNewEKSSelfManagedLinuxNodeGroup\n\n## What does this document do?\nThe AWS-MigrateToNewEKSSelfManagedLinuxNodeGroup runbook creates an EKS self-managed node group using\n[CreateStack](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateStack.html) API that will\nbe used to replace the old self-managed node group. This runbook follows steps 1-5 from\n[Migrating to a new node group](https://docs.aws.amazon.com/eks/latest/userguide/migrate-stack.html) document. After\nthe new node group is complete, you are responsible to update the `NodeInstanceRole` permissions as needed if using\nKubernetes [Cluster AutoScaler](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler) (step 3)\nand complete the remaining kubectl steps to gracefully migrate your existing applications to new node group. After\nyour old nodes finish draining, you are responsible to perform the remaining steps to revoke the security group\ninbound rules pertaining to the old node group and delete the old node group stack.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM)\nrole that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems\nManager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* OldStackName: (Required) The name or the unique stack ID of the AWS CloudFormation stack for your old\nself-managed node group, find in the [AWS CloudFormation Console](https://console.aws.amazon.com/cloudformation/).\n* NewStackName: (Optional) The unique name for the AWS CloudFormation stack that will be created for the new\nself-managed node group. The name must be unique in the Region in which you are creating the stack. By default,\nthe stack will be named `NewNodeGroup-<ClusterName>-<AutomationExecutionID`.\n  * Default: \"\"\n* ClusterControlPlaneSecurityGroup: (Optional) The security group of the cluster control plane. Choose the\nSecurityGroups value from the AWS CloudFormation output that you generated when you created your\n[VPC](https://docs.aws.amazon.com/eks/latest/userguide/creating-a-vpc.html). By default, the same parameter value\nfrom the `OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n* NodeGroupName: (Optional) The name for your node group. This name can be used later to identify the Auto Scaling\nnode group that's created for your nodes. By default, the same parameter value from the `OldStackName` for the old\nself-managed node group will be used.\n  * Default: \"\"\n* NodeAutoScalingGroupMinSize: (Optional) The minimum number of nodes that your node Auto Scaling group can scale in\nto. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.\n* NodeAutoScalingGroupDesiredCapacity: (Optional) The desired number of nodes to scale to when your stack is created.\nThis number must be greater than or equal to the `NodeAutoScalingGroupMinSize` and less than or equal to the\n`NodeAutoScalingGroupMaxSize`. By default, the same parameter value from the `OldStackName` for the old\nself-managed node group will be used.\n  * Default: \"\"\n* NodeAutoScalingGroupMaxSize: (Optional) The maximum number of nodes that your node Auto Scaling group can scale out\nto. This number must be set to at least 1 greater than `NodeAutoScalingGroupDesiredCapacity`. By default, the\nsame parameter value from the `OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n* NodeInstanceType: (Optional) Choose an instance type for your nodes. For more information, see\n[Choosing an Amazon EC2 instance type](https://docs.aws.amazon.com/eks/latest/userguide/choosing-instance-type.html).\nBy default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n* NodeImageIdSSMParam: (Optional) The Amazon EC2 Systems Manager parameter of the Amazon EKS optimized AMI you want\nto use for your Kubernetes version. See additional notes on the latest Amazon EKS optimized AMI for Kubernetes\nversion and/or how to use the Amazon EKS optimized accelerated AMI in the\n[Launching self-managed Amazon Linux nodes](https://docs.aws.amazon.com/eks/latest/userguide/launch-workers.html).\nBy default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n* NodeImageId: (Optional) The ID for the AMI to use, if you wish to use your own custom AMI. This value overrides\nany value specified for 'NodeImageIdSSMParam'. If you want to use the 'NodeImageIdSSMParam' value, ensure that the\nvalue for 'NodeImageId' is blank. By default, the same parameter value from the `OldStackName` for the old\nself-managed node group will be used.\n  * Default: \"\"\n* NodeVolumeSize: (Optional) The root volume size for your nodes, in GiB. By default, the same parameter value from\nthe `OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n* NodeVolumeType: (Optional) The root volume type for your nodes. By default, the same parameter value from the\n`OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n* KeyName: (Optional) The name of an Amazon EC2 SSH key pair that you can use to connect using SSH into your\nnodes with after they launch. By default, the same parameter value from the `OldStackName` for the old self-managed\nnode group will be used.\n  * Default: \"\"\n* BootstrapArguments: (Optional) Any optional arguments to pass to the node bootstrap script, such as extra kubelet\narguments. See\n[Launching self-managed Amazon Linux nodes](https://docs.aws.amazon.com/eks/latest/userguide/launch-workers.html)\nas a reference for performing bootstrap. By default, the same parameter value from the `OldStackName` for the old\nself-managed node group will be used.\n  * Default: \"\"\n* DisableIMDSv1: (Optional) A value that indicates whether IMDSv1 should be disabled. By default, each node supports\nthe Instance Metadata Service Version 1 (IMDSv1) and IMDSv2. However, you can disable IMDSv1. Select true if you\ndon't want any nodes or any pods scheduled in the node group to use IMDSv1. By default, the same parameter value\nfrom the `OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n* Subnets: (Optional) Comma-delimited list of subnets where workers can be created. For example,\n`subnet-0ebced1e1e3413614, subnet-0ebced1e1e3413614`. Subnets must be in the same VPC as the EKS cluster. By\ndefault, the same parameter value from the `OldStackName` for the old self-managed node group will be used.\n  * Default: \"\"\n\n## Output Parameters\n\n* DetermineParameterValuesForNewNodeGroup.NewStackParameters: The parameters to be used to create the new stack.\n* GetNewStackNodeInstanceRole.NewNodeInstanceRole: The node instance role for the new node group.\n* GetNewStackSecurityGroup.NewNodeSecurityGroup: The security group for the new node group.\n* DetermineParameterValuesForNewNodeGroup.NewStackName: The CloudFormation stack name for the new node group.\n* CreateStack.StackId: The CloudFormation stack ID for the new node group.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "OldStackName": {
+      "type": "String",
+      "description": "(Required) The name or the unique stack ID of the AWS CloudFormation stack for your old self-managed node group, find in the [AWS CloudFormation Console](https://console.aws.amazon.com/cloudformation/).",
+      "allowedPattern": "^[a-zA-Z][a-zA-Z0-9-]{0,254}$|^arn:aws[a-z0-9-]*:cloudformation:[a-z0-9-]+:\\d{12}:stack\\/[a-zA-Z][a-zA-Z0-9-]{0,254}\\/[a-zA-Z0-9-]{1,1017}$"
+    },
+    "NewStackName": {
+      "type": "String",
+      "description": "(Optional) The unique name for the AWS CloudFormation stack that will be created for the new self-managed node group. The name must be unique in the Region in which you are creating the stack. By default, the stack will be named `NewNodeGroup-<ClusterName>-<AutomationExecutionID`.",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z][a-zA-Z0-9-]{0,254}$"
+    },
+    "ClusterControlPlaneSecurityGroup": {
+      "type": "String",
+      "description": "(Optional) The security group of the cluster control plane. Choose the SecurityGroups value from the AWS CloudFormation output that you generated when you created your [VPC](https://docs.aws.amazon.com/eks/latest/userguide/creating-a-vpc.html). By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^sg-[a-z0-9]{1,1021}$"
+    },
+    "NodeGroupName": {
+      "type": "String",
+      "description": "(Optional) The name for your node group. This name can be used later to identify the Auto Scaling node group that's created for your nodes. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z0-9][a-zA-Z0-9_-]{0,1023}$"
+    },
+    "NodeAutoScalingGroupMinSize": {
+      "type": "String",
+      "description": "(Optional) The minimum number of nodes that your node Auto Scaling group can scale in to. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^\\d+$"
+    },
+    "NodeAutoScalingGroupDesiredCapacity": {
+      "type": "String",
+      "description": "(Optional) The desired number of nodes to scale to when your stack is created. This number must be greater than or equal to the `NodeAutoScalingGroupMinSize` and less than or equal to the `NodeAutoScalingGroupMaxSize`. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^\\d+$"
+    },
+    "NodeAutoScalingGroupMaxSize": {
+      "type": "String",
+      "description": "(Optional) The maximum number of nodes that your node Auto Scaling group can scale out to. This number must be set to at least 1 greater than `NodeAutoScalingGroupDesiredCapacity`. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^\\d+$"
+    },
+    "NodeInstanceType": {
+      "type": "String",
+      "description": "(Optional) Choose an instance type for your nodes. For more information, see [Choosing an Amazon EC2 instance type](https://docs.aws.amazon.com/eks/latest/userguide/choosing-instance-type.html). By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z][a-z0-9-]+\\.[a-z0-9]{1,100}$"
+    },
+    "NodeImageIdSSMParam": {
+      "type": "String",
+      "description": "(Optional) The Amazon EC2 Systems Manager parameter of the Amazon EKS optimized AMI you want to use for your Kubernetes version. See additional notes on the latest Amazon EKS optimized AMI for Kubernetes version and/or how to use the Amazon EKS optimized accelerated AMI in the [Launching self-managed Amazon Linux nodes](https://docs.aws.amazon.com/eks/latest/userguide/launch-workers.html). By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z0-9_\\.\\/-]{1,1011}$"
+    },
+    "NodeImageId": {
+      "type": "String",
+      "description": "(Optional) The ID for the AMI to use, if you wish to use your own custom AMI. This value overrides any value specified for 'NodeImageIdSSMParam'. If you want to use the 'NodeImageIdSSMParam' value, ensure that the value for 'NodeImageId' is blank. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z0-9_\\.\\/-]{1,1011}$"
+    },
+    "NodeVolumeSize": {
+      "type": "String",
+      "description": "(Optional) The root volume size for your nodes, in GiB. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^\\d+$"
+    },
+    "NodeVolumeType": {
+      "type": "String",
+      "description": "(Optional) The root volume type for your nodes. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z0-9]{1,1024}$"
+    },
+    "KeyName": {
+      "type": "String",
+      "description": "(Optional) The name of an Amazon EC2 SSH key pair that you can use to connect using SSH into your nodes with after they launch. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^\\S(?:.{1,1024}\\S)?$"
+    },
+    "BootstrapArguments": {
+      "type": "String",
+      "description": "(Optional) Any optional arguments to pass to the node bootstrap script, such as extra kubelet arguments. See [Launching self-managed Amazon Linux nodes](https://docs.aws.amazon.com/eks/latest/userguide/launch-workers.html) as a reference for performing bootstrap. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^--.*$"
+    },
+    "DisableIMDSv1": {
+      "type": "String",
+      "description": "(Optional) A value that indicates whether IMDSv1 should be disabled. By default, each node supports the Instance Metadata Service Version 1 (IMDSv1) and IMDSv2. However, you can disable IMDSv1. Select true if you don't want any nodes or any pods scheduled in the node group to use IMDSv1. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^true|false$"
+    },
+    "Subnets": {
+      "type": "String",
+      "description": "(Optional) Comma-delimited list of subnets where workers can be created. For example, `subnet-0ebced1e1e3413614, subnet-0ebced1e1e3413614`. Subnets must be in the same VPC as the EKS cluster. By default, the same parameter value from the `OldStackName` for the old self-managed node group will be used.",
+      "default": "",
+      "allowedPattern": "^$|^(subnet-[a-z0-9]{1,1017})$|^((subnet-[a-z0-9]{1,1017}(,|, ))*subnet-[a-z0-9]{1,1017})$"
+    }
+  },
+  "outputs": [
+    "DetermineParameterValuesForNewNodeGroup.NewStackParameters",
+    "GetNewStackNodeInstanceRole.NewNodeInstanceRole",
+    "GetNewStackSecurityGroup.NewNodeSecurityGroup",
+    "DetermineParameterValuesForNewNodeGroup.NewStackName",
+    "CreateStack.StackId"
+  ],
+  "mainSteps": [
+    {
+      "name": "DetermineParameterValuesForNewNodeGroup",
+      "description": "## DetermineParameterValuesForNewNodeGroup\nGets the parameter and output values from the old stack, compares them with the runbook parameter values, and\ndetermines which values will be used to create the new node group stack.\n## Outputs\n* OldStackDescribeStacksResponse: Response from the DescribeStacks API call.\n* NewStackParameters: The parameters to be used to create the new stack.\n* NewStackName: The CloudFormation stack name for the new node group.\n* ClusterControlPlaneSecurityGroup: The security group of the cluster control plane.\n* NodeGroupName: The name for your node group.\n* NodeAutoScalingGroupMinSize: The minimum number of nodes that your node Auto Scaling group can scale in to.\n* NodeAutoScalingGroupDesiredCapacity: The desired number of nodes to scale to when your stack is created.\n* NodeAutoScalingGroupMaxSize: The maximum number of nodes that your node Auto Scaling group can scale out to.\n* NodeInstanceType: The instance type for your nodes.\n* NodeImageIdSSMParam: The Amazon EC2 Systems Manager parameter of the Amazon EKS optimized AMI you want to use\n  for your Kubernetes version.\n* NodeImageId: The ID for the AMI to use, if you wish to use your own custom AMI.\n* NodeVolumeSize: The root volume size for your nodes, in GiB.\n* NodeVolumeType: The root volume type for your nodes.\n* KeyName: The name of an Amazon EC2 SSH key pair that you can use to connect using SSH into your nodes with\n  after they launch.\n* BootstrapArguments: Any optional arguments to pass to the node bootstrap script, such as extra kubelet\n  arguments.\n* DisableIMDSv1: A value that indicates whether IMDSv1 should be disabled.\n* Subnets: The subnets where workers can be created.\n* OldNodeInstanceRole: The old node instance role.\n* OldNodeSecurityGroup: The security group for the old node group.\n",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "OldStackName": "{{ OldStackName }}",
+          "NewStackName": "{{ NewStackName }}",
+          "ClusterControlPlaneSecurityGroup": "{{ ClusterControlPlaneSecurityGroup }}",
+          "NodeGroupName": "{{ NodeGroupName }}",
+          "NodeAutoScalingGroupMinSize": "{{ NodeAutoScalingGroupMinSize }}",
+          "NodeAutoScalingGroupDesiredCapacity": "{{ NodeAutoScalingGroupDesiredCapacity }}",
+          "NodeAutoScalingGroupMaxSize": "{{ NodeAutoScalingGroupMaxSize }}",
+          "NodeInstanceType": "{{ NodeInstanceType }}",
+          "NodeImageIdSSMParam": "{{ NodeImageIdSSMParam }}",
+          "NodeImageId": "{{ NodeImageId }}",
+          "NodeVolumeSize": "{{ NodeVolumeSize }}",
+          "NodeVolumeType": "{{ NodeVolumeType }}",
+          "KeyName": "{{ KeyName }}",
+          "BootstrapArguments": "{{ BootstrapArguments }}",
+          "DisableIMDSv1": "{{ DisableIMDSv1 }}",
+          "Subnets": "{{ Subnets }}",
+          "AutomationExecutionId": "{{ automation:EXECUTION_ID }}"
+        },
+        "Script": "import datetime\nimport json\n\nimport boto3\n\n\ndef get_runbook_parameter_values(event):\n    return {\n        \"NewStackName\": extract_value(event[\"NewStackName\"]),\n        \"ClusterName\": None,\n        \"ClusterControlPlaneSecurityGroup\": extract_value(event[\"ClusterControlPlaneSecurityGroup\"]),\n        \"NodeGroupName\": extract_value(event[\"NodeGroupName\"]),\n        \"NodeAutoScalingGroupMinSize\": extract_value(event[\"NodeAutoScalingGroupMinSize\"]),\n        \"NodeAutoScalingGroupDesiredCapacity\": extract_value(event[\"NodeAutoScalingGroupDesiredCapacity\"]),\n        \"NodeAutoScalingGroupMaxSize\": extract_value(event[\"NodeAutoScalingGroupMaxSize\"]),\n        \"NodeInstanceType\": extract_value(event[\"NodeInstanceType\"]),\n        \"NodeImageIdSSMParam\": extract_value(event[\"NodeImageIdSSMParam\"]),\n        \"NodeImageId\": extract_value(event[\"NodeImageId\"]),\n        \"NodeVolumeSize\": extract_value(event[\"NodeVolumeSize\"]),\n        \"NodeVolumeType\": extract_value(event[\"NodeVolumeType\"]),\n        \"KeyName\": extract_value(event[\"KeyName\"]),\n        \"BootstrapArguments\": extract_value(event[\"BootstrapArguments\"]),\n        \"DisableIMDSv1\": extract_value(event[\"DisableIMDSv1\"]),\n        \"VpcId\": None,\n        \"Subnets\": extract_value(event[\"Subnets\"]),\n        \"AutomationExecutionId\": extract_value(event[\"AutomationExecutionId\"]),\n    }\n\n\ndef get_old_stack_values(event, cfn_client):\n    response = cfn_client.describe_stacks(StackName=event[\"OldStackName\"])\n    old_stack_parameter_values = {}\n    old_stack_output_values = {}\n    for parameter in response[\"Stacks\"][0][\"Parameters\"]:\n        old_stack_parameter_values[parameter[\"ParameterKey\"]] = parameter[\"ParameterValue\"]\n    for output in response[\"Stacks\"][0][\"Outputs\"]:\n        old_stack_output_values[output[\"OutputKey\"]] = output[\"OutputValue\"]\n\n    return {\n        \"OldStackDescribeStacksResponse\": response,\n        \"OldStackParameters\": old_stack_parameter_values,\n        \"OldStackOutputs\": old_stack_output_values,\n    }\n\n\ndef get_new_stack_parameter_values(runbook_parameter_values, old_stack_parameter_values):\n    new_stack_parameter_values = {}\n    for key in runbook_parameter_values.keys():\n        if runbook_parameter_values[key]:\n            new_stack_parameter_values[key] = runbook_parameter_values[key]\n        elif key == \"NewStackName\":\n            new_stack_parameter_values[key] = (\n                f\"NewNodeGroup-{old_stack_parameter_values['ClusterName']}\"\n                + f\"-{runbook_parameter_values['AutomationExecutionId']}\"\n            )\n        else:\n            new_stack_parameter_values[key] = old_stack_parameter_values[key]\n    del new_stack_parameter_values[\"AutomationExecutionId\"]\n    return new_stack_parameter_values\n\n\ndef extract_value(event_value):\n    if not event_value:\n        return None\n    if isinstance(event_value, str):\n        return event_value.strip()\n    return event_value\n\n\ndef serialize_datetime(object):\n    if isinstance(object, (datetime.date, datetime.datetime)):\n        return object.isoformat()\n    return str(object)\n\n\ndef handler(event, context):\n    cfn_client = boto3.client(\"cloudformation\")\n    runbook_values = get_runbook_parameter_values(event)\n    old_stack_values = get_old_stack_values(event, cfn_client)\n    new_stack_values = get_new_stack_parameter_values(runbook_values, old_stack_values[\"OldStackParameters\"])\n    new_stack_values[\"Output\"] = json.dumps(new_stack_values, indent=4, default=serialize_datetime)\n    return {\n        \"OldStackDescribeStacksResponse\": json.dumps(\n            old_stack_values[\"OldStackDescribeStacksResponse\"], indent=4, default=serialize_datetime\n        ),\n        \"OldStackParameters\": old_stack_values[\"OldStackParameters\"],\n        \"OldStackOutputs\": old_stack_values[\"OldStackOutputs\"],\n        \"NewStackParameters\": new_stack_values,\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "OldStackDescribeStacksResponse",
+          "Selector": "$.Payload.OldStackDescribeStacksResponse",
+          "Type": "String"
+        },
+        {
+          "Name": "NewStackParameters",
+          "Selector": "$.Payload.NewStackParameters.Output",
+          "Type": "String"
+        },
+        {
+          "Name": "NewStackName",
+          "Selector": "$.Payload.NewStackParameters.NewStackName",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterName",
+          "Selector": "$.Payload.NewStackParameters.ClusterName",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterControlPlaneSecurityGroup",
+          "Selector": "$.Payload.NewStackParameters.ClusterControlPlaneSecurityGroup",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeGroupName",
+          "Selector": "$.Payload.NewStackParameters.NodeGroupName",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeAutoScalingGroupMinSize",
+          "Selector": "$.Payload.NewStackParameters.NodeAutoScalingGroupMinSize",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeAutoScalingGroupDesiredCapacity",
+          "Selector": "$.Payload.NewStackParameters.NodeAutoScalingGroupDesiredCapacity",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeAutoScalingGroupMaxSize",
+          "Selector": "$.Payload.NewStackParameters.NodeAutoScalingGroupMaxSize",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeInstanceType",
+          "Selector": "$.Payload.NewStackParameters.NodeInstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeImageIdSSMParam",
+          "Selector": "$.Payload.NewStackParameters.NodeImageIdSSMParam",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeImageId",
+          "Selector": "$.Payload.NewStackParameters.NodeImageId",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeVolumeSize",
+          "Selector": "$.Payload.NewStackParameters.NodeVolumeSize",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeVolumeType",
+          "Selector": "$.Payload.NewStackParameters.NodeVolumeType",
+          "Type": "String"
+        },
+        {
+          "Name": "KeyName",
+          "Selector": "$.Payload.NewStackParameters.KeyName",
+          "Type": "String"
+        },
+        {
+          "Name": "BootstrapArguments",
+          "Selector": "$.Payload.NewStackParameters.BootstrapArguments",
+          "Type": "String"
+        },
+        {
+          "Name": "DisableIMDSv1",
+          "Selector": "$.Payload.NewStackParameters.DisableIMDSv1",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Payload.NewStackParameters.VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "Subnets",
+          "Selector": "$.Payload.NewStackParameters.Subnets",
+          "Type": "String"
+        },
+        {
+          "Name": "OldNodeInstanceRole",
+          "Selector": "$.Payload.OldStackOutputs.NodeInstanceRole",
+          "Type": "String"
+        },
+        {
+          "Name": "OldNodeSecurityGroup",
+          "Selector": "$.Payload.OldStackOutputs.NodeSecurityGroup",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateStack",
+      "description": "## CreateStack\nCreates the new self-managed node group AWS CloudFormation stack.\n## Outputs\n* StackId: Unique identifier of the stack.\n* StackStatus: Current status of the stack.\n* StackStatusReason: Success or failure message associated with the stack status.\n",
+      "action": "aws:createStack",
+      "inputs": {
+        "Capabilities": [
+          "CAPABILITY_IAM"
+        ],
+        "StackName": "{{ DetermineParameterValuesForNewNodeGroup.NewStackName }}",
+        "TemplateURL": "https://s3.us-west-2.amazonaws.com/amazon-eks/cloudformation/2022-12-23/amazon-eks-nodegroup.yaml",
+        "OnFailure": "DELETE",
+        "TimeoutInMinutes": 30,
+        "Parameters": [
+          {
+            "ParameterKey": "ClusterName",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.ClusterName }}"
+          },
+          {
+            "ParameterKey": "ClusterControlPlaneSecurityGroup",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.ClusterControlPlaneSecurityGroup }}"
+          },
+          {
+            "ParameterKey": "NodeGroupName",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeGroupName }}"
+          },
+          {
+            "ParameterKey": "NodeAutoScalingGroupMinSize",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeAutoScalingGroupMinSize }}"
+          },
+          {
+            "ParameterKey": "NodeAutoScalingGroupDesiredCapacity",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeAutoScalingGroupDesiredCapacity }}"
+          },
+          {
+            "ParameterKey": "NodeAutoScalingGroupMaxSize",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeAutoScalingGroupMaxSize }}"
+          },
+          {
+            "ParameterKey": "NodeInstanceType",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeInstanceType }}"
+          },
+          {
+            "ParameterKey": "NodeImageIdSSMParam",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeImageIdSSMParam }}"
+          },
+          {
+            "ParameterKey": "NodeImageId",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeImageId }}"
+          },
+          {
+            "ParameterKey": "NodeVolumeSize",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeVolumeSize }}"
+          },
+          {
+            "ParameterKey": "NodeVolumeType",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.NodeVolumeType }}"
+          },
+          {
+            "ParameterKey": "KeyName",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.KeyName }}"
+          },
+          {
+            "ParameterKey": "BootstrapArguments",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.BootstrapArguments }}"
+          },
+          {
+            "ParameterKey": "DisableIMDSv1",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.DisableIMDSv1 }}"
+          },
+          {
+            "ParameterKey": "VpcId",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.VpcId }}"
+          },
+          {
+            "ParameterKey": "Subnets",
+            "ParameterValue": "{{ DetermineParameterValuesForNewNodeGroup.Subnets }}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "GetNewStackNodeInstanceRole",
+      "description": "## GetNewStackNodeInstanceRole\nGets the node instance role from the `NewStackName`.\n## Outputs\n* NewNodeInstanceRole: The node instance role for the new node group.\n",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStackResource",
+        "StackName": "{{ DetermineParameterValuesForNewNodeGroup.NewStackName }}",
+        "LogicalResourceId": "NodeInstanceRole"
+      },
+      "outputs": [
+        {
+          "Name": "NewNodeInstanceRole",
+          "Selector": "$.StackResourceDetail.PhysicalResourceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetNewStackSecurityGroup",
+      "description": "## GetNewStackSecurityGroup\nGets the node security group from the `NewStackName`.\n## Outputs\n* NewNodeSecurityGroup: The security group for the new node group.\n",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStackResource",
+        "StackName": "{{ DetermineParameterValuesForNewNodeGroup.NewStackName }}",
+        "LogicalResourceId": "NodeSecurityGroup"
+      },
+      "outputs": [
+        {
+          "Name": "NewNodeSecurityGroup",
+          "Selector": "$.StackResourceDetail.PhysicalResourceId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "AddIngressRulesToNewNodeSecurityGroup",
+      "description": "## AddIngressRulesToNewNodeSecurityGroup\nAdds ingress rules to NewNodeSecurityGroup so it can accept traffic from OldNodeSecurityGroup.\n# Outputs\nAuthorizeSecurityGroupIngressResponse: Response from the AuthorizeSecurityGroupIngress API call.\n",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "AuthorizeSecurityGroupIngress",
+        "GroupId": "{{ GetNewStackSecurityGroup.NewNodeSecurityGroup }}",
+        "IpPermissions": [
+          {
+            "IpProtocol": "-1",
+            "UserIdGroupPairs": [
+              {
+                "GroupId": "{{ DetermineParameterValuesForNewNodeGroup.OldNodeSecurityGroup }}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "AuthorizeSecurityGroupIngressResponse",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "AddIngressRulesToOldNodeSecurityGroup",
+      "description": "## AddIngressRulesToOldNodeSecurityGroup\nAdds ingress rules to OldNodeSecurityGroup so it can accept traffic from NewNodeSecurityGroup.\n# Outputs\nAuthorizeSecurityGroupIngressResponse: Response from the AuthorizeSecurityGroupIngress API call.\n",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "AuthorizeSecurityGroupIngress",
+        "GroupId": "{{ DetermineParameterValuesForNewNodeGroup.OldNodeSecurityGroup }}",
+        "IpPermissions": [
+          {
+            "IpProtocol": "-1",
+            "UserIdGroupPairs": [
+              {
+                "GroupId": "{{ GetNewStackSecurityGroup.NewNodeSecurityGroup }}"
+              }
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "AuthorizeSecurityGroupIngressResponse",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyStackComplete",
+      "description": "## VerifyStackComplete\nVerifies the `NewStackName` has a `StackStatus` of UPDATE_COMPLETE.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ DetermineParameterValuesForNewNodeGroup.NewStackName }}",
+        "PropertySelector": "Stacks[0].StackStatus",
+        "DesiredValues": [
+          "CREATE_COMPLETE"
+        ]
+      }
+    }
+  ]
+}

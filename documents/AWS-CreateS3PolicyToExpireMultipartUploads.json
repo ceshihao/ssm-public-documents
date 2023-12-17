@@ -1,0 +1,83 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-CreateS3PolicyToExpireMultipartUploads\n\n## What does this document do?\nThe AWS-CreateS3PolicyToExpireMultipartUploads runbook enables an administrator to create a lifecycle policy for a \nspecified bucket that will expire incomplete, multi-part uploads in progress after a set number of days. This \nrunbook will merge existing lifecycle bucket policies if one already exists by appending the ExpireMultipartUploads \nconfiguration.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) \nrole that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems \nManager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* BucketName: (Required) This is the Amazon bucket name that will have the lifecycle policy feature of Expire \nincomplete multipart uploads added.\n* DaysUntilExpire: (Required) This specifies the days since the initiation of an incomplete multipart upload that \nAmazon S3 will wait before permanently removing all parts of the upload.\n* RuleId: (Required) The ID used to identify the S3 Bucket Lifecycle rule name. This must be a unique value.\n* S3Prefix: (Optional) An object key name prefix that identifies the subset of objects to which the configuration\napplies.\n  * Default: \"\"\n\n## Outputs\n* VerifyExpireMultipartUploads.VerifyExpireMultipartUploadsResponse\n* VerifyExpireMultipartUploads.LifecycleConfigurationRule\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows \nSystems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager \nAutomation uses the permissions of the user that starts this runbook.\n",
+      "default": ""
+    },
+    "BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) This is the Amazon bucket name that will have the lifecycle policy feature of Expire incomplete \nmultipart uploads added.\n"
+    },
+    "DaysUntilExpire": {
+      "type": "Integer",
+      "allowedPattern": "^[1-9][0-9]{0,1023}$",
+      "description": "(Required) This specifies the days since the initiation of an incomplete multipart upload that Amazon S3 \nwill wait before permanently removing all parts of the upload.\n"
+    },
+    "RuleId": {
+      "type": "String",
+      "description": "(Required) The ID used to identify the S3 Bucket Lifecycle rule name. This must be a unique value.",
+      "allowedPattern": "^[a-zA-Z0-9_-]{1,1024}$"
+    },
+    "S3Prefix": {
+      "type": "String",
+      "description": "(Optional) An object key name prefix that identifies the subset of objects to which the configuration\napplies.\n",
+      "allowedPattern": "^(|[^\\/]{1,1024})$",
+      "default": ""
+    }
+  },
+  "outputs": [
+    "VerifyExpireMultipartUploads.VerifyExpireMultipartUploadsResponse",
+    "VerifyExpireMultipartUploads.LifecycleConfigurationRule"
+  ],
+  "mainSteps": [
+    {
+      "name": "ConfigureExpireMultipartUploads",
+      "description": "## ConfigureExpireMultipartUploads\nThis step will get the S3 Bucket's existing lifecycle rules, create a new lifecycle configuration to expire \nmultipart uploads, merge the existing and new configurations, and put the combined configuration on the bucket.\n",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "DaysUntilExpire": "{{ DaysUntilExpire }}",
+          "RuleId": "{{ RuleId }}",
+          "S3Prefix": "{{ S3Prefix }}"
+        },
+        "Script": "import time\nimport boto3\nimport botocore\n\n\ndef get_bucket_rules(s3_client, bucket_name):\n    try:\n        response = s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)\n        return response[\"Rules\"]\n    except botocore.exceptions.ClientError as error:\n        response = error.response\n        error_code = response[\"Error\"][\"Code\"]\n        error_message = response[\"Error\"][\"Message\"]\n        if error_code == \"NoSuchLifecycleConfiguration\" and \"does not exist\" in error_message:\n            return []\n        raise Exception from error\n\n\ndef handler(event, context):\n    bucket_name = event[\"BucketName\"]\n    days_until_expire = event[\"DaysUntilExpire\"]\n    rule_id = event[\"RuleId\"]\n    s3_prefix = event.get(\"S3Prefix\")\n\n    s3_client = boto3.client(\"s3\")\n    bucket_rules = get_bucket_rules(s3_client=s3_client, bucket_name=bucket_name)\n\n    if bucket_rules and len(bucket_rules) == 1000:\n        raise Exception(f\"S3 BUCKET {bucket_name} CANNOT HAVE MORE THAN 1,000 LIFECYCLE CONFIGURATION RULES\")\n\n    if bucket_rules:\n        bucket_rule_ids = []\n        for rule in bucket_rules:\n            bucket_rule_ids.append(rule[\"ID\"])\n        if rule_id in bucket_rule_ids:\n            raise Exception(\n                f\"S3 BUCKET {bucket_name} ALREADY CONTAINS A LIFECYCLE CONFIGURATION WITH ID {rule_id}\"\n            )\n\n    expire_multipart_uploads_rule = {\n        \"Status\": \"Enabled\",\n        \"ID\": rule_id,\n        \"AbortIncompleteMultipartUpload\": {\"DaysAfterInitiation\": days_until_expire},\n        \"Filter\": {\"Prefix\": s3_prefix if s3_prefix else \"\"},\n    }\n\n    bucket_rules.append(expire_multipart_uploads_rule)\n\n    try:\n        s3_client.put_bucket_lifecycle_configuration(\n            Bucket=bucket_name, LifecycleConfiguration={\"Rules\": bucket_rules}\n        )\n        time.sleep(5)\n    except botocore.exceptions.ClientError as error:\n        raise Exception from error\n"
+      }
+    },
+    {
+      "name": "VerifyExpireMultipartUploads",
+      "description": "## VerifyExpireMultipartUploads\nThis step verifies the rule ID created and applied to the S3 Bucket in the previous step was successfully \nenabled in the combined Bucket lifecycle configuration.\n## Outputs\n* VerifyExpireMultipartUploadsResponse: Output of the step indicating successful modification of the Amazon\nS3 Bucket lifecycle configuration.\n* LifecycleConfigurationRule: Lifecycle Configuration Rule configured on the Amazon S3 bucket.\n",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 5,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "RuleId": "{{ RuleId }}"
+        },
+        "Script": "import boto3\nimport botocore\n\n\ndef handler(event, context):\n    bucket_name = event[\"BucketName\"]\n    rule_id = event[\"RuleId\"]\n\n    s3_client = boto3.client(\"s3\")\n\n    try:\n        response = s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)\n        rules = response[\"Rules\"]\n        for rule in rules:\n            if rule_id == rule.get(\"ID\"):\n                success_message = (\n                    \"Verification of expiration of multipart upload configured for Amazon S3 Bucket is\"\n                    \" successful.\"\n                )\n                return {\"VerifyExpireMultipartUploads\": success_message, \"Rule\": rule}\n        raise Exception(\n            f\"FAILED TO VERIFY LIFECYCLE CONFIGURATION RULE WITH ID {rule_id} ON S3 BUCKET {bucket_name}\"\n        )\n    except botocore.exceptions.ClientError as error:\n        raise Exception from error\n"
+      },
+      "outputs": [
+        {
+          "Name": "VerifyExpireMultipartUploadsResponse",
+          "Type": "String",
+          "Selector": "$.Payload.VerifyExpireMultipartUploads"
+        },
+        {
+          "Name": "LifecycleConfigurationRule",
+          "Type": "StringMap",
+          "Selector": "$.Payload.Rule"
+        }
+      ]
+    }
+  ]
+}
