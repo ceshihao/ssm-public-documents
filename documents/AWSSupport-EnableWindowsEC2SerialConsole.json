@@ -1,0 +1,405 @@
+{
+  "description": "The **AWSSupport-EnableWindowsEC2SerialConsole** automation runbook helps to enable Special Admin Console (SAC) and boot menu on Amazon Elastic Compute Cloud (Amazon EC2) instances running Microsoft Windows Server. For instances in `running` state and managed by AWS Systems Manager, the runbook runs an AWS Systems Manager Run Command PowerShell script to enable SAC and boot menu. For instances in `stopped` state or not managed by AWS Systems Manager, the runbook uses the [AWSSupport-StartEC2RescueWorkflow]( https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-startec2rescueworkflow.html) automation workflow to create a temporary EC2 instance to perform the required changes `offline`.\n\nFor more information see [EC2 Serial Console for Windows instances]( https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/ec2-serial-console.html).\n\n### Important:\n\n> * Please note that if you enable SAC on an instance, the EC2 services that rely on password retrieval will not work from the Amazon EC2 console. For more information, please see [Use SAC to troubleshoot your Windows instance](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/troubleshooting-sac.html).\n> * To configure access to the serial console, you must grant serial console access at the account level and then configure IAM policies to grant access to your users. You must also configure a password-based user on every instance so that your users can use the serial console for troubleshooting. For more information see: [Configure access to the EC2 Serial Console]( https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-access-to-serial-console.html).\n> * To see if your accounts has Serial Console enabled see [View account access status to the serial console](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/configure-access-to-serial-console.html#sc-view-account-access).\n> * Serial Console Access is only supported on virtualized instances built on the [Nitro System]( https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html#nitro-instance-types).\n\nFor more information see the EC2 Serial Console [Prerequisites]( https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/ec2-serial-console-prerequisites.html).",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of Amazon EC2 instance that you want to enable EC2 serial console, Special Admin Console (SAC), and boot menu."
+    },
+    "HelperInstanceType": {
+      "type": "String",
+      "description": "(Conditional) The type of Amazon EC2 instance that the runbook provisions to configure EC2 serial console for an offline instance.",
+      "allowedValues": [
+        "t2.small",
+        "t2.medium",
+        "t2.large",
+        "t3.small",
+        "t3.medium",
+        "t3.large"
+      ],
+      "default": "t3.medium"
+    },
+    "SubnetId": {
+      "type": "String",
+      "description": "(Conditional) The subnet ID for a helper instance. By default, the same subnet where the provided instance resides is used. Important: If you provide a custom subnet, it must be in the same Availability Zone as InstanceId, and it must allow access to the Systems Manager endpoints. This is only required if the target instance is in `stopped` state or is not managed by AWS Systems Manager.",
+      "allowedPattern": "^SelectedInstanceSubnet$|^subnet-[a-z0-9]{8,17}$",
+      "default": "SelectedInstanceSubnet"
+    },
+    "HelperInstanceProfileName": {
+      "type": "String",
+      "description": "(Conditional) The name of an existing IAM instance profile for the helper instance. If you are enabling SAC and boot menu on an instance that is in `stopped` state or not managed by AWS Systems Manager, this is required. If an IAM instance profile is not specified, the automation creates one on your behalf.",
+      "default": "",
+      "allowedPattern": "^$|^[\\w+=,.@-]{1,128}$"
+    },
+    "CreateInstanceBackupBeforeScriptExecution": {
+      "type": "String",
+      "description": "(Optional) Specify `True` to create an Amazon Machine Images (AMI) backup of the EC2 instance before enabling SAC and boot menu. The AMI will persist after the automation completes. It is your responsibility to secure access to the AMI, or to delete it.",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "BackupAmazonMachineImagePrefix": {
+      "type": "String",
+      "description": "(Conditional) A prefix for the Amazon Machine Image (AMI) that is created if the `CreateInstanceBackupBeforeScriptExecution` parameter is set to `True`.",
+      "allowedPattern": "[-._a-zA-Z0-9]{3,20}$",
+      "default": "AWSSupport"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckIfEc2SerialConsoleAccessEnabled",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Checks if EC2 Serial Console access is enabled at the account level. **Note:** Access to the serial console is not available by default, for more information see [Configure access to the EC2 Serial Console](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/configure-access-to-serial-console.html#sc-grant-account-access)",
+      "onFailure": "Abort",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "GetSerialConsoleAccessStatus",
+        "PropertySelector": "$.SerialConsoleAccessEnabled",
+        "DesiredValues": [
+          "True"
+        ]
+      },
+      "nextStep": "CheckIfEc2InstanceIsWindows"
+    },
+    {
+      "name": "CheckIfEc2InstanceIsWindows",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Asserts if the target instance platform is `Windows`.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].Platform",
+        "DesiredValues": [
+          "windows"
+        ]
+      },
+      "nextStep": "GetInstanceType"
+    },
+    {
+      "name": "GetInstanceType",
+      "action": "aws:executeAwsApi",
+      "description": "Retrieves the instance type of the target instance.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Reservations[0].Instances[0].InstanceType",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckIfInstanceTypeIsNitro"
+    },
+    {
+      "name": "CheckIfInstanceTypeIsNitro",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Checks if the instance type hypervisor is Nitro-based. Serial Console Access is only supported on virtualized instances built on the [Nitro System]( https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html#nitro-instance-types).",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceTypes",
+        "InstanceTypes": [
+          "{{ GetInstanceType.InstanceType }}"
+        ],
+        "PropertySelector": "$.InstanceTypes[0].Hypervisor",
+        "DesiredValues": [
+          "nitro"
+        ]
+      },
+      "nextStep": "CheckIfInstanceIsInAutoScalingGroup"
+    },
+    {
+      "name": "CheckIfInstanceIsInAutoScalingGroup",
+      "action": "aws:executeScript",
+      "description": "Checks if the EC2 instance is part of an Amazon EC2 Auto Scaling group by calling the `DescribeAutoScalingInstances` API. If the instance is part of an Amazon EC2 Auto Scaling group, ensures the EC2 instance is in `Standby` lifecycle state.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\n\ndef handler(events, context):\n    \"\"\"\n    This is a handler function that is specified in SSM document step 'CheckIfInstanceInAutoScalingGroup'. It checks if\n    the provided instance belongs to an Auto Scaling Group and not in 'Standby' mode. Raises an exception if it does to avoid\n    unintended termination of the instance by reboot.\n    \"\"\"\n    instance_id = events.get(\"InstanceId\", \"\")\n    autoscaling = boto3.client(\"autoscaling\")\n\n    try:\n        print(f\"Checking if EC2 instance {instance_id} belongs to an Auto Scaling group.\")\n        instances = autoscaling.describe_auto_scaling_instances(InstanceIds=[instance_id])[\"AutoScalingInstances\"]\n        if instances and instances[0][\"LifecycleState\"] not in [\"Standby\"]:\n            print(\n                \"ERROR - The target EC2 instance is part of an EC2 Auto Scaling Group and not in 'Standby' lifecycle state\"\n            )\n            sys.exit(1)\n        else:\n            print(f\"PASSED - Confirmed that EC2 instance {instance_id} does not belong to an Auto Scaling group.\")\n            return\n\n    except ClientError as e:\n        c = e.response[\"Error\"][\"Code\"]\n        m = e.response[\"Error\"][\"Message\"]\n        raise Exception(f\"An error occurred when describing Auto Scaling instances: {c}:{m}\")\n"
+      },
+      "nextStep": "WaitForEc2InstanceStateStablized"
+    },
+    {
+      "name": "WaitForEc2InstanceStateStablized",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the instance to be in `running` or `stopped` state.",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "Reservations[0].Instances[0].State.Name",
+        "DesiredValues": [
+          "running",
+          "stopped"
+        ]
+      },
+      "nextStep": "GetEc2InstanceState"
+    },
+    {
+      "name": "GetEc2InstanceState",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the current state of the instance.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "State",
+          "Selector": "$.Reservations[0].Instances[0].State.Name",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnEc2InstanceState"
+    },
+    {
+      "name": "BranchOnEc2InstanceState",
+      "action": "aws:branch",
+      "description": "Branches the automation based on the instance state. If the instance is in `running` state, the automation checks if it is managed by AWS Systems Manager.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckIfEc2InstanceIsManagedBySSM",
+            "Variable": "{{ GetEc2InstanceState.State }}",
+            "StringEquals": "running"
+          }
+        ],
+        "Default": "CheckIfHelperInstanceProfileIsProvided"
+      },
+      "nextStep": "CheckIfHelperInstanceProfileIsProvided"
+    },
+    {
+      "name": "CheckIfEc2InstanceIsManagedBySSM",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Checks if the instance is managed by AWS Systems Manager. Ff managed, the runbook enables SAC and boot menu using a PowerShell Run Command.",
+      "isCritical": false,
+      "onFailure": "step:CheckIfHelperInstanceProfileIsProvided",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "nextStep": "BranchOnPreEC2RescueBackup"
+    },
+    {
+      "name": "BranchOnPreEC2RescueBackup",
+      "action": "aws:branch",
+      "description": "Branches on the `CreateInstanceBackupBeforeScriptExecution` input value. Creates an Amazon Machine Image (AMI) backup if 'CreateInstanceBackupBeforeScriptExecution' is equal to `True`.",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CreateAmazonMachineImageBackup",
+            "Variable": "{{ CreateInstanceBackupBeforeScriptExecution }}",
+            "StringEquals": "True"
+          }
+        ],
+        "Default": "EnableSACAndBootMenu"
+      },
+      "nextStep": "CreateAmazonMachineImageBackup"
+    },
+    {
+      "name": "CreateAmazonMachineImageBackup",
+      "action": "aws:createImage",
+      "description": "Creates an Amazon Machine Image (AMI) backup of the instance.",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InstanceId": "{{ InstanceId }}",
+        "ImageDescription": "Pre-Script Backup AMI Generated by Automation on {{ global:DATE_TIME }} from {{ InstanceId }}.",
+        "NoReboot": true,
+        "ImageName": "{{ BackupAmazonMachineImagePrefix }}-Pre-Script-Backup_{{ InstanceId }}_{{ global:DATE_TIME }}"
+      },
+      "nextStep": "EnableSACAndBootMenu"
+    },
+    {
+      "name": "EnableSACAndBootMenu",
+      "action": "aws:runCommand",
+      "description": "Enables SAC and boot menu by running a PowerShell Run Command script.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "Write-Verbose \"Setting up SAC access and boot menu using bcdedit...\"",
+            "",
+            "bcdedit /ems '{current}' on",
+            "bcdedit /emssettings EMSPORT:1 EMSBAUDRATE:115200",
+            "bcdedit /set '{bootmgr}' displaybootmenu yes",
+            "bcdedit /set '{bootmgr}' timeout 15",
+            "bcdedit /set '{bootmgr}' bootems yes",
+            "",
+            "Write-Verbose \"Setting up SAC access and boot menu complete.\""
+          ]
+        }
+      },
+      "nextStep": "RebootInstance"
+    },
+    {
+      "name": "RebootInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Reboots the EC2 instance to apply the configuration. This is the final step if the instance is `online` and is managed by AWS Systems Manager.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "RebootInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "CheckIfHelperInstanceProfileIsProvided",
+      "action": "aws:executeScript",
+      "description": "Checks if the 'HelperInstanceProfileName' specified exists before enabling SAC and boot menu offline using a temporary EC2 instance.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "HelperInstanceProfileName": "{{ HelperInstanceProfileName }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\n\ndef handler(events, context):\n    \"\"\"\n    This is a handler function that is specified in SSM document step 'CheckIfHelperInstanceProfileIsProvided'. It checks if helper\n    instance profile name is provided and if so, verify that it exists. Raises an exception if get_instance_profile() fails.\n    When returned error from get_instance_profile() contains 'NoSuchEntity', it assumes the provide helper instance does not exist\n    \"\"\"\n\n    helper_instance_profile = events.get(\"HelperInstanceProfileName\", \"\")\n    if helper_instance_profile == \"\":\n        print(\"'HelperInstanceProfileName' not provided. The automation will create one on your behalf.\")\n\n    iam_client = boto3.client(\"iam\")\n    try:\n        print(f\"Checking if instance profile '{helper_instance_profile}' exists.\")\n        iam_client.get_instance_profile(InstanceProfileName=helper_instance_profile)\n        print(f\"PASSED - Instance profile '{helper_instance_profile}' exists.\")\n\n    except ClientError as error:\n        if error.response[\"Error\"][\"Code\"] == \"NoSuchEntity\":\n            print(f\"ERROR - The provided instance profile '{helper_instance_profile}' does not exist.\")\n            sys.exit(1)\n        else:\n            print(f\"ERROR - Failed to run 'GetInstanceProfile' API on {helper_instance_profile} - {str(error)}.\")\n            sys.exit(1)\n"
+      },
+      "nextStep": "RunAutomationToInjectOfflineScriptForEnablingSACAndBootMenu"
+    },
+    {
+      "name": "RunAutomationToInjectOfflineScriptForEnablingSACAndBootMenu",
+      "action": "aws:executeAutomation",
+      "description": "Runs the `AWSSupport-StartEC2RescueWorkflow` to enable SAC and boot menu when the instance is in `stopped` state or not managed by AWS Systems Manager.",
+      "onFailure": "Abort",
+      "inputs": {
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ InstanceId }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "OfflineScript": [
+            "YmNkZWRpdCAvc3RvcmUgZDpcYm9vdC9iY2QgL2VtcyAne2RlZmF1bHR9JyBvbg0KYmNkZWRpdCAvc3RvcmUgZDpcYm9vdC9iY2QgL2Vtc3NldHRpbmdzIEVNU1BPUlQ6MSBFTVNCQVVEUkFURToxMTUyMDANCmJjZGVkaXQgL3N0b3JlIGQ6XGJvb3QvYmNkIC9zZXQgJ3tib290bWdyfScgZGlzcGxheWJvb3RtZW51IHllcw0KYmNkZWRpdCAvc3RvcmUgZDpcYm9vdC9iY2QgL3NldCAne2Jvb3RtZ3J9JyB0aW1lb3V0IDE1DQpiY2RlZGl0IC9zdG9yZSBkOlxib290L2JjZCAvc2V0ICd7Ym9vdG1ncn0nIGJvb3RlbXMgeWVz"
+          ],
+          "SubnetId": [
+            "{{ SubnetId }}"
+          ],
+          "EC2RescueInstanceType": [
+            "{{ HelperInstanceType }}"
+          ],
+          "HelperInstanceProfileName": [
+            "{{ HelperInstanceProfileName }}"
+          ],
+          "CreatePreEC2RescueBackup": [
+            "{{ CreateInstanceBackupBeforeScriptExecution }}"
+          ],
+          "CreatePostEC2RescueBackup": [
+            "False"
+          ],
+          "UniqueId": [
+            "{{ automation:EXECUTION_ID }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
+      },
+      "nextStep": "GetExecutionDetails"
+    },
+    {
+      "name": "GetExecutionDetails",
+      "action": "aws:executeAwsApi",
+      "description": "Retrieves ImageIds of backup and offline script output.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetAutomationExecution",
+        "AutomationExecutionId": "{{ RunAutomationToInjectOfflineScriptForEnablingSACAndBootMenu.ExecutionId }}"
+      },
+      "outputs": [
+        {
+          "Name": "BackupBeforeScriptExecution",
+          "Selector": "$.AutomationExecution.Outputs.'preScriptBackup.ImageId'[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "BackupAfterScriptExecution",
+          "Selector": "$.AutomationExecution.Outputs.'postScriptBackup.ImageId'[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "OfflineScriptOutput",
+          "Selector": "$.AutomationExecution.Outputs.'runScriptForWindows.Output'[0]",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "EnableSACAndBootMenu.Output",
+    "GetExecutionDetails.OfflineScriptOutput",
+    "GetExecutionDetails.BackupBeforeScriptExecution",
+    "GetExecutionDetails.BackupAfterScriptExecution"
+  ]
+}

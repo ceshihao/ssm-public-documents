@@ -1,0 +1,574 @@
+{
+  "description": "The **AWSSupport-TroubleshootEC2InstanceConnect** automation helps detecting why customers cannot connect to an Amazon Elastic Compute Cloud (Amazon EC2) Linux instance using [EC2 Instance Connect](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connect-linux-inst-eic.html). The runbooks tries to detect issues caused by an unsupported Amazon Machine Image (AMI), missing OS-level package installation or configuration, missing IAM permissions, or network configuration issues. The runbook requires the following permissions: `ec2:DescribeInstances`, `ec2:DescribeSecurityGroups`, `ec2:DescribeNetworkAcls`, `ec2:DescribeRouteTables`, `ec2:DescribeInternetGateways`, `iam:SimulatePrincipalPolicy`, `ssm:DescribeInstanceInformation`, `ssm:ListCommands`, `ssm:ListCommandInvocations`, and `ssm:SendCommand`.\n\n### Important:\n> * Connect using [EC2 Instance Connect Endpoint](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connect-using-eice.html) is not validated.\n> * The automation does not check if the SSH client is installed in the source machine and if it can reach the instance's private IP address in case private connection is chosen.\n> * Supported Operating Systems: Amazon Linux 2, Amazon Linux 2023, Ubuntu 16 or higher, CentOS Stream 8 and 9, macOS Sonoma, Ventura, and Monterey, and Red Hat Enterprise Linux (RHEL) 8 and 9.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of the Amazon EC2 instance you want to troubleshoot EC2 Instance Connect."
+    },
+    "Username": {
+      "type": "String",
+      "description": "(Required) The username used to connect to the EC2 instance using EC2 Instance Connect. It is used to evaluate if IAM access is granted for this particular user.",
+      "allowedPattern": "^[A-Za-z_][A-Za-z0-9\\@\\._-]{0,30}[A-Za-z0-9\\$_-]?$"
+    },
+    "EC2InstanceConnectRoleOrUser": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role or user that is being used to leverage EC2 Instance Connect and push keys to the instance.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):iam::[0-9]{12}:(role|user)\\/[a-zA-Z0-9+=,.@_\\/-]+$"
+    },
+    "SSHPort": {
+      "type": "String",
+      "description": "(Optional) The SSH port configured on the EC2 instance. Default value is `22`. The port number must be between `1-65535`.",
+      "default": "22",
+      "allowedPattern": "^([1-9]{1,4}|[1-5][0-9]{1,4}|6[0-5]{2}[0-3][0-5])$"
+    },
+    "SourceNetworkType": {
+      "description": "(Optional) The network access method to the EC2 instance: **Browser**: you are connecting to the EC2 instance using your browser by clicking the connect button from the console. **Public**: you are accessing the EC2 instance located in a public subnet over the Internet (example: from your local computer). **Private**: you are connecting to your instance through its private IP address.",
+      "type": "String",
+      "allowedValues": [
+        "Browser",
+        "Public",
+        "Private"
+      ],
+      "default": "Browser"
+    },
+    "SourceIpCIDR": {
+      "type": "String",
+      "description": "(Optional) The source CIDR that includes the IP address of the device you will be logging from using EC2 Instance Connect (such as your local computer). Example: 172.31.48.0/20.",
+      "default": "None",
+      "allowedPattern": "^(None|(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]).){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(3[0-2]|[1-2][0-9]|[0-9])))$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertInitialState",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Ensures the EC2 instance status is running otherwise the automation ends.",
+      "onFailure": "Abort",
+      "nextStep": "GetInstanceProperties",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "Reservations[0].Instances[0].State.Name",
+        "DesiredValues": [
+          "running"
+        ]
+      }
+    },
+    {
+      "name": "GetInstanceProperties",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the current EC2 instance properties: PlatformDetails, PublicIpAddress, SubnetId, VpcId, State, and MetadataHttpEndpoint.",
+      "nextStep": "GatherInstanceInformationFromSSM",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Platform",
+          "Selector": "$.Reservations[0].Instances[0].PlatformDetails",
+          "Type": "String"
+        },
+        {
+          "Name": "PublicIpAddress",
+          "Selector": "$.Reservations[0].Instances[0].PublicIpAddress",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Reservations[0].Instances[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Reservations[0].Instances[0].VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "MetadataHttpEndpoint",
+          "Selector": "$.Reservations[0].Instances[0].MetadataOptions.HttpEndpoint",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GatherInstanceInformationFromSSM",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the Systems Manager instance's ping status and operating system details if the instance is managed by Systems Manager.",
+      "onFailure": "Abort",
+      "nextStep": "CheckIfAWSRegionSupported",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PingStatus",
+          "Selector": "$.InstanceInformationList[0].PingStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "PlatformName",
+          "Selector": "$.InstanceInformationList[0].PlatformName",
+          "Type": "String"
+        },
+        {
+          "Name": "PlatformVersion",
+          "Selector": "$.InstanceInformationList[0].PlatformVersion",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckIfAWSRegionSupported",
+      "action": "aws:executeScript",
+      "description": "Checks if the EC2 instance is located in an EC2 Instance Connect supported AWS region.",
+      "nextStep": "BranchOnIfAWSRegionSupported",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_region.function_handler",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "RegionCheckExecutionLogs",
+          "Selector": "$.Payload.RegionCheckExecutionLogs",
+          "Type": "String"
+        },
+        {
+          "Name": "RegionCheckResult",
+          "Selector": "$.Payload.RegionCheckResult",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "RegionIpPrefix",
+          "Selector": "$.Payload.RegionIpPrefix",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnIfAWSRegionSupported",
+      "action": "aws:branch",
+      "description": "Branches on if AWS region is supported by EC2 Instance Connect.",
+      "nextStep": "MakeFinalOutput",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckIfInstanceAMIIsSupported",
+            "Variable": "{{ CheckIfAWSRegionSupported.RegionCheckResult }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "MakeFinalOutput"
+      }
+    },
+    {
+      "name": "CheckIfInstanceAMIIsSupported",
+      "action": "aws:executeScript",
+      "description": "Checks if the Amazon Machine Image (AMI) associated with the instance is supported by EC2 Instance Connect.",
+      "nextStep": "BranchOnIfInstanceAMIIsSupported",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_ami_supported.function_handler",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "PingStatus": "{{ GatherInstanceInformationFromSSM.PingStatus }}",
+          "PlatformName": "{{ GatherInstanceInformationFromSSM.PlatformName }}",
+          "PlatformVersion": "{{ GatherInstanceInformationFromSSM.PlatformVersion }}"
+        },
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ExecutionLogs",
+          "Selector": "$.Payload.ExecutionLogs",
+          "Type": "String"
+        },
+        {
+          "Name": "AMICheckResult",
+          "Selector": "$.Payload.AMICheckResult",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnIfInstanceAMIIsSupported",
+      "action": "aws:branch",
+      "description": "Branches based on whether the instance associated AMI is supported by EC2 Instance Connect or not.",
+      "nextStep": "MakeFinalOutput",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "MakeFinalOutput",
+            "Variable": "{{ CheckIfInstanceAMIIsSupported.AMICheckResult }}",
+            "StringEquals": "NO"
+          },
+          {
+            "NextStep": "CheckIMDSReachabilityFromOs",
+            "Variable": "{{ CheckIfInstanceAMIIsSupported.AMICheckResult }}",
+            "StringEquals": "YES"
+          },
+          {
+            "NextStep": "CheckMetadataHTTPEndpointIsEnabled",
+            "Variable": "{{ CheckIfInstanceAMIIsSupported.AMICheckResult }}",
+            "StringEquals": "SKIPPED"
+          }
+        ],
+        "Default": "MakeFinalOutput"
+      }
+    },
+    {
+      "name": "CheckIMDSReachabilityFromOs",
+      "action": "aws:runCommand",
+      "description": "Runs a Bash script on the target Amazon EC2 Linux instance to check if it is able to reach the Instance Metadata Service (IMDSv2).",
+      "nextStep": "CheckEICPackageInstallation",
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "",
+            "echo \"### Checking if Instance Metadata service (IMDSv2) is reachable ###\"",
+            "if [ \"$(curl -m 20 --retry 10 --retry-delay 2 -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 5' -o /dev/null -I -w %{http_code})\" == \"200\" ]; then",
+            "    echo \"SUCCESS: Instance metadata is reachable.\"",
+            "else",
+            "    echo \"ERROR: Instance Metadata service (IMDSv2) is not reachable. Check this article for more information about this issue: https://repost.aws/knowledge-center/ec2-linux-metadata-retrieval\"",
+            "fi"
+          ]
+        }
+      }
+    },
+    {
+      "name": "CheckEICPackageInstallation",
+      "action": "aws:runCommand",
+      "description": "Runs a Bash script on the target Amazon EC2 Linux instance to check if the EC2 Instance Connect package is installed and configured.",
+      "nextStep": "CheckSSHConfigFromOs",
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "",
+            "ubuntu_base_dir=\"/usr/share/ec2-instance-connect/\"",
+            "ubuntu_config_file=\"/lib/systemd/system/ssh.service.d/ec2-instance-connect.conf\"",
+            "ubuntu_ec2_connect_config=(\"AuthorizedKeysCommand /usr/share/ec2-instance-connect/eic_run_authorized_keys %%u %%f\" \"AuthorizedKeysCommandUser ec2-instance-connect\")",
+            "ubuntu_pkg_cmd=\"dpkg -l\"",
+            "",
+            "al_config_file=\"/etc/ssh/sshd_config\"",
+            "rhel_centos_8_config_file=\"/lib/systemd/system/ssh.service.d/ec2-instance-connect.conf\"",
+            "macos_rhel_centos_9_config_file=\"/etc/ssh/sshd_config.d/60-ec2-instance-connect.conf\"",
+            "",
+            "rpm_macos_common_base_dir=\"/opt/aws/bin/\"",
+            "rpm_macos_common_ec2_connect_config=(\"AuthorizedKeysCommand /opt/aws/bin/eic_run_authorized_keys %u %f\" \"AuthorizedKeysCommandUser ec2-instance-connect\")",
+            "rpm_common_pkg_cmd=\"rpm -q\"",
+            "",
+            "macos_brew_cmd=\"su - ec2-user -c 'brew list ec2-instance-connect &>/dev/null'\"",
+            "",
+            "ec2_connect_scripts=(\"eic_curl_authorized_keys\" \"eic_parse_authorized_keys\" \"eic_run_authorized_keys\")",
+            "",
+            "check_scripts_exist() {",
+            "    exist=0",
+            "    if [ \"$2\" = \"$al_config_file\" ] || [ \"$2\" = \"$ubuntu_config_file\" ]; then",
+            "        for script in \"${ec2_connect_scripts[@]}\"; do",
+            "            if ! [ -f \"$1$script\" ]; then",
+            "                echo \"ERROR: 'ec2-connect' script is missing: $1$script\"",
+            "                exist=1",
+            "            fi",
+            "        done",
+            "    else",
+            "        script=\"${ec2_connect_scripts[${#ec2_connect_scripts[@]}-1]}\"",
+            "        if ! [ -f \"$1$script\" ]; then",
+            "            echo \"ERROR: 'ec2-connect' script is missing: $1$script\"",
+            "            exist=1",
+            "        fi",
+            "    fi",
+            "    return $exist",
+            "}",
+            "",
+            "check_ec2_connect_config() {",
+            "    local config_file=\"$1\"",
+            "    shift",
+            "    local config_lines=(\"$@\")",
+            "    valid_config=0",
+            "    for config_line in \"${config_lines[@]}\"; do",
+            "        if ! grep -F \"$config_line\" \"$config_file\" &>/dev/null; then",
+            "            echo \"ERROR: 'ec2-instance-connect' configuration is missing or invalid: $config_line\"",
+            "            valid_config=1",
+            "        fi",
+            "    done",
+            "    return $valid_config",
+            "}",
+            "",
+            "check_eic_proper_installation_and_configuration(){",
+            "    pkg_cmd=$1",
+            "    base_dir=$2",
+            "    config_file=$3",
+            "    shift 3",
+            "    ec2_connect_config=(\"$@\")",
+            "",
+            "    if [ \"$pkg_cmd\" == \"$macos_brew_cmd\" ]; then",
+            "        eval \"$pkg_cmd\" &>/dev/null",
+            "    else",
+            "        $pkg_cmd ec2-instance-connect &>/dev/null",
+            "    fi",
+            "    if [ $? -ne 0 ]; then",
+            "        echo \"ERROR: 'ec2-instance-connect' package is not installed\"",
+            "    else ",
+            "        echo \"SUCCESS: 'ec2-instance-connect' package is installed\"",
+            "        check_scripts_exist $base_dir $config_file; script_check_result=$?",
+            "        check_ec2_connect_config \"$config_file\" \"${ec2_connect_config[@]}\" ; config_check_result=$?",
+            "        if [ $script_check_result -eq 0 ] && [ $config_check_result -eq 0 ]; then",
+            "            echo \"SUCCESS: 'ec2-instance-connect' is properly configured\"",
+            "        else",
+            "            echo \"ERROR: 'ec2-instance-connect' is not properly configured. For more information see: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-connect-set-up.html\"",
+            "        fi",
+            "    fi",
+            "}",
+            "",
+            "echo \"### Checking if EC2 Instance Connect package is installed and configured on the instance: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-connect-set-up.html ###\"",
+            "",
+            "if grep 'Amazon Linux' /etc/os-release &> /dev/null; then",
+            "    check_eic_proper_installation_and_configuration \"$rpm_common_pkg_cmd\" \"$rpm_macos_common_base_dir\" \"$al_config_file\" \"${rpm_macos_common_ec2_connect_config[@]}\"",
+            "elif grep '^Red Hat.*8' /etc/redhat-release &> /dev/null || grep 'CentOS.*8' /etc/centos-release &> /dev/null; then",
+            "    check_eic_proper_installation_and_configuration \"$rpm_common_pkg_cmd\" \"$rpm_macos_common_base_dir\" \"$rhel_centos_8_config_file\" \"${rpm_macos_common_ec2_connect_config[@]}\"",
+            "elif grep '^Red Hat.*9' /etc/redhat-release &> /dev/null || grep 'CentOS.*9' /etc/centos-release &> /dev/null; then",
+            "    check_eic_proper_installation_and_configuration \"$rpm_common_pkg_cmd\" \"$rpm_macos_common_base_dir\" \"$macos_rhel_centos_9_config_file\" \"${rpm_macos_common_ec2_connect_config[@]}\"",
+            "elif grep 'Ubuntu' /etc/os-release &> /dev/null; then",
+            "    check_eic_proper_installation_and_configuration \"$ubuntu_pkg_cmd\" \"$ubuntu_base_dir\" \"$ubuntu_config_file\" \"${ubuntu_ec2_connect_config[@]}\"",
+            "elif [ \"$(uname)\" == \"Darwin\" ]; then",
+            "    check_eic_proper_installation_and_configuration \"$macos_brew_cmd\" \"$rpm_macos_common_base_dir\" \"$macos_rhel_centos_9_config_file\" \"${rpm_macos_common_ec2_connect_config[@]}\"",
+            "else",
+            "    echo \"WARNING: AMI is not supported\"",
+            "    exit 1",
+            "fi"
+          ]
+        }
+      }
+    },
+    {
+      "name": "CheckSSHConfigFromOs",
+      "action": "aws:runCommand",
+      "description": "Runs a Bash script on the target Amazon EC2 Linux instance to check if the configured SSH port matches the input parameter `SSHPort`.",
+      "nextStep": "CheckEICNetworkAccess",
+      "onFailure": "Abort",
+      "inputs": {
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "",
+            "echo \"### Checking SSH configuration at the OS-level ###\"",
+            "echo \"WARNING: If you configured a firewall in the EC2 instance make sure that it allows SSH traffic from the source ip CIDR\"",
+            "",
+            "# Check if the SSH config file exist",
+            "if [ ! -f \"/etc/ssh/sshd_config\" ]; then",
+            "    echo \"ERROR: SSH configuration file not found. Please check that the SSH server is installed and properly configured in your instance\"",
+            "    exit 0",
+            "fi",
+            "",
+            "# Find and display the configured SSH port",
+            "configured_ssh_port=$(grep -E \"^\\s*Port\\s+[0-9]+\" /etc/ssh/sshd_config | awk '{print $2}')",
+            "if [ -n \"$configured_ssh_port\" ]; then",
+            "    echo \"INFO: SSH is configured to listen on port $configured_ssh_port.\"",
+            "else",
+            "    echo \"INFO: SSH is using the default port (22).\"",
+            "    configured_ssh_port=\"22\"",
+            "fi",
+            "",
+            "input_ssh_port={{SSHPort}}",
+            "",
+            "if [ \"$configured_ssh_port\" -eq \"$input_ssh_port\" ]; then",
+            "    echo \"SUCCESS: The configured SSH port ($configured_ssh_port) matches the provided input port ($input_ssh_port).\"",
+            "else",
+            "    echo \"ERROR: The configured SSH port ($configured_ssh_port) does not match the provided input port ($input_ssh_port).\"",
+            "fi"
+          ]
+        }
+      }
+    },
+    {
+      "name": "CheckMetadataHTTPEndpointIsEnabled",
+      "action": "aws:executeScript",
+      "description": "Checks if the instance metadata service HTTP endpoint is enabled.",
+      "nextStep": "CheckEICNetworkAccess",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_metadata_http_endpoint_enabled.function_handler",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "MetadataHttpEndpoint": "{{ GetInstanceProperties.MetadataHttpEndpoint }}"
+        },
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ExecutionLogs",
+          "Selector": "$.Payload.ExecutionLogs",
+          "Type": "String"
+        },
+        {
+          "Name": "MetadataCheckResult",
+          "Selector": "$.Payload.MetadataCheckResult",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "CheckEICNetworkAccess",
+      "action": "aws:executeScript",
+      "description": "Checks if the network configuration (security groups, network ACLs, and route tables) allows connection to the instance through EC2 Instance Connect.",
+      "nextStep": "CheckIAMRoleOrUserPermissions",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_network_access.function_handler",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "PublicIpAddress": "{{ GetInstanceProperties.PublicIpAddress }}",
+          "SubnetId": "{{ GetInstanceProperties.SubnetId }}",
+          "VpcId": "{{ GetInstanceProperties.VpcId }}",
+          "SSHPort": "{{ SSHPort }}",
+          "SourceNetworkType": "{{ SourceNetworkType }}",
+          "SourceIpCIDR": "{{ SourceIpCIDR }}",
+          "RegionIpPrefix": "{{ CheckIfAWSRegionSupported.RegionIpPrefix }}"
+        },
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ExecutionLogs",
+          "Selector": "$.Payload.ExecutionLogs",
+          "Type": "String"
+        },
+        {
+          "Name": "NetowrkAccessCheckResult",
+          "Selector": "$.Payload.NetowrkAccessCheckResult",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "CheckIAMRoleOrUserPermissions",
+      "action": "aws:executeScript",
+      "description": "Checks if the AWS Identity and Access Management (IAM) role or IAM user used to leverage EC2 Instance Connect has access to push keys to the EC2 instance.",
+      "nextStep": "MakeFinalOutput",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_iam_permissions.function_handler",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "EC2InstanceConnectRoleOrUser": "{{ EC2InstanceConnectRoleOrUser }}",
+          "Username": "{{ Username }}"
+        },
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ExecutionLogs",
+          "Selector": "$.Payload.ExecutionLogs",
+          "Type": "String"
+        },
+        {
+          "Name": "IAMPermissionCheckResult",
+          "Selector": "$.Payload.IAMPermissionCheckResult",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "MakeFinalOutput",
+      "action": "aws:executeScript",
+      "description": "Consolidates the output of all previous steps.",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "make_final_output.function_handler",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "RegionCheckExecutionLogs": "{{ CheckIfAWSRegionSupported.RegionCheckExecutionLogs }}",
+          "RegionCheckResult": "{{ CheckIfAWSRegionSupported.RegionCheckResult }}",
+          "AMICheckLogs": "{{ CheckIfInstanceAMIIsSupported.ExecutionLogs }}",
+          "AMICheckResult": "{{ CheckIfInstanceAMIIsSupported.AMICheckResult }}",
+          "InstallationCheckLogs": "{{ CheckEICPackageInstallation.Output }}",
+          "HTTPMetadataCheckLogs": "{{ CheckMetadataHTTPEndpointIsEnabled.ExecutionLogs }}",
+          "OSMetadataCheckLogs": "{{ CheckIMDSReachabilityFromOs.Output }}",
+          "OsSSHConfigLogs": "{{ CheckSSHConfigFromOs.Output }}",
+          "NetworkAccessCheckLogs": "{{ CheckEICNetworkAccess.ExecutionLogs }}",
+          "IAMCheckLogs": "{{ CheckIAMRoleOrUserPermissions.ExecutionLogs }}"
+        },
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ExecutionLogs",
+          "Selector": "$.Payload.ExecutionLogs",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "MakeFinalOutput.ExecutionLogs"
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "4083665bd1a9d4aa007b6fffd925a0e5e6a92ef086df5315feecab7f39821e0d"
+      }
+    }
+  }
+}
