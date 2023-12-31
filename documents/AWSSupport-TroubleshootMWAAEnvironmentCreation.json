@@ -1,0 +1,373 @@
+{
+  "description": "The **AWSSupport-TroubleshootMWAAEnvironmentCreation** helps you print information to debug Amazon Managed Workflows for Apache Airflow (Amazon MWAA) Environment creation issues perform checks along with the documented reasons on a best effort basis to help identify the failure. Important: This runbook does not check the VPC Endpoint policies.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "maxChars": 2048,
+      "default": ""
+    },
+    "EnvironmentName": {
+      "type": "String",
+      "description": "(Required) Name of the MWAA environment you wish to evaluate.",
+      "maxChars": 80,
+      "allowedPattern": "^[a-zA-Z][0-9a-zA-Z-_]*$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetMWAAEnvironmentDetails",
+      "action": "aws:executeAwsApi",
+      "description": "Retrieves the details for the MWAA (Amazon Managed Workflows for Apache Airflow) environment.",
+      "nextStep": "CheckIAMPermissionsOnExecutionRole",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Service": "mwaa",
+        "Api": "GetEnvironment",
+        "Name": "{{EnvironmentName}}"
+      },
+      "outputs": [
+        {
+          "Name": "EnvironmentArn",
+          "Selector": "$.Environment.Arn",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceBucketArn",
+          "Selector": "$.Environment.SourceBucketArn",
+          "Type": "String"
+        },
+        {
+          "Name": "ExecutionRoleArn",
+          "Selector": "$.Environment.ExecutionRoleArn",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetIds",
+          "Selector": "$.Environment.NetworkConfiguration.SubnetIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "KmsKey",
+          "Selector": "$.Environment.KmsKey",
+          "Type": "String"
+        },
+        {
+          "Name": "LoggingConfiguration",
+          "Selector": "$.Environment.LoggingConfiguration",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "CreatedAt",
+          "Selector": "$.Environment.LastUpdate.CreatedAt",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Environment.NetworkConfiguration.SecurityGroupIds",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "CheckIAMPermissionsOnExecutionRole",
+      "action": "aws:executeScript",
+      "description": "Verifies if the execution role has the required permissions for Airflow, S3, Logs, CloudWatch, and SQS resources. If a Customer Managed KMS key is detected, the automation validates the key's required permissions.",
+      "nextStep": "CheckKMSPolicyOnKMSKey",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "check_iam_permissions.check_iam_permissions",
+        "InputPayload": {
+          "EnvironmentArn": "{{GetMWAAEnvironmentDetails.EnvironmentArn}}",
+          "ExecutionRoleArn": "{{GetMWAAEnvironmentDetails.ExecutionRoleArn}}",
+          "KmsKey": "{{GetMWAAEnvironmentDetails.KmsKey}}",
+          "SourceBucketArn": "{{GetMWAAEnvironmentDetails.SourceBucketArn}}",
+          "EnvironmentName": "{{EnvironmentName}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "KmsKey",
+          "Selector": "$.Payload.kms_key",
+          "Type": "String"
+        },
+        {
+          "Name": "TopLevelDomain",
+          "Selector": "$.Payload.top_level_domain",
+          "Type": "String"
+        },
+        {
+          "Name": "ExecutionRoleEvaluation",
+          "Selector": "$.Payload.execution_role_output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckKMSPolicyOnKMSKey",
+      "action": "aws:executeScript",
+      "description": "Checks if the KMS key policy allows the MWAA environment to use the key for CloudWatch Logs encryption. If the KMS key is AWS managed, the automation does not perform any checks.",
+      "nextStep": "CheckIfRequiredLogGroupsExists",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "check_kms_key_policy.check_kms_key_policy",
+        "InputPayload": {
+          "KmsKey": "{{CheckIAMPermissionsOnExecutionRole.KmsKey}}",
+          "TopLevelDomain": "{{CheckIAMPermissionsOnExecutionRole.TopLevelDomain}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "KmsKeyPolicyEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckIfRequiredLogGroupsExists",
+      "action": "aws:executeScript",
+      "description": "Checks if the MWAA environment required CloudWatch Log Groups exist, if not the automation checks CloudTrail in order to locate CreateLogGroup and DeletelogGroup events.",
+      "nextStep": "BranchOnLogGroupsFindings",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "check_log_groups.check_log_groups",
+        "InputPayload": {
+          "EnvironmentName": "{{EnvironmentName}}",
+          "LoggingConfiguration": "{{GetMWAAEnvironmentDetails.LoggingConfiguration}}",
+          "CreatedAt": "{{GetMWAAEnvironmentDetails.CreatedAt}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "LogGroupExists",
+          "Selector": "$.Payload.existing_groups.num_of_found_log_groups",
+          "Type": "Integer"
+        },
+        {
+          "Name": "LogGroupsEvaluation",
+          "Selector": "$.Payload.existing_groups.logs_groups_output",
+          "Type": "String"
+        },
+        {
+          "Name": "LogGroupsNames",
+          "Selector": "$.Payload.log_groups_names",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnLogGroupsFindings",
+      "action": "aws:branch",
+      "description": "Branches on the existente of CloudWatch log groups related to the MWAA environment. If at least one log group exist the automation parses it in order to locate errors.",
+      "nextStep": "GetRequiredEndPointsDetails",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckForErrorsInLogGroups",
+            "Variable": "{{CheckIfRequiredLogGroupsExists.LogGroupExists}}",
+            "NumericGreater": 0
+          }
+        ],
+        "Default": "GetRequiredEndPointsDetails"
+      }
+    },
+    {
+      "name": "CheckForErrorsInLogGroups",
+      "action": "aws:executeScript",
+      "description": "Parses existing MWAA environment CloudWatch log groups in order to locate errors.",
+      "nextStep": "GetRequiredEndPointsDetails",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "check_for_failing_logs.check_for_failing_logs",
+        "InputPayload": {
+          "EnvironmentName": "{{EnvironmentName}}",
+          "LogGroupsNames": "{{CheckIfRequiredLogGroupsExists.LogGroupsNames}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "LogGroupsErrorsEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetRequiredEndPointsDetails",
+      "action": "aws:executeScript",
+      "description": "Retrieves the services' endpoints utilized by the MWAA environment.",
+      "nextStep": "CheckNetworkConfiguration",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "get_required_endpoints_details.get_required_endpoints_details",
+        "InputPayload": {
+          "TopLevelDomain": "{{CheckIAMPermissionsOnExecutionRole.TopLevelDomain}}",
+          "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "EndPointsDetails",
+          "Selector": "$.Payload.mwaa_utilized_services",
+          "Type": "MapList"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Payload.vpc_id",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckNetworkConfiguration",
+      "action": "aws:executeScript",
+      "description": "Verifies if the MWAA environment's network configuration is properly configured, this step verifies multiple networking resources.",
+      "nextStep": "CheckEndpointsConnectivity",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "check_network_reachability.networking_check",
+        "InputPayload": {
+          "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}",
+          "VpcId": "{{GetRequiredEndPointsDetails.VpcId}}",
+          "SecurityGroupsIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "RoutesEvaluation",
+          "Selector": "$.Payload.routes_check",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupsEvaluation",
+          "Selector": "$.Payload.security_groups_check",
+          "Type": "String"
+        },
+        {
+          "Name": "NaclsEvaluation",
+          "Selector": "$.Payload.nacl_check",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetsEvaluation",
+          "Selector": "$.Payload.subnets_check",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckEndpointsConnectivity",
+      "action": "aws:executeScript",
+      "description": "Verifies if the MWAA environment is able to access the required endpoints, for this the automation invokes the 'AWSSupport-ConnectivityTroubleshooter' automation.",
+      "nextStep": "CheckS3BlockPublicAccess",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "check_service_connectivity.check_connectivity_to_dep_services",
+        "InputPayload": {
+          "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}",
+          "VpcId": "{{GetRequiredEndPointsDetails.VpcId}}",
+          "SecurityGroupsIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}",
+          "EndPointsDetails": "{{GetRequiredEndPointsDetails.EndPointsDetails}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "ConnectivityEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckS3BlockPublicAccess",
+      "action": "aws:executeScript",
+      "description": "Checks if the MWAA environment S3 bucket has Block Public Access enabled, also checks the account's S3 Block Public Access settings.",
+      "nextStep": "GenerateReport",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "check_s3_block_public_access.is_bucket_public",
+        "InputPayload": {
+          "SourceBucketArn": "{{GetMWAAEnvironmentDetails.SourceBucketArn}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "S3BlockPublicAccessEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "Generates a report with the findings of the automation.",
+      "isEnd": true,
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Attachment": "attachment.zip",
+        "Handler": "generate_report.generate_report",
+        "InputPayload": {
+          "EnvironmentName": "{{EnvironmentName}}",
+          "ExecutionRoleEvaluation": "{{CheckIAMPermissionsOnExecutionRole.ExecutionRoleEvaluation}}",
+          "KmsKeyPolicyEvaluation": "{{CheckKMSPolicyOnKMSKey.KmsKeyPolicyEvaluation}}",
+          "LogGroupsEvaluation": "{{CheckIfRequiredLogGroupsExists.LogGroupsEvaluation}}",
+          "LogGroupsErrorsEvaluation": "{{CheckForErrorsInLogGroups.LogGroupsErrorsEvaluation}}",
+          "RoutesEvaluation": "{{CheckNetworkConfiguration.RoutesEvaluation}}",
+          "SecurityGroupsEvaluation": "{{CheckNetworkConfiguration.SecurityGroupsEvaluation}}",
+          "NaclsEvaluation": "{{CheckNetworkConfiguration.NaclsEvaluation}}",
+          "SubnetsEvaluation": "{{CheckNetworkConfiguration.SubnetsEvaluation}}",
+          "ConnectivityEvaluation": "{{CheckEndpointsConnectivity.ConnectivityEvaluation}}",
+          "S3BlockPublicAccessEvaluation": "{{CheckS3BlockPublicAccess.S3BlockPublicAccessEvaluation}}"
+        },
+        "Script": "%PYTHONSCRIPT%"
+      },
+      "outputs": [
+        {
+          "Name": "AutomationReport",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateReport.AutomationReport"
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "sha256": "480ecf847f0c08157aa45d201547805eb98ee4413d3a3548428cdbbe6a4e378d"
+      }
+    }
+  }
+}

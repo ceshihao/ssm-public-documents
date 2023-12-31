@@ -1,0 +1,265 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Composite document for Quick Setup Managing Instances association. This document ensures IAM role for instance profile is created in account with all required policies",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String"
+    },
+    "InstanceId": {
+      "type": "String"
+    },
+    "AwsAccountId": {
+      "type": "String"
+    },
+    "QSConfigurationId": {
+      "type": "String"
+    },
+    "IsPolicyAttachAllowed": {
+      "type": "String"
+    }
+  },
+  "mainSteps": [
+    {
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{InstanceId}}",
+            "StartsWith": "i-",
+            "NextStep": "getExistingRoleName"
+          }
+        ]
+      },
+      "name": "branchOnInstanceType",
+      "action": "aws:branch",
+      "isEnd": true
+    },
+    {
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "existingInstanceProfileRoleName",
+          "Selector": "$.Payload.RoleName"
+        }
+      ],
+      "inputs": {
+        "Script": "import boto3\n\ndef getInstanceProfileName(events, context):\n    ec2_client = boto3.client(\"ec2\")\n    response = ec2_client.describe_instances(InstanceIds=[events[\"InstanceId\"]])\n    if 'IamInstanceProfile' in response['Reservations'][0]['Instances'][0]:\n        return {'RoleName': response['Reservations'][0]['Instances'][0]['IamInstanceProfile']['Arn'].split('instance-profile/')[1]}\n    return {'RoleName': 'NoRoleFound'}",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "InstanceId": "{{InstanceId}}"
+        },
+        "Handler": "getInstanceProfileName"
+      },
+      "name": "getExistingRoleName",
+      "action": "aws:executeScript",
+      "nextStep": "branchIfProfileExists"
+    },
+    {
+      "inputs": {
+        "Choices": [
+          {
+            "StringEquals": "NoRoleFound",
+            "Variable": "{{getExistingRoleName.existingInstanceProfileRoleName}}",
+            "NextStep": "createRoleIfNotExists"
+          }
+        ],
+        "Default": "checkIfPolicyAttachAllowed"
+      },
+      "name": "branchIfProfileExists",
+      "action": "aws:branch"
+    },
+    {
+      "inputs": {
+        "Choices": [
+          {
+            "StringEquals": "true",
+            "Variable": "{{IsPolicyAttachAllowed}}",
+            "NextStep": "getRoleFromInstanceProfile"
+          }
+        ],
+        "Default": "createRoleIfNotExists"
+      },
+      "name": "checkIfPolicyAttachAllowed",
+      "action": "aws:branch"
+    },
+    {
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "existingRoleName",
+          "Selector": "$.InstanceProfile.Roles[0].RoleName"
+        }
+      ],
+      "inputs": {
+        "InstanceProfileName": "{{getExistingRoleName.existingInstanceProfileRoleName}}",
+        "Service": "iam",
+        "Api": "GetInstanceProfile"
+      },
+      "name": "getRoleFromInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "nextStep": "createBaselineOverridePolicyForExistingRole"
+    },
+    {
+      "inputs": {
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\niam_client = boto3.client('iam')            \ndef createBaselineOverridePolicy(events, context):\n    try:\n        policy_name = events['PolicyName']\n        iam_client.create_policy(PolicyName=policy_name,PolicyDocument=events['PolicyDocument'],Path=events['Path'])\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'EntityAlreadyExists':\n            print('Policy already exists. Skipping creation.')\n        else:\n            raise e",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "Path": "/ssm/quicksetup/patchpolicy/",
+          "PolicyName": "aws-quicksetup-patchpolicy-baselineoverrides-s3",
+          "PolicyDocument": "{\"Version\": \"2012-10-17\",\"Statement\": [{\"Effect\": \"Allow\",\"Action\": \"s3:GetObject\",\"Resource\": \"arn:aws:s3:::aws-quicksetup-patchpolicy-*\"}]}"
+        },
+        "Handler": "createBaselineOverridePolicy"
+      },
+      "name": "createBaselineOverridePolicyForExistingRole",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "Create the S3 Bucket Policy. If exception and EntityAlreadyExists, continue, else Abort.",
+      "nextStep": "attachBaselineOverridePolicyToExistingRole"
+    },
+    {
+      "inputs": {
+        "RoleName": "{{getRoleFromInstanceProfile.existingRoleName}}",
+        "PolicyArn": "arn:aws:iam::629124890785:policy/ssm/quicksetup/patchpolicy/aws-quicksetup-patchpolicy-baselineoverrides-s3",
+        "Service": "iam",
+        "Api": "AttachRolePolicy"
+      },
+      "name": "attachBaselineOverridePolicyToExistingRole",
+      "action": "aws:executeAwsApi",
+      "description": "Attach required managed policy to Instance Profile role.",
+      "nextStep": "attachAmazonSSMManagedInstanceCoreToExistingRole",
+      "onFailure": "Abort"
+    },
+    {
+      "inputs": {
+        "RoleName": "{{getRoleFromInstanceProfile.existingRoleName}}",
+        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        "Service": "iam",
+        "Api": "AttachRolePolicy"
+      },
+      "name": "attachAmazonSSMManagedInstanceCoreToExistingRole",
+      "action": "aws:executeAwsApi",
+      "nextStep": "attachTagToExistingRole"
+    },
+    {
+      "inputs": {
+        "RoleName": "{{getRoleFromInstanceProfile.existingRoleName}}",
+        "Service": "iam",
+        "Api": "TagRole",
+        "Tags": [
+          {
+            "Value": "vj13t",
+            "Key": "QSConfigId-vj13t"
+          }
+        ]
+      },
+      "name": "attachTagToExistingRole",
+      "action": "aws:executeAwsApi",
+      "isEnd": true
+    },
+    {
+      "inputs": {
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\niam_client = boto3.client('iam')            \ndef createRoleIfNotExists(events, context):\n    try:\n        iam_client.create_role(\n            Path=events['Path'],\n            RoleName=events['RoleName'],\n            AssumeRolePolicyDocument=events['AssumeRolePolicyDocument'],\n            Description=events['Description']\n        )\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'EntityAlreadyExists':\n            print('Role already exists. Skipping creation.')\n        else:\n            raise e",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "Path": "/",
+          "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+          "Description": "EC2 role for SSM for Quick-Setup",
+          "AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+        },
+        "Handler": "createRoleIfNotExists"
+      },
+      "name": "createRoleIfNotExists",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "Create AmazonSSMRoleForInstancesQuickSetup Role For SSM Quick Setup",
+      "nextStep": "assertRoleForInstanceProfileExists"
+    },
+    {
+      "inputs": {
+        "PropertySelector": "$.Role.RoleName",
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+        "DesiredValues": [
+          "AmazonSSMRoleForInstancesQuickSetup"
+        ],
+        "Service": "iam",
+        "Api": "GetRole"
+      },
+      "name": "assertRoleForInstanceProfileExists",
+      "action": "aws:assertAwsResourceProperty",
+      "nextStep": "createBaselineOverridePolicyForRole"
+    },
+    {
+      "inputs": {
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\niam_client = boto3.client('iam')            \ndef createBaselineOverridePolicy(events, context):\n    try:\n        policy_name = events['PolicyName']\n        iam_client.create_policy(PolicyName=policy_name,PolicyDocument=events['PolicyDocument'],Path=events['Path'])\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'EntityAlreadyExists':\n            print('Policy already exists. Skipping creation.')\n        else:\n            raise e",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "Path": "/ssm/quicksetup/patchpolicy/",
+          "PolicyName": "aws-quicksetup-patchpolicy-baselineoverrides-s3",
+          "PolicyDocument": "{\"Version\": \"2012-10-17\",\"Statement\": [{\"Effect\": \"Allow\",\"Action\": \"s3:GetObject\",\"Resource\": \"arn:aws:s3:::aws-quicksetup-patchpolicy-*\"}]}"
+        },
+        "Handler": "createBaselineOverridePolicy"
+      },
+      "name": "createBaselineOverridePolicyForRole",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "Create the S3 Bucket Policy. If exception and EntityAlreadyExists, continue, else Abort.",
+      "nextStep": "attachBaselineOverridePolicyToRole"
+    },
+    {
+      "inputs": {
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+        "PolicyArn": "arn:aws:iam::629124890785:policy/ssm/quicksetup/patchpolicy/aws-quicksetup-patchpolicy-baselineoverrides-s3",
+        "Service": "iam",
+        "Api": "AttachRolePolicy"
+      },
+      "name": "attachBaselineOverridePolicyToRole",
+      "action": "aws:executeAwsApi",
+      "description": "Attach required managed policy to Instance Profile role.",
+      "nextStep": "attachTagToRole",
+      "onFailure": "Abort"
+    },
+    {
+      "inputs": {
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+        "Service": "iam",
+        "Api": "TagRole",
+        "Tags": [
+          {
+            "Value": "vj13t",
+            "Key": "QSConfigId-vj13t"
+          }
+        ]
+      },
+      "name": "attachTagToRole",
+      "action": "aws:executeAwsApi",
+      "nextStep": "attachAmazonSSMManagedInstanceCoreToRole"
+    },
+    {
+      "inputs": {
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        "Service": "iam",
+        "Api": "AttachRolePolicy"
+      },
+      "name": "attachAmazonSSMManagedInstanceCoreToRole",
+      "action": "aws:executeAwsApi",
+      "nextStep": "executeAttachIAMToInstance"
+    },
+    {
+      "maxAttempts": 10,
+      "inputs": {
+        "RuntimeParameters": {
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+          "InstanceId": "{{ InstanceId }}",
+          "ForceReplace": false
+        },
+        "DocumentName": "AWS-AttachIAMToInstance"
+      },
+      "name": "executeAttachIAMToInstance",
+      "action": "aws:executeAutomation",
+      "timeoutSeconds": 60,
+      "isEnd": true
+    }
+  ]
+}

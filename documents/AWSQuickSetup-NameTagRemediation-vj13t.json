@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Composite document for Quick Setup Naming  functionality. This document ensures that the appropriate tag is removed from all nodes in an account that are no longer a target of a Patch Policy.",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String"
+    },
+    "NameValue": {
+      "type": "String"
+    },
+    "TargetValues": {
+      "type": "String"
+    },
+    "TargetType": {
+      "type": "String"
+    },
+    "Region": {
+      "type": "String"
+    },
+    "NameKey": {
+      "type": "String"
+    }
+  },
+  "mainSteps": [
+    {
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "existingInstanceProfileRoleName",
+          "Selector": "$.Payload.RoleName"
+        }
+      ],
+      "inputs": {
+        "Script": "import os\nimport resource\nimport boto3\nimport time\nimport json\n\ndef get_ssm_client(region):\n    return boto3.client('ssm', region_name=region)\n\ndef get_ec2_client(region):\n    return boto3.client('ec2', region_name=region)\n\ndef throw_exception_on_response_code(response):\n    response_code = str(response[\"ResponseMetadata\"][\"HTTPStatusCode\"])\n    if  response_code != \"200\":\n        raise Exception(\"Non-OK Status Code received: %s. Full Response: %s. Failing remediation document\"%(response_code, str(response)))\n\ndef remove_tag_from_resources(on_prem_instances, tag_key, region):\n    print(\"Removing tags from on prem instances: %s\"%(\",\".join(on_prem_instances)))\n    try:\n        for on_prem_instance in on_prem_instances:\n            response = get_ssm_client(region).remove_tags_from_resource(\n                ResourceType='ManagedInstance',\n                ResourceId=on_prem_instance,\n                TagKeys=[\n                    tag_key\n                ]\n            )\n            print(response)\n            throw_exception_on_response_code(response)\n            time.sleep(0.05)\n    except Exception as e:\n        print(\"Exception occurred removing tag for on prem instance %s: %s\"%(on_prem_instance, str(e)))\n        raise(e)\n\ndef delete_tags(ec2_instances, tag_key, tag_value, region):\n    print(\"Removing tags from ec2 instances: %s\"%(\",\".join(ec2_instances)))\n    try:\n        for i in range(0, len(ec2_instances), 250):\n            response = get_ec2_client(region).delete_tags(\n                DryRun=False,\n                Resources=ec2_instances[i:i+250],\n                Tags=[\n                    {\n                        'Key': tag_key,\n                        'Value': tag_value\n                    }\n                ]\n            )\n            throw_exception_on_response_code(response)\n            time.sleep(0.20)\n    except Exception as e:\n        print(\"Exception occurred removing tag from EC2 Instance %s: %s\"%(\", \".join(ec2_instances), str(e)))\n        raise (e)\n\ndef get_inventory(request, region):\n\n    try:\n        instance_ids = []\n        print(\"Calling get_inventory with request : \\n%s \\n\\n\"%(str(request)))\n        response = get_ssm_client(region).get_inventory(**request)\n        print(\"\\n\\n\")\n        print(response)\n        throw_exception_on_response_code(response)\n\n        [instance_ids.append(i[\"Id\"]) for i in response[\"Entities\"]]\n        next_token = None\n        if \"NextToken\" in response:\n            next_token = response[\"NextToken\"]\n\n        while next_token:\n            request[\"NextToken\"] = next_token\n            response = get_ssm_client(region).get_inventory(**request)\n            \n            throw_exception_on_response_code(response)\n            \n            [instance_ids.append(i[\"Id\"]) for i in response[\"Entities\"]]\n            \n            time.sleep(0.33)\n\n            if \"NextToken\" in response:\n                next_token = response[\"NextToken\"]\n            else:\n                next_token = None\n\n        return instance_ids\n    except Exception as e: \n        print(\"Something went wrong retrieving inventory with request: %s. \\\n         Exception: %s .\\n Failing remediation document. \"%(request, str(e)))\n        raise e\n\ndef remove_tags(list_of_instances, tag_key, tag_value, region):\n    mi = []\n    i = []\n    for instance in list_of_instances:\n        if (instance.startswith(\"mi\")):\n            mi.append(instance)\n        else:\n            i.append(instance)\n   \n    delete_tags(i, tag_key, tag_value, region)           \n    remove_tag_from_resources(mi, tag_key, region)\n\ndef get_tag_request(target):\n    tag_key = check_for_key(target, \"Key\")\n    \n    request = {\n        \"Filters\": [{\n            \"Key\": \"AWS:Tag.Key\", \n            \"Values\": [tag_key],\n            \"Type\": \"Equal\"\n\n        }]\n    }\n    # For the case where only a tag-key is targeted.\n    if \"Value\" in target:\n        tag_value = check_for_key(target, \"Value\")\n        request[\"Filters\"].append({\n            \"Key\": \"AWS:Tag.Value\", \n            \"Values\": [tag_value],\n            \"Type\": \"Equal\"\n        })\n\n    return request\n\ndef get_resource_group_request(target):\n    # for resource groups, the name is the Target key. e.g. '\"Target\": {\"Key\": \"ResourceGroupName\"}:\n    resource_group_name = check_for_key(target, \"Key\")\n    request = {    \n        \"Filters\": [{\n\n            \"Key\": \"AWS:ResourceGroup.Name\",\n            \"Values\": [resource_group_name],\n            \"Type\": \"Equal\"\n        }]\n    }\n    return request\n\ndef get_instance_ids_request(target):\n    request = {\"Filters\": []}\n    instance_ids = check_for_key(target, \"Key\").split(\",\")\n    for ids in range(0, len(instance_ids), 40):\n        request[\"Filters\"].append(            {\n                \"Key\": \"AWS:InstanceInformation.InstanceId\",\n                \"Values\": instance_ids[ids:ids+40],\n                \"Type\": \"Equal\"\n            })\n    return request\n\ndef check_for_key(hashmap, key):\n    if not key in hashmap:\n        raise Exception(\"The required key %s is not present. Failing.\"%(key))\n    else:\n        # return the value\n        return hashmap[key]\n\ndef get_target_request(target_type, target):\n    if target_type.lower() == \"tags\":\n        return get_tag_request(target)\n    elif target_type.lower() == \"instanceids\":\n        return get_instance_ids_request(target)\n    elif target_type.lower() == \"resourcegroups\":\n        return get_resource_group_request(target)\n    \n    raise Exception(\"Unable to understand the target type of the Patch Policy.\\\n         Received values was: %s. Failing remediation document. \"%(target_type))\n\ndef begin_remediation(event, context):\n    # Get all variables\n    target_type = check_for_key(event, \"TargetType\")\n\n    if target_type == \"*\":\n        return\n\n    name_key = check_for_key(event, \"NameKey\")\n    name_value = check_for_key(event, \"NameValue\")\n    region = check_for_key(event, \"Region\")\n\n    ## Add exception (to make it more robust)\n    target_dict = check_for_key(event, \"Targets\")\n\n    target = json.loads(target_dict)\n\n    # This filter will return all targets of the Patch Policy.\n    request = get_target_request(target_type, target)\n    target_instances = get_inventory(request, region)\n\n    # This will return targets that have the name tag\n    new_request = {\"Filters\": [{\n            \"Key\": \"AWS:Tag.Key\",\n            \"Values\": [name_key],\n            \"Type\": \"Equal\"\n        },\n        {\n            \"Key\": \"AWS:InstanceInformation.InstanceStatus\",\n            \"Values\": [\"Terminated\", \"ConnectionLost\"],\n            \"Type\": \"NotEqual\"\n        }]}\n\n    named_instances = get_inventory(new_request, region)\n\n    # 'get instances that are NOT a target of the Patch Policy but have the name tag'\n    instances_to_remove = set(named_instances) - set(target_instances)\n\n    # remove the tags\n    remove_tags(instances_to_remove, name_key, name_value, region)",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "NameValue": "{{NameValue}}",
+          "TargetType": "{{TargetType}}",
+          "Region": "{{Region}}",
+          "Targets": "{{TargetValues}}",
+          "NameKey": "{{NameKey}}"
+        },
+        "Handler": "begin_remediation"
+      },
+      "name": "performRemediation",
+      "action": "aws:executeScript",
+      "isEnd": true
+    }
+  ]
+}
