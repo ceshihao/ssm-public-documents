@@ -1,0 +1,109 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# Document name - AWS-EnableNeptuneDbClusterDeletionProtection\n\n## What does this document do?\nThe AWS-EnableNeptuneDbClusterDeletionProtection runbook will use the\n[Neptune ModifyDBCluster](https://docs.aws.amazon.com/neptune/latest/apiref/API_ModifyDBCluster.html) API to enable\nDeletion Protection for the specified database. An Amazon Neptune DB cluster can't be deleted while deletion\nprotection is enabled. To modify a cluster, the cluster must be in the available\nstate with an engine type of `neptune`.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role\n  that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\n  Systems Manager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* DBClusterResourceId: (Required) The Amazon Neptune DB cluster resourceId for which the\n  Deletion Protection should be enabled.\n\n## Output Parameters\n* EnableNeptuneDbDeletionProtection.EnableNeptuneDbDeletionProtectionResponse: The output from the\n  ModifyDBCluster call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that\nallows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\nSystems Manager Automation uses the permissions of the user that starts this runbook.\n",
+      "default": ""
+    },
+    "DbClusterResourceId": {
+      "type": "String",
+      "description": "(Required) The Amazon Neptune DB cluster resourceId for which the Deletion Protection should be enabled.\n",
+      "allowedPattern": "^cluster-[a-zA-Z0-9-]{1,1016}$"
+    }
+  },
+  "outputs": [
+    "EnableNeptuneDbDeletionProtection.EnableNeptuneDbDeletionProtectionResponse"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetNeptuneDbClusterIdentifier",
+      "description": "## GetNeptuneDbClusterIdentifier\nThis step will use the Amazon Neptune DbClusterResourceId to retrieve the DBClusterIdentifier.\n## Outputs\nDbClusterResourceIdentifier: The Neptune cluster identifier.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBClusters",
+        "Filters": [
+          {
+            "Name": "db-cluster-resource-id",
+            "Values": [
+              "{{ DbClusterResourceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DbClusterResourceIdentifier",
+          "Selector": "$.DBClusters[0].DBClusterIdentifier",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyNeptuneDbEngine",
+      "description": "## VerifyNeptuneDbEngine\nThis step will verify the Amazon Neptune DB engine type as `neptune` in order to prevent inadvertent\nmodification to any other RDS engine type.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterResourceIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Engine",
+        "DesiredValues": [
+          "neptune"
+        ]
+      }
+    },
+    {
+      "name": "VerifyNeptuneStatus",
+      "description": "## VerifyNeptuneStatus\nThis step will check the Amazon Neptune cluster status is `available` in order to ensure that the database is\nready to accept changes from the runbook.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterResourceIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "EnableNeptuneDbDeletionProtection",
+      "description": "## EnableNeptuneDbDeletionProtection\nThis step will enable Deletion Protection for the Amazon Neptune DB cluster.\n## Outputs\nEnableNeptuneDbDeletionProtectionResponse: The output from the ModifyDBCluster call.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "neptune",
+        "Api": "ModifyDBCluster",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterResourceIdentifier }}",
+        "DeletionProtection": true
+      },
+      "outputs": [
+        {
+          "Name": "EnableNeptuneDbDeletionProtectionResponse",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyNeptuneDbDeletionProtection",
+      "description": "## VerifyNeptuneDbDeletionProtection\nThis step verifies the Deletion Protection for the Amazon Neptune DB cluster has been successfully enabled.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterResourceIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].DeletionProtection",
+        "DesiredValues": [
+          "True"
+        ]
+      }
+    }
+  ]
+}

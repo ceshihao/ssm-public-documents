@@ -1,0 +1,136 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# Document name - AWS-EnableNeptuneDbAuditLogsToCloudWatch\n\n## What does this document do?\nThe AWS-EnableNeptuneDbAuditLogsToCloudWatch runbook will utilize the\n[ModifyDBCluster](https://docs.aws.amazon.com/neptune/latest/apiref/API_ModifyDBCluster.html) API call to enable \nAmazon Neptune DB clusters to send audit logs to Amazon CloudWatch. The Amazon Neptune DB cluster must be in an \navailable state and the engine type must be set to `neptune`.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) \n  role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\n  Systems Manager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* DbClusterResourceId: (Required) The Amazon Neptune DB cluster resourceId for which the audit logging should be \n  enabled.\n\n## Output Parameters\n* EnableNeptuneDbAuditLogs.EnableNeptuneDbAuditLogsResponse: The output from the ModifyDBCluster call.\n* VerifyNeptuneDbAuditLogs.VerifyNeptuneDbAuditLogsResponse: The output of the DescribeDBCluster call.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that\nallows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\nSystems Manager Automation uses the permissions of the user that starts this runbook.\n",
+      "default": ""
+    },
+    "DbClusterResourceId": {
+      "type": "String",
+      "description": "(Required) The Amazon Neptune DB cluster resourceId for which the audit logging should be enabled.\n",
+      "allowedPattern": "^cluster-[a-zA-Z0-9-]{1,1016}$"
+    }
+  },
+  "outputs": [
+    "EnableNeptuneDbAuditLogs.EnableNeptuneDbAuditLogsResponse",
+    "VerifyNeptuneDbAuditLogs.VerifyNeptuneDbAuditLogsResponse"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetNeptuneDbClusterIdentifier",
+      "description": "## GetNeptuneDbClusterIdentifier\nThis step will use the Amazon Neptune DBClusterResourceId to retrieve the DBClusterIdentifier.\n## Outputs\n* DBClusterIdentifier: The Amazon Neptune DB cluster identifier.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBClusters",
+        "Filters": [
+          {
+            "Name": "db-cluster-resource-id",
+            "Values": [
+              "{{ DbClusterResourceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DBClusterIdentifier",
+          "Selector": "$.DBClusters[0].DBClusterIdentifier",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyNeptuneDbEngine",
+      "description": "## VerifyNeptuneDbEngine\nThis step will verify the Amazon Neptune DB engine type as `neptune` in order to prevent inadvertent modification \nto any other RDS engine type.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Engine",
+        "DesiredValues": [
+          "neptune"
+        ]
+      }
+    },
+    {
+      "name": "VerifyNeptuneDbStatus",
+      "description": "## VerifyNeptuneDbStatus\nThis step will check the Amazon Neptune DB cluster status is `available` in order to ensure that the database is \nready to accept changes from the runbook.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "EnableNeptuneDbAuditLogs",
+      "description": "## EnableNeptuneDbAuditLogs\nThis step will enable Amazon CloudWatch audit logs for the Amazon Neptune DB cluster.\n## Outputs\n* EnableNeptuneDbAuditLogsResponse: The output from the ModifyDBCluster call.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "neptune",
+        "Api": "ModifyDBCluster",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DBClusterIdentifier }}",
+        "CloudwatchLogsExportConfiguration": {
+          "EnableLogTypes": [
+            "audit"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "Name": "EnableNeptuneDbAuditLogsResponse",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyNeptuneDbLogStatus",
+      "description": "## VerifyNeptuneDbLogStatus\nThis step will check the Amazon Neptune DB cluster status after the audit log changes have been made and is ready\nto accept API calls again.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DBClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "VerifyNeptuneDbAuditLogs",
+      "description": "## VerifyNeptuneDbAuditLogs\nThis step verifies the audit logs to Amazon CloudWatch for the Amazon Neptune DB cluster have been successfully \nset using DescribeDBClusters API.\n## Outputs\n* VerifyNeptuneDbAuditLogsResponse: Output of the step indicating successful audit log configuration for \n  Amazon Neptune DB cluster.\n",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DBClusterIdentifier }}",
+          "DbClusterResourceId": "{{ DbClusterResourceId }}"
+        },
+        "Script": "import boto3\nimport botocore\n\ndef handler(event, context):\n  neptune_cluster_id = event[\"DBClusterIdentifier\"]\n  neptune_resource_identifier = event[\"DbClusterResourceId\"]\n  neptune_client = boto3.client(\"neptune\")\n\n  try:\n    response = neptune_client.describe_db_clusters(DBClusterIdentifier=neptune_cluster_id)[\"DBClusters\"][0]\n  except botocore.exceptions.ClientError as error:\n    raise Exception from error\n\n  cloudwatch_logging_config = response.get(\"EnabledCloudwatchLogsExports\")\n  if cloudwatch_logging_config and \"audit\" in cloudwatch_logging_config:\n    success_message = \"Verification of CloudWatch audit logging enabled for Neptune cluster is successful.\"\n    return {\"VerifyNeptuneDbAuditLogsEnabled\": success_message}\n    \n  raise Exception(\n    f\"VERIFICATION STEP FAILED. NEPTUNE RESOURCE ID {neptune_resource_identifier} CLOUDWATCH AUDIT LOGS \"\n    \"WERE NOT ENABLED PER PARAMETERS.\"\n  )"
+      },
+      "outputs": [
+        {
+          "Name": "VerifyNeptuneDbAuditLogsResponse",
+          "Selector": "$.Payload.VerifyNeptuneDbAuditLogsEnabled",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,131 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# Document name - AWS-EnableNeptuneDbBackupRetentionPeriod\n\n## What does this document do?\nThe AWS-EnableNeptuneDbBackupRetentionPeriod runbook will use the Amazon Neptune \n[ModifyDBCluster](https://docs.aws.amazon.com/neptune/latest/apiref/API_ModifyDBCluster.html) API to enable \nautomated backups with a backup retention period between 7 and 35 days for the specified Amazon Neptune DB cluster. \nThe Amazon Neptune DB cluster must be in an available state and the engine type must be set to `neptune`.\n\n## Input Parameters\n* AutomationAssumeRole: (Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role\n  that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\n  Systems Manager Automation uses the permissions of the user that starts this runbook.\n  * Default: \"\"\n* DbClusterResourceId: (Required) The Amazon Neptune DB cluster resourceId for which the \n  Backup Retention Period should be enabled.\n* BackupRetentionPeriod: (Required) The number of days for which automated backups are retained. \n  Must be a value from 7-35 days.\n* PreferredBackupWindow: (Optional) A daily time range value of at least 30 minutes, in \n  Universal Time Coordinated (UTC) in the format hh24:mm-hh24:mm (e.g., 07:14-07:44). \n  Must not conflict with the preferred maintenance window.\n  * Default: \"\"\n\n## Output Parameters\n* ModifyNeptuneDbRetentionPeriod.ModifyDbClusterResponse: Response from the ModifyDBCluster API call.\n* VerifyNeptuneDbBackupsEnabled.VerifyDbClusterBackupsEnabled: Output of the verify step indicating \n  successful modification of the Neptune DB cluster.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that\nallows Systems Manager Automation to perform the actions on your behalf. If no role is specified,\nSystems Manager Automation uses the permissions of the user that starts this runbook.\n",
+      "default": ""
+    },
+    "DbClusterResourceId": {
+      "type": "String",
+      "description": "(Required) The Amazon Neptune DB cluster resourceId for which the \nBackup Retention Period should be enabled.\n",
+      "allowedPattern": "^cluster-[a-zA-Z0-9-]{1,1016}$"
+    },
+    "BackupRetentionPeriod": {
+      "type": "Integer",
+      "description": "(Required) The number of days for which automated backups are \nretained. Must be a value from 7-35 days. \n",
+      "allowedPattern": "^([7-9]|[12][0-9]|3[0-5])$"
+    },
+    "PreferredBackupWindow": {
+      "type": "String",
+      "description": "(Optional) A daily time range value of at least 30 minutes, in Universal Time Coordinated (UTC) \nin the format hh24:mm-hh24:mm (e.g., 07:14-07:44). Must not conflict with the preferred maintenance window.\n",
+      "allowedPattern": "^$|^([01]\\d|2[0-3]):[0-5]\\d-([01]\\d|2[0-3]):[0-5]\\d$",
+      "default": ""
+    }
+  },
+  "outputs": [
+    "ModifyNeptuneDbRetentionPeriod.ModifyDbClusterResponse",
+    "VerifyNeptuneDbBackupsEnabled.VerifyDbClusterBackupsEnabled"
+  ],
+  "mainSteps": [
+    {
+      "name": "GetNeptuneDbClusterIdentifier",
+      "description": "## GetNeptuneDbClusterIdentifier\nThis step will use the Amazon Neptune DB cluster resource Id to retrieve the Amazon Neptune DB cluster identifier.\n## Outputs\n* DbClusterResourceIdentifier: The Amazon Neptune DB cluster identifier.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "rds",
+        "Api": "DescribeDBClusters",
+        "Filters": [
+          {
+            "Name": "db-cluster-resource-id",
+            "Values": [
+              "{{ DbClusterResourceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "DbClusterIdentifier",
+          "Selector": "$.DBClusters[0].DBClusterIdentifier",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyNeptuneDbEngine",
+      "description": "## VerifyNeptuneDbEngine\nThis step will verify the Amazon Neptune DB engine type as `neptune` in order to prevent \ninadvertent modification to any other RDS engine type.\n",
+      "action": "aws:assertAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Engine",
+        "DesiredValues": [
+          "neptune"
+        ]
+      }
+    },
+    {
+      "name": "VerifyNeptuneStatus",
+      "description": "## VerifyNeptuneStatus\nThis step will check the Amazon Neptune DB cluster status is `available` in order \nto ensure that the database is ready to accept changes from the runbook.\n",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "neptune",
+        "Api": "DescribeDBClusters",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterIdentifier }}",
+        "PropertySelector": "$.DBClusters[0].Status",
+        "DesiredValues": [
+          "available"
+        ]
+      }
+    },
+    {
+      "name": "ModifyNeptuneDbRetentionPeriod",
+      "description": "## ModifyNeptuneDbRetentionPeriod\nThis step will set the Retention Period from the customer for the Amazon Neptune DB cluster \nusing the ModifyDBCluster API call.\n## Outputs\nModifyDbClusterResponse: The output from the ModifyDBCluster API Call.\n",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "neptune",
+        "Api": "ModifyDBCluster",
+        "DBClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterIdentifier }}",
+        "BackupRetentionPeriod": "{{ BackupRetentionPeriod }}",
+        "PreferredBackupWindow": "{{ PreferredBackupWindow }}"
+      },
+      "outputs": [
+        {
+          "Name": "ModifyDbClusterResponse",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyNeptuneDbBackupsEnabled",
+      "description": "## VerifyNeptuneDbBackupsEnabled\nThis step verifies the Retention Period for the Amazon Neptune DB cluster and the Preferred Backup Window \n(if specified) have been successfully set.\n## Outputs\nVerifyDbClusterBackupsEnabled: Output of the step indicating successful modification of the Amazon Neptune DB cluster.\n",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "DbClusterIdentifier": "{{ GetNeptuneDbClusterIdentifier.DbClusterIdentifier }}",
+          "BackupRetentionPeriod": "{{ BackupRetentionPeriod }}",
+          "PreferredBackupWindow": "{{ PreferredBackupWindow }}",
+          "DbClusterResourceId": "{{ DbClusterResourceId }}"
+        },
+        "Script": "import boto3\nimport botocore\n\ndef verify_neptune_backups_enabled(\n  neptune_client, neptune_cluster_identifier, parameter_backup_retention_period, \n  parameter_preferred_backup_window\n):\n  try:\n    response=neptune_client.describe_db_clusters(DBClusterIdentifier = neptune_cluster_identifier)[\"DBClusters\"][0]\n  except botocore.exceptions.ClientError as error:\n    raise Exception from error\n\n  neptune_cluster_backup_retention_period = response[\"BackupRetentionPeriod\"]\n  neptune_cluster_preferred_backup_window = response.get(\"PreferredBackupWindow\")\n\n  if parameter_preferred_backup_window:\n    return (neptune_cluster_backup_retention_period == parameter_backup_retention_period and \n    (neptune_cluster_preferred_backup_window == parameter_preferred_backup_window))\n\n  return (neptune_cluster_backup_retention_period == parameter_backup_retention_period)\n\ndef handler(event, context):\n  neptune_client = boto3.client(\"neptune\")\n  neptune_cluster_identifier = event[\"DbClusterIdentifier\"]\n  neptune_backup_retention_period = event[\"BackupRetentionPeriod\"]\n  neptune_preferred_backup_window = event.get(\"PreferredBackupWindow\")\n  neptune_resource_identifier = event[\"DbClusterResourceId\"]\n\n  if verify_neptune_backups_enabled(\n    neptune_client, neptune_cluster_identifier, neptune_backup_retention_period, neptune_preferred_backup_window\n  ):\n    success_message = \"Verification of backups enabled for Amazon Neptune DB cluster is successful.\"\n    return {\"VerifyNeptuneClusterBackupsEnabled\": success_message}\n  raise Exception(\n    f\"VERIFICATION STEP FAILED. NEPTUNE RESOURCE ID {neptune_resource_identifier} \"\n    \"BACKUPS WERE NOT ENABLED PER PARAMETERS.\"\n  )"
+      },
+      "outputs": [
+        {
+          "Name": "VerifyDbClusterBackupsEnabled",
+          "Selector": "$.Payload.VerifyNeptuneClusterBackupsEnabled",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}
