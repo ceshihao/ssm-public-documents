@@ -1,6 +1,6 @@
 {
   "schemaVersion": "0.3",
-  "description": "Given a running Instance with SSM Agent installed, upgrade to Windows Server 2012 R2, 2016, 2019 or 2022. The upgrade paths supported are 2008R2->2012R2, 2012R2->2016,  2012R2->2019, 2012R2->2022, 2016->2019, 2016->2022 and 2019->2022. If your running instance in 2008R2, and you would like to  upgrade to either 2016, 2019 or 2022, the doc performs 2 steps, it first upgrades from 2008R2->2012R2  and upgrade 2012R2-2016, 2012R2-2019 or 2012R2->2022. This document will create an AMI from the running instance and launch a new instance from the Image and will upgrade the new instance. Note that if the running instance does not have SSM installed, we will attempt to install SSM in the new instance before it is upgraded. The running instance remains untouched.",
+  "description": "Given a running Instance with SSM Agent installed, and Windows Server 2008R2, 2012R2, 2016, or 2019 upgrade to Windows Server 2016, 2019 or 2022.  This document will create an AMI from the running instance and launch a new instance from the Image and will upgrade the new instance. Note that if the running instance does not have SSM installed, we will attempt to install SSM in the new instance before it is upgraded. The running instance remains untouched. If your running instance is 2008R2, this first upgrades from 2008R2->2012R2  and then upgrades 2012R2 to 2016, 2019 or 2022.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "InstanceId": {
@@ -65,6 +65,18 @@
   },
   "mainSteps": [
     {
+      "name": "putSSMInvocationMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeWindows",
+        "MetricName": "Invocations",
+        "MetricValue": "1.0"
+      },
+      "nextStep": "describeOriginalInstanceDetails"
+    },
+    {
       "name": "describeOriginalInstanceDetails",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
@@ -124,7 +136,7 @@
       "name": "getOSVersion",
       "action": "aws:runCommand",
       "maxAttempts": 3,
-      "onFailure": "Abort",
+      "onFailure": "step:putWindowsUpgradeFailureMetric",
       "timeoutSeconds": 600,
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
@@ -165,6 +177,18 @@
         }
       },
       "nextStep": "branchUpgradePath"
+    },
+    {
+      "name": "putWindowsUpgradeFailureMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeWindows",
+        "MetricName": "Failure",
+        "MetricValue": "1.0"
+      },
+      "isEnd": "true"
     },
     {
       "name": "branchUpgradePath",
@@ -1375,7 +1399,7 @@
           {
             "Variable": "{{ checkAfterWindowsUpgrade.Output }}",
             "Contains": "Error: Upgrade failed",
-            "NextStep": "deleteServerUpgradeInstance"
+            "NextStep": "putWindowsUpgradeFailureMetric"
           }
         ],
         "Default": "branchOnLicensingTypeToActivateLicense"
@@ -1730,11 +1754,49 @@
                 "StringEquals": "2012R2"
               }
             ],
-            "NextStep": "deleteServerUpgradeInstance"
+            "NextStep": "putWindowsUpgradeSuccessMetricFrom2008"
           }
         ],
         "Default": "runUpgradeTo2016Or2019From2008R2"
       }
+    },
+    {
+      "name": "putWindowsUpgradeSuccessMetricFrom2008",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeWindows",
+        "MetricName": "Successful_Upgrades",
+        "MetricValue": "1.0"
+      },
+      "nextStep": "deleteServerUpgradeInstance"
+    },
+    {
+      "name": "putWindowsUpgradeFailureMetricFrom2008",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeWindows",
+        "MetricName": "Failure",
+        "MetricValue": "1.0"
+      },
+      "nextStep": "deleteServerUpgradeInstance"
+    },
+    {
+      "name": "putWindowsUpgradeSuccessMetric",
+      "action": "aws:putServerUpgradeMetrics",
+      "maxAttempts": 3,
+      "inputs": {
+        "DimensionName": "SSM_METRICS",
+        "DimensionValue": "AWSEC2-CloneInstanceAndUpgradeWindows",
+        "MetricName": "Successful_Upgrades",
+        "MetricValue": "1.0"
+      },
+      "isEnd": "true"
     },
     {
       "name": "deleteServerUpgradeInstance",
@@ -1872,7 +1934,7 @@
     {
       "name": "runUpgradeFrom2012R2Or2016",
       "action": "aws:executeAutomation",
-      "onFailure": "Abort",
+      "onFailure": "step:putWindowsUpgradeFailureMetric",
       "inputs": {
         "DocumentName": "AWSEC2-CloneInstanceAndUpgradeWindows2019",
         "RuntimeParameters": {
@@ -1932,12 +1994,12 @@
           "Type": "String"
         }
       ],
-      "isEnd": "true"
+      "nextStep": "putWindowsUpgradeSuccessMetric"
     },
     {
       "name": "runUpgradeTo2016Or2019From2008R2",
       "action": "aws:executeAutomation",
-      "onFailure": "Abort",
+      "onFailure": "step:putWindowsUpgradeFailureMetricFrom2008",
       "inputs": {
         "DocumentName": "AWSEC2-CloneInstanceAndUpgradeWindows2019",
         "RuntimeParameters": {
@@ -1997,7 +2059,7 @@
           "Type": "String"
         }
       ],
-      "nextStep": "deleteServerUpgradeInstance"
+      "nextStep": "putWindowsUpgradeSuccessMetricFrom2008"
     }
   ],
   "outputs": [

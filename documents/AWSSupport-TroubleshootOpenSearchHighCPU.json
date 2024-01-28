@@ -1,0 +1,406 @@
+{
+  "description": "The **AWSSupport-TroubleshootOpenSearchHighCPU** runbook provides an automated solution to collect diagnostic data from your Amazon OpenSearch Service (AOS) domain to troubleshoot high CPU issues. The runbook collects the following data from your AOS domain.\n\n> * Hot threads information\n> * Detailed information about the currently executing tasks\n> * Thread pool statistics for each node in the domain\n> * Information about the nodes in the domain sorted by their CPU usage in descending order\n> * Shard allocation to each data node and their disk space\n> * Health status and basic information about the health of OpenSearch domain\n\n### Note:\nBy default, this runbook automates the collection of five data samples every 3 seconds and saves it to Amazon CloudWatch Logs for up to 24 hours. You can control the number and seconds between data samples to be collected by specifying a custom value for `NumberOfDataSamples` and `NumberOfSecondsBetweenSamples` input parameters. You can also retain the output in the Amazon CloudWatch Logs for up to 30 days by specifying the number of days in the `DataRetentionDays` input parameter.\n\n### How does it work?\n\n> * This runbook runs the [DescribeDomain](https://docs.aws.amazon.com/voiceid/latest/APIReference/API_DescribeDomain.html) API to get details about your OpenSearch domain.\n> * Checks whether the OpenSearch is public or virtual private cloud (VPC) based.\n> * Creates a public or [VPC based](https://docs.aws.amazon.com/lambda/latest/dg/foundation-networking.html) AWS Lambda function using an AWS CloudFormation stack.\n> * The AWS Lambda function is responsible for fetching diagnostic data from your Amazon OpenSearch Service domain.\n> * In order to gather a more comprehensive dataset for troubleshooting high CPU issues, the runbook orchestrates the execution of the AWS Lambda function multiple times, this is achieved through the use of an AWS Step Function that is also created using CloudFormation.\n> * The collected data is stored in an Amazon CloudWatch log group.\n> * Deletes the created resources except for the Amazon CloudWatch log group.\n\n### Prerequisites:\n\nBefore you start the runbook, you need a service role (automation assume role) and an Access Management (IAM) IAM role for the Lambda function. \n\n#### Automation assume role:\n> * Trust relationship:\n```\n{\n    \"Version\": \"2012-10-17\",\n    \"Statement\": [\n        {\n            \"Sid\": \"\",\n            \"Effect\": \"Allow\",\n            \"Principal\": {\n                \"Service\": \"ssm.amazonaws.com\"\n            },\n            \"Action\": \"sts:AssumeRole\"\n        }\n    ]\n}\n```\n> * Permission required to manage the Amazon CloudWatch, AWS Lambda function, OpenSearch domain, VPC, IAM, and AWS Step Function\n```\n{\n    \"Version\": \"2012-10-17\",\n    \"Statement\": [\n        {\n            \"Action\": [\n                \"cloudformation:CreateStack\",\n                \"cloudformation:DescribeStacks\",\n                \"cloudformation:DeleteStack\",\n                \"cloudformation:DescribeStackEvents\"\n            ],\n            \"Resource\": \"arn:*:cloudformation:*:*:stack/AWSSupport-TroubleshootOpenSearchHighCPU-*\",\n            \"Effect\": \"Allow\",\n            \"Sid\": \"cloudformation\"\n        },\n        {\n            \"Action\": [\n                \"lambda:CreateFunction\",\n                \"lambda:DeleteFunction\",\n                \"lambda:InvokeFunction\",\n                \"lambda:GetFunction\",\n                \"lambda:TagResource\"\n            ],\n            \"Resource\": \"arn:*:lambda:*:*:function:AWSSupport-HighCPU-*\",\n            \"Effect\": \"Allow\",\n            \"Sid\": \"lambda\"\n        },\n        {\n            \"Action\": [\n                \"es:DescribeDomain\"\n            ],\n            \"Resource\": \"arn:*:es:*:*:domain/{Domain-name}\",\n            \"Effect\": \"Allow\",\n            \"Sid\": \"opensearch\"\n        },\n        {\n            \"Action\": [\n                \"ec2:DescribeSecurityGroups\",\n                \"ec2:DescribeSubnets\",\n                \"ec2:DescribeVpcs\",\n                \"ec2:DescribeNetworkInterfaces\",\n                \"ec2:CreateNetworkInterface\",\n                \"ec2:DeleteNetworkInterface\",\n                \"ec2:DescribeInstances\",\n                \"ec2:AttachNetworkInterface\"\n            ],\n            \"Resource\": \"*\",\n            \"Effect\": \"Allow\"\n        },\n        {\n            \"Action\": [\n                \"iam:CreateRole\",\n                \"iam:DeleteRole\",\n                \"iam:GetRole\",\n                \"iam:PutRolePolicy\",\n                \"iam:DeleteRolePolicy\"\n            ],\n            \"Resource\": \"arn:*:iam::*:role/*\",\n            \"Effect\": \"Allow\",\n            \"Sid\": \"iam1\"\n        },\n        {\n            \"Action\": [\n                \"iam:PassRole\"\n            ],\n            \"Resource\": [\n                \"arn:*:iam::*:role/LambdaExecutionRoleForOpensearchHighCPU\",\n                \"arn:*:iam::*:role/AWSSupport-HighCPU-IAM-role*\"\n            ],\n            \"Effect\": \"Allow\",\n            \"Sid\": \"iam2\"\n        },\n        {\n            \"Action\": [\n                \"logs:CreateLogGroup\",\n                \"logs:PutRetentionPolicy\",\n                \"logs:TagResource\"\n            ],\n            \"Resource\": \"*\",\n            \"Effect\": \"Allow\",\n            \"Sid\": \"logs\"\n        },\n        {\n            \"Action\": [\n                \"ssm:DescribeAutomationExecutions\",\n                \"ssm:GetAutomationExecution\"\n            ],\n            \"Resource\": \"*\",\n            \"Effect\": \"Allow\",\n            \"Sid\": \"ssm\"\n        },\n        {\n            \"Action\": [\n                \"states:CreateStateMachine\",\n                \"states:DeleteStateMachine\",\n                \"states:StartExecution\",\n                \"states:TagResource\",\n                \"states:DescribeStateMachine\",\n                \"states:DescribeExecution\"\n            ],\n            \"Resource\": \"*\",\n            \"Effect\": \"Allow\",\n            \"Sid\": \"statemachine\"\n        }\n    ]\n}\n```\n\n#### LambdaRoleForOpenSearch\n- Trust relationship \n```\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"Service\": \"lambda.amazonaws.com\"\n      },\n      \"Action\": \"sts:AssumeRole\"\n    }\n  ]\n}\n```\n- Permission pertaining to OpenSearch Rest APIs\n```\n{\n    \"Version\": \"2012-10-17\",\n    \"Statement\": [\n        {\n            \"Effect\": \"Allow\",\n            \"Action\": [\n                \"es:ESHttpGet\"\n            ],\n            \"Resource\": [\n                \"arn:aws:es:<region>:<account>:domain/<domain-name>/_cluster/health*\"\n                \"arn:aws:es:<region>:<account>:domain/<domain-name>/_nodes/hot_threads*\"\n                \"arn:aws:es:<region>:<account>:domain/<domain-name>/_task*\",\n                \"arn:aws:es:<region>:<account>:domain/<domain-name>/_cat/nodes*\",\n                \"arn:aws:es:<region>:<account>:domain/<domain-name>/_cat/allocation*\",\n                \"arn:aws:es:<region>:<account>:domain/<domain-name>/_cat/thread_pool*\"\n            ]\n        }\n    ]\n}\n```\n- Permission pertaining to VPC-Lambda and CloudWatch log group \n```\n{\n    \"Version\": \"2012-10-17\",\n    \"Statement\": [\n        {\n            \"Effect\": \"Allow\",\n            \"Action\": [\n                \"logs:CreateLogStream\",\n                \"logs:PutLogEvents\"\n            ],\n            \"Resource\": [\n                \"arn:aws:logs:us-east-1:<account-id>:log-group:*\"\n            ]\n        },\n        {\n            \"Effect\": \"Allow\",\n            \"Action\": [\n                \"ec2:DescribeNetworkInterfaces\",\n                \"ec2:CreateNetworkInterface\",\n                \"ec2:DeleteNetworkInterface\"\n            ],\n            \"Resource\": \"*\"\n        }\n    ]\n}\n```\n\nFor instructions about creating an execution role for AWS Lambda see [Lambda execution role](https://docs.aws.amazon.com/lambda/latest/dg/lambda-intro-execution-role.html)\n\n### Important:\nFor Amazon OpenSearch domains with *fine-grained access control* enabled, please make sure that the *LambdaExecutionRoleForOpenSearch* role is mapped to the OpenSearch dashboard role with at least `cluster_monitor` permissions. Steps to map the role:\n> * Login to the OpenSearch Dashboards with master user credentials\n> *> Select the navigation three-line menu at the top left corner\n> * Under OpenSearch Plugins choose **Security**.\n> * Select **Roles**.\n> * Select the role with minimum of `cluster_monitor` permissions, for example `readall_and_monitor`.\n> * Select **Manage Mapping**.\n> * In the **Backend roles** section paste the ARN you are specifying in the `LambdaExecutionRoleForOpenSearch` parameter and choose **map**.\n\nFor more information on managing permissions and role mapping, see [Fine-grained access control in Amazon OpenSearch Service](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/fgac.html#fgac-access-control)\n\n### Important:\n\n> * This runbook creates the following resources in your account during invocation. These resources may incur additional costs.\n> * An AWS Lambda function to collect data from the AOS domain. See [AWS Lambda Pricing](https://aws.amazon.com/lambda/pricing/).\n> * An AWS Step Function state machine to orchestrate the data collection. See [AWS Step Functions Pricing](https://aws.amazon.com/step-functions/pricing/).\n> * An Amazon CloudWatch log group to store the data collected by the AWS Lambda function. See [Amazon CloudWatch Pricing](https://aws.amazon.com/cloudwatch/pricing/).\n\n#### Note:\nAll the resources except for the CloudWatch Logs log group are deleted by the automation at the end of the run. The log group is not deleted automatically and the logs are retained for the number of days you specify in the `DataRetentionDays` parameter. You must delete the log group manually after troubleshooting the high CPU issue.\n> * The maximum number of data samples you can collect using this automation is limited to 10.\n> * You can save the data in CloudWatch Logs for a maximum of 30 days. If you want to retain the data more than 30 days, you need to export it to an Amazon Simple Storage Service (Amazon S3) bucket. For more information, see [Export log data to Amazon S3 using the console](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/S3ExportTasksConsole.html).",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "finalStatus.FinalOutput",
+    "finalStatus.LogGroupUrl",
+    "finalStatus.LogGroupName"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "DomainName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon OpenSearch domain that you want to troubleshoot for high CPU issues.",
+      "allowedPattern": "^(\\d{12}/)?[a-z]{1}[a-z0-9-]{2,28}$"
+    },
+    "LambdaExecutionRoleForOpenSearch": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the IAM role to attach to the AWS Lambda function. The AWS Lambda function uses the credentials from this role to sign requests to your AOS domain. If *fine-grained access control (FGAC)* are enabled on your AOS domain, you must map this role to the OpenSearch Dashboards backend role with minimum of `cluster_monitor` permissions.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov):iam::\\d{12}:role/[\\w+=/,.@-]+$"
+    },
+    "DataRetentionDays": {
+      "type": "Integer",
+      "description": "(Optional) The number of days to retain the diagnostic data collected from the AOS domain. By default, the data is retained for `24` hours (1 day). You can choose to retain the data for a maximum of up to `30` days.",
+      "allowedValues": [
+        1,
+        3,
+        5,
+        7,
+        14,
+        30
+      ],
+      "default": 1
+    },
+    "NumberOfDataSamples": {
+      "type": "Integer",
+      "description": "(Optional) The number of data samples to collect from the AOS domain. By default, `5` data samples are collected. You can collect up to `10` samples. The AWS Lambda function is invoked for each sample collection.",
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "default": 5
+    },
+    "NumberOfSecondsBetweenSamples": {
+      "type": "Integer",
+      "description": "(Optional) The number of seconds between data samples. By default, `3` seconds.",
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "default": 3
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "checkConcurrency",
+      "action": "aws:executeScript",
+      "description": "Ensures there is only one execution of this runbook targeting the specified Amazon OpenSearch domain. If the runbook finds another in progress execution targeting the same domain name, it returns an error and ends.",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "check_concurrency.check_concurrency_handler",
+        "InputPayload": {
+          "TargetResourceId": "{{ DomainName }}",
+          "ParameterName": "DomainName"
+        },
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "getDomainConfig",
+      "onFailure": "step:finalStatus"
+    },
+    {
+      "name": "getDomainConfig",
+      "action": "aws:executeScript",
+      "description": "Gets the configuration details for the target Amazon OpenSearch domain.",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "function_handler",
+        "InputPayload": {
+          "DomainName": "{{ DomainName }}"
+        },
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\n\ndef function_handler(events, context):\n    \"\"\"\n    AWS Lambda function to describe an Amazon OpenSearch domain.\n\n    Args:\n        events : AWS Lambda event input containing the \"DomainName\" key.\n        context: AWS Lambda context object (unused).\n\n    Returns:\n        dict: A dictionary containing information about the OpenSearch domain, including\n              its endpoint, ARN, subnet IDs, security group IDs, and VPC ID.\n\n    Raises:\n        Exception: If there is an error during the domain description or execution.\n    \"\"\"\n    aos_client = boto3.client(\"opensearch\")\n\n    try:\n        # DescribeDomain\n        domain_status = aos_client.describe_domain(DomainName=events[\"DomainName\"]).get(\"DomainStatus\")\n\n        # Creating an empty dictionary to store the results\n        result = {}\n\n        # here if condition is required as the for vpc domain the value of endpoint is stored in Endpoints and for non-vpc its in Endpoint\n        if \"Endpoint\" in domain_status:\n            result[\"Endpoint\"] = domain_status.get(\"Endpoint\", \"\")\n        else:\n            result[\"Endpoint\"] = domain_status[\"Endpoints\"].get(\"vpc\", \"\")\n\n        result[\"ARN\"] = domain_status.get(\"ARN\", \"\")\n        result[\"SubnetIds\"] = \",\".join((domain_status.get(\"VPCOptions\", {})).get(\"SubnetIds\", []))\n        result[\"SecurityGroupIds\"] = \",\".join((domain_status.get(\"VPCOptions\", {})).get(\"SecurityGroupIds\", []))\n        result[\"VpcId\"] = (domain_status.get(\"VPCOptions\", {})).get(\"VPCId\", \"\")\n    except ClientError as error:\n        raise RuntimeError(\n            f\"[ERROR] An error occurred when describing the AWS OpenSearch domain {str(error)}\"\n        ) from None\n\n    return result\n"
+      },
+      "outputs": [
+        {
+          "Name": "OpenSearchDomainEndpoint",
+          "Selector": "$.Payload.Endpoint",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetIds",
+          "Selector": "$.Payload.SubnetIds",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Payload.SecurityGroupIds",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Payload.VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "OpenSearchDomainArn",
+          "Selector": "$.Payload.ARN",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "provisionResources",
+      "onFailure": "step:finalStatus"
+    },
+    {
+      "name": "provisionResources",
+      "action": "aws:createStack",
+      "description": "Provisions the resources for data collection using AWS CloudFormation.",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootOpenSearchHighCPU-{{ automation:EXECUTION_ID }}",
+        "TemplateBody": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nAWSTemplateFormatVersion: '2010-09-09'\nDescription: CloudFormation Stack to create the AWS Lambda function for the AWSSupport-TroubleshootOpenSearchHighCPU\n  runbook.\nParameters:\n  LambdaName:\n    Description: Name of the AWS Lambda function\n    Type: String\n    Default: AWSSupport-highCPU\n  VpcId:\n    Description: VPC ID of the OpenSearch domain\n    Type: String\n  SubnetIds:\n    Description: Comma separated list of Subnet Ids\n    Type: CommaDelimitedList\n  SecurityGroupIds:\n    Description: Comma separated list of Security Group Ids\n    Type: CommaDelimitedList\n  IAMRoleName:\n    Description: Name of the IAM role\n    Type: String\n    Default: AWSSupport-highCPU-IAM-role\n  IAMpolicy:\n    Description: Name of the IAM policy\n    Type: String\n    Default: AWSSupport-highCPU-IAM-policy\n  NumberOfDataSamples:\n    Description: Number of Lambda function invocations to collect data from the OpenSearch\n      domain\n    Default: 5\n    Type: Number\n  NumberOfSecondsBetweenSamples:\n    Description: Number of seconds between Lambda function invocations\n    Default: 3\n    Type: Number\n  OpenSearchDomainEndpoint:\n    Description: OpenSearch domain endpoint\n    Type: String\n  StateMachineName:\n    Description: Name of the State Machine\n    Type: String\n    Default: AWSSupport-highCPU-state-machine\n  LambdaExecutionRoleForOpenSearch:\n    Description: IAM role to be assumed by Lambda to send request to the OpenSearch\n      domain\n    Type: String\n    Default: ''\n  LogGroupName:\n    Description: Name of the CloudWatch log group for the Lambda function\n    Type: String\n    Default: /aws/lambda/AWSSupport-highCPU\n  DataRetentionDays:\n    Description: Retention days for Lambda function CloudWatch log group\n    Type: Number\n    Default: 1\nConditions:\n  UseVpc: !Not [!Equals [!Ref VpcId, '']]\nResources:\n  LambdaLogsLogGroup:\n    Type: AWS::Logs::LogGroup\n    DeletionPolicy: Retain\n    UpdateReplacePolicy: Retain\n    Properties:\n      LogGroupName: !Ref LogGroupName\n      RetentionInDays: !Ref DataRetentionDays\n\n  LambdaFunction:\n    Type: AWS::Lambda::Function\n    DependsOn: LambdaLogsLogGroup\n    Properties:\n      FunctionName: !Ref LambdaName\n      Handler: index.function_handler\n      Role: !Ref LambdaExecutionRoleForOpenSearch\n      Code:\n        ZipFile: \"# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\\n\\\n          \\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\\n\\n# Licensed\\\n          \\ under the Amazon Software License  http://aws.amazon.com/asl/\\n\\n\\n\\n\\\n          import http.client\\n\\nimport logging\\n\\nimport os\\n\\nimport time\\n\\nfrom\\\n          \\ concurrent.futures import ThreadPoolExecutor\\n\\nfrom urllib.parse import\\\n          \\ urlparse\\n\\n\\n\\nimport botocore.session\\n\\nfrom botocore.auth import SigV4Auth\\n\\\n          \\nfrom botocore.awsrequest import AWSRequest\\n\\n\\n\\n# Initialize a botocore\\\n          \\ session\\n\\nsession = botocore.session.Session()\\n\\n\\n\\n# Logger Configuration\\n\\\n          \\nlogger = logging.getLogger()\\n\\nlogger.setLevel(logging.INFO)\\n\\n\\n\\n\\n\\\n          \\ndef request_opensearch(domain_endpoint, path=\\\"\\\", filters=\\\"\\\"):\\n\\n\\\n          \\    \\\"\\\"\\\"\\n\\n    Make a request to OpenSearch.\\n\\n\\n\\n    Args:\\n\\n  \\\n          \\      domain_endpoint (str): The OpenSearch domain endpoint.\\n\\n      \\\n          \\  path (str): The path to append to the URL.\\n\\n        filters (str):\\\n          \\ Additional filters for the request.\\n\\n\\n\\n    Returns:\\n\\n        dict:\\\n          \\ A dictionary containing the response text.\\n\\n\\n\\n    \\\"\\\"\\\"\\n\\n    region\\\n          \\ = os.environ.get(\\\"AWS_REGION\\\")\\n\\n    sigv4 = SigV4Auth(session.get_credentials(),\\\n          \\ \\\"es\\\", region)\\n\\n    endpoint = domain_endpoint + path + filters\\n\\n\\\n          \\    request = AWSRequest(method=\\\"GET\\\", url=endpoint)\\n\\n\\n\\n    if \\\"\\\n          :desc\\\" in filters:\\n\\n        request.url += \\\"&s=cpu:desc\\\"\\n\\n\\n\\n  \\\n          \\  if \\\"queue,rejected,completed\\\" in filters:\\n\\n        request.url +=\\\n          \\ \\\"?v=true&h=id,name,active,queue,rejected,completed\\\"\\n\\n\\n\\n    sigv4.add_auth(request)\\n\\\n          \\n    prepped = request.prepare()\\n\\n\\n\\n    url_parse = urlparse(endpoint)\\n\\\n          \\n    path_and_query = url_parse.path if url_parse.query is None else url_parse.path\\\n          \\ + \\\"?\\\" + url_parse.query\\n\\n    connection = http.client.HTTPSConnection(url_parse.hostname)\\\n          \\  # nosec B309\\n\\n    connection.request(prepped.method, path_and_query,\\\n          \\ headers=prepped.headers)\\n\\n    response = connection.getresponse()\\n\\n\\\n          \\    return {\\\"response_text\\\": response.read().decode()}\\n\\n\\n\\n\\n\\ndef\\\n          \\ check_accessibility(api_name, url, max_retries=3):\\n\\n    \\\"\\\"\\\"\\n\\n \\\n          \\   Check the accessibility of an OpenSearch API with retry.\\n\\n\\n\\n   \\\n          \\ Args:\\n\\n        api_name (str): The name of the API being checked.\\n\\n\\\n          \\        url (str): The URL of the API.\\n\\n        max_retries (int): Maximum\\\n          \\ number of retry attempts.\\n\\n\\n\\n    Returns:\\n\\n    str: The response\\\n          \\ data from the API.\\n\\n    \\\"\\\"\\\"\\n\\n    retries = 0\\n\\n    while retries\\\n          \\ < max_retries:\\n\\n        try:\\n\\n            response = request_opensearch(url)\\n\\\n          \\n            response_data = response[\\\"response_text\\\"]\\n\\n          \\\n          \\  return response_data\\n\\n        except Exception as e:\\n\\n          \\\n          \\  log_message = f\\\"Attempt {retries + 1} - An error occurred: {e}\\\"\\n\\n\\\n          \\            # Log the error message and sleep for a short duration before\\\n          \\ retrying\\n\\n            logger.info(log_message)\\n\\n            time.sleep(2)\\n\\\n          \\n            retries += 1\\n\\n\\n\\n    # If all retry attempts fail, return\\\n          \\ an error message\\n\\n    return f\\\"Max retries ({max_retries}) reached.\\\n          \\ Could not access the API: {api_name}\\\"\\n\\n\\n\\n\\n\\ndef function_handler(events,\\\n          \\ context):\\n\\n    \\\"\\\"\\\"\\n\\n    Lambda main function for troubleshooting\\\n          \\ high CPU in OpenSearch.\\n\\n\\n\\n    Args:\\n\\n        event: The Lambda\\\n          \\ event.\\n\\n        context: The Lambda context.\\n\\n\\n\\n    Returns:\\n\\n\\\n          \\    dict: A response message.\\n\\n    \\\"\\\"\\\"\\n\\n    number_of_data_samples\\\n          \\ = int(events[\\\"numberofdatasamples\\\"])\\n\\n    index = int(events[\\\"index\\\"\\\n          ])\\n\\n    opensearch_domain_endpoint = events.get(\\\"opensearchdomainendpoint\\\"\\\n          )\\n\\n\\n\\n    urls = {\\n\\n        \\\"accessibility\\\": f\\\"https://{opensearch_domain_endpoint}/_cluster/health?pretty\\\"\\\n          ,\\n\\n        \\\"allocation\\\": f\\\"https://{opensearch_domain_endpoint}/_cat/allocation?v\\\"\\\n          ,\\n\\n        \\\"nodes_CPU\\\": f\\\"https://{opensearch_domain_endpoint}/_cat/nodes?v\\\"\\\n          ,\\n\\n        \\\"threadpool\\\": f\\\"https://{opensearch_domain_endpoint}/_cat/thread_pool\\\"\\\n          ,\\n\\n        \\\"hot_threads\\\": f\\\"https://{opensearch_domain_endpoint}/_nodes/hot_threads\\\"\\\n          ,\\n\\n        \\\"tasksDetails\\\": f\\\"https://{opensearch_domain_endpoint}/_tasks?detailed\\\"\\\n          ,\\n\\n    }\\n\\n\\n\\n    outputs = []\\n\\n    try:\\n\\n        with ThreadPoolExecutor(max_workers=6)\\\n          \\ as pool:\\n\\n            outputs = list(pool.map(check_accessibility, urls.keys(),\\\n          \\ urls.values()))\\n\\n    except Exception as e:\\n\\n        log_message =\\\n          \\ f\\\"An error occurred: {e}\\\"\\n\\n        outputs = [log_message] * len(urls)\\n\\\n          \\n\\n\\n    output = []\\n\\n\\n\\n    output.append(f\\\"{index}. Iteration\\\")\\n\\\n          \\n    output.append(\\\"Health status and basic information about the health\\\n          \\ of OpenSearch domain:\\\")\\n\\n    output.append(outputs[0])\\n\\n\\n\\n    output.append(\\\"\\\n          Shard allocation to each data node and their disk space:\\\")\\n\\n    output.append(outputs[1])\\n\\\n          \\n\\n\\n    output.append(\\\"Information about the nodes in the domain sorted\\\n          \\ by their CPU usage in descending order:\\\")\\n\\n    output.append(outputs[2])\\n\\\n          \\n\\n\\n    output.append(\\\"Threadpool Statistics for each node in the domain:\\\"\\\n          )\\n\\n    output.append(outputs[3])\\n\\n\\n\\n    output.append(\\\"Hot Threads\\\n          \\ information:\\\")\\n\\n    output.append(outputs[4])\\n\\n\\n\\n    output.append(\\\"\\\n          Currently executing tasks:\\\")\\n\\n    output.append(outputs[5])\\n\\n\\n\\n \\\n          \\   logger.info(\\\"\\\\n\\\".join(output[:204800]))\\n\\n    if len(output) > 204800:\\n\\\n          \\n        print(\\\"[WARNING] The output has been truncated. Please reduce\\\n          \\ the number of samples.\\\")\\n\\n\\n\\n    index += 1\\n\\n    return {\\n\\n  \\\n          \\      \\\"numberofdatasamples\\\": number_of_data_samples,\\n\\n        \\\"index\\\"\\\n          : index,\\n\\n        \\\"opensearchdomainendpoint\\\": opensearch_domain_endpoint,\\n\\\n          \\n        \\\"continue\\\": index <= number_of_data_samples,\\n\\n        \\\"response\\\"\\\n          : f\\\"Hot threads data collection interation {index} completed.\\\",\\n\\n  \\\n          \\  }\\n\\n\"\n      Runtime: python3.11\n      Timeout: 60\n      VpcConfig:\n        SubnetIds: !If [UseVpc, !Ref SubnetIds, !Ref \"AWS::NoValue\"]\n        SecurityGroupIds: !If [UseVpc, !Ref SecurityGroupIds, !Ref \"AWS::NoValue\"]\n  StateMachineIAMRole:\n    Type: AWS::IAM::Role\n    Properties:\n      RoleName: !Ref IAMRoleName\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n        - Effect: Allow\n          Principal:\n            Service:\n            - states.amazonaws.com\n          Action: sts:AssumeRole\n      Policies:\n      - PolicyName: !Ref IAMpolicy\n        PolicyDocument:\n          Version: '2012-10-17'\n          Statement:\n          - Effect: Allow\n            Action:\n            - lambda:InvokeFunction\n            Resource: !GetAtt LambdaFunction.Arn\n\n  LambdaStatemachine:\n    Type: AWS::StepFunctions::StateMachine\n    Properties:\n      StateMachineName: !Ref StateMachineName\n      DefinitionString: !Sub >\n        {\n          \"Comment\": \"Amazon OpenSearch data collector for high CPU utilization troubleshooting\",\n          \"StartAt\": \"ConfigureCount\",\n          \"States\": {\n            \"ConfigureCount\": {\n              \"Type\": \"Pass\",\n              \"ResultPath\": \"$\",\n              \"Next\": \"Iterator\",\n              \"Parameters\": {\n                \"numberofdatasamples\": ${NumberOfDataSamples},\n                \"index\": 1,\n                \"opensearchdomainendpoint\": \"${OpenSearchDomainEndpoint}\"\n              }\n            },\n            \"Iterator\": {\n              \"Type\": \"Task\",\n              \"Resource\": \"${LambdaFunction.Arn}\",\n              \"ResultPath\": \"$\",\n              \"Next\": \"IsCountReached\"\n            },\n            \"IsCountReached\": {\n              \"Type\": \"Choice\",\n              \"Choices\": [\n                {\n                  \"Variable\": \"$.continue\",\n                  \"BooleanEquals\": true,\n                  \"Next\": \"Wait\"\n                }\n              ],\n              \"Default\": \"Done\"\n            },\n            \"Wait\": {\n              \"Comment\": \"Wait N seconds\",\n              \"Type\": \"Wait\",\n              \"Seconds\": ${NumberOfSecondsBetweenSamples},\n              \"Next\": \"Iterator\"\n            },\n            \"Done\": {\n              \"Type\": \"Pass\",\n              \"End\": true\n            }\n          }\n        }\n      RoleArn: !GetAtt StateMachineIAMRole.Arn\n\nOutputs:\n  StateMachineARN:\n    Description: State machine ARN\n    Value: !GetAtt LambdaStatemachine.Arn\n  LogGroupARN:\n    Description: log group name\n    Value: !Ref LogGroupName\n",
+        "TimeoutInMinutes": 20,
+        "OnFailure": "DELETE",
+        "ClientRequestToken": "AWSSupport-TroubleshootOpenSearchHighCPU-{{ automation:EXECUTION_ID }}",
+        "Parameters": [
+          {
+            "ParameterKey": "LambdaName",
+            "ParameterValue": "AWSSupport-HighCPU-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "VpcId",
+            "ParameterValue": "{{ getDomainConfig.VpcId }}"
+          },
+          {
+            "ParameterKey": "SubnetIds",
+            "ParameterValue": "{{ getDomainConfig.SubnetIds }}"
+          },
+          {
+            "ParameterKey": "SecurityGroupIds",
+            "ParameterValue": "{{ getDomainConfig.SecurityGroupIds }}"
+          },
+          {
+            "ParameterKey": "IAMRoleName",
+            "ParameterValue": "AWSSupport-HighCPU-IAM-role-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "IAMpolicy",
+            "ParameterValue": "AWSSupport-HighCPU-IAM-policy-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "NumberOfDataSamples",
+            "ParameterValue": "{{ NumberOfDataSamples }}"
+          },
+          {
+            "ParameterKey": "StateMachineName",
+            "ParameterValue": "AWSSupport-HighCPU-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "LambdaExecutionRoleForOpenSearch",
+            "ParameterValue": "{{ LambdaExecutionRoleForOpenSearch }}"
+          },
+          {
+            "ParameterKey": "LogGroupName",
+            "ParameterValue": "/aws/lambda/AWSSupport-HighCPU-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "DataRetentionDays",
+            "ParameterValue": "{{ DataRetentionDays }}"
+          },
+          {
+            "ParameterKey": "NumberOfSecondsBetweenSamples",
+            "ParameterValue": "{{ NumberOfSecondsBetweenSamples }}"
+          },
+          {
+            "ParameterKey": "OpenSearchDomainEndpoint",
+            "ParameterValue": "{{ getDomainConfig.OpenSearchDomainEndpoint }}"
+          }
+        ],
+        "Capabilities": [
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootOpenSearchHighCPU-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-TroubleshootOpenSearchHighCPU-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CloudFormationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "waitForStackCreation",
+      "onFailure": "step:describeErrorsFromStackEvents"
+    },
+    {
+      "name": "waitForStackCreation",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the CloudFormation stack to complete.",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ provisionResources.CloudFormationStackId }}",
+        "PropertySelector": "$.Stacks[0].StackStatus",
+        "DesiredValues": [
+          "UPDATE_COMPLETE",
+          "CREATE_COMPLETE"
+        ]
+      },
+      "nextStep": "describeStackResources",
+      "onFailure": "step:describeErrorsFromStackEvents"
+    },
+    {
+      "name": "describeStackResources",
+      "action": "aws:executeAwsApi",
+      "description": "Describes the CloudFormation stack and gets the ARN of the AWS Step Function.",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ provisionResources.CloudFormationStackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "StateMachineARN",
+          "Selector": "$.Stacks[0].Outputs[0].OutputValue",
+          "Type": "String"
+        },
+        {
+          "Name": "LogGroupARN",
+          "Selector": "$.Stacks[0].Outputs[1].OutputValue",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "runStateMachine",
+      "onFailure": "step:describeErrorsFromStackEvents"
+    },
+    {
+      "name": "runStateMachine",
+      "action": "aws:executeStateMachine",
+      "description": "Invokes the data collector Lambda function one or more times by running the AWS Step Functions state machine.",
+      "isCritical": true,
+      "timeoutSeconds": 650,
+      "inputs": {
+        "stateMachineArn": "{{ describeStackResources.StateMachineARN }}",
+        "input": "{}"
+      },
+      "nextStep": "unstageOpenSearchHighCPUAutomation",
+      "outputs": [
+        {
+          "Name": "StateMachineStatus",
+          "Selector": "$.status",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "step:describeErrorsFromStackEvents"
+    },
+    {
+      "name": "describeErrorsFromStackEvents",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to create the AWS CloudFormation stack.",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "function_handler",
+        "InputPayload": {
+          "StackName": "{{ provisionResources.CloudFormationStackId }}",
+          "ExpectedStackStatus": "CREATE_COMPLETE",
+          "NonExpectedStackStatus": "ROLLBACK_COMPLETE,CREATE_FAILED,ROLLBACK_FAILED"
+        },
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\nimport sys\nimport textwrap\n\nimport boto3\nimport botocore.exceptions\n\ncloudformation = boto3.client(\"cloudformation\")\n\n\ndef function_handler(events, context):\n    partition = context[\"global:AWS_PARTITION\"]\n    region = context[\"global:REGION\"]\n    stack_name = events[\"StackName\"]\n    expected_stack_status = events[\"ExpectedStackStatus\"]\n    non_expected_resource_status = events[\"NonExpectedStackStatus\"].split(\",\")\n    console_url = get_stack_url(stack_name, partition, region)\n    stackfailurereasons(stack_name, console_url, expected_stack_status, non_expected_resource_status)\n\n\ndef stackfailurereasons(\n    stack_name,\n    console_url,\n    expected_stack_status,\n    non_expected_resource_status,\n):\n    # Find events different than 'DELETE_COMPLETE' in the list of recent stack events\n    # to get failure reason\n    stack_failure_msg = []\n    stack_failure_msg.append(\n        f\"\\n\\nThe AWS CloudFormation '{stack_name}' stack is not in '{expected_stack_status}' status.\\n\"\n    )\n    if expected_stack_status == \"DELETE_COMPLETE\":\n        stack_failure_msg.append(\"Try to delete the CloudFormation stack from the AWS CloudFormation console.\\n\\n\")\n        stack_failure_msg.append(f\"CloudFormation stack: {console_url}\\n\")\n        stack_failure_msg.append(\"For more information on deleting a stack see \")\n        stack_failure_msg.append(\n            \"https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html\\n\"\n        )\n\n    elif expected_stack_status == \"CREATE_COMPLETE\":\n        stack_failure_msg.append(\"Check for the stack associated events in the AWS CloudFormation console.\\n\\n\")\n        stack_failure_msg.append(f\"CloudFormation stack: {console_url}\\n\")\n        stack_failure_msg.append(\"For more information see \")\n        stack_failure_msg.append(\n            \"https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/troubleshooting.html\\n\"\n        )\n\n    try:\n        stack_status = cloudformation.describe_stacks(StackName=stack_name).get(\"Stacks\", [{}])[0].get(\"StackStatus\")\n        if stack_status == expected_stack_status:\n            stack_success_msg = (\n                f\"AWS CloudFormation '{stack_name}' stack successfully in '{expected_stack_status}' status.\\n\"\n            )\n            stack_success_msg += f\"CloudFormation stack: {console_url}\\n\"\n            print(repr(stack_success_msg))\n            return stack_success_msg\n\n        paginator = cloudformation.get_paginator(\"describe_stack_events\")\n        params = {\"StackName\": stack_name}\n\n        for page in paginator.paginate(**params):\n            stack_failure_msg.append(\"\\nThe following stack events are associated with the stack:\\n\")\n            events = page.get(\"StackEvents\", [])\n            for event in events:\n                if event.get(\"ResourceStatus\") in non_expected_resource_status:\n                    line = textwrap.dedent(event.get(\"ResourceStatusReason\", \"\"))\n                    text = \"\\n\".join(textwrap.wrap(line, width=120))\n                    stack_failure_msg.append(f\"> {event.get('LogicalResourceId')}:\\n{text}\\n\\n\")\n\n        stack_failure_msg.append(\"\\n\")\n        print(\"\".join(stack_failure_msg))\n        return stack_failure_msg\n\n    except botocore.exceptions.ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"ValidationError\" and \"does not exist\" in str(e):\n            stack_success_msg = (\n                f\"AWS CloudFormation Stack '{stack_name}' has been successfully deleted by the Automaton.\\n\"\n            )\n            print(repr(stack_success_msg))\n            return stack_success_msg\n        else:\n            print(f\"An error occurred when trying to describe the CloudFormation stack '{stack_name}': {str(e)}\\n\")\n        print(\"\".join(stack_failure_msg))\n        sys.exit(1)\n\n\n# Function that gets the CloudFormation url\ndef get_stack_url(stack_name: str, partition: str, aws_region: str) -> str:\n    domain_url_mapping = {\n        \"aws\": \"aws.amazon.com\",\n        \"aws-cn\": \"amazonaws.cn\",\n        \"aws-us-gov\": \"amazonaws-us-gov.com\",\n    }\n    domain_url = domain_url_mapping[partition]\n    return (\n        f\"https://console.{domain_url}/cloudformation/home?region={aws_region}#/stacks/stackinfo?stackId={stack_name}\"\n    )\n"
+      },
+      "outputs": [
+        {
+          "Name": "ErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "unstageOpenSearchHighCPUAutomation",
+      "onFailure": "step:unstageOpenSearchHighCPUAutomation"
+    },
+    {
+      "name": "unstageOpenSearchHighCPUAutomation",
+      "action": "aws:deleteStack",
+      "description": "Deletes the AWS CloudFormation stack.",
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 1800,
+      "inputs": {
+        "StackName": "{{ provisionResources.CloudFormationStackId }}"
+      },
+      "onFailure": "step:describeErrorsFromStackDeletion",
+      "nextStep": "describeErrorsFromStackDeletion"
+    },
+    {
+      "name": "describeErrorsFromStackDeletion",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to delete the AWS CloudFormation stack.",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "function_handler",
+        "InputPayload": {
+          "StackName": "{{ provisionResources.CloudFormationStackId }}",
+          "ExpectedStackStatus": "DELETE_COMPLETE",
+          "NonExpectedStackStatus": "DELETE_FAILED"
+        },
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\nimport sys\nimport textwrap\n\nimport boto3\nimport botocore.exceptions\n\ncloudformation = boto3.client(\"cloudformation\")\n\n\ndef function_handler(events, context):\n    partition = context[\"global:AWS_PARTITION\"]\n    region = context[\"global:REGION\"]\n    stack_name = events[\"StackName\"]\n    expected_stack_status = events[\"ExpectedStackStatus\"]\n    non_expected_resource_status = events[\"NonExpectedStackStatus\"].split(\",\")\n    console_url = get_stack_url(stack_name, partition, region)\n    stackfailurereasons(stack_name, console_url, expected_stack_status, non_expected_resource_status)\n\n\ndef stackfailurereasons(\n    stack_name,\n    console_url,\n    expected_stack_status,\n    non_expected_resource_status,\n):\n    # Find events different than 'DELETE_COMPLETE' in the list of recent stack events\n    # to get failure reason\n    stack_failure_msg = []\n    stack_failure_msg.append(\n        f\"\\n\\nThe AWS CloudFormation '{stack_name}' stack is not in '{expected_stack_status}' status.\\n\"\n    )\n    if expected_stack_status == \"DELETE_COMPLETE\":\n        stack_failure_msg.append(\"Try to delete the CloudFormation stack from the AWS CloudFormation console.\\n\\n\")\n        stack_failure_msg.append(f\"CloudFormation stack: {console_url}\\n\")\n        stack_failure_msg.append(\"For more information on deleting a stack see \")\n        stack_failure_msg.append(\n            \"https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html\\n\"\n        )\n\n    elif expected_stack_status == \"CREATE_COMPLETE\":\n        stack_failure_msg.append(\"Check for the stack associated events in the AWS CloudFormation console.\\n\\n\")\n        stack_failure_msg.append(f\"CloudFormation stack: {console_url}\\n\")\n        stack_failure_msg.append(\"For more information see \")\n        stack_failure_msg.append(\n            \"https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/troubleshooting.html\\n\"\n        )\n\n    try:\n        stack_status = cloudformation.describe_stacks(StackName=stack_name).get(\"Stacks\", [{}])[0].get(\"StackStatus\")\n        if stack_status == expected_stack_status:\n            stack_success_msg = (\n                f\"AWS CloudFormation '{stack_name}' stack successfully in '{expected_stack_status}' status.\\n\"\n            )\n            stack_success_msg += f\"CloudFormation stack: {console_url}\\n\"\n            print(repr(stack_success_msg))\n            return stack_success_msg\n\n        paginator = cloudformation.get_paginator(\"describe_stack_events\")\n        params = {\"StackName\": stack_name}\n\n        for page in paginator.paginate(**params):\n            stack_failure_msg.append(\"\\nThe following stack events are associated with the stack:\\n\")\n            events = page.get(\"StackEvents\", [])\n            for event in events:\n                if event.get(\"ResourceStatus\") in non_expected_resource_status:\n                    line = textwrap.dedent(event.get(\"ResourceStatusReason\", \"\"))\n                    text = \"\\n\".join(textwrap.wrap(line, width=120))\n                    stack_failure_msg.append(f\"> {event.get('LogicalResourceId')}:\\n{text}\\n\\n\")\n\n        stack_failure_msg.append(\"\\n\")\n        print(\"\".join(stack_failure_msg))\n        return stack_failure_msg\n\n    except botocore.exceptions.ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"ValidationError\" and \"does not exist\" in str(e):\n            stack_success_msg = (\n                f\"AWS CloudFormation Stack '{stack_name}' has been successfully deleted by the Automaton.\\n\"\n            )\n            print(repr(stack_success_msg))\n            return stack_success_msg\n        else:\n            print(f\"An error occurred when trying to describe the CloudFormation stack '{stack_name}': {str(e)}\\n\")\n        print(\"\".join(stack_failure_msg))\n        sys.exit(1)\n\n\n# Function that gets the CloudFormation url\ndef get_stack_url(stack_name: str, partition: str, aws_region: str) -> str:\n    domain_url_mapping = {\n        \"aws\": \"aws.amazon.com\",\n        \"aws-cn\": \"amazonaws.cn\",\n        \"aws-us-gov\": \"amazonaws-us-gov.com\",\n    }\n    domain_url = domain_url_mapping[partition]\n    return (\n        f\"https://console.{domain_url}/cloudformation/home?region={aws_region}#/stacks/stackinfo?stackId={stack_name}\"\n    )\n"
+      },
+      "outputs": [
+        {
+          "Name": "DeletionErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Continue",
+      "nextStep": "finalStatus"
+    },
+    {
+      "name": "finalStatus",
+      "action": "aws:executeScript",
+      "description": "Returns the troubleshooting results.",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "function_handler",
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\ndef function_handler(events, context):\n    status = str(events.get(\"Status\"))\n    cw_log_group_name = str(events.get(\"LogGroupName\"))\n    automation_execution_id = str(events.get(\"AutomationID\"))\n\n    partition = context[\"global:AWS_PARTITION\"]\n    region = context[\"global:REGION\"]\n\n    url = get_cw_log_group_url(cw_log_group_name, partition, region)\n\n    if status == \"SUCCEEDED\":\n        message = f\"Hot threads data collection completed. Please check the CloudWatch log group '{cw_log_group_name}' for more information.\"\n\n    else:\n        message = (\n            f\"An error occurred, please check the Automation Execution ID '{automation_execution_id}' for more details.\"\n        )\n\n    return {\"message\": message, \"url\": url, \"log_group\": cw_log_group_name}\n\n\n# Function that gets the CloudWatch log group url\ndef get_cw_log_group_url(cw_log_group_name: str, partition: str, aws_region: str) -> str:\n    domain_url_mapping = {\n        \"aws\": \"aws.amazon.com\",\n        \"aws-cn\": \"amazonaws.cn\",\n        \"aws-us-gov\": \"amazonaws-us-gov.com\",\n    }\n    domain_url = domain_url_mapping[partition]\n    return f\"https://console.{domain_url}/cloudwatch/home?region={aws_region}#logsV2:log-groups/log-group/{cw_log_group_name}\"\n",
+        "InputPayload": {
+          "Status": "{{ runStateMachine.status }}",
+          "LogGroupName": "{{ describeStackResources.LogGroupARN }}",
+          "AutomationID": "{{ automation:EXECUTION_ID }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "FinalOutput",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "LogGroupUrl",
+          "Selector": "$.Payload.url",
+          "Type": "String"
+        },
+        {
+          "Name": "LogGroupName",
+          "Selector": "$.Payload.log_group",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort",
+      "isEnd": true
+    }
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "e92299e6ab097016df2931aad12b8e174eaa14f3d00b76ab9e11e2ede066bdf5"
+      }
+    }
+  }
+}
