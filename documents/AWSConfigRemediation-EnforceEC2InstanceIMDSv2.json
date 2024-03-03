@@ -1,25 +1,67 @@
 {
   "schemaVersion": "0.3",
-  "description": "### Document Name - AWSConfigRemediation-EnforceEC2InstanceIMDSv2\n\n## What does this document do?\nThis document is used to enforce Amazon Elastic Compute Cloud (Amazon EC2) instance metadata version to Instance Metadata Service Version 2 (IMDSv2) on a given Amazon EC2 instance using [ModifyInstanceMetadataOptions](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceMetadataOptions.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* InstanceId: (Required) The ID of the Amazon EC2 instance.\n\n## Output Parameters\n* ModifyInstanceMetadataOptions.Output: The standard HTTP response from the ModifyInstanceMetadataOptions API.\n",
+  "description": "### Document Name - AWSConfigRemediation-EnforceEC2InstanceIMDSv2\n\n## What does this document do?\nThis document is used to enforce Amazon Elastic Compute Cloud (Amazon EC2) instance metadata version to Instance Metadata Service Version 2 (IMDSv2) on a given Amazon EC2 instance using [ModifyInstanceMetadataOptions](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifyInstanceMetadataOptions.html) API.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* InstanceId: (Required) The ID of the Amazon EC2 instance.\n* HttpPutResponseHopLimit: (Optional) The Hop response limit from the IMDS service back to the requester. Set to 2 or greater for EC2 instances hosting containers. Set to 0 to not change (Default).\n\n## Output Parameters\n* GetInstanceMetadataOptions.Output: The final state of the MetadataOptions for the EC2 instance.\n",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
-      "allowedPattern": "^arn:aws[a-z0-9-]*:iam::\\d{12}:role\\/[\\w-\\/.@+=,]{1,1017}$"
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
     },
     "InstanceId": {
-      "type": "String",
-      "description": "The ID of the Amazon EC2 instance.",
-      "allowedPattern": "^i-[a-z0-9]{17}$|^i-[a-z0-9]{8}$"
+      "type": "AWS::EC2::Instance::Id",
+      "description": "The ID of the Amazon EC2 instance."
+    },
+    "HttpPutResponseHopLimit": {
+      "type": "Integer",
+      "description": "(Optional) The Hop response limit from the IMDS service back to the requester. Set to 2 or greater for EC2 instances hosting containers. Set to 0 to not change (Default).",
+      "allowedPattern": "^([1-5]?\\d|6[0-4])$",
+      "default": 0
     }
   },
   "outputs": [
-    "ModifyInstanceMetadataOptions.Output"
+    "GetInstanceMetadataOptions.Output"
   ],
   "mainSteps": [
     {
-      "name": "ModifyInstanceMetadataOptions",
+      "name": "ModifyInstanceMetadataHopLimitBranch",
+      "action": "aws:branch",
+      "description": "## ModifyInstanceMetadataHopLimitBranch\nChecks if a Hop Limit was supplied in the input parameters. If so branch to ModifyInstanceMetadataOptionsEditHop, otherwise to ModifyInstanceMetadataOptionsNoEditHop.\n",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ModifyInstanceMetadataOptionsNoEditHop",
+            "Variable": "{{HttpPutResponseHopLimit}}",
+            "NumericEquals": 0
+          }
+        ],
+        "Default": "ModifyInstanceMetadataOptionsEditHop"
+      }
+    },
+    {
+      "name": "ModifyInstanceMetadataOptionsEditHop",
+      "action": "aws:executeAwsApi",
+      "description": "## ModifyInstanceMetadataOptions\nModifies the instance metadata options on a running or stopped instance.\n## Outputs\n* Output: The standard HTTP response from the ModifyInstanceMetadataOptions API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "ModifyInstanceMetadataOptions",
+        "InstanceId": "{{ InstanceId }}",
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": "{{HttpPutResponseHopLimit}}"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "GetInstanceMetadataOptions"
+    },
+    {
+      "name": "ModifyInstanceMetadataOptionsNoEditHop",
       "action": "aws:executeAwsApi",
       "description": "## ModifyInstanceMetadataOptions\nModifies the instance metadata options on a running or stopped instance.\n## Outputs\n* Output: The standard HTTP response from the ModifyInstanceMetadataOptions API.\n",
       "timeoutSeconds": 600,
@@ -36,7 +78,30 @@
           "Selector": "$",
           "Type": "StringMap"
         }
-      ]
+      ],
+      "nextStep": "GetInstanceMetadataOptions"
+    },
+    {
+      "name": "GetInstanceMetadataOptions",
+      "action": "aws:executeAwsApi",
+      "description": "## ModifyInstanceMetadataOptions\nModifies the instance metadata options on a running or stopped instance.\n## Outputs\n* Output: The standard HTTP response from the ModifyInstanceMetadataOptions API.\n",
+      "timeoutSeconds": 600,
+      "isEnd": false,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Reservations[0].Instances[0].MetadataOptions",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "VerifyEC2IMDSv2Enforced"
     },
     {
       "name": "VerifyEC2IMDSv2Enforced",
