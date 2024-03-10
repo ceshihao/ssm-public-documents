@@ -1,14 +1,19 @@
 {
   "schemaVersion": "0.3",
-  "description": "The AWSSupport-TroubleshootSSH automation document installs the [Amazon Elastic Compute Cloud (EC2) Rescue for Linux (ec2rl)](https://github.com/awslabs/aws-ec2rescue-linux) tool, and then uses the [openssh](https://github.com/awslabs/aws-ec2rescue-linux/blob/develop/docs/modules/openssh.md) module to check or attempt to fix common issues that prevent a remote connection to the Linux machine via SSH. Optionally, changes can be applied offline by stopping and starting the instance, if the user explicitly allows for offline remediation. By default, the document operates in read-only mode.",
+  "description": "The **AWSSupport-TroubleshootSSH** automation document installs the [Amazon Elastic Compute Cloud (EC2) Rescue for Linux (ec2rl)](https://github.com/awslabs/aws-ec2rescue-linux) tool, and then uses the [openssh](https://github.com/awslabs/aws-ec2rescue-linux/blob/develop/docs/modules/openssh.md) module to check or attempt to fix common issues that prevent a remote connection to the Linux machine via Secure Shell (SSH). Optionally, changes can be applied offline by stopping and starting the instance, if the user explicitly allows for offline remediation using the `AllowOffline` input parameter. By default, the document operates in read-only mode.\n\n#### Important:\n> * It is recommended to take a backup or snapshot of your EBS volumes if you are modifying the instance configuration.\n> * If the target instance is not managed by AWS Systems Manager and the parameters `AllowOffline` is set to `True` and `Action` is set to `FixAll`, the runbook runs the [AWSSupport-ExecuteEC2Rescue](https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-executeec2rescue.html) runbook to run the `ec2rl` openssh tool. **Important:** The `AWSSupport-ExecuteEC2Rescue` automation stops the instance, and creates an AMI before attempting any operations. Data stored in instance store volumes will be lost. The public IP address will change if you are not using an Elastic IP address.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
     "InstanceId": {
       "type": "AWS::EC2::Instance::Id",
-      "description": "(Required) ID of your EC2 Linux instance."
+      "description": "(Required) The ID of your EC2 Linux instance."
     },
     "Action": {
-      "description": "(Required) Specify if you want to check for issues without fixing them or to check and automatically fix any discovered issues.",
+      "description": "(Optional) The troubleshoot action. Specify if you want to check for issues without fixing them (`CheckAll`) or to check and automatically fix any discovered issues (`FixAll`).",
       "type": "String",
       "allowedValues": [
         "CheckAll",
@@ -18,7 +23,7 @@
     },
     "AllowOffline": {
       "type": "String",
-      "description": "(Optional) Fix only - Set it to true if you allow an offline SSH remediation in case the online troubleshooting fails, or the provided instance is not a managed instance. Note: For the offline remediation, SSM Automation stops the instance, and creates an AMI before attempting any operations.",
+      "description": "(Optional) Fix only - Set it to `True` if you allow an offline SSH remediation in case the online troubleshooting fails, or the provided instance is not a managed instance. Note: For the offline remediation, this automation stops the instance, and creates an AMI before attempting any operations.",
       "default": "False",
       "allowedValues": [
         "True",
@@ -27,18 +32,27 @@
     },
     "SubnetId": {
       "type": "String",
-      "description": "(Optional) Offline only - The subnet ID for the EC2Rescue instance used to perform the offline troubleshooting. If no subnet ID is specified, AWS Systems Manager Automation will create a new VPC. IMPORTANT: The subnet must be in the same Availability Zone as InstanceId, and it must allow access to the SSM endpoints.",
+      "description": "(Conditional) Offline only - The subnet ID for the EC2Rescue instance used to perform the offline troubleshooting. If no subnet ID is specified, AWS Systems Manager Automation will create a new VPC. **Important:** The subnet must be in the same Availability Zone as InstanceId, and it must allow access to the AWS Systems Manager endpoints.",
       "default": "SelectedInstanceSubnet",
       "allowedPattern": "^$|^subnet-[a-z0-9]{8,17}$|SelectedInstanceSubnet"
     },
-    "S3BucketName": {
-      "description": "(Optional) Offline only - S3 bucket name in your account where you want to upload the troubleshooting logs. Make sure the bucket policy does not grant unnecessary read/write permissions to parties that do not need access to the collected logs.",
-      "type": "AWS::S3::Bucket::Name",
-      "default": ""
+    "EC2RescueInstanceType": {
+      "type": "String",
+      "description": "(Conditional) Offline only - The EC2 instance type for the EC2Rescue instance.",
+      "default": "t3.medium",
+      "allowedValues": [
+        "t2.small",
+        "t2.medium",
+        "t2.large",
+        "t3.small",
+        "t3.medium",
+        "t3.large",
+        "i3.large"
+      ]
     },
-    "AutomationAssumeRole": {
-      "type": "AWS::IAM::Role::Arn",
-      "description": "(Optional) The IAM role for this execution. If no role is specified, AWS Systems Manager Automation will use the permissions of the user that executes this document.",
+    "S3BucketName": {
+      "description": "(Optional) Offline only - The Amazon S3 bucket name in your account where you want to upload the troubleshooting logs. Make sure the bucket policy does not grant unnecessary read/write permissions to parties that do not need access to the collected logs.",
+      "type": "AWS::S3::Bucket::Name",
       "default": ""
     }
   },
@@ -46,7 +60,8 @@
     {
       "name": "assertInstanceIsManagedInstance",
       "action": "aws:assertAwsResourceProperty",
-      "onFailure": "step:assertAllowOffline",
+      "description": "Checks if the instance is managed by AWS Systems Manager.",
+      "onFailure": "step:branchOnAllowOffline",
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -63,12 +78,13 @@
           "Online"
         ]
       },
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "installEC2Rescue"
     },
     {
       "name": "installEC2Rescue",
       "action": "aws:runCommand",
+      "description": "Install EC2Rescue for Linux via `AWS-ConfigureAWSPackage`.",
       "onFailure": "Abort",
       "inputs": {
         "DocumentName": "AWS-ConfigureAWSPackage",
@@ -81,11 +97,13 @@
           "version": "latest"
         }
       },
-      "nextStep": "troubleshootSSH"
+      "nextStep": "troubleshootSSH",
+      "isCritical": true
     },
     {
       "name": "troubleshootSSH",
       "action": "aws:runCommand",
+      "description": "Runs the bash script to run EC2Rescue for Linux.",
       "onFailure": "Abort",
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
@@ -94,71 +112,69 @@
         ],
         "Parameters": {
           "commands": [
-            "#!/bin/sh ",
-            "if test \"{{ Action }}\" = \"FixAll\" ",
-            "then ",
-            "    printf \"Running EC2 Rescue for Linux openssh module with --remediate option\\\\n\" ",
-            "    sudo ec2rl run --remediate --only-modules=openssh ",
-            "else ",
-            "    printf \"Running EC2 Rescue for Linux openssh module\\\\n\" ",
-            "    sudo ec2rl run --only-modules=openssh ",
-            "fi ",
-            "printf \"For more information please refer to https://github.com/awslabs/aws-ec2rescue-linux/blob/develop/docs/modules/openssh.md.\\\\n\" ",
-            "printf \"The EC2Rescue execution completed successfully.\\\\n\" "
+            "#!/bin/sh",
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "if test \"{{ Action }}\" = \"FixAll\"",
+            "then",
+            "    printf \"Running EC2 Rescue for Linux openssh module with --remediate option\\\\n\"",
+            "    sudo ec2rl run --remediate --only-modules=openssh",
+            "else",
+            "    printf \"Running EC2 Rescue for Linux openssh module\\\\n\"",
+            "    sudo ec2rl run --only-modules=openssh",
+            "fi",
+            "printf \"For more information please refer to https://github.com/awslabs/aws-ec2rescue-linux/blob/develop/docs/modules/openssh.md.\\\\n\"",
+            "printf \"The EC2Rescue execution completed successfully.\\\\n\""
           ]
         }
       },
-      "isEnd": "true"
+      "isEnd": true
     },
     {
-      "name": "assertAllowOffline",
-      "action": "aws:assertAwsResourceProperty",
-      "onFailure": "Abort",
+      "name": "branchOnAllowOffline",
+      "action": "aws:branch",
+      "description": "Branches the automation based on the value of the `AllowOffline` and `Action` input parameters.",
       "inputs": {
-        "Service": "ssm",
-        "Api": "GetAutomationExecution",
-        "AutomationExecutionId": "{{ automation:EXECUTION_ID }}",
-        "PropertySelector": "$.AutomationExecution.Parameters.AllowOffline[0]",
-        "DesiredValues": [
-          "True"
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ AllowOffline }}",
+                "StringEquals": "True"
+              },
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "FixAll"
+              }
+            ],
+            "NextStep": "branchOnSubnetId"
+          }
         ]
       },
-      "nextStep": "assertActionIsFixAll"
+      "isEnd": true
     },
     {
-      "name": "assertActionIsFixAll",
-      "action": "aws:assertAwsResourceProperty",
-      "onFailure": "Abort",
+      "name": "branchOnSubnetId",
+      "action": "aws:branch",
+      "description": "Branches the automation based on if the provided 'SubnetId' value.",
       "inputs": {
-        "Service": "ssm",
-        "Api": "GetAutomationExecution",
-        "AutomationExecutionId": "{{ automation:EXECUTION_ID }}",
-        "PropertySelector": "$.AutomationExecution.Parameters.Action[0]",
-        "DesiredValues": [
-          "FixAll"
-        ]
+        "Choices": [
+          {
+            "NextStep": "describeSourceInstance",
+            "Variable": "{{ SubnetId }}",
+            "StringEquals": "SelectedInstanceSubnet"
+          }
+        ],
+        "Default": "troubleshootSSHOffline"
       },
-      "nextStep": "assertSubnetId"
-    },
-    {
-      "name": "assertSubnetId",
-      "action": "aws:assertAwsResourceProperty",
-      "onFailure": "step:troubleshootSSHOffline",
-      "inputs": {
-        "Service": "ssm",
-        "Api": "GetAutomationExecution",
-        "AutomationExecutionId": "{{ automation:EXECUTION_ID }}",
-        "PropertySelector": "$.AutomationExecution.Parameters.SubnetId[0]",
-        "DesiredValues": [
-          "SelectedInstanceSubnet"
-        ]
-      },
-      "isCritical": "false",
-      "nextStep": "describeSourceInstance"
+      "isEnd": true
     },
     {
       "name": "describeSourceInstance",
       "action": "aws:executeAwsApi",
+      "description": "Retrieves the current instance's subnet.",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
@@ -179,6 +195,7 @@
     {
       "name": "troubleshootSSHOffline",
       "action": "aws:executeAutomation",
+      "description": "Runs the `AWSSupport-ExecuteEC2Rescue` runbook with the provided `SubnetId` value.",
       "onFailure": "Abort",
       "inputs": {
         "RuntimeParameters": {
@@ -193,15 +210,19 @@
           ],
           "AssumeRole": [
             "{{ AutomationAssumeRole }}"
+          ],
+          "EC2RescueInstanceType": [
+            "{{ EC2RescueInstanceType }}"
           ]
         },
         "DocumentName": "AWSSupport-ExecuteEC2Rescue"
       },
-      "isEnd": "true"
+      "isEnd": true
     },
     {
       "name": "troubleshootSSHOfflineWithSubnetId",
       "action": "aws:executeAutomation",
+      "description": "Runs the `AWSSupport-ExecuteEC2Rescue` runbook with the target instance subnet ID (`SelectedInstanceSubnet`).",
       "onFailure": "Abort",
       "inputs": {
         "RuntimeParameters": {
@@ -216,11 +237,14 @@
           ],
           "AssumeRole": [
             "{{ AutomationAssumeRole }}"
+          ],
+          "EC2RescueInstanceType": [
+            "{{ EC2RescueInstanceType }}"
           ]
         },
         "DocumentName": "AWSSupport-ExecuteEC2Rescue"
       },
-      "isEnd": "true"
+      "isEnd": true
     }
   ],
   "outputs": [
