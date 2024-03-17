@@ -1,0 +1,283 @@
+{
+  "description": "Orchestrates multi-StackSet deployments for EasyButton.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "description": "(Required) Role for Systems Manager Automation to assume.",
+      "type": "String"
+    },
+    "DelegatedAdminAccountId": {
+      "default": "",
+      "description": "(Optional) The account ID number of the member account in the organization to register as a delegated administrator.",
+      "type": "String"
+    },
+    "CallAs": {
+      "type": "String",
+      "description": "(Optional) The account context from which this document is being run.",
+      "allowedValues": [
+        "SELF",
+        "DELEGATED_ADMIN"
+      ],
+      "default": "SELF"
+    },
+    "ServicePrincipal": {
+      "allowedPattern": "^$|^([a-z0-9][a-z0-9-]*\\.)+(amazon(aws)?\\.com)(\\.[a-z]+)?$",
+      "default": "",
+      "description": "(Optional) The service principal of the AWS service for which you want to make the member account a delegated administrator.",
+      "type": "String"
+    },
+    "StackSetConfig1": {
+      "description": "(Required) Deployment settings for the first StackSet to be deployed.",
+      "type": "StringMap"
+    },
+    "CreateSecondStackSet": {
+      "description": "(Optional) Whether to create a second StackSet.",
+      "type": "String",
+      "default": "true",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "StackSetConfig2": {
+      "description": "(Optional) Deployment settings for the second StackSet to be deployed.",
+      "type": "StringMap",
+      "default": {}
+    },
+    "CreateThirdStackSet": {
+      "description": "(Optional) Whether to create a third StackSet.",
+      "type": "String",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "StackSetConfig3": {
+      "description": "(Optional) Deployment settings for the third StackSet to be deployed.",
+      "type": "StringMap",
+      "default": {}
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ShouldSkipManagementAccountActions",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CreateStackInstances1",
+            "StringEquals": "DELEGATED_ADMIN",
+            "Variable": "{{ CallAs }}"
+          }
+        ],
+        "Default": "ShouldEnableTrustedAccessForConfig"
+      }
+    },
+    {
+      "name": "ShouldEnableTrustedAccessForConfig",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EnableTrustedAccessForConfig",
+            "StringEquals": "config-multiaccountsetup.amazonaws.com",
+            "Variable": "{{ ServicePrincipal }}"
+          }
+        ],
+        "Default": "ShouldRegisterDelegatedAdmin"
+      }
+    },
+    {
+      "name": "EnableTrustedAccessForConfig",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "organizations",
+        "Api": "EnableAWSServiceAccess",
+        "ServicePrincipal": "config-multiaccountsetup.amazonaws.com"
+      }
+    },
+    {
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RegisterDelegatedAdministrator",
+            "Not": {
+              "StringEquals": "",
+              "Variable": "{{ DelegatedAdminAccountId }}"
+            }
+          }
+        ],
+        "Default": "CreateStackInstances1"
+      },
+      "name": "ShouldRegisterDelegatedAdmin"
+    },
+    {
+      "action": "aws:executeScript",
+      "inputs": {
+        "Handler": "register_delegated_admin_handler",
+        "InputPayload": {
+          "AccountId": "{{ DelegatedAdminAccountId }}",
+          "ServicePrincipal": "{{ ServicePrincipal }}"
+        },
+        "Runtime": "python3.6",
+        "Script": "import boto3\n\n\ndef register_delegated_admin_handler(events, context):\n    account_id = events['AccountId']\n    service_principal = events['ServicePrincipal']\n\n    org_client = boto3.client('organizations')\n    try:\n        org_client.register_delegated_administrator(\n            AccountId=account_id,\n            ServicePrincipal=service_principal\n        )\n    except org_client.exceptions.AccountAlreadyRegisteredException as error:\n        print(error.response['Error']['Message'])\n"
+      },
+      "maxAttempts": 3,
+      "name": "RegisterDelegatedAdministrator",
+      "timeoutSeconds": 600
+    },
+    {
+      "action": "aws:executeScript",
+      "inputs": {
+        "Handler": "deploy_stack_set",
+        "InputPayload": {
+          "StackSetConfig": "{{ StackSetConfig1 }}"
+        },
+        "Runtime": "python3.6",
+        "Script": "import boto3\n\n\ndef deploy_stack_set(events, context):\n    # get required parameters\n    stack_set_config = events['StackSetConfig']\n    stack_set_name = stack_set_config['StackSetName']\n    deployment_regions = stack_set_config['Regions']\n    operationPreferences = stack_set_config['OperationPreferences']\n    deployment_targets = stack_set_config['DeploymentTargets']\n\n    cfn_client = boto3.client('cloudformation')\n    deployment_id = cfn_client.create_stack_instances(\n        StackSetName=stack_set_name,\n        DeploymentTargets=deployment_targets,\n        Regions=deployment_regions,\n        OperationPreferences={\n            'FailureTolerancePercentage': operationPreferences['FailureTolerancePercentage'],\n            'MaxConcurrentPercentage': operationPreferences['MaxConcurrentPercentage'],\n            'RegionConcurrencyType': operationPreferences['RegionConcurrencyType'],\n        }\n    )['OperationId']\n\n    return {\n        'StackSetName': stack_set_name,\n        'OperationId': deployment_id,\n    }\n"
+      },
+      "name": "CreateStackInstances1",
+      "outputs": [
+        {
+          "Name": "StackSetName",
+          "Selector": "$.Payload.StackSetName",
+          "Type": "String"
+        },
+        {
+          "Name": "OperationId",
+          "Selector": "$.Payload.OperationId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Api": "DescribeStackSetOperation",
+        "DesiredValues": [
+          "SUCCEEDED"
+        ],
+        "OperationId": "{{ CreateStackInstances1.OperationId }}",
+        "PropertySelector": "$.StackSetOperation.Status",
+        "Service": "CloudFormation",
+        "StackSetName": "{{ CreateStackInstances1.StackSetName }}"
+      },
+      "name": "VerifyDeployment1"
+    },
+    {
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CreateStackInstances2",
+            "StringEquals": "true",
+            "Variable": "{{ CreateSecondStackSet }}"
+          }
+        ],
+        "Default": "SleepOneSecond"
+      },
+      "name": "ShouldCreateStackSet2"
+    },
+    {
+      "action": "aws:executeScript",
+      "inputs": {
+        "Handler": "deploy_stack_set",
+        "InputPayload": {
+          "StackSetConfig": "{{ StackSetConfig2 }}"
+        },
+        "Runtime": "python3.6",
+        "Script": "import boto3\n\n\ndef deploy_stack_set(events, context):\n    # get required parameters\n    stack_set_config = events['StackSetConfig']\n    stack_set_name = stack_set_config['StackSetName']\n    deployment_regions = stack_set_config['Regions']\n    operationPreferences = stack_set_config['OperationPreferences']\n    deployment_targets = stack_set_config['DeploymentTargets']\n\n    cfn_client = boto3.client('cloudformation')\n    deployment_id = cfn_client.create_stack_instances(\n        StackSetName=stack_set_name,\n        DeploymentTargets=deployment_targets,\n        Regions=deployment_regions,\n        OperationPreferences={\n            'FailureTolerancePercentage': operationPreferences['FailureTolerancePercentage'],\n            'MaxConcurrentPercentage': operationPreferences['MaxConcurrentPercentage'],\n            'RegionConcurrencyType': operationPreferences['RegionConcurrencyType'],\n        }\n    )['OperationId']\n\n    return {\n        'StackSetName': stack_set_name,\n        'OperationId': deployment_id,\n    }\n"
+      },
+      "name": "CreateStackInstances2",
+      "outputs": [
+        {
+          "Name": "StackSetName",
+          "Selector": "$.Payload.StackSetName",
+          "Type": "String"
+        },
+        {
+          "Name": "OperationId",
+          "Selector": "$.Payload.OperationId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Api": "DescribeStackSetOperation",
+        "DesiredValues": [
+          "SUCCEEDED"
+        ],
+        "OperationId": "{{ CreateStackInstances2.OperationId }}",
+        "PropertySelector": "$.StackSetOperation.Status",
+        "Service": "CloudFormation",
+        "StackSetName": "{{ CreateStackInstances2.StackSetName }}"
+      },
+      "name": "VerifyDeployment2"
+    },
+    {
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CreateStackInstances3",
+            "StringEquals": "true",
+            "Variable": "{{ CreateThirdStackSet }}"
+          }
+        ],
+        "Default": "SleepOneSecond"
+      },
+      "name": "ShouldCreateStackSet3"
+    },
+    {
+      "action": "aws:executeScript",
+      "inputs": {
+        "Handler": "deploy_stack_set",
+        "InputPayload": {
+          "StackSetConfig": "{{ StackSetConfig3 }}"
+        },
+        "Runtime": "python3.6",
+        "Script": "import boto3\n\n\ndef deploy_stack_set(events, context):\n    # get required parameters\n    stack_set_config = events['StackSetConfig']\n    stack_set_name = stack_set_config['StackSetName']\n    deployment_regions = stack_set_config['Regions']\n    operationPreferences = stack_set_config['OperationPreferences']\n    deployment_targets = stack_set_config['DeploymentTargets']\n\n    cfn_client = boto3.client('cloudformation')\n    deployment_id = cfn_client.create_stack_instances(\n        StackSetName=stack_set_name,\n        DeploymentTargets=deployment_targets,\n        Regions=deployment_regions,\n        OperationPreferences={\n            'FailureTolerancePercentage': operationPreferences['FailureTolerancePercentage'],\n            'MaxConcurrentPercentage': operationPreferences['MaxConcurrentPercentage'],\n            'RegionConcurrencyType': operationPreferences['RegionConcurrencyType'],\n        }\n    )['OperationId']\n\n    return {\n        'StackSetName': stack_set_name,\n        'OperationId': deployment_id,\n    }\n"
+      },
+      "name": "CreateStackInstances3",
+      "outputs": [
+        {
+          "Name": "StackSetName",
+          "Selector": "$.Payload.StackSetName",
+          "Type": "String"
+        },
+        {
+          "Name": "OperationId",
+          "Selector": "$.Payload.OperationId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "action": "aws:waitForAwsResourceProperty",
+      "inputs": {
+        "Api": "DescribeStackSetOperation",
+        "DesiredValues": [
+          "SUCCEEDED"
+        ],
+        "OperationId": "{{ CreateStackInstances3.OperationId }}",
+        "PropertySelector": "$.StackSetOperation.Status",
+        "Service": "CloudFormation",
+        "StackSetName": "{{ CreateStackInstances3.StackSetName }}"
+      },
+      "name": "VerifyDeployment3",
+      "isEnd": true
+    },
+    {
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT1S"
+      },
+      "name": "SleepOneSecond"
+    }
+  ]
+}
