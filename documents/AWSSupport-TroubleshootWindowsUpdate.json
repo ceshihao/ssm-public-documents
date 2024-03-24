@@ -1,0 +1,966 @@
+{
+  "description": "The **AWSSupport-TroubleshootWindowsUpdate** runbook helps you troubleshoot common issues related to Windows Updates for Windows Amazon Elastic Compute Cloud (Amazon EC2) instances. This runbook checks the following:\n\n> * Checks if the target EC2 instance is Windows and managed by Systems Manager.\n> * Checks if the SSM Agent and Windows Server versions are supported for Systems Manager Patch Operations.\n> * Checks the available disk space recommended for Windows Updates and if a reboot is pending (This normally indicates that there are updates pending on the machine and a reboot is required prior to any additional updates being performed).\n> * Gets the proxy settings configured at the operating system level (these can be used to troubleshoot connectivity issues).\n> * Performs an Amazon Simple Storage Service (Amazon S3) endpoint connectivity test and try to retrieve the current snapshot for the patch baseline the managed instance use when calling the [GetDeployablePatchSnapshotForInstance](https://docs.aws.amazon.com/systems-manager/latest/APIReference/API_GetDeployablePatchSnapshotForInstance.html) API for path operations.\n> * If the connection to Amazon S3 fails, the runbook provides the option to run the **AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2** runbook to analyze the instance's connectivity to the Amazon S3 endpoint.\n> * Validates the Windows Updates configuration and tests Windows Updates connectivity.\n\n### Prerequisites:\n> * Active Directory domain controllers are not supported.\n> * Windows Server version 2012 or previous versions are not supported.\n> * SSM Agent 1.2.371 or previous versions are not supported.\n> * The **AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2** runbook is not available in all regions where Systems Manager is supported.\n\n### Important:\n> * The **AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2** runbook uses [VPC Reachability Analyzer](https://docs.aws.amazon.com/vpc/latest/reachability/what-is-reachability-analyzer.html) to analyze the network connectivity between a source and a service endpoint. You are charged per analysis run between a source and destination. For more details, see [Amazon VPC Pricing](http://aws.amazon.com/vpc/pricing/).",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of the Amazon EC2 instance."
+    },
+    "RunVpcReachabilityAnalyzer": {
+      "type": "Boolean",
+      "description": "(Optional) Specify `true` if you want to run the `AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2` automation if the runbook detects that the instance is not able to connect to the required Amazon S3 endpoint. This parameter defaults to `false`.",
+      "default": false
+    },
+    "RetainVpcReachabilityAnalysis": {
+      "type": "Boolean",
+      "description": "(Conditional) Only applicable if the `RunVpcReachabilityAnalyzer` input parameter is set to `true`. Specify `true` to retain the network insight path and related analyses created by the VPC Reachability Analyzer. By default, the analysis is deleted after running successfully. If you choose to retain the analysis, the `AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2` runbook does not delete the analysis and you can visualize it in the VPC console. The console link will be available in the child automation output. This parameter defaults to `false`.",
+      "default": false
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "assertInstanceIsWindows",
+      "action": "aws:assertAwsResourceProperty",
+      "nextStep": "assertifInstanceIsSsmManaged",
+      "description": "Checks if the EC2 instance platform is `windows`, otherwise the automation ends.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "isCritical": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].Platform",
+        "DesiredValues": [
+          "windows"
+        ]
+      }
+    },
+    {
+      "name": "assertifInstanceIsSsmManaged",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Ensures the EC2 instance is managed by AWS Systems Manager, otherwise the automation ends.",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "InstanceInformationFilterList": [
+          {
+            "key": "InstanceIds",
+            "valueSet": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      },
+      "isCritical": true,
+      "nextStep": "getWindowsServerAndSSMAgentVersion"
+    },
+    {
+      "name": "getWindowsServerAndSSMAgentVersion",
+      "action": "aws:executeAwsApi",
+      "description": "Gets details about the SSM Agent and Windows Server version by calling the `DescribeInstanceInformation` API.",
+      "inputs": {
+        "Api": "DescribeInstanceInformation",
+        "Service": "ssm",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          }
+        ]
+      },
+      "onFailure": "Continue",
+      "outputs": [
+        {
+          "Name": "AgentVersion",
+          "Type": "String",
+          "Selector": "$.InstanceInformationList[0].AgentVersion"
+        },
+        {
+          "Name": "PlatformType",
+          "Type": "String",
+          "Selector": "$.InstanceInformationList[0].PlatformType"
+        },
+        {
+          "Name": "PlatformVersion",
+          "Type": "String",
+          "Selector": "$.InstanceInformationList[0].PlatformVersion"
+        }
+      ],
+      "isCritical": true,
+      "nextStep": "CheckProxy"
+    },
+    {
+      "name": "CheckProxy",
+      "action": "aws:runCommand",
+      "description": "Checks the operating system-level proxy settings that could affect network connectivity.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Initialize variable to track proxy presence",
+            "$proxy_present = $false",
+            "",
+            "# Check WinInet proxy",
+            "$Proxy = [System.Net.WebProxy]::GetDefaultProxy()",
+            "if ($null -eq $Proxy.Address) {",
+            "    Write-Output \"No WinInet Proxy is set on the system.\"",
+            "} else {",
+            "    $proxy_present = $true",
+            "    Write-Output \"The Proxy Address is: $($Proxy.Address)\"",
+            "    Write-Output \"Proxy is bypassing local address: $($Proxy.BypassProxyOnLocal)\"",
+            "    Write-Output \"Addresses bypassed by this proxy: $($Proxy.Bypasslist)\"",
+            "}",
+            "",
+            "# Check Winhttp proxy",
+            "$Conprx = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Connections\" -Name WinHttpSettings).WinHttpSettings",
+            "if ($Conprx) {",
+            "    $proxylength = $Conprx[12]",
+            "    if ($proxylength -gt 0) {",
+            "        $proxywinhttp = -join ($Conprx[(12 + 3 + 1)..(12 + 3 + 1 + $proxylength - 1)] | ForEach-Object { ([char]$_) })",
+            "        $bypasslength = $Conprx[(12 + 3 + 1 + $proxylength)]",
+            "        if ($bypasslength -gt 0) {",
+            "            $bypasslist = -join ($Conprx[(12 + 3 + 1 + $proxylength + 3 + 1)..(12 + 3 + 1 + $proxylength + 3 + 1 + $bypasslength)] | ForEach-Object { ([char]$_) })",
+            "        } else {",
+            "            $bypasslist = '(none)'",
+            "        }",
+            "        $result = [PSCustomObject]@{",
+            "            \"Winhttpproxy\"      = $proxywinhttp",
+            "            \"Winhttpbypasslist\" = $bypasslist",
+            "        }",
+            "    } else {",
+            "        $result = [PSCustomObject]@{",
+            "            \"Winhttpproxy\"      = \"Direct Access\"",
+            "            \"Winhttpbypasslist\" = \"(none)\"",
+            "        }",
+            "    }",
+            "} else {",
+            "    $result = [PSCustomObject]@{",
+            "        \"Winhttpproxy\"      = \"Error: Not able to read registry entry\"",
+            "        \"Winhttpbypasslist\" = \"Error: Not able to read registry entry\"",
+            "    }",
+            "}",
+            "",
+            "if ($result.Winhttpproxy -eq \"Direct Access\") {",
+            "    Write-Output \"No Winhttp Proxy is set on the system.\"",
+            "} else {",
+            "    $proxy_present = $true",
+            "    Write-Output \"The Winhttp Proxy is: $($result.Winhttpproxy)\"",
+            "    Write-Output \"The Winhttp bypass list is: $($result.Winhttpbypasslist)\"",
+            "    Write-Output \"For more information, check: https://learn.microsoft.com/en-us/windows/win32/winhttp/setting-wininet-proxy-configurations-in-winhttp\"",
+            "}",
+            "",
+            "# Check Amazon SSM Agent Proxy",
+            "$serviceKey = \"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\AmazonSSMAgent\"",
+            "$keyInfo = (Get-Item -Path $serviceKey).GetValue(\"Environment\")",
+            "if ($null -eq $keyInfo) {",
+            "    Write-Output \"There is no proxy setting for the Amazon SSM Agent.\"",
+            "} else {",
+            "    $proxy_present = $true",
+            "    $value = (Get-Item -Path $serviceKey).GetValue(\"Environment\")",
+            "    Write-Output \"SSM Agent is configured with proxy settings: $($value)\"",
+            "    Write-Output \"For more information, see: https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-install-ssm-proxy.html.\"",
+            "}",
+            "",
+            "# Check System Wide Environment Variable proxy",
+            "$syshttpProxy = [System.Environment]::GetEnvironmentVariable('HTTP_PROXY', [System.EnvironmentVariableTarget]::Machine)",
+            "if ($syshttpProxy -or $syshttpProxy -eq '') {",
+            "    $proxy_present = $true",
+            "    Write-Output \"System Wide Environment HTTP Proxy is set: $($syshttpProxy)\"",
+            "} else {",
+            "    Write-Output \"System Wide Environment HTTP Proxy is not set.\"",
+            "}",
+            "",
+            "$syshttpsProxy = [System.Environment]::GetEnvironmentVariable('HTTPS_PROXY', [System.EnvironmentVariableTarget]::Machine)",
+            "if ($syshttpsProxy -or $syshttpsProxy -eq '') {",
+            "    $proxy_present = $true",
+            "    Write-Output \"System Wide Environment HTTPS Proxy is set: $($syshttpsProxy)\"",
+            "} else {",
+            "    Write-Output \"System Wide Environment HTTPS Proxy is not set.\"",
+            "}",
+            "",
+            "$sysnoProxy = [System.Environment]::GetEnvironmentVariable('NO_PROXY', [System.EnvironmentVariableTarget]::Machine)",
+            "if ($sysnoProxy -or $sysnoProxy -eq '') {",
+            "    $proxy_present = $true",
+            "    Write-Output \"System Wide Environment NO PROXY is set: $($sysnoProxy)\"",
+            "} else {",
+            "    Write-Output \"System Wide Environment NO PROXY is not set.\"",
+            "}",
+            "",
+            "# Check Local System Account User environment Variable proxy",
+            "$defaultUserEnvPath = \"Registry::HKEY_USERS\\.DEFAULT\\Environment\"",
+            "$httpproxy = (Get-ItemProperty -Path $defaultUserEnvPath).HTTP_Proxy",
+            "$httpsproxy = (Get-ItemProperty -Path $defaultUserEnvPath).HTTPS_Proxy",
+            "$noproxy = (Get-ItemProperty -Path $defaultUserEnvPath).NO_Proxy",
+            "if (($null -eq $httpProxy) -and ($null -eq $httpsproxy) -and ($null -eq $noproxy)) {",
+            "    Write-Output \"There is no HTTP Proxy configured at local system account user environment.\"",
+            "} else {",
+            "    $proxy_present = $true",
+            "    Write-Output \"Please find below proxy details configured at local system account user environment: \"",
+            "    Write-Output  $(If ($null -ne $httpproxy) {\"HTTP Proxy: $($httpproxy)\"} else {\"HTTP Proxy: None\"})",
+            "    Write-Output  $(If ($null -ne $httpsproxy) {\"HTTPS Proxy: $($httpsproxy)\"} else {\"HTTPS Proxy: None\"})",
+            "    Write-Output  $(If ($null -ne $noproxy) {\"No Proxy: $($noproxy)\"} else {\"No Proxy: None\"})",
+            "    Write-Output \"For more information, see: https://docs.microsoft.com/en-us/windows/win32/procthread/environment-variables.\"",
+            "}",
+            "",
+            "Write-Output \"\"",
+            "",
+            "# Failure message",
+            "if ($proxy_present) {",
+            "    Write-Output \"WARNING: Windows Update might have failed due to proxy settings configured. Please check proxy settings using the details in the Output section.\"",
+            "    Write-Warning \"Make sure that your proxy settings allow access to the Amazon S3 and Systems Manager endpoints.\"",
+            "    Write-Warning \"Make sure that your proxy settings allow access to the EC2 instance metadata IP address (169.254.169.254).\"",
+            "    Write-Warning \"Make sure that your proxy settings allow access to the Windows Update endpoints.\"",
+            "    Exit 0",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckPrerequisites"
+    },
+    {
+      "name": "CheckPrerequisites",
+      "action": "aws:runCommand",
+      "description": "Gets and validates if the Windows and SSM Agent versions are supported, and check if the instance is an Active Directory domain controller (DC). If the instance is a DC or if the Windows and/or the SSM Agent version are not supported, the runbook ends.",
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Retrieve OS information",
+            "$osInfo = Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -Property Caption, Version",
+            "$currentPlatformVersion = [System.Version]$OsInfo.Version",
+            "",
+            "# Initialize error flag",
+            "$errorOccurred = $false",
+            "",
+            "# Check if the target instance is not a Domain Controller (ProductType == 2)",
+            "if ((Get-WmiObject -Class Win32_OperatingSystem).ProductType -eq 2) {",
+            "    Write-Error \"ERROR: The script does not support Active Directory Domain Controllers.\"",
+            "    $errorOccurred = $true",
+            "}",
+            "else {",
+            "    Write-Output \"INFO: The target instance is not an Active Directory Domain Controller.\"",
+            "}",
+            "",
+            "# Check if the target instance OS version is less than Windows Server 2012 (6.2)",
+            "if ($currentPlatformVersion -lt [System.Version]\"6.2\") {",
+            "    Write-Error \"ERROR: The script doesn't support Windows Server version 2008 R2 or lower versions.\"",
+            "    $errorOccurred = $true",
+            "}",
+            "else {",
+            "    Write-Output \"INFO: The platform $currentPlatformVersion is supported.\"",
+            "}",
+            "",
+            "# Define required SSM Agent version",
+            "$requiredAgentVersion = \"1.2.371\"",
+            "$agent_version = \"{{ getWindowsServerAndSSMAgentVersion.AgentVersion }}\"",
+            "$currentAgentVersion = [System.Version]\"$agent_version\"",
+            "",
+            "# Check if the target instance SSM Agent version is less than required",
+            "if ($currentAgentVersion -lt [System.Version]$requiredAgentVersion) {",
+            "    Write-Error \"ERROR: The runbook doesn't support SSM Agent version $requiredAgentVersion or lower versions.\"",
+            "    $errorOccurred = $true",
+            "} else {",
+            "    Write-Output \"INFO: The SSM Agent version $currentAgentVersion is supported.\"",
+            "}",
+            "",
+            "# Exit script with appropriate status code if any prerequisite fails",
+            "if ($errorOccurred) {",
+            "    Exit 1",
+            "} else {",
+            "    Exit 0",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckDiskSpace"
+    },
+    {
+      "name": "CheckDiskSpace",
+      "action": "aws:runCommand",
+      "description": "Gets and validates the available disk space recommended for performing Windows updates.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Get system drive and its free space",
+            "$systemDrive = (Get-WmiObject Win32_OperatingSystem).SystemDrive",
+            "$freeSpace = (Get-WmiObject CIM_LogicalDisk -Filter \"DeviceId='$systemDrive'\").FreeSpace",
+            "",
+            "# Check available disk space",
+            "if ($freeSpace -lt 10GB) {",
+            "    Write-Warning \"WARNING: Available disk space on the system is less than 10 GB ($([math]::Ceiling($freeSpace / 1GB)) GB). It is recommended to free up at least 10 GBs of disk space before running Windows Update.\"",
+            "} else {",
+            "    Write-Output \"INFO: Disk space on drive $systemDrive is sufficient to run Windows updates.\"",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckPendingReboot"
+    },
+    {
+      "name": "CheckPendingReboot",
+      "action": "aws:runCommand",
+      "description": "Checks if there is any system-level pending reboot that is required prior to install additional Windows updates.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "# Initialize variable to track reboot status",
+            "$RebootPending = $false",
+            "",
+            "# Check for 'Reboot Required' registry key under Component Based Servicing",
+            "if (Test-Path \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending\" -ea SilentlyContinue) {",
+            "    $RebootPending = $true",
+            "}",
+            "",
+            "# Check for 'Reboot Required' registry key under WindowsUpdate\\Auto Update",
+            "if (Test-Path \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired\" -ea SilentlyContinue) {",
+            "    $RebootPending = $true",
+            "}",
+            "",
+            "# Check for recent installation requiring reboot",
+            "if (Test-Path \"HKLM:\\SOFTWARE\\Microsoft\\Updates\\UpdateExeVolatile\" -ea SilentlyContinue) {",
+            "    $RebootPending = $true",
+            "}",
+            "",
+            "# Check for System Center Configuration Manager reboot status",
+            "if (Test-Path \"HKLM:\\SOFTWARE\\Microsoft\\SMS\\Mobile Client\\Reboot Management\\RebootData\" -ea SilentlyContinue) {",
+            "    $RebootPending = $true",
+            "}",
+            "",
+            "# Check for PendingFileRenameOperations",
+            "if (Get-ItemProperty \"HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\" -Name PendingFileRenameOperations -EA SilentlyContinue) {",
+            "    $RebootPending = $true",
+            "}",
+            "",
+            "# Check if a reboot is pending and exit with an error if true",
+            "if ($RebootPending) {",
+            "    Write-Error \"ERROR: Windows is in a pending reboot state. Please complete it to proceed with Windows Update.\"",
+            "    Exit 1",
+            "} else {",
+            "    Write-Output \"INFO: There is no pending reboot.\"",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckS3Connectivity"
+    },
+    {
+      "name": "CheckS3Connectivity",
+      "action": "aws:runCommand",
+      "description": "Checks if the instance is able to reach the Amazon S3 endpoint for Patch Baseline operations. ",
+      "onFailure": "step:GenerateEndpoint",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Set TLS security protocol",
+            "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls13 -bor [System.Net.SecurityProtocolType]::Tls12",
+            "",
+            "# Test metadata accessibility",
+            "try {",
+            "    # Default to IMDSv2",
+            "    try {",
+            "        $token = Invoke-RestMethod -Headers @{\"X-aws-ec2-metadata-token-ttl-seconds\" = \"21600\"} -Method PUT -Uri http://169.254.169.254/latest/api/token",
+            "        $instanceId = Invoke-RestMethod -Headers @{\"X-aws-ec2-metadata-token\" = $token} -Method GET -Uri http://169.254.169.254/latest/meta-data/instance-id",
+            "    }",
+            "    # Fallback to IMDSv1",
+            "    catch {",
+            "        $metadataUrl = \"http://169.254.169.254/latest/meta-data/instance-id\"",
+            "        $instanceId = (Invoke-WebRequest -UseBasicParsing -Uri $metadataUrl).Content",
+            "    }",
+            "",
+            "    if ($null -eq $instanceId) {",
+            "        Write-Output \"The instance Id read from the metadata is $InstanceId\"`n",
+            "    }",
+            "}",
+            "catch {",
+            "    Write-Output \"\"",
+            "    Write-Error (\"ERROR: Failed to get metadata: {0}\" -f $_.Exception.Message)",
+            "    Write-Warning \"WARNING: Instance metadata (IMDS) is not accessible.\"",
+            "    Write-Output \"Please check the SSM Agent technical reference for troubleshooting: `nhttps://docs.aws.amazon.com/systems-manager/latest/userguide/ssm-agent-technical-details.html.\"",
+            "}",
+            "",
+            "# Attempt to download Windows patching file",
+            "$attemptCount = 1",
+            "$tempPath = (Resolve-Path ${env:temp}).Path",
+            "$tempFile = \"${tempPath}\\Patch.json\"",
+            "",
+            "try {",
+            "    Write-Output \"Calling GetDeployablePatchSnapshotForInstance API ... \"",
+            "    $snap = Get-SSMDeployablePatchSnapshotForInstance -SnapshotId '00000000-0000-0000-0000-000000000000' -InstanceId $instanceId -Verbose",
+            "}",
+            "catch {",
+            "    Write-Output \"\"",
+            "    Write-Error (\"ERROR: Failed to GetDeployablePatchSnapshotForInstance: {0}\" -f $_.Exception.Message)",
+            "    Write-Output \"\"",
+            "    Exit 1",
+            "}",
+            "",
+            "try {",
+            "    Write-Output \"Downloading Windows Patching file...\"",
+            "    $maxAttempts = 5",
+            "    Do {",
+            "        Write-Output \"Downloading Windows Patching file, attempt: $attemptCount/5...\"",
+            "        (New-Object Net.WebClient).DownloadFile($snap.SnapshotDownloadUrl, $tempFile)",
+            "        Start-Sleep -Seconds (1 * $attemptCount)",
+            "        $attemptCount++",
+            "    } While (((Test-Path $tempFile) -eq $false) -and ($attemptCount -le $maxAttempts))",
+            "",
+            "    if ($attemptCount -gt $maxAttempts) {",
+            "        Write-Error \"ERROR: Download failed after $maxAttempts attempts. Max attempts reached.\"",
+            "    } else {",
+            "        Write-Output \"INFO: Deployable Patch Snapshot downloaded successfully\"",
+            "    }",
+            "}",
+            "catch {",
+            "    Write-Error (\"ERROR: Failed to download Windows patch file: {0}\" -f $_.Exception.Message)",
+            "    Write-Output \"Please see for troubleshooting: https://aws.amazon.com/premiumsupport/knowledge-center/connect-s3-vpc-endpoint/\"",
+            "    Write-Output \"NOTE: This error can be ignored if you are not using PatchBaseline to install Windows updates.\"",
+            "    Exit 1",
+            "}",
+            "",
+            "# Clean up temporary files",
+            "if (Test-Path $tempFile) {",
+            "    Remove-Item -Path $tempFile -Recurse -Force",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckWindowsUpdateServices"
+    },
+    {
+      "name": "GenerateEndpoint",
+      "action": "aws:executeScript",
+      "description": "Generates the Amazon S3 endpoint URI to be used by the **AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2** runbook and checks if the runbook is available in the target region to perform a network connectivity test.",
+      "nextStep": "branchOnRunVpcReachabilityAnalyzer",
+      "onFailure": "step:CheckWindowsUpdateServices",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\n# Function that checks if a Systems Manager document exist or not\ndef check_ssm_document(document_name) -> bool:\n    try:\n        ssm_client = boto3.client(\"ssm\")\n        ssm_client.get_document(Name=document_name)\n        return True\n    except ClientError as error:\n        if error.response[\"Error\"][\"Code\"] == \"InvalidDocument\":\n            print(f\"Systems Manager document {document_name} not found.\")\n            return False\n        else:\n            print(f\"An error occur when getting the document {document_name}: {str(error)}.\")\n            return False\n\n\ndef script_handler(events, context):\n    region = context[\"global:REGION\"]\n    partition = context[\"global:AWS_PARTITION\"]\n    document_name = events[\"DocumentName\"]\n    exist = check_ssm_document(document_name)\n\n    if partition == \"aws-cn\":\n        return {\"endpoint\": f\"s3.{region}.amazonaws.com.cn\", \"exist\": exist}\n    else:\n        if region == \"us-east-1\":\n            return {\"endpoint\": \"s3.amazonaws.com\", \"exist\": exist}\n        else:\n            return {\"endpoint\": f\"s3.{region}.amazonaws.com\", \"exist\": exist}\n",
+        "InputPayload": {
+          "DocumentName": "AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "S3Endpoint",
+          "Selector": "$.Payload.endpoint",
+          "Type": "String"
+        },
+        {
+          "Name": "DocumentExists",
+          "Selector": "$.Payload.exist",
+          "Type": "Boolean"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "branchOnRunVpcReachabilityAnalyzer",
+      "action": "aws:branch",
+      "description": "Branches the automation based on the value of the parameter `RunVpcReachabilityAnalyzer`.",
+      "inputs": {
+        "Default": "CheckWindowsUpdateServices",
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ RunVpcReachabilityAnalyzer }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ GenerateEndpoint.DocumentExists }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "analyzeAwsEndpointReachabilityFromEC2"
+          }
+        ]
+      },
+      "nextStep": "CheckWindowsUpdateServices",
+      "isCritical": true
+    },
+    {
+      "name": "analyzeAwsEndpointReachabilityFromEC2",
+      "action": "aws:executeAutomation",
+      "description": "Initiates the automation runbook `AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2` to analyze reachability to the Amazon S3 endpoint.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "DocumentName": "AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2",
+        "TargetParameterName": "ServiceEndpoint",
+        "Targets": [
+          {
+            "Key": "ParameterValues",
+            "Values": [
+              "{{ GenerateEndpoint.S3Endpoint }}"
+            ]
+          }
+        ],
+        "RuntimeParameters": {
+          "Source": "{{ InstanceId }}",
+          "RetainVpcReachabilityAnalysis": "{{ RetainVpcReachabilityAnalysis }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        }
+      },
+      "onFailure": "Continue",
+      "nextStep": "CheckWindowsUpdateServices",
+      "isCritical": false
+    },
+    {
+      "name": "CheckWindowsUpdateServices",
+      "action": "aws:runCommand",
+      "description": "Checks the status and start type of Windows Updates related services.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Check Windows Update service status and type",
+            "Write-Output \"Retrieving Services Status and types for Windows Update...\"",
+            "",
+            "$failed = $false",
+            "",
+            "Get-Service -Name \"wuauserv\", \"BITS\", \"appidsvc\", \"cryptsvc\", \"TrustedInstaller\", \"msiserver\" | Sort-Object Name, Status, DisplayName, StartType |",
+            "",
+            "ForEach-Object {",
+            "    $DisplayName = $_.DisplayName",
+            "    $Name = $_.Name",
+            "    if ($_.Status -eq \"Running\") {",
+            "        Write-Output (\"INFO: The service '{0}' is currently '{1}'\" -f $DisplayName, $_.Status)",
+            "    } else {",
+            "        Write-Output (\"The service '{0}' is currently '{1}' and is set to '{2}'\" -f $DisplayName, $_.Status, $_.StartType)",
+            "",
+            "        if ($_.StartType -eq \"Disabled\") {",
+            "            Write-Error (\"ERROR: Service '{0}' is '{1}'\" -f $DisplayName, $_.StartType)",
+            "            $failed = $true",
+            "        }",
+            "",
+            "        if ($_.Status -eq \"Stopped\" -and $_.StartType -ne \"Disabled\") {",
+            "            try {",
+            "                Write-Output (\"Starting the service: '{0}'\" -f $DisplayName)",
+            "                Start-Service -Name $DisplayName",
+            "                Write-Output (\"Service '{0}' started successfully\" -f $DisplayName)",
+            "            } catch {",
+            "                Write-Error (\"ERROR: Failed to start service: '{0}'\" -f $_.Exception.Message)",
+            "                $failed = $true",
+            "            }",
+            "        } else {",
+            "            if ($Name -eq \"BITS\") {",
+            "                Write-Warning (\"WARNING: Service '{0}' is '{1}'. '{2}' is often used by the Windows Update service to download updates in the background without significantly impacting internet usage.\" -f $DisplayName, $_.StartType, $Name)",
+            "            } else {",
+            "                $failed = $true",
+            "                Write-Error (\"ERROR: Service '{0}' status is '{1}'. Please set it to either Manual or Automatic to fix issues with Windows updates.\" -f $DisplayName, $_.StartType)",
+            "            }",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "if ($failed) {",
+            "    Write-Error \"ERROR: For more details, please check this document: https://learn.microsoft.com/en-us/security-updates/windowsupdateservices/18127451\"",
+            "    Exit 1",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckWindowsUpdateSettings"
+    },
+    {
+      "name": "CheckWindowsUpdateSettings",
+      "action": "aws:runCommand",
+      "description": "Checks for system-level Windows Update settings.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Check Windows Update policy settings",
+            "$WUSettingsNoAutoUpdate = (Get-ItemProperty -Path \"HKLM:\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" -ErrorAction SilentlyContinue).NoAutoUpdate",
+            "$WUSettingsAUOptions = (Get-ItemProperty -Path \"HKLM:\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" -ErrorAction SilentlyContinue).AUOptions",
+            "",
+            "if ($WUSettingsNoAutoUpdate.Length -eq 0) {",
+            "    Write-Output \"INFO: Windows Update (Policies): Not Configured (Default is automatic)\"",
+            "} else {",
+            "    if ($WUSettingsNoAutoUpdate -eq \"1\") {",
+            "        Write-Output \"INFO: Windows Update (Policies): Never check for updates\"",
+            "    } elseif ($WUSettingsAUOptions -eq \"2\") {",
+            "        Write-Output \"INFO: Windows Update (Policies): Notify Before Download\"",
+            "    } elseif ($WUSettingsAUOptions -eq \"3\") {",
+            "        Write-Output \"INFO: Windows Update (Policies): Notify Before Installation\"",
+            "    } elseif ($WUSettingsAUOptions -eq \"4\") {",
+            "        Write-Output \"INFO: Windows Update (Policies): Install updates automatically\"",
+            "    } else {",
+            "        Write-Output \"INFO: Windows Update (Policies): Custom\"",
+            "    }",
+            "    Write-Output \"INFO: To modify this setting, navigate to Computer Configuration\\Administrative Templates\\Windows Components\\Windows Update\\Configure Automatic Updates.\"",
+            "    Write-Output \"For more details, please check this document: https://learn.microsoft.com/en-us/security-updates/windowsupdateservices/18127451\"",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckWSUSSettings"
+    },
+    {
+      "name": "CheckWSUSSettings",
+      "action": "aws:runCommand",
+      "description": "Checks whether Windows Update is configured with Windows Server Update Services (WSUS) or the Microsoft Update catalog.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Fetching Windows Update settings",
+            "$WSUSSetting = (Get-ItemProperty -Path \"HKLM:\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" -ErrorAction SilentlyContinue).UseWUServer",
+            "$WSUSSettingWUServer = (Get-ItemProperty -Path \"HKLM:\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate\" -ErrorAction SilentlyContinue).WUServer",
+            "$wsushost = ([System.Uri]$WSUSSettingWUServer).Host",
+            "$wsusport = ([System.Uri]$WSUSSettingWUServer).Port",
+            "",
+            "# Setting up TLS protocols",
+            "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls13 -bor [System.Net.SecurityProtocolType]::Tls12",
+            "",
+            "# Output Windows Update sources information",
+            "Write-Output \"Windows can receive updates from various sources, including Windows Update online, a Windows Server Update Services server, and others.\"",
+            "Write-Output \"INFO: Automatic Updates (AU) configuration (source of Windows Updates currently being used):\"",
+            "$WauConfiguration = $(New-Object -ComObject \"Microsoft.Update.ServiceManager\").Services | Select-Object Name, IsDefaultAUService",
+            "foreach ($service in $WauConfiguration) {",
+            "    Write-Output \"$($service.Name) $($service.IsDefaultAUService)\"",
+            "}",
+            "",
+            "# Checking WSUS configuration and connectivity",
+            "if ($WSUSSetting.Length -eq 0) {",
+            "    Write-Output \"INFO: The EC2 instance is configured to use Windows Update or Microsoft Update.\"",
+            "} else {",
+            "    if ($null -ne $WSUSSettingWUServer) {",
+            "        Try {",
+            "            Write-Output \"INFO: The EC2 instance is configured to use WSUS ($WSUSSettingWUServer).\"",
+            "            Write-Warning (\"Checking connectivity to WSUS server on TCP port {0}...\" -f $wsusport)",
+            "            $testnet = Test-NetConnection $wsushost -Port $wsusport -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Select-Object TcpTestSucceeded",
+            "            $WebResponse = Invoke-WebRequest $WSUSSettingWUServer",
+            "            if ($testnet.TcpTestSucceeded -eq \"True\" -and $WebResponse.StatusCode -eq \"200\") {",
+            "                Write-Output (\"INFO: WSUS server is reachable, and the status code is {0}.\" -f $WebResponse.StatusCode)",
+            "            } else {",
+            "                Write-Error \"ERROR: WSUS server is not reachable. Please ensure that the connection to WSUS is not blocked. For troubleshooting, refer to: https://learn.microsoft.com/en-us/troubleshoot/windows-client/deployment/additional-resources-for-windows-update.\"",
+            "                Exit 1",
+            "            }",
+            "        } catch {",
+            "            Write-Error (\"ERROR: {0}\" -f $_.Exception.Message)",
+            "            Exit 1",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "# Try to download Windows Updates using the default method",
+            "try {",
+            "    # \"IsInstalled=0\" finds updates that are not installed on the destination computer",
+            "    $DefaultWuaSearchString = \"IsInstalled=0\"",
+            "    Write-Output \"INFO: Trying to connect to the default server for updates...\"",
+            "    $Searcher = New-Object -ComObject Microsoft.Update.Searcher",
+            "",
+            "    # ServerSelection = 0 (Search the default server for updates)",
+            "    $Searcher.ServerSelection = 0",
+            "    $SearchResult = $Searcher.Search($DefaultWuaSearchString)",
+            "",
+            "    $Updates = $SearchResult.Updates.Count",
+            "    Write-Output \"INFO: There are $Updates pending updates.\"",
+            "} catch {",
+            "    Write-Output \"Windows Update common errors and mitigation: https://learn.microsoft.com/en-us/troubleshoot/windows-client/deployment/common-windows-update-errors\"",
+            "    Write-Error (\"ERROR: {0}\" -f $_.Exception.Message)",
+            "    Exit 1",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "CheckWUGlobalSettings"
+    },
+    {
+      "name": "CheckWUGlobalSettings",
+      "action": "aws:runCommand",
+      "description": "Checks the Windows Update global settings configured at system-level.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Check Windows Update global settings",
+            "$WSUSSettingWU = (Get-ItemProperty -Path \"HKLM:\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate\" -ErrorAction SilentlyContinue).DisableWindowsUpdateAccess",
+            "",
+            "if ($WSUSSettingWU.Length -eq 0) {",
+            "    Write-Output \"Windows Update Client has no restrictions.\"",
+            "} else {",
+            "    if ($WSUSSettingWU -eq \"0\") {",
+            "        Write-Output \"Windows Update Client has no restrictions.\"",
+            "    } else {",
+            "        Write-Output \"Windows Update is restricted by Group Policy Object (GPO), System Policy, or Registry Policy.\"",
+            "        Write-Output \"Current Windows Update settings value is: $($WSUSSettingWU)\"",
+            "    }",
+            "    Write-Output \"DisableWindowsUpdateAccess: This setting is in User Configuration\\Administrative Templates\\Windows Components\\Windows Update\\Remove Access To Use All Windows Update Features.\"",
+            "    Write-Output \"For more details, please check this document: https://learn.microsoft.com/en-us/security-updates/windowsupdateservices/18127451\"",
+            "}"
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "GenerateLogs"
+    },
+    {
+      "name": "GenerateLogs",
+      "action": "aws:runCommand",
+      "description": "Copies the `Microsoft-Windows-WindowsUpdateClient`, Windows Update, and CBS (Component-Based Servicing) logs to a temporary folder. You can use these logs for troubleshooting Windows updates issues.",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Copy logs to a temporary folder",
+            "$SSMAutomationExecutionId = \"{{ automation:EXECUTION_ID }}\"",
+            "$tempFolderPath = [System.IO.Path]::GetTempPath()",
+            "$destinationFolder = Join-Path -Path $tempFolderPath -ChildPath $SSMAutomationExecutionId",
+            "",
+            "# Fetch Windows Events logs",
+            "try {",
+            "    $logName = \"System\"",
+            "    $source = \"Microsoft-Windows-WindowsUpdateClient\"",
+            "    $events = Get-WinEvent -MaxEvents 25 -LogName $logName -FilterXPath \"*[System[Provider[@Name='$source']]]\" -ErrorAction SilentlyContinue",
+            "    $errors = $events | Where-Object { $_.LevelDisplayName -eq \"Error\" }",
+            "",
+            "    if ($errors.Count -gt 0) {",
+            "        $errorCount = 0",
+            "        $maxToShow = 5",
+            "",
+            "        Write-Output \"Windows Update errors found: $($errors.Count)\"",
+            "        Write-Output \"Showing the first $maxToShow errors:\"",
+            "        foreach ($error in $errors) {",
+            "            Write-Output \"Event ID: $($error.Id) | Message: $($error.Message)\"",
+            "            $errorCount++",
+            "            if ($errorCount -eq $maxToShow) {",
+            "                break",
+            "            }",
+            "        }",
+            "",
+            "        Write-Output \"\"",
+            "        Write-Output \"For troubleshooting, see:\"",
+            "        Write-Output \"  Windows Update Logs: https://learn.microsoft.com/en-us/windows/deployment/update/windows-update-logs\"",
+            "        Write-Output \"  Hex Codes: https://social.technet.microsoft.com/wiki/contents/articles/15260.windows-update-agent-error-codes.aspx\"",
+            "        Write-Output \"  CBS Logs: https://learn.microsoft.com/en-us/troubleshoot/windows-server/deployment/cbs-log-file-record-entries-not-repaired-run-sfc\"",
+            "        Write-Output \"  Event Logs: https://learn.microsoft.com/en-us/windows/win32/wes/windows-event-log-reference\"",
+            "        Write-Output \"\"",
+            "",
+            "        if (-not (Test-Path -Path $destinationFolder)) {",
+            "            New-Item -Path $destinationFolder -ItemType Directory | Out-Null",
+            "        }",
+            "",
+            "        # Save errors to a .log file",
+            "        $errors | ForEach-Object {",
+            "            $_ | Out-File -FilePath \"$destinationFolder\\Microsoft-Windows-WindowsUpdateClient.log\" -Append",
+            "        }",
+            "        Write-Output \"INFO: Microsoft-Windows-WindowsUpdateClient errors copied to the $destinationFolder folder.\"",
+            "",
+            "    } else {",
+            "        Write-Output \"No errors found in Microsoft-Windows-WindowsUpdateClient events.\"",
+            "    }",
+            "}",
+            "catch {",
+            "    Write-Error (\"ERROR: Failed to get Microsoft-Windows-WindowsUpdateClient events: {0}\" -f $_.Exception.Message)",
+            "    Exit 1",
+            "}",
+            "",
+            "try {",
+            "    if (-not (Test-Path -Path $destinationFolder)) {",
+            "        New-Item -Path $destinationFolder -ItemType Directory | Out-Null",
+            "    }",
+            "",
+            "    # Get and copy CBS logs to destination folder",
+            "    $cbsLogsPath = \"$env:SystemRoot\\Logs\\CBS\"",
+            "    if (Test-Path -Path $cbsLogsPath) {",
+            "        Copy-Item -Path $cbsLogsPath -Destination $destinationFolder -Recurse -Force | Out-Null",
+            "        Write-Output \"INFO: CBS logs copied to the $destinationFolder folder.\"",
+            "    }",
+            "",
+            "    # Get and copy Windows Update logs to destination folder",
+            "    $tempWindowsUpdateLogFolder = \"$destinationFolder\\WindowsUpdate.log\"",
+            "    if (Get-Command -Name \"Get-WindowsUpdateLog\" -ErrorAction SilentlyContinue) {",
+            "        try {",
+            "            # Creates a transcript of the Windows Update log file retrieval process",
+            "            Get-WindowsUpdateLog -LogPath $tempWindowsUpdateLogFolder | Out-Default -Transcript \"$destinationFolder\\Get-WindowsUpdateLog-Transcript.txt\"",
+            "            Write-Output \"INFO: Get-WindowsUpdateLog copied to the $tempWindowsUpdateLogFolder file.\"",
+            "            Write-Output \"INFO: Get-WindowsUpdateLog transcript logging can be found in the $destinationFolder folder.\"",
+            "        } catch {",
+            "            Write-Error (\"ERROR: Failed to run Get-WindowsUpdateLog: {0}\" -f $_.Exception.Message)",
+            "        }",
+            "    } else {",
+            "        $windowsUpdateLogsPath = \"$env:SystemRoot\\Logs\\WindowsUpdate\"",
+            "        if (Test-Path -Path $windowsUpdateLogsPath) {",
+            "            Copy-Item -Path $windowsUpdateLogsPath -Destination $destinationFolder -Recurse -Force | Out-Null",
+            "            Write-Output \"INFO: $windowsUpdateLogsPath logs copied to the $destinationFolder folder.\"",
+            "        }",
+            "        $windowsUpdateLogsPath = \"$env:SystemRoot\\WindowsUpdate.log\"",
+            "        if (Test-Path -Path $windowsUpdateLogsPath) {",
+            "            Copy-Item -Path $windowsUpdateLogsPath -Destination $destinationFolder -Recurse -Force | Out-Null",
+            "            Write-Output \"INFO: $windowsUpdateLogsPath log copied to the $destinationFolder folder.\"",
+            "        }",
+            "        $softwareDistributionLogsPath = \"$env:SystemRoot\\SoftwareDistribution\\ReportingEvents.log\"",
+            "        if (Test-Path -Path $softwareDistributionLogsPath) {",
+            "            Copy-Item -Path $softwareDistributionLogsPath -Destination $destinationFolder -Recurse -Force | Out-Null",
+            "            Write-Output \"INFO: $softwareDistributionLogsPath logs copied to the $destinationFolder folder.\"",
+            "        }",
+            "    }",
+            "}",
+            "catch {",
+            "    Write-Error (\"ERROR: Failed to copy logs: {0}\" -f $_.Exception.Message)",
+            "    Exit 1",
+            "}",
+            ""
+          ]
+        }
+      },
+      "isCritical": true,
+      "nextStep": "FinalReport"
+    },
+    {
+      "name": "FinalReport",
+      "action": "aws:executeScript",
+      "description": "Consolidates the outputs of all executed steps for review and analysis.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\ndef print_results(results: list):\n    # Formats the results for printing.\n    import textwrap\n\n    text = \"\"\n    for paragraph in results:\n        paragraph = textwrap.dedent(paragraph)\n        for line in paragraph.splitlines():\n            text += \"\\n\".join(textwrap.wrap(line, width=120)) + \"\\n\"\n\n    return repr(text)\n\n\ndef append_output(title: str, events: dict, status: str, output: str, default=\"No output available\") -> list:\n    # Appends output messages based on event status.\n    step_output = events.get(output, default)\n    result_status = \"Result: \\u274c [FAILED]\"\n    if events.get(status, \"\").lower() in \"success\":\n        result_status = \"Result: \\u2705 [PASSED]\"\n    elif events.get(status, \"\").lower() == \"pending\":\n        result_status = \"Result: \\u23ED [SKIPPED]\"\n        step_output = \"\"\n\n    return [f\"\\n{title:=^120}\", result_status, step_output]\n\n\ndef script_handler(events, context):\n    results = []\n\n    results.extend(append_output(\"Prerequisites Check\", events, \"CheckPrerequisitesStatus\", \"CheckPrerequisites\"))\n\n    if events.get(\"CheckPrerequisitesStatus\", \"\").lower() == \"failed\":\n        return print_results(results)\n\n    results.extend(append_output(\"Disk Space Check\", events, \"CheckDiskSpaceStatus\", \"CheckDiskSpace\"))\n    results.extend(append_output(\"Pending Reboot Check\", events, \"CheckPendingRebootStatus\", \"CheckPendingReboot\"))\n    results.extend(\n        append_output(\"Amazon S3 Connectivity Check\", events, \"CheckS3ConnectivityStatus\", \"CheckS3Connectivity\")\n    )\n\n    branch_nextstep = events.get(\"branchOnRunVpcReachabilityAnalyzer\")\n    title = \"AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2\"\n    if branch_nextstep == \"CheckWindowsUpdateServices\":\n        results.append(f\"\\n{title:=^120}\")\n        results.append(\"Result: \\u2705 [PASSED]\")\n        results.append(\"The 'RunVpcReachabilityAnalyzer' input parameter was set to 'false'\")\n    else:\n        results.extend(\n            append_output(\n                title,\n                events,\n                \"analyzeAwsEndpointReachabilityFromEC2\",\n                \"CheckS3Connectivity\",\n                \"Check the analyzeAwsEndpointReachabilityFromEC2 output\",\n            )\n        )\n\n    results.extend(\n        append_output(\n            \"Windows Update Services Status\", events, \"CheckWindowsUpdateServicesStatus\", \"CheckWindowsUpdateServices\"\n        )\n    )\n    results.extend(append_output(\"Windows Proxy Settings\", events, \"CheckProxyStatus\", \"CheckProxy\"))\n    results.extend(\n        append_output(\n            \"Windows Update Settings\", events, \"CheckWindowsUpdateSettingsStatus\", \"CheckWindowsUpdateSettings\"\n        )\n    )\n    results.extend(\n        append_output(\"Windows Update Global Settings\", events, \"CheckWUGlobalSettingsStatus\", \"CheckWUGlobalSettings\")\n    )\n    results.extend(append_output(\"Copy of Windows Update and CBS logs\", events, \"GenerateLogsStatus\", \"GenerateLogs\"))\n\n    return print_results(results)\n",
+        "InputPayload": {
+          "CheckPrerequisites": "{{ CheckPrerequisites.Output }}",
+          "CheckPrerequisitesStatus": "{{ CheckPrerequisites.Status }}",
+          "CheckDiskSpace": "{{ CheckDiskSpace.Output }}",
+          "CheckDiskSpaceSuccess": "{{ CheckDiskSpace. Status }}",
+          "CheckPendingReboot": "{{ CheckPendingReboot.Output }}",
+          "CheckPendingRebootStatus": "{{ CheckPendingReboot.Status }}",
+          "CheckS3Connectivity": "{{ CheckS3Connectivity.Output }}",
+          "CheckS3ConnectivityStatus": "{{ CheckS3Connectivity.Status }}",
+          "branchOnRunVpcReachabilityAnalyzer": "{{ branchOnRunVpcReachabilityAnalyzer.NextStep }}",
+          "analyzeAwsEndpointReachabilityFromEC2Status": "{{ analyzeAwsEndpointReachabilityFromEC2.Status }}",
+          "CheckWindowsUpdateServices": "{{ CheckWindowsUpdateServices.Output }}",
+          "CheckWindowsUpdateServicesStatus": "{{ CheckWindowsUpdateServices.Status }}",
+          "CheckProxy": "{{ CheckProxy.Output }}",
+          "CheckProxyStatus": "{{ CheckProxy.Status }}",
+          "CheckWindowsUpdateSettings": "{{ CheckWindowsUpdateSettings.Output }}",
+          "CheckWindowsUpdateSettingsStatus": "{{ CheckWindowsUpdateSettings.Status }}",
+          "CheckWSUSSettings": "{{ CheckWSUSSettings.Output }}",
+          "CheckWSUSSettingsStatus": "{{ CheckWSUSSettings.Status }}",
+          "CheckWUGlobalSettings": "{{ CheckWUGlobalSettings.Output }}",
+          "CheckWUGlobalSettingsStatus": "{{ CheckWUGlobalSettings.Status }}",
+          "GenerateLogs": "{{ GenerateLogs.Output }}",
+          "GenerateLogsStatus": "{{ GenerateLogs.Status }}"
+        }
+      },
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Results",
+          "Selector": "$.Payload",
+          "Type": "StringList"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "FinalReport.Results"
+  ]
+}
