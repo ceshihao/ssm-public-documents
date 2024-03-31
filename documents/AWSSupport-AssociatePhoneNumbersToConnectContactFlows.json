@@ -1,0 +1,284 @@
+{
+  "description": "The **AWSSupport-AssociatePhoneNumbersToConnectContactFlows** automation runbook helps to associate multiple phone numbers with specific Contact Flows within an Amazon Connect instance. You can specify the numbers by uploading a Comma-separated values (CSV) text file with contains the mapping information to an Amazon Simple Storage Service (Amazon S3) bucket. The CSV file must adhere to a specified format, with each `PhoneNumber` entry formatted according to the [E.164](https://www.itu.int/rec/T-REC-E.164/en) standard and the identifier of the flow.\n\n**Example:**\n```\nPhoneNumber,ContactFlowName\n+1800555xxxx,ContactFlowA\n+1800555yyyy,ContactFlowB\n+1800555zzzz,ContactFlowC\n```\n\nThe automation runbook creates the following files in the Amazon S3 bucket you specify in the `DestinationFileLocation` parameter under the Id of the automation execution:\n> * **ResourceIdList.csv**: A temporary file that contains the pairs of `PhoneNumberId` and `ContactFlowId` that are required when calling the `AssociatePhoneNumberContactFlow` API.\n> * **ErrorResourceList.csv**: A file that contains the pairs of phone number and Contact Flows that could not be processed due to an error such as `ResourceNotFoundException`. The file contains the `PhoneNumber`, `ContactFlowName`, and `ErrorMessage`\n> * **NonProcessedResourceList.csv**: A file that contains the pairs of phone number and Contact Flow that weren't processed by the automation. The runbook tries to process as many phone numbers and contact flows as possible within 14.5 min (15 min of AWS Lambda function timeout - 30 sec of buffer). If there are some phone numbers/contact flows that could not be processed due to the time constraint, the list of those resources will be included into the CSV file so you can use the file as an input for a next runbook execution.\n\n### Important:\n> * This runbook creates an AWS Lambda function in your account using an AWS CloudFormation stack. The AWS Lambda function associates each number to a contact flow listed in the source CSV file, and invokes the function.\n> * Verify that the associated bucket policies and ACLs do not grant any unnecessary read or write permissions to principals that do not need access the buckets.\n> * We recommend setting Amazon S3 [server-side encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingEncryption.html). You can also enable [Amazon S3 server access logging](https://docs.aws.amazon.com/AmazonS3/latest/userguide/enable-server-access-logging.html) to log the requests that are made to the bucket, and [Amazon S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/manage-versioning-examples.html) to keep multiple versions of your objects.\n> * For more information about the meaning of `public` access and the Amazon S3 Block Public Access feature, please refer to [Blocking public access to your Amazon S3 storage](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html#access-control-block-public-access-policy-status).",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ConnectInstanceId": {
+      "type": "String",
+      "description": "(Required) The ID of your Amazon Connect instance.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "SourceFileBucket": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The Amazon S3 bucket name that stores the CSV file which contains the pairs of phone numbers and Contact Flows."
+    },
+    "SourceFilePath": {
+      "type": "String",
+      "description": "(Required) The Amazon S3 object key of the CSV file that contains the pairs of phone numbers and Contact Flows. Example: `path/to/input.csv'`.",
+      "allowedPattern": "^[a-zA-Z0-9\\.\\-_\\\\!*'()/]{1,994}\\.csv$"
+    },
+    "DestinationFileBucket": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The Amazon S3 bucket that the automation will copy the file to be processed, the report, and any non-processed phone number and Contact Flow pair."
+    },
+    "DestinationFilePath": {
+      "type": "String",
+      "description": "(Optional) The Amazon S3 object path in `DestinationFileBucket` to copy the file to be processed, the report, and any non-processed phone number and Contact Flow pair. For example, if you specify `path/to/files/`, the files will be stored under 's3://<DestinationFileBucket>/path/to/files/<automation:EXECUTION_ID]>'.",
+      "allowedPattern": "^$|^[a-zA-Z0-9\\.\\-_\\\\!*'()/]{1,994}/$",
+      "default": ""
+    },
+    "S3BucketOwnerAccount": {
+      "type": "String",
+      "description": "(Optional) The AWS Account Number that owns the Amazon S3 bucket where you want to upload the Contact Flow Log. If you do not specify this parameter, the runbooks uses the AWS account ID of the user or role in which the Automation runs.",
+      "allowedPattern": "^$|^[0-9]{12}$",
+      "default": ""
+    },
+    "S3BucketOwnerRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the IAM role with permissions to get the Amazon S3 bucket and account block public access settings, bucket encryption configuration, the bucket ACLs, the bucket policy status, and upload objects to the bucket. If this parameter is not specified, the runbook uses the `AutomationAssumeRole` (if specified) or user that starts this runbook (if `AutomationAssumeRole` is not specified). Please see the required permissions section in the runbook description.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckConnectInstanceExistance",
+      "description": "Checks if the Amazon Connect instance provided in the `ConnectInstanceId` parameter exists.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "connect",
+        "Api": "DescribeInstance",
+        "InstanceId": "{{ ConnectInstanceId }}"
+      },
+      "nextStep": "CheckSourceS3BucketPublicStatus"
+    },
+    {
+      "name": "CheckSourceS3BucketPublicStatus",
+      "description": "Checks if the Amazon S3 buckets specified in `SourceFileBucket` allows anonymous, or public read or write access permissions.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "BucketName": "{{ SourceFileBucket }}",
+          "BucketOwnerRoleArn": "{{ S3BucketOwnerRoleArn }}",
+          "BucketOwnerAccount": "{{ S3BucketOwnerAccount }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.8",
+        "Attachment": "check_bucket_public_status.zip"
+      },
+      "nextStep": "CheckDestinationS3BucketPublicStatus"
+    },
+    {
+      "name": "CheckDestinationS3BucketPublicStatus",
+      "description": "Checks if the Amazon S3 buckets specified in `DestinationFileBucket` allows anonymous, or public read or write access permissions.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "BucketName": "{{ SourceFileBucket }}",
+          "BucketOwnerRoleArn": "{{ S3BucketOwnerRoleArn }}",
+          "BucketOwnerAccount": "{{ S3BucketOwnerAccount }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.8",
+        "Attachment": "check_bucket_public_status.zip"
+      },
+      "nextStep": "CheckSourceFileExistenceAndSize"
+    },
+    {
+      "name": "CheckSourceFileExistenceAndSize",
+      "description": "Checks if the source CSV file specified in `SourceFilePath` exists and if the file size exceeds the limit of 25 MiB.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "SourceFileBucket": "{{ SourceFileBucket }}",
+          "SourceFilePath": "{{ SourceFilePath }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport sys\n\nimport boto3\nfrom botocore.errorfactory import ClientError\n\nsys.tracebacklimit = 0\ns3 = boto3.client(\"s3\")\n\n\ndef object_exist(bucket_name, object_key):\n    try:\n        s3.head_object(Bucket=bucket_name, Key=object_key)\n        print(\"Info: Confirmed the provided source CSV file exists.\")\n        return True\n\n    except ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"404\":\n            print(\"Error: The provided source CSV file 's3://{}/{}' does not exist.\".format(bucket_name, object_key))\n            return False\n        else:\n            print(\n                \"Error: An error ocurred when retreving metadata from the provided source CSV file - {}.\"\n                \" The runbook will assume that the provided CSV file does not exist.\".format(str(e))\n            )\n            return False\n\n    except Exception as e:\n        print(f\"Error: {str(e)}\")\n        return False\n\n\ndef get_object_size(bucket_name, object_key):\n    try:\n        response = s3.get_object_attributes(Bucket=bucket_name, Key=object_key, ObjectAttributes=[\"ObjectSize\"])\n        return response[\"ObjectSize\"]\n\n    except Exception as e:\n        print(f\"Error: An error occured when checking object size of the provided source CSV file: {str(e)}\")\n        raise e\n\n\ndef handler(event, context):\n    bucket_name = event.get(\"SourceFileBucket\", \"\")\n    object_key = event.get(\"SourceFilePath\", \"\")\n\n    if not object_exist(bucket_name, object_key):\n        raise Exception(\n            \"Error: The runbook has found that the provided source CSV file 's3://{}/{}' does not exist.\"\n            \" Please check if the source CSV file exist.\".format(bucket_name, object_key)\n        )\n\n    if get_object_size(bucket_name, object_key) > 25 * 1024 * 1024:\n        raise Exception(\n            \"Error: The runbook has found that the size of the provided source CSV file 's3://{}/{}' exceed the limit of 25 MiB.\"\n            \" Please divide the entries into multiple files.\".format(bucket_name, object_key)\n        )\n\n    return\n"
+      },
+      "nextStep": "GenerateResourceIdMap"
+    },
+    {
+      "name": "GenerateResourceIdMap",
+      "description": "Downloads the source CSV file specified in `SourceFileBucket` and `SourceFilePath`, and identify `PhoneNumberId` and `ContactFlowId` for each resource. Once it's done, uploads a temporary CSV file that contains `PhoneNumber`, `PhoneNumberId`, `ContactFlowName`, and `ContactFlowId` to the destination Amazon S3 bucket specified in `DestinationFileBucket`. If `PhoneNumberId` cannot be identified for a certain number, the value will be empty in the CSV file.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "S3BucketOwnerAccount": "{{ S3BucketOwnerAccount }}",
+          "SourceFileBucket": "{{ SourceFileBucket }}",
+          "SourceFilePath": "{{ SourceFilePath }}",
+          "DestinationFileBucket": "{{ DestinationFileBucket }}",
+          "DestinationFilePath": "{{ DestinationFilePath }}",
+          "ConnectInstanceId": "{{ ConnectInstanceId }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport csv\nimport io\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\ns3 = boto3.client(\"s3\")\nconnect = boto3.client(\"connect\")\n\n\ndef get_source_number_flow_map_list(source_bucket_name, source_object_key):\n    try:\n        get_object_response = s3.get_object(Bucket=source_bucket_name, Key=source_object_key)\n        csv_string = io.StringIO(get_object_response[\"Body\"].read().decode(\"utf-8\"))\n        return [source_number_flow_map for source_number_flow_map in csv.DictReader(csv_string)]\n\n    except Exception as e:\n        raise Exception(f\"Error: {str(e)}\")\n\n\ndef get_resource_id_map(instance_id, resource_type):\n    resource_id_map = {}\n    resource_remains = True\n    next_token = \"\"\n    list_resources = {\"PhoneNumber\": connect.list_phone_numbers, \"ContactFlow\": connect.list_contact_flows}\n    resource_selector = {\"PhoneNumber\": \"PhoneNumber\", \"ContactFlow\": \"Name\"}\n\n    while resource_remains:\n        try:\n            if next_token == \"\":\n                list_resource_response = list_resources[resource_type](InstanceId=instance_id, MaxResults=1000)\n            else:\n                list_resource_response = list_resources[resource_type](\n                    InstanceId=instance_id, MaxResults=1000, NextToken=next_token\n                )\n\n        except Exception as e:\n            raise Exception(f\"Error: {str(e)}\")\n\n        for resource_summary in list_resource_response[\"{}SummaryList\".format(resource_type)]:\n            resource_id_map[resource_summary[resource_selector[resource_type]]] = resource_summary[\"Id\"]\n\n        if \"NextToken\" in list_resource_response:\n            next_token = list_resource_response[\"NextToken\"]\n        else:\n            resource_remains = False\n\n    return resource_id_map\n\n\ndef build_resource_id_list(number_flow_map_list, phone_number_id_map, contact_flow_id_map):\n    resource_id_list = []\n    for number_flow_map in number_flow_map_list:\n        phone_number = number_flow_map[\"PhoneNumber\"].replace(\"-\", \"\").replace(\" \", \"\")\n        contact_flow = number_flow_map[\"ContactFlowName\"]\n        phone_number_id = \"\"\n        contact_flow_id = \"\"\n\n        if phone_number in phone_number_id_map:\n            phone_number_id = phone_number_id_map[phone_number]\n        if contact_flow in contact_flow_id_map:\n            contact_flow_id = contact_flow_id_map[contact_flow]\n\n        resource_id_list.append(\n            {\n                \"PhoneNumber\": phone_number,\n                \"PhoneNumberId\": phone_number_id,\n                \"ContactFlowName\": contact_flow,\n                \"ContactFlowId\": contact_flow_id,\n            }\n        )\n    return resource_id_list\n\n\ndef upload_resource_id_list(resource_id_list, dest_bucket_name, dest_object_path, account_id, execution_id):\n    buff = io.StringIO()\n    writer = csv.DictWriter(buff, fieldnames=[\"PhoneNumber\", \"PhoneNumberId\", \"ContactFlowName\", \"ContactFlowId\"])\n    writer.writeheader()\n    for resource_id in resource_id_list:\n        writer.writerow(resource_id)\n\n    try:\n        object_key = \"{}{}/ResourceIdList.csv\".format(dest_object_path, execution_id)\n        s3.put_object(\n            Bucket=dest_bucket_name,\n            Key=object_key,\n            Body=buff.getvalue().encode(\"utf-8\"),\n            ExpectedBucketOwner=account_id,\n            ACL=\"bucket-owner-full-control\",\n        )\n        return \"s3://{}/{}\".format(dest_bucket_name, object_key)\n\n    except Exception as e:\n        raise Exception(f\"Error: {str(e)}\")\n\n\ndef handler(event, context):\n    account_id = event.get(\"S3BucketOwnerAccount\", \"\")\n    instance_id = event.get(\"ConnectInstanceId\", \"\")\n    source_bucket_name = event.get(\"SourceFileBucket\", \"\")\n    dest_bucket_name = event.get(\"DestinationFileBucket\", \"\")\n    source_object_key = event.get(\"SourceFilePath\", \"\")\n    dest_object_path = event.get(\"DestinationFilePath\", \"\")\n    execution_id = context[\"automation:EXECUTION_ID\"]\n\n    if not account_id:\n        account_id = context[\"global:ACCOUNT_ID\"]\n\n    number_flow_map_list = get_source_number_flow_map_list(source_bucket_name, source_object_key)\n    phone_number_id_map = get_resource_id_map(instance_id, \"PhoneNumber\")\n    contact_flow_id_map = get_resource_id_map(instance_id, \"ContactFlow\")\n    resource_id_list = build_resource_id_list(number_flow_map_list, phone_number_id_map, contact_flow_id_map)\n\n    resource_id_map_location = upload_resource_id_list(\n        resource_id_list, dest_bucket_name, dest_object_path, account_id, execution_id\n    )\n\n    return {\"ResourceIdMapFileLocation\": resource_id_map_location}\n"
+      },
+      "outputs": [
+        {
+          "Name": "ResourceIdMapFileLocation",
+          "Selector": "$.Payload.ResourceIdMapFileLocation",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "AssociatePhoneNumbersToContactFlows"
+    },
+    {
+      "name": "AssociatePhoneNumbersToContactFlows",
+      "description": "Creates an AWS Lambda function in your account using an AWS CloudFormation stack. The AWS Lambda function associates each number to a contact flow listed in the source CSV file specified in `SourceFileBucket` and `SourceFilePath`, and invokes the function. The AWS Lambda function tries to map phone numbers to contact flows as many as possible in `14.5` minutes. The list of any phone numbers and Contact Flows that could not be processed due to an error is uploaded to `<automation:EXECUTION_ID>/ErrorResourceList.csv`, and the ones that could not be processed due to the time constraint is uploaded to `<automation:EXECUTION_ID>/NonProcessedResourceList.csv`.",
+      "action": "aws:createStack",
+      "maxAttempts": 1,
+      "onFailure": "step:DescribeCloudFormationErrorFromStackEvents",
+      "inputs": {
+        "Capabilities": [
+          "CAPABILITY_IAM"
+        ],
+        "StackName": "AWSSupport-AssociatePhoneNumbersToContactFlow-{{ automation:EXECUTION_ID }}",
+        "ClientRequestToken": "AWSSupport-AssociatePhoneNumbersToContactFlow-{{ automation:EXECUTION_ID }}",
+        "TimeoutInMinutes": 30,
+        "Parameters": [
+          {
+            "ParameterKey": "ConnectInstanceId",
+            "ParameterValue": "{{ ConnectInstanceId }}"
+          },
+          {
+            "ParameterKey": "DestinationFileBucket",
+            "ParameterValue": "{{ DestinationFileBucket }}"
+          },
+          {
+            "ParameterKey": "DestinationFilePath",
+            "ParameterValue": "{{ DestinationFilePath }}"
+          },
+          {
+            "ParameterKey": "ResourceIdMapFileLocation",
+            "ParameterValue": "{{ GenerateResourceIdMap.ResourceIdMapFileLocation }}"
+          },
+          {
+            "ParameterKey": "SSMExecutionId",
+            "ParameterValue": "{{ automation:EXECUTION_ID }}"
+          }
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nDescription: Deploy Lambda Function and map phone numbers to Contact Flows\nParameters:\n  S3BucketOwnerAccount:\n    Type: String\n    Default: ''\n  ConnectInstanceId:\n    Type: String\n    Default: ''\n  DestinationFileBucket:\n    Type: String\n    Default: ''\n  DestinationFilePath:\n    Type: String\n    Default: ''\n  ResourceIdMapFileLocation:\n    Type: String\n    Default: ''\n  SSMExecutionId:\n    Type: String\n    Default: 00000000-0000-0000-0000-000000000000\nResources:\n  AssociatePhoneNumbersToContactFlows:\n    Type: AWS::CloudFormation::CustomResource\n    Properties:\n      ServiceToken: !GetAtt PhoneNumberMappingLambda.Arn\n  PhoneNumberMappingLambda:\n    Type: AWS::Lambda::Function\n    Properties:\n      FunctionName: !Sub PhoneNumberMappingLambda_${SSMExecutionId}\n      Environment:\n        Variables:\n          S3BucketOwnerAccount: !Ref S3BucketOwnerAccount\n          ConnectInstanceId: !Ref ConnectInstanceId\n          DestinationFileBucket: !Ref DestinationFileBucket\n          DestinationFilePath: !Ref DestinationFilePath\n          ResourceIdMapFileLocation: !Ref ResourceIdMapFileLocation\n          SSMExecutionId: !Ref SSMExecutionId\n      Handler: index.handler\n      Runtime: python3.11\n      Timeout: 900\n      Role: !GetAtt PhoneNumberMappingLambdaRole.Arn\n      Code:\n        ZipFile: |+\n          # Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n\n          # SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n\n          # Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\n\n\n\n          import csv\n\n          import io\n\n          import os\n\n          import time\n\n\n\n          import boto3\n\n          import botocore\n\n          import cfnresponse\n\n          from botocore.config import Config\n\n\n\n\n\n          def get_resource_id_map_list(resource_id_map_bucket, resource_id_map_key):\n\n              s3 = boto3.client(\"s3\")\n\n              try:\n\n                  get_object_response = s3.get_object(Bucket=resource_id_map_bucket, Key=resource_id_map_key)\n\n                  csv_string = io.StringIO(get_object_response[\"Body\"].read().decode(\"utf-8\"))\n\n                  return [resource_id_map for resource_id_map in csv.DictReader(csv_string)]\n\n\n\n              except botocore.exceptions.ClientError as e:\n\n                  raise e\n\n\n\n\n\n          def associate_number_to_flow(instance_id, resource_id_map_list, context):\n\n              connect = boto3.client(\"connect\", config=Config(connect_timeout=5, read_timeout=5))\n\n              error_list = []\n\n              non_processed_list = []\n\n              num_processed = 0\n\n\n\n              for idx, resource_id_map in enumerate(resource_id_map_list):\n\n                  err_msg = \"\"\n\n                  if resource_id_map[\"PhoneNumberId\"] == \"\":\n\n                      err_msg = err_msg + 'The Phone Number \"{}\" does not exist. '.format(resource_id_map[\"PhoneNumber\"])\n\n                  if resource_id_map[\"ContactFlowId\"] == \"\":\n\n                      err_msg = err_msg + 'The Contact Flow \"{}\" does not exist.'.format(resource_id_map[\"ContactFlowName\"])\n\n\n\n                  if err_msg:\n\n                      error_list.append(\n\n                          {\n\n                              \"PhoneNumber\": resource_id_map[\"PhoneNumber\"],\n\n                              \"ContactFlowName\": resource_id_map[\"ContactFlowName\"],\n\n                              \"ErrorMessage\": err_msg,\n\n                          }\n\n                      )\n\n                  else:\n\n                      try:\n\n                          connect.associate_phone_number_contact_flow(\n\n                              PhoneNumberId=resource_id_map[\"PhoneNumberId\"],\n\n                              ContactFlowId=resource_id_map[\"ContactFlowId\"],\n\n                              InstanceId=instance_id,\n\n                          )\n\n                          num_processed = num_processed + 1\n\n                          time.sleep(0.5)\n\n\n\n                      except Exception as e:\n\n                          error_list.append(\n\n                              {\n\n                                  \"PhoneNumber\": resource_id_map[\"PhoneNumber\"],\n\n                                  \"ContactFlowName\": resource_id_map[\"ContactFlowName\"],\n\n                                  \"ErrorMessage\": str(e),\n\n                              }\n\n                          )\n\n\n\n                  if context.get_remaining_time_in_millis() < 30000:\n\n                      for resource_id_map in resource_id_map_list[idx + 1 :]:\n\n                          non_processed_list.append(\n\n                              {\n\n                                  \"PhoneNumber\": resource_id_map[\"PhoneNumber\"],\n\n                                  \"ContactFlowName\": resource_id_map[\"ContactFlowName\"],\n\n                              }\n\n                          )\n\n                      return num_processed, error_list, non_processed_list\n\n\n\n              return num_processed, error_list, non_processed_list\n\n\n\n\n\n          def upload_csv_file(resource_list, dest_bucket_name, dest_object_path, account_id, execution_id, is_error_list):\n\n              s3 = boto3.client(\"s3\")\n\n              fieldnames = [\"PhoneNumber\", \"ContactFlowName\"]\n\n              filename = \"NonProcessedResourceList.csv\"\n\n              if is_error_list:\n\n                  fieldnames.append(\"ErrorMessage\")\n\n                  filename = \"ErrorResourceList.csv\"\n\n\n\n              buff = io.StringIO()\n\n              writer = csv.DictWriter(buff, fieldnames=fieldnames)\n\n              writer.writeheader()\n\n              for resource in resource_list:\n\n                  writer.writerow(resource)\n\n\n\n              try:\n\n                  object_key = \"{}{}/{}\".format(dest_object_path, execution_id, filename)\n\n                  s3.put_object(\n\n                      Bucket=dest_bucket_name,\n\n                      Key=object_key,\n\n                      Body=buff.getvalue().encode(\"utf-8\"),\n\n                      ExpectedBucketOwner=account_id,\n\n                      ACL=\"bucket-owner-full-control\",\n\n                  )\n\n                  return \"s3://{}/{}\".format(dest_bucket_name, object_key)\n\n\n\n              except RuntimeError as e:\n\n                  raise e\n\n\n\n\n\n          def handler(event, context):\n\n              response_data = {}\n\n              print(event)\n\n              if event[\"RequestType\"] == \"Create\":\n\n                  account_id = os.environ.get(\"S3BucketOwnerAccount\", \"\")\n\n                  instance_id = os.environ.get(\"ConnectInstanceId\", \"\")\n\n                  dest_bucket_name = os.environ.get(\"DestinationFileBucket\", \"\")\n\n                  dest_object_path = os.environ.get(\"DestinationFilePath\", \"\")\n\n                  resource_id_map_location = os.environ.get(\"ResourceIdMapFileLocation\", \"\")\n\n                  resource_id_map_bucket = resource_id_map_location.replace(\"s3://\", \"\").split(\"/\")[0]\n\n                  resource_id_map_key = resource_id_map_location.replace(\"s3://{}/\".format(resource_id_map_bucket), \"\")\n\n\n\n                  execution_id = os.environ.get(\"SSMExecutionId\", \"\")\n\n                  if not account_id:\n\n                      account_id = account_id = boto3.client(\"sts\").get_caller_identity()[\"Account\"]\n\n\n\n                  resource_id_map_list = get_resource_id_map_list(resource_id_map_bucket, resource_id_map_key)\n\n                  num_processed, error_list, non_processed_list = associate_number_to_flow(\n\n                      instance_id, resource_id_map_list, context\n\n                  )\n\n\n\n                  error_list_location = \"\"\n\n                  non_processed_list_location = \"\"\n\n                  if error_list:\n\n                      error_list_location = upload_csv_file(\n\n                          error_list, dest_bucket_name, dest_object_path, account_id, execution_id, True\n\n                      )\n\n                  if non_processed_list:\n\n                      non_processed_list_location = upload_csv_file(\n\n                          non_processed_list, dest_bucket_name, dest_object_path, account_id, execution_id, False\n\n                      )\n\n\n\n                  response_data = {\n\n                      \"ErrorListLocation\": error_list_location,\n\n                      \"NonProcessedListLocation\": non_processed_list_location,\n\n                      \"NumInput\": str(len([item for item in resource_id_map_list])),\n\n                      \"NumProcessed\": str(num_processed),\n\n                      \"NumError\": str(len(error_list)),\n\n                      \"NumNonProcessed\": str(len(non_processed_list)),\n\n                  }\n\n                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)\n\n              else:\n\n                  response_data[\"Message\"] = \"Do nothing.\"\n\n                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)\n\n  PhoneNumberMappingLambdaRole:\n    Type: AWS::IAM::Role\n    Properties:\n      AssumeRolePolicyDocument:\n        Version: 2012-10-17\n        Statement:\n        - Effect: Allow\n          Principal:\n            Service:\n            - lambda.amazonaws.com\n          Action:\n          - sts:AssumeRole\n      Path: /service-role/\n      Policies:\n      - PolicyName: SAWPhoneNumberMappingLambdaRolePolicy\n        PolicyDocument:\n          Version: 2012-10-17\n          Statement:\n          - Effect: Allow\n            Action:\n            - logs:CreateLogGroup\n            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'\n          - Effect: Allow\n            Action:\n            - logs:CreateLogStream\n            - logs:PutLogEvents\n            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/PhoneNumberMappingLambda_${SSMExecutionId}:*'\n          - Effect: Allow\n            Action:\n            - connect:AssociatePhoneNumberContactFlow\n            Resource: '*'\n          - Effect: Allow\n            Action:\n            - s3:PutObject\n            - s3:GetObject\n            Resource: !Sub 'arn:${AWS::Partition}:s3:::${DestinationFileBucket}/${DestinationFilePath}*'\nOutputs:\n  ErrorListLocation:\n    Description: The S3 location for the CSV file that contains the list of resources\n      that could not be processed due to an error.\n    Value: !GetAtt AssociatePhoneNumbersToContactFlows.ErrorListLocation\n  NonProcessedListLocation:\n    Description: The S3 location for the CSV file that contains the list of resources\n      that weren't processed due to time limitation.\n    Value: !GetAtt AssociatePhoneNumbersToContactFlows.NonProcessedListLocation\n  NumInput:\n    Description: The number of resource mappings provided by the input.\n    Value: !GetAtt AssociatePhoneNumbersToContactFlows.NumInput\n  NumProcessed:\n    Description: The number of resource mappings that were processed.\n    Value: !GetAtt AssociatePhoneNumbersToContactFlows.NumProcessed\n  NumError:\n    Description: The number of resource mappings that could not be processed due to\n      an error.\n    Value: !GetAtt AssociatePhoneNumbersToContactFlows.NumError\n  NumNonProcessed:\n    Description: The number of resource mappings that weren't processed due to time\n      limitation.\n    Value: !GetAtt AssociatePhoneNumbersToContactFlows.NumNonProcessed\n",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-AssociatePhoneNumbersToContactFlow-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-AssociatePhoneNumbersToContactFlow-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CloudformationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        },
+        {
+          "Name": "CloudformationStackStatus",
+          "Selector": "$.StackStatus",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "WaitForPhoneNumberContactFlowAssociationCompletion"
+    },
+    {
+      "name": "WaitForPhoneNumberContactFlowAssociationCompletion",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits until the AWS Lambda function that maps phone numbers to contact flows is created and its invocation completes.",
+      "timeoutSeconds": 1800,
+      "onFailure": "step:DescribeCloudFormationErrorFromStackEvents",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ AssociatePhoneNumbersToContactFlows.CloudformationStackId }}",
+        "PropertySelector": "$.Stacks[0].StackStatus",
+        "DesiredValues": [
+          "UPDATE_COMPLETE",
+          "CREATE_COMPLETE"
+        ]
+      },
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "GenerateReport",
+      "description": "Generates the report that contains the number of phone numbers mapped to contact flows, the ones that could not be processed due to an error, and the one that could not be processed due to the time constraint. The report also shows the location (S3 URI and S3 Console URL) for `<automation:EXECUTION_ID>/ErrorResourceList.csv` or `<automation:EXECUTION_ID>/NonProcessedResourceList.csv` if applicable.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "step:DeleteCloudFormationStack",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "handler",
+        "InputPayload": {
+          "StackName": "{{ AssociatePhoneNumbersToContactFlows.CloudformationStackId }}"
+        },
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\n\n\ndef get_s3_console_url(s3_uri, context):\n    s3_bucket = s3_uri.replace(\"s3://\", \"\").split(\"/\")[0]\n    s3_object_key = s3_uri.replace(\"s3://{}/\".format(s3_bucket), \"\")\n\n    s3_console_uri = \"https://s3.console.aws.amazon.com/s3/object\"\n    if context[\"global:AWS_PARTITION\"] == \"aws-cn\":\n        s3_console_uri = \"https://console.amazonaws.cn/s3/object\"\n    elif context[\"global:AWS_PARTITION\"] == \"aws-us-gov\":\n        s3_console_uri = \"https://console.amazonaws-us-gov.com/s3/object\"\n\n    return \"{}/{}?region={}&prefix={}\".format(s3_console_uri, s3_bucket, context[\"global:REGION\"], s3_object_key)\n\n\ndef retrieve_association_result(stack_id):\n    cloudformation = boto3.client(\"cloudformation\")\n    result = {}\n    try:\n        response = cloudformation.describe_stacks(StackName=stack_id)\n    except Exception as e:\n        raise Exception(f\"Error: {str(e)}\")\n\n    for output in response[\"Stacks\"][0][\"Outputs\"]:\n        result[output[\"OutputKey\"]] = output[\"OutputValue\"]\n\n    return result\n\n\ndef handler(event, context):\n    stack_id = event.get(\"StackName\")\n    result = retrieve_association_result(stack_id)\n\n    return_data = \"\"\n    return_data += (\n        \"\\n\\n{:=<50}\".format(\"\")\n        + \"\\n{:^50}\".format(\"Amazon Connect Phone Number Mapping Result\")\n        + \"\\n{:=<50}\".format(\"\")\n        + \"\\n\\n\"\n    )\n    return_data += \"* Phone number and Contact Flow pairs listed in the provided input: {}\\n\".format(result[\"NumInput\"])\n    return_data += \"* Phone numbers associated with Contact Flow processed: {}\\n\".format(result[\"NumProcessed\"])\n    return_data += \"* Phone numbers that could not be associated with Contact Flow due to an error: {}\\n\".format(\n        result[\"NumError\"]\n    )\n    return_data += \"* Phone numbers that weren't associated with Contact Flow due to the time constraint: {}\\n\".format(\n        result[\"NumNonProcessed\"]\n    )\n    return_data += \"\\n\\n\\n\"\n\n    error_list_uri = result[\"ErrorListLocation\"]\n    non_processed_list_uri = result[\"NonProcessedListLocation\"]\n\n    if len(error_list_uri) > 0:\n        error_list_console_url = get_s3_console_url(error_list_uri, context)\n        return_data += (\n            \"{:=<50}\".format(\"\") + \"\\n{:^50}\".format(\"Error list file location\") + \"\\n{:=<50}\".format(\"\") + \"\\n\\n\"\n        )\n        return_data += \"* S3 URI: {}\\n\".format(error_list_uri)\n        return_data += \"* S3 Console URL: {}\\n\".format(error_list_console_url)\n        return_data += \"\\n\"\n        return_data += \"INFO: The above file contains the list of phone numbers and Contact Flows that could not be associated due to an error.\"\n        return_data += \"You can look into the error detail in order to address the issue.\"\n        return_data += \"\\n\\n\"\n\n    if len(non_processed_list_uri) > 0:\n        non_processed_list_console_url = get_s3_console_url(non_processed_list_uri, context)\n        return_data += (\n            \"{:=<50}\".format(\"\") + \"\\n{:^50}\".format(\"Unprocessed list file location\") + \"\\n{:=<50}\".format(\"\") + \"\\n\\n\"\n        )\n        return_data += \"* S3 URI: {}\\n\".format(non_processed_list_uri)\n        return_data += \"* S3 Console URL: {}\\n\".format(non_processed_list_console_url)\n        return_data += \"\\n\"\n        return_data += \"INFO: The above file contains the list of phone numbers and Contact Flows that weren't associated due to the time constraint (15 minutes).\"\n        return_data += 'You can execute this runbook again by specifying the file as an input \"SourceFileLocation\" so that you can process them.'\n        return_data += \"\\n\\n\"\n\n    return return_data\n"
+      },
+      "nextStep": "DeleteCloudFormationStack"
+    },
+    {
+      "name": "DescribeCloudFormationErrorFromStackEvents",
+      "onFailure": "Continue",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "description": "Describes errors from the CloudFormation stack.",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStackEvents",
+        "StackName": "{{ AssociatePhoneNumbersToContactFlows.CloudformationStackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "Events",
+          "Selector": "$.StackEvents..ResourceStatusReason",
+          "Type": "StringList"
+        }
+      ],
+      "isCritical": false,
+      "nextStep": "DeleteCloudFormationStack"
+    },
+    {
+      "name": "DeleteCloudFormationStack",
+      "action": "aws:executeAwsApi",
+      "description": "Deletes the AWS CloudFormation stack including the AWS Lambda function for mapping.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DeleteStack",
+        "StackName": "{{ AssociatePhoneNumbersToContactFlows.CloudformationStackId }}"
+      },
+      "isCritical": true,
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "GenerateReport.OutputPayload",
+    "DescribeCloudFormationErrorFromStackEvents.Events"
+  ],
+  "files": {
+    "check_bucket_public_status.zip": {
+      "checksums": {
+        "SHA256": "6678a7736a0ebdb346c385417bff05d0480d7598ba1cdc1fdf2b153963ee0d66"
+      }
+    }
+  }
+}

@@ -22,7 +22,7 @@
     "name": {
       "description": "(Required) The package to install/uninstall.",
       "type": "String",
-      "allowedPattern": "^arn:[a-z0-9][-.a-z0-9]{0,62}:[a-z0-9][-.a-z0-9]{0,62}:([a-z0-9][-.a-z0-9]{0,62})?:([a-z0-9][-.a-z0-9]{0,62})?:(package|document)\\/[a-zA-Z0-9/:.\\-_]{1,128}$|^[a-zA-Z0-9/:.\\-_]{1,128}$"
+      "allowedPattern": "^(arn:aws([a-z0-9-]{0,15})?:ssm:[a-z0-9-]{0,30}:(?:\\d{12}):document\\/)?AmazonGuardDuty-RuntimeMonitoringSsmPlugin$"
     },
     "version": {
       "description": "(Optional) The version of the package to install or uninstall. If you don't specify a version, the system installs the latest published version by default. The system will only attempt to uninstall the version that is currently installed. If no version of the package is installed, the system returns an error.",
@@ -32,6 +32,75 @@
     }
   },
   "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "name": "checkProvisioningEligibility",
+      "inputs": {
+        "runCommand": [
+          "#!/bin/bash",
+          "",
+          "[ -f \"/usr/bin/curl\" ] && export CURL=/usr/bin/curl || export CURL=/bin/curl",
+          "[ -f \"/usr/bin/echo\" ] && export ECHO=/usr/bin/echo || export ECHO=/bin/echo",
+          "[ -f \"/usr/bin/tail\" ] && export TAIL=/usr/bin/tail || export TAIL=/bin/tail",
+          "[ -f \"/usr/bin/sed\" ] && export SED=/usr/bin/sed || export SED=/bin/sed",
+          "",
+          "IS_ELIGIBLE_TO_PROVISION=true",
+          "",
+          "check_provisioning_eligibility() {",
+          "        IMDS_URI=\"http://169.254.169.254/latest\"",
+          "        IMDS_TOKEN=$($CURL -sS -X PUT \"$IMDS_URI/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\")",
+          "        iid_response=$($CURL -sS -w \"\n%{http_code}\" -H \"X-aws-ec2-metadata-token: $IMDS_TOKEN\" -v $IMDS_URI/dynamic/instance-identity/ 2> /dev/null)",
+          "        iid_http_code=$($TAIL -n1 <<< \"$iid_response\")",
+          "",
+          "        if [ $iid_http_code -ne 200 ]; then # When IMDS is unavailable",
+          "                $ECHO \"This instance will be excluded since the instance identity document is unavailable from IMDS.\"",
+          "                IS_ELIGIBLE_TO_PROVISION=false",
+          "                return 0",
+          "        fi",
+          "",
+          "        GUARD_DUTY_TAG_KEY=\"GuardDutyManaged\"",
+          "        GUARD_DUTY_EXCLUSION_TAG_VALUE=\"false\"",
+          "        instance_metadata_tag_response=$($CURL -sS -w \"\n%{http_code}\" -H \"X-aws-ec2-metadata-token: $IMDS_TOKEN\" -v $IMDS_URI/meta-data/tags/instance/${GUARD_DUTY_TAG_KEY} 2> /dev/null)",
+          "        imt_http_code=$($TAIL -n1 <<< \"$instance_metadata_tag_response\")",
+          "        if [ $imt_http_code -ne 200 ]; then",
+          "                $ECHO \"Failed to get instance tags from instance metadata or no ${GUARD_DUTY_TAG_KEY} present in tag keys. Assuming no exclusion tag present.\"",
+          "                return 0",
+          "        else",
+          "                $ECHO \"Retrieved instance tags from instance metadata.\"",
+          "                tag_value=$($SED '$ d' <<< \"$instance_metadata_tag_response\")",
+          "                if [ $tag_value == \"${GUARD_DUTY_EXCLUSION_TAG_VALUE}\" ]; then",
+          "                        $ECHO \"This instance will be excluded based on the instance tag key [${GUARD_DUTY_TAG_KEY}] and value [${GUARD_DUTY_EXCLUSION_TAG_VALUE}].\"",
+          "                        IS_ELIGIBLE_TO_PROVISION=false",
+          "                        return 0",
+          "                fi",
+          "        fi",
+          "        return 0",
+          "}",
+          "",
+          "{",
+          "        check_provisioning_eligibility",
+          "} || { # catch exception, proceed provisioning",
+          "        $ECHO \"Exception caught $?, will provision GuardDuty agent.\"",
+          "        exit 0",
+          "}",
+          "",
+          "if [ $IS_ELIGIBLE_TO_PROVISION = false ]; then",
+          "        $ECHO \"This instance will be excluded from provisioning GuardDuty agent.\"",
+          "        exit 1 # fail this script to skip next step",
+          "fi",
+          "",
+          "$ECHO 'Will provision GuardDuty agent.'",
+          "exit 0"
+        ],
+        "onFailure": "successAndExit"
+      }
+    },
     {
       "action": "aws:configurePackage",
       "precondition": {
