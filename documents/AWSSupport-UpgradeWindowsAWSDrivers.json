@@ -1,16 +1,21 @@
 {
   "schemaVersion": "0.3",
-  "description": "The AWSSupport-UpgradeWindowsAWSDrivers upgrades or repairs storage and network AWS drivers on the specified EC2 instance. The document attempts to install the latest versions of AWS drivers online by calling the SSM agent. If the SSM agent is not contactable, the document can perform an offline installation of the AWS drivers if explicitly requested. Note: Both the online and offline upgrade will create an AMI before attempting any operations, which will persist after the automation completes. It is your responsibility to secure access to the AMI, or to delete it. The online method restarts the instance as part of the upgrade process, while the offline method requires the provided EC2 instance be stopped and then started.",
+  "description": "The **AWSSupport-UpgradeWindowsAWSDrivers** automation runbook upgrades or repairs storage and network AWS drivers on the specified Windows Amazon Elastic Compute Cloud (Amazon EC2) instance. The document attempts to install the latest versions of AWS drivers online by using the SSM agent. If the SSM agent is not contactable, the document can perform an offline installation of the AWS drivers if explicitly requested. **Note:** Both the online and offline upgrade will create an Amazon Machine Image (AMI) before attempting any operations, which will persist after the automation completes. It is your responsibility to secure access to the AMI, or to delete it. The online method restarts the instance as part of the upgrade process, while the offline method requires the provided EC2 instance be stopped and then started.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
     "InstanceId": {
       "type": "AWS::EC2::Instance::Id",
-      "description": "(Required) ID of your EC2 Windows instance.",
+      "description": "(Required) The ID of your EC2 Windows instance.",
       "allowedPattern": "^i-[a-z0-9]{8,17}$"
     },
     "AllowOffline": {
       "type": "String",
-      "description": "(Optional) Set it to true if you allow an offline drivers upgrade in case the online installation cannot be performed. Note: The offline method requires the provided EC2 instance be stopped and then started. Data stored in instance store volumes will be lost. The public IP address will change if you are not using an Elastic IP.",
+      "description": "(Optional) Set it to `True` if you allow an offline drivers upgrade in case the online installation cannot be performed. **Note:** The offline method requires the provided EC2 instance be stopped and then started. Data stored in instance store volumes will be lost. The public IP address will change if you are not using an Elastic IP.",
       "default": "False",
       "allowedValues": [
         "True",
@@ -19,13 +24,13 @@
     },
     "SubnetId": {
       "type": "String",
-      "description": "(Optional) Offline only - The subnet ID for the EC2Rescue instance used to perform the offline drivers upgrade. If you specify CreateNewVPC, AWS Systems Manager Automation will create a new VPC. IMPORTANT: The subnet must be in the same Availability Zone as InstanceId, and it must allow access to the SSM endpoints.",
+      "description": "(Optional) Offline only - The subnet ID for the EC2Rescue instance used to perform the offline drivers upgrade. If you specify `CreateNewVPC`, AWS Systems Manager Automation will create a new Amazon Virtual Private Cloud (Amazon VPC). IMPORTANT: The subnet must be in the same availability zone as the `InstanceId`, and it must allow access to the AWS Systems Manager endpoints.",
       "default": "SelectedInstanceSubnet",
       "allowedPattern": "^SelectedInstanceSubnet$|^CreateNewVPC$|^subnet-[a-z0-9]{8,17}$"
     },
     "ForceUpgrade": {
       "type": "String",
-      "description": "(Optional) Offline only - Set it to true if you allow the offline drivers upgrade to proceed even though your instance already has the latest drivers installed.",
+      "description": "(Optional) Offline only - Set it to `True` if you allow the offline drivers upgrade to proceed even though your instance already has the latest drivers installed.",
       "default": "False",
       "allowedValues": [
         "True",
@@ -46,10 +51,11 @@
         "i3.large"
       ]
     },
-    "AutomationAssumeRole": {
-      "type": "AWS::IAM::Role::Arn",
-      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
-      "default": ""
+    "EC2RescueInstanceProfileName": {
+      "type": "String",
+      "description": "(Conditional) The name of an existing IAM instance profile for the EC2Rescue instance. If an IAM instance profile is not specified, the automation creates one on your behalf.",
+      "default": "",
+      "allowedPattern": "^$|^[\\w+=,.@-]{1,128}$"
     }
   },
   "mainSteps": [
@@ -69,13 +75,13 @@
           "windows"
         ]
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "describeManagedInstance"
     },
     {
       "name": "describeManagedInstance",
       "action": "aws:executeAwsApi",
-      "description": "Verifies the input EC2 instance is managed by Systems Manager.",
+      "description": "Verifies the input EC2 instance is managed by AWS Systems Manager.",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ssm",
@@ -95,13 +101,13 @@
           "Selector": "$.InstanceInformationList[0].PingStatus"
         }
       ],
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "branchOnManagedInstancePingStatus"
     },
     {
       "name": "branchOnManagedInstancePingStatus",
       "action": "aws:branch",
-      "description": "Branches the workflow based on weather the EC2 instance is managed by Systems Manager or not. If so, the online upgrade starts, otherwise the offline upgrade is evaluated.",
+      "description": "Branches the workflow based on whether the EC2 instance is managed by AWS Systems Manager or not. If so, the online upgrade starts, otherwise the offline upgrade is evaluated.",
       "onFailure": "Abort",
       "inputs": {
         "Choices": [
@@ -111,14 +117,15 @@
             "StringEquals": "Online"
           }
         ],
-        "Default": "assertAllowOffline"
+        "Default": "BranchOnAllowOffline"
       },
-      "isCritical": "true"
+      "isCritical": true,
+      "nextStep": "BranchOnAllowOffline"
     },
     {
       "name": "preUpgradeBackup",
       "action": "aws:createImage",
-      "description": "Creates an Amazon Machine Image (AMI) backup.",
+      "description": "Creates an Amazon Machine Image (AMI) backup. This step reboots the instance so that it can take snapshots of the attached volumes while data is at rest, in order to ensure a consistent state.",
       "onFailure": "Abort",
       "inputs": {
         "InstanceId": "{{ InstanceId }}",
@@ -133,7 +140,7 @@
           "Type": "String"
         }
       ],
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "tagPreUpgradeBackup"
     },
     {
@@ -157,13 +164,13 @@
         ],
         "ResourceType": "EC2"
       },
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "assertpreUpgradeBackup"
     },
     {
       "name": "assertpreUpgradeBackup",
       "action": "aws:waitForAwsResourceProperty",
-      "description": "Verifies the Amazon Machine Image (AMI) backup is in 'available' state.",
+      "description": "Verifies the Amazon Machine Image (AMI) backup is in `available` state.",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
@@ -181,7 +188,7 @@
           "available"
         ]
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "installAWSNVMeOnInstance"
     },
     {
@@ -321,7 +328,7 @@
           ]
         }
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "installAWSPVDriverOnInstance"
     },
     {
@@ -412,8 +419,13 @@
             "        throw ($bcdstderr[0])",
             "    }",
             "    # Backup the Hosts file and create a new one with SSM endpoint entries for DNS resolution during DSRM",
-            "    $ssmEndpoint = \"ssm.{{ global:REGION }}.amazonaws.com\"",
-            "    $ec2messagesEndpoint = \"ec2messages.{{ global:REGION }}.amazonaws.com\"",
+            "    $awsDomain = \"amazonaws.com\"",
+            "    $awsPartition = \"{{ global:AWS_PARTITION }}\"",
+            "    if ($awsPartition -eq \"aws-cn\") {",
+            "        $awsDomain = \"amazonaws.com.cn\"",
+            "    }",
+            "    $ssmEndpoint = \"ssm.{{ global:REGION }}.$awsDomain\"",
+            "    $ec2messagesEndpoint = \"ec2messages.{{ global:REGION }}.$awsDomain\"",
             "    $ssmEPIPAddress = [System.Net.Dns]::GetHostAddresses($ssmEndpoint)[0].IPAddressToString",
             "    $ec2messagesEPIPAddress = [System.Net.Dns]::GetHostAddresses($ec2messagesEndpoint)[0].IPAddressToString",
             "    Move-Item -Path \"${env:SYSTEMROOT}\\System32\\drivers\\etc\\hosts\" -Destination \"${env:SYSTEMROOT}\\System32\\drivers\\etc\\hosts-{{ automation:EXECUTION_ID }}\" -Force",
@@ -657,7 +669,7 @@
           ]
         }
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "installAwsEnaNetworkDriverOnInstance"
     },
     {
@@ -766,30 +778,30 @@
           ]
         }
       },
-      "isCritical": "true",
-      "isEnd": "true"
+      "isCritical": true,
+      "isEnd": true
     },
     {
-      "name": "assertAllowOffline",
-      "action": "aws:assertAwsResourceProperty",
-      "description": "Verifies if the 'AllowOffline' flag is set to true. If so, the offline upgrade starts, otherwise the automation ends.",
+      "name": "BranchOnAllowOffline",
+      "action": "aws:branch",
+      "description": "Branches the workflow based on whether the `AllowOffline` input parameter is set to `True`. If so, the offline upgrade starts, otherwise the automation ends.",
       "onFailure": "Abort",
       "inputs": {
-        "Service": "ssm",
-        "Api": "GetAutomationExecution",
-        "AutomationExecutionId": "{{ automation:EXECUTION_ID }}",
-        "PropertySelector": "$.AutomationExecution.Parameters.AllowOffline[0]",
-        "DesiredValues": [
-          "True"
+        "Choices": [
+          {
+            "NextStep": "stopInstance",
+            "Variable": "{{ AllowOffline }}",
+            "StringEquals": "True"
+          }
         ]
       },
-      "isCritical": "true",
-      "nextStep": "stopInstance"
+      "isEnd": true,
+      "isCritical": true
     },
     {
       "name": "stopInstance",
       "action": "aws:changeInstanceState",
-      "description": "Stops the source EC2 instance.",
+      "description": "Stops the target EC2 instance.",
       "onFailure": "Continue",
       "inputs": {
         "InstanceIds": [
@@ -798,7 +810,7 @@
         "CheckStateOnly": false,
         "DesiredState": "stopped"
       },
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "forceStopInstance"
     },
     {
@@ -814,7 +826,7 @@
         "DesiredState": "stopped",
         "Force": true
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "preOfflineUpgradeBackup"
     },
     {
@@ -835,7 +847,7 @@
           "Type": "String"
         }
       ],
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "tagPreOfflineUpgradeBackup"
     },
     {
@@ -859,13 +871,13 @@
           }
         ]
       },
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "assertPreOfflineUpgradeBackup"
     },
     {
       "name": "assertPreOfflineUpgradeBackup",
       "action": "aws:waitForAwsResourceProperty",
-      "description": "Verifies the Amazon Machine Image (AMI) backup of the source EC2 instance is in 'available' state.",
+      "description": "Verifies the Amazon Machine Image (AMI) backup of the source EC2 instance is in `available` state.",
       "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
@@ -883,7 +895,7 @@
           "available"
         ]
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "enableEnaSupport"
     },
     {
@@ -899,13 +911,13 @@
           "Value": true
         }
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "branchOnForceUpgrade"
     },
     {
       "name": "branchOnForceUpgrade",
       "action": "aws:branch",
-      "description": "Asserts the 'ForceUpgrade' flag.",
+      "description": "Asserts the `ForceUpgrade` input parameter. If `True` then proceed to install the drivers even though your instance already has the latest drivers installed.",
       "onFailure": "step:startInstance",
       "inputs": {
         "Choices": [
@@ -919,15 +931,17 @@
             "Variable": "{{ ForceUpgrade }}",
             "StringEquals": "True"
           }
-        ]
+        ],
+        "Default": "startInstance"
       },
-      "isCritical": "true"
+      "nextStep": "startInstance",
+      "isCritical": true
     },
     {
       "name": "upgradeDriversOffline",
       "onFailure": "Continue",
       "action": "aws:executeAutomation",
-      "description": "If 'ForceUpgrade' = 'true' then run aws:executeAutomation to invoke AWSSupport-StartEC2RescueWorkflow with the drivers force upgrade script. This installs the drivers regardless of the current version that is installed.",
+      "description": "If `ForceUpgrade` is set to `True` then run `aws:executeAutomation` to invoke `AWSSupport-StartEC2RescueWorkflow` with the drivers force upgrade script. This installs the drivers regardless of the current versions that are installed.",
       "inputs": {
         "RuntimeParameters": {
           "InstanceId": [
@@ -937,10 +951,13 @@
             "{{ EC2RescueInstanceType }}"
           ],
           "OfflineScript": [
-            "JEFXU1BWVmVyc2lvbj0iTGF0ZXN0Ig0KJEVOQVZlcnNpb249IkxhdGVzdCINCiROVk1FVmVyc2lvbj0iTGF0ZXN0Ig0KJEtCMzAzMzkyOSA9IFtTeXN0ZW0uVmVyc2lvbl0iNi4xLjc2MDEuMjI5NDgiDQokVGFyZ2V0VmVyc2lvbiA9IFtTeXN0ZW0uVmVyc2lvbl0kZW52OkVDMlJFU0NVRV9PRkZMSU5FX0tFUk5FTF9WRVINCmlmIChbU3lzdGVtLlZlcnNpb25dOjpuZXcoJFRhcmdldFZlcnNpb24uTWFqb3IsJFRhcmdldFZlcnNpb24uTWlub3IpIC1sZSBbU3lzdGVtLlZlcnNpb25dOjpuZXcoNiwxKSkgew0KICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyBiYWNrIHRvIHRoZSBsYXRlc3QgY29tcGF0aWJsZSBkcml2ZXIgdmVyc2lvbnMiDQogICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIE5WTUUgZHJpdmVycyB2ZXJzaW9uIDEuMy4yIg0KICAgICROVk1FVmVyc2lvbj0iMS4zLjIiDQogICAgaWYgKCRUYXJnZXRWZXJzaW9uIC1sdCAkS0IzMDMzOTI5KXsNCiAgICAgICAgV3JpdGUtSG9zdCAiT3BlcmF0aW5nIFN5c3RlbSBpcyBtaXNzaW5nIEtCMzAzMzkyOS4iDQogICAgICAgICMgOC4zLjIgaXMgdGhlIGhpZ2hlc3QgQVdTIFBWIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyIHdpdGhvdXQgS0IzMDMzOTI5DQogICAgICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBBV1MgUFYgZHJpdmVycyB2ZXJzaW9uIDguMy4yIg0KICAgICAgICAkQVdTUFZWZXJzaW9uPSI4LjMuMiINCiAgICAgICAgIyAyLjEuNCBpcyB0aGUgaGlnaGVzdCBFTkEgdmVyc2lvbiB0aGF0IHN1cHBvcnRzIFdpbmRvd3MgU2VydmVyIDIwMDggUjIgd2l0aG91dCBLQjMwMzM5MjkNCiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEVOQSBkcml2ZXJzIHZlcnNpb24gMi4xLjQiDQogICAgICAgICRFTkFWZXJzaW9uPSIyLjEuNCINCiAgICB9DQogICAgZWxzZSB7DQogICAgICAgICMgOC4zLjUgaXMgdGhlIGxhdGVzdCBBV1MgUFYgdmVyc2lvbiB0aGF0IHN1cHBvcnRzIFdpbmRvd3MgU2VydmVyIDIwMDggUjINCiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEFXUyBQViBkcml2ZXJzIHZlcnNpb24gOC4zLjUiDQogICAgICAgICRBV1NQVlZlcnNpb249IjguMy41Ig0KICAgICAgICAjIDIuMi4zIGlzIHRoZSBsYXRlc3QgRU5BIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyDQogICAgICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBFTkEgZHJpdmVycyB2ZXJzaW9uIDIuMi4zIg0KICAgICAgICAkRU5BVmVyc2lvbj0iMi4yLjMiDQogICAgfQ0KfQ0KDQpTZXQtQm9vdERyaXZlcnNLZXkgLVdpbmRvd3NJbnN0YWxsRGF0YSAkc2NyaXB0OkVDMlJFU0NVRV9PRkZMSU5FX1dJTkRPV1NfSU5TVEFMTA0KSW5zdGFsbC1QVkRyaXZlcnMgLVdpbmRvd3NJbnN0YWxsRGF0YSAkc2NyaXB0OkVDMlJFU0NVRV9PRkZMSU5FX1dJTkRPV1NfSU5TVEFMTCAtQVdTUFZWZXJzaW9uICRBV1NQVlZlcnNpb24NCkluc3RhbGwtTml0cm9Ecml2ZXJzIC1XaW5kb3dzSW5zdGFsbERhdGEgJHNjcmlwdDpFQzJSRVNDVUVfT0ZGTElORV9XSU5ET1dTX0lOU1RBTEwgLUVOQVZlcnNpb24gJEVOQVZlcnNpb24gIC1OVk1FVmVyc2lvbiAkTlZNRVZlcnNpb24="
+            "JEFXU1BWVmVyc2lvbj0iTGF0ZXN0IgokRU5BVmVyc2lvbj0iTGF0ZXN0IgokTlZNRVZlcnNpb249IkxhdGVzdCIKJEtCMzAzMzkyOSA9IFtTeXN0ZW0uVmVyc2lvbl0iNi4xLjc2MDEuMjI5NDgiCiRUYXJnZXRWZXJzaW9uID0gW1N5c3RlbS5WZXJzaW9uXSRlbnY6RUMyUkVTQ1VFX09GRkxJTkVfS0VSTkVMX1ZFUgppZiAoW1N5c3RlbS5WZXJzaW9uXSIkKCRUYXJnZXRWZXJzaW9uLk1ham9yKS4kKCRUYXJnZXRWZXJzaW9uLk1pbm9yKSIgLWxlIFtTeXN0ZW0uVmVyc2lvbl0iNi4xIikgewogICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIGJhY2sgdG8gdGhlIGxhdGVzdCBjb21wYXRpYmxlIGRyaXZlciB2ZXJzaW9ucyIKICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBOVk1FIGRyaXZlcnMgdmVyc2lvbiAxLjMuMiIKICAgICROVk1FVmVyc2lvbj0iMS4zLjIiCiAgICBpZiAoJFRhcmdldFZlcnNpb24gLWx0ICRLQjMwMzM5MjkpewogICAgICAgIFdyaXRlLUhvc3QgIk9wZXJhdGluZyBTeXN0ZW0gaXMgbWlzc2luZyBLQjMwMzM5MjkuIgogICAgICAgICMgOC4zLjIgaXMgdGhlIGhpZ2hlc3QgQVdTIFBWIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyIHdpdGhvdXQgS0IzMDMzOTI5CiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEFXUyBQViBkcml2ZXJzIHZlcnNpb24gOC4zLjIiCiAgICAgICAgJEFXU1BWVmVyc2lvbj0iOC4zLjIiCiAgICAgICAgIyAyLjEuNCBpcyB0aGUgaGlnaGVzdCBFTkEgdmVyc2lvbiB0aGF0IHN1cHBvcnRzIFdpbmRvd3MgU2VydmVyIDIwMDggUjIgd2l0aG91dCBLQjMwMzM5MjkKICAgICAgICBXcml0ZS1Ib3N0ICJSZXZlcnRpbmcgdG8gRU5BIGRyaXZlcnMgdmVyc2lvbiAyLjEuNCIKICAgICAgICAkRU5BVmVyc2lvbj0iMi4xLjQiCiAgICB9CiAgICBlbHNlIHsKICAgICAgICAjIDguMy41IGlzIHRoZSBsYXRlc3QgQVdTIFBWIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyCiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEFXUyBQViBkcml2ZXJzIHZlcnNpb24gOC4zLjUiCiAgICAgICAgJEFXU1BWVmVyc2lvbj0iOC4zLjUiCiAgICAgICAgIyAyLjIuMyBpcyB0aGUgbGF0ZXN0IEVOQSB2ZXJzaW9uIHRoYXQgc3VwcG9ydHMgV2luZG93cyBTZXJ2ZXIgMjAwOCBSMgogICAgICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBFTkEgZHJpdmVycyB2ZXJzaW9uIDIuMi4zIgogICAgICAgICRFTkFWZXJzaW9uPSIyLjIuMyIKICAgIH0KfQoKU2V0LUJvb3REcml2ZXJzS2V5IC1XaW5kb3dzSW5zdGFsbERhdGEgJHNjcmlwdDpFQzJSRVNDVUVfT0ZGTElORV9XSU5ET1dTX0lOU1RBTEwKSW5zdGFsbC1QVkRyaXZlcnMgLVdpbmRvd3NJbnN0YWxsRGF0YSAkc2NyaXB0OkVDMlJFU0NVRV9PRkZMSU5FX1dJTkRPV1NfSU5TVEFMTCAtQVdTUFZWZXJzaW9uICRBV1NQVlZlcnNpb24KSW5zdGFsbC1OaXRyb0RyaXZlcnMgLVdpbmRvd3NJbnN0YWxsRGF0YSAkc2NyaXB0OkVDMlJFU0NVRV9PRkZMSU5FX1dJTkRPV1NfSU5TVEFMTCAtRU5BVmVyc2lvbiAkRU5BVmVyc2lvbiAgLU5WTUVWZXJzaW9uICROVk1FVmVyc2lvbg=="
           ],
           "SubnetId": [
             "{{ SubnetId }}"
+          ],
+          "HelperInstanceProfileName": [
+            "{{ EC2RescueInstanceProfileName }}"
           ],
           "AutomationAssumeRole": [
             "{{ AutomationAssumeRole }}"
@@ -949,14 +966,14 @@
         },
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "startInstance"
     },
     {
       "name": "forceUpgradeDriversOffline",
       "onFailure": "Continue",
       "action": "aws:executeAutomation",
-      "description": "If 'ForceUpgrade' = 'false' then run aws:executeAutomation to invoke AWSSupport-StartEC2RescueWorkflow with the drivers upgrade script.",
+      "description": "If `ForceUpgrade` is set to `False` then run `aws:executeAutomation` to invoke `AWSSupport-StartEC2RescueWorkflow` with the drivers upgrade script. This installs the drivers only if the current versions are outdated.",
       "inputs": {
         "RuntimeParameters": {
           "InstanceId": [
@@ -966,10 +983,13 @@
             "{{ EC2RescueInstanceType }}"
           ],
           "OfflineScript": [
-            "JEFXU1BWVmVyc2lvbj0iTGF0ZXN0Ig0KJEVOQVZlcnNpb249IkxhdGVzdCINCiROVk1FVmVyc2lvbj0iTGF0ZXN0Ig0KJEtCMzAzMzkyOSA9IFtTeXN0ZW0uVmVyc2lvbl0iNi4xLjc2MDEuMjI5NDgiDQokVGFyZ2V0VmVyc2lvbiA9IFtTeXN0ZW0uVmVyc2lvbl0kZW52OkVDMlJFU0NVRV9PRkZMSU5FX0tFUk5FTF9WRVINCmlmIChbU3lzdGVtLlZlcnNpb25dOjpuZXcoJFRhcmdldFZlcnNpb24uTWFqb3IsJFRhcmdldFZlcnNpb24uTWlub3IpIC1sZSBbU3lzdGVtLlZlcnNpb25dOjpuZXcoNiwxKSkgew0KICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyBiYWNrIHRvIHRoZSBsYXRlc3QgY29tcGF0aWJsZSBkcml2ZXIgdmVyc2lvbnMiDQogICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIE5WTUUgZHJpdmVycyB2ZXJzaW9uIDEuMy4yIg0KICAgICROVk1FVmVyc2lvbj0iMS4zLjIiDQogICAgaWYgKCRUYXJnZXRWZXJzaW9uIC1sdCAkS0IzMDMzOTI5KXsNCiAgICAgICAgV3JpdGUtSG9zdCAiT3BlcmF0aW5nIFN5c3RlbSBpcyBtaXNzaW5nIEtCMzAzMzkyOS4iDQogICAgICAgICMgOC4zLjIgaXMgdGhlIGhpZ2hlc3QgQVdTIFBWIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyIHdpdGhvdXQgS0IzMDMzOTI5DQogICAgICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBBV1MgUFYgZHJpdmVycyB2ZXJzaW9uIDguMy4yIg0KICAgICAgICAkQVdTUFZWZXJzaW9uPSI4LjMuMiINCiAgICAgICAgIyAyLjEuNCBpcyB0aGUgaGlnaGVzdCBFTkEgdmVyc2lvbiB0aGF0IHN1cHBvcnRzIFdpbmRvd3MgU2VydmVyIDIwMDggUjIgd2l0aG91dCBLQjMwMzM5MjkNCiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEVOQSBkcml2ZXJzIHZlcnNpb24gMi4xLjQiDQogICAgICAgICRFTkFWZXJzaW9uPSIyLjEuNCINCiAgICB9DQogICAgZWxzZSB7DQogICAgICAgICMgOC4zLjUgaXMgdGhlIGxhdGVzdCBBV1MgUFYgdmVyc2lvbiB0aGF0IHN1cHBvcnRzIFdpbmRvd3MgU2VydmVyIDIwMDggUjINCiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEFXUyBQViBkcml2ZXJzIHZlcnNpb24gOC4zLjUiDQogICAgICAgICRBV1NQVlZlcnNpb249IjguMy41Ig0KICAgICAgICAjIDIuMi4zIGlzIHRoZSBsYXRlc3QgRU5BIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyDQogICAgICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBFTkEgZHJpdmVycyB2ZXJzaW9uIDIuMi4zIg0KICAgICAgICAkRU5BVmVyc2lvbj0iMi4yLjMiDQogICAgfQ0KfQ0KDQpTZXQtQm9vdERyaXZlcnNLZXkgLVdpbmRvd3NJbnN0YWxsRGF0YSAkc2NyaXB0OkVDMlJFU0NVRV9PRkZMSU5FX1dJTkRPV1NfSU5TVEFMTA0KSW5zdGFsbC1QVkRyaXZlcnMgLVdpbmRvd3NJbnN0YWxsRGF0YSAkc2NyaXB0OkVDMlJFU0NVRV9PRkZMSU5FX1dJTkRPV1NfSU5TVEFMTCAtQVdTUFZWZXJzaW9uICRBV1NQVlZlcnNpb24gLUZvcmNlDQpJbnN0YWxsLU5pdHJvRHJpdmVycyAtV2luZG93c0luc3RhbGxEYXRhICRzY3JpcHQ6RUMyUkVTQ1VFX09GRkxJTkVfV0lORE9XU19JTlNUQUxMIC1FTkFWZXJzaW9uICRFTkFWZXJzaW9uICAtTlZNRVZlcnNpb24gJE5WTUVWZXJzaW9uIC1Gb3JjZQ=="
+            "JEFXU1BWVmVyc2lvbj0iTGF0ZXN0IgokRU5BVmVyc2lvbj0iTGF0ZXN0IgokTlZNRVZlcnNpb249IkxhdGVzdCIKJEtCMzAzMzkyOSA9IFtTeXN0ZW0uVmVyc2lvbl0iNi4xLjc2MDEuMjI5NDgiCiRUYXJnZXRWZXJzaW9uID0gW1N5c3RlbS5WZXJzaW9uXSRlbnY6RUMyUkVTQ1VFX09GRkxJTkVfS0VSTkVMX1ZFUgppZiAoW1N5c3RlbS5WZXJzaW9uXSIkKCRUYXJnZXRWZXJzaW9uLk1ham9yKS4kKCRUYXJnZXRWZXJzaW9uLk1pbm9yKSIgLWxlIFtTeXN0ZW0uVmVyc2lvbl0iNi4xIikgewogICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIGJhY2sgdG8gdGhlIGxhdGVzdCBjb21wYXRpYmxlIGRyaXZlciB2ZXJzaW9ucyIKICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBOVk1FIGRyaXZlcnMgdmVyc2lvbiAxLjMuMiIKICAgICROVk1FVmVyc2lvbj0iMS4zLjIiCiAgICBpZiAoJFRhcmdldFZlcnNpb24gLWx0ICRLQjMwMzM5MjkpewogICAgICAgIFdyaXRlLUhvc3QgIk9wZXJhdGluZyBTeXN0ZW0gaXMgbWlzc2luZyBLQjMwMzM5MjkuIgogICAgICAgICMgOC4zLjIgaXMgdGhlIGhpZ2hlc3QgQVdTIFBWIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyIHdpdGhvdXQgS0IzMDMzOTI5CiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEFXUyBQViBkcml2ZXJzIHZlcnNpb24gOC4zLjIiCiAgICAgICAgJEFXU1BWVmVyc2lvbj0iOC4zLjIiCiAgICAgICAgIyAyLjEuNCBpcyB0aGUgaGlnaGVzdCBFTkEgdmVyc2lvbiB0aGF0IHN1cHBvcnRzIFdpbmRvd3MgU2VydmVyIDIwMDggUjIgd2l0aG91dCBLQjMwMzM5MjkKICAgICAgICBXcml0ZS1Ib3N0ICJSZXZlcnRpbmcgdG8gRU5BIGRyaXZlcnMgdmVyc2lvbiAyLjEuNCIKICAgICAgICAkRU5BVmVyc2lvbj0iMi4xLjQiCiAgICB9CiAgICBlbHNlIHsKICAgICAgICAjIDguMy41IGlzIHRoZSBsYXRlc3QgQVdTIFBWIHZlcnNpb24gdGhhdCBzdXBwb3J0cyBXaW5kb3dzIFNlcnZlciAyMDA4IFIyCiAgICAgICAgV3JpdGUtSG9zdCAiUmV2ZXJ0aW5nIHRvIEFXUyBQViBkcml2ZXJzIHZlcnNpb24gOC4zLjUiCiAgICAgICAgJEFXU1BWVmVyc2lvbj0iOC4zLjUiCiAgICAgICAgIyAyLjIuMyBpcyB0aGUgbGF0ZXN0IEVOQSB2ZXJzaW9uIHRoYXQgc3VwcG9ydHMgV2luZG93cyBTZXJ2ZXIgMjAwOCBSMgogICAgICAgIFdyaXRlLUhvc3QgIlJldmVydGluZyB0byBFTkEgZHJpdmVycyB2ZXJzaW9uIDIuMi4zIgogICAgICAgICRFTkFWZXJzaW9uPSIyLjIuMyIKICAgIH0KfQoKU2V0LUJvb3REcml2ZXJzS2V5IC1XaW5kb3dzSW5zdGFsbERhdGEgJHNjcmlwdDpFQzJSRVNDVUVfT0ZGTElORV9XSU5ET1dTX0lOU1RBTEwKSW5zdGFsbC1QVkRyaXZlcnMgLVdpbmRvd3NJbnN0YWxsRGF0YSAkc2NyaXB0OkVDMlJFU0NVRV9PRkZMSU5FX1dJTkRPV1NfSU5TVEFMTCAtQVdTUFZWZXJzaW9uICRBV1NQVlZlcnNpb24gLUZvcmNlCkluc3RhbGwtTml0cm9Ecml2ZXJzIC1XaW5kb3dzSW5zdGFsbERhdGEgJHNjcmlwdDpFQzJSRVNDVUVfT0ZGTElORV9XSU5ET1dTX0lOU1RBTEwgLUVOQVZlcnNpb24gJEVOQVZlcnNpb24gIC1OVk1FVmVyc2lvbiAkTlZNRVZlcnNpb24gLUZvcmNl"
           ],
           "SubnetId": [
             "{{ SubnetId }}"
+          ],
+          "HelperInstanceProfileName": [
+            "{{ EC2RescueInstanceProfileName }}"
           ],
           "AutomationAssumeRole": [
             "{{ AutomationAssumeRole }}"
@@ -978,7 +998,7 @@
         },
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "startInstance"
     },
     {
@@ -993,8 +1013,8 @@
         "CheckStateOnly": false,
         "DesiredState": "running"
       },
-      "isCritical": "true",
-      "isEnd": "true"
+      "isCritical": true,
+      "isEnd": true
     }
   ],
   "outputs": [
