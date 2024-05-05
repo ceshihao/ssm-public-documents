@@ -1,0 +1,986 @@
+{
+  "description": "The **AWSSupport-ValidateFSxWindowsADConfig** runbook validates the [self-managed](https://docs.aws.amazon.com/fsx/latest/WindowsGuide/self-managed-AD.html) Microsoft Active Directory configuration for Amazon FSx for Windows File Server. By default, the runbook uses an AWS CloudFormation stack to create a temporary Windows Server Amazon EC2 Compute Service (Amazon EC2) instance on the Amazon FSx preferred subnet. The stack includes an EC2 instance profile and its associated AWS Identity and Access Management (IAM) role, and a security group with outbound access to HTTPS. The `FSxSecurityGroupId` is also associated to the EC2 instance. The automation then runs the [AmazonFSxADValidation](https://docs.aws.amazon.com/fsx/latest/WindowsGuide/samples/AmazonFSxADValidation.zip) tool on the target EC2 instance to validate your Microsoft Active Directory configuration against the required [prerequisites](https://docs.aws.amazon.com/fsx/latest/WindowsGuide/validate-ad-config.html). If you want to run the `AmazonFSxADValidation` script on an existing Amazon EC2 instance, provide the ID in the parameter `InstanceId`.\nAfter running the validation script, the automation deletes the AWS CloudFormation stack, however, you can optionally retain the resources indefinitely by setting the `RetainCloudFormationStack` parameter to `true`.\nThe optional IAM role created by the automation has the required AWS Systems Manager permissions to run the PowerShell RunCommands and to retrieve the secret specified in `SecretArn` from AWS Secrets Manager containing the FSx service account username and password that is used to validate the configuration. You can optionally specify an existing IAM EC2 instance profile for the temporary instance by using the `InstanceProfileName` parameter. The associated IAM role must contain the following permissions:\n> * (Required) `ec2:DescribeSubnets` and `ec2:DescribeVpcs` permissions and the Managed Policy `AmazonSSMManagedInstanceCore`.\n> * (Required) Permissions to get the Amazon FSx service account username and password from AWS Systems Manager by calling the `GetSecretValue` API.\n\n### Prerequisites:\n> * The subnet where the temporary EC2 instance is created (or the existing instance provided in the `InstanceId` parameter) must allow access to the AWS Systems Manager, AWS Secrets Manager, and Amazon S3 endpoints in order to run the `AmazonFSxADValidation` script using *Systems Manager Run Command*.\n\n### AWS Secrets Manager setup:\n\nThe validation script connects to the Microsoft Active Directory domain by retrieving the Amazon FSx service account username and password with a runtime call to AWS Secrets Manager. Follow the steps in [Create an AWS Secrets Manager secret](https://docs.aws.amazon.com/secretsmanager/latest/userguide/create_secret.html) to create a new AWS Secrets Manager secret. Make sure that the username and password are stored using a key/value pair in the format `{\"username\":\"EXAMPLE-USER\",\"password\":\"EXAMPLE-PASSWORD\"}\"`. Please refer to [Authentication and access control for AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access.html) for information about to secure access to secrets.\n\nFor more information about the tool refer to the `TROUBLESHOOTING.md` and `README.md` files in the [AmazonFSxADValidation](https://docs.aws.amazon.com/fsx/latest/WindowsGuide/samples/AmazonFSxADValidation.zip) file.\n\n### Important Security Notice:\n\nThe **AmazonFSxADValidation** tool retrieves sensitive information from your Microsoft Active Directory domain, including the names and IP addresses of domain controllers and DNS servers. To prevent unauthorized access and protect against misuse, it is essential that the outputs from this tool and your AWS Secrets Manager secret are secured and accessible only to authorized users in your AWS account. You can use the Amazon EC2 key pair (`InstanceKeyPairName`), the optionally recommended AWS KMS key (`InstanceEncryptionKeyId`), and the optionally recommended IAM instance profile (`InstanceProfileName`) to help prevent unauthorized access to the instance. Additionally, if you retain the AWS CloudFormation stack using the option `RetainCloudFormationStack`, ensure it is deleted after troubleshooting. For guidance on deleting an AWS CloudFormation stack, refer to [Deleting a stack on the AWS CloudFormation console](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html).",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "SecretArn": {
+      "type": "String",
+      "description": "(Required) The ARN of your AWS Secrets Manager secret containing the FSx service account username and password. Make sure that the username and password are stored using a key/value pair in the format `{\"username\":\"EXAMPLE-USER\",\"password\":\"EXAMPLE-PASSWORD\"}\"`.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):secretsmanager:[a-z0-9-]{2,20}:[0-9]{12}:secret:[a-zA-Z0-9]{1}[a-zA-Z0-9\\/_+=.@-]{1,256}$"
+    },
+    "BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The Amazon S3 bucket to upload the validation results to. Please make sure the bucket is configured with server-side encryption (SSE), and the bucket policy does not grant unnecessary read/write permissions to parties that do not need to access the logs. Also please make sure EC2 Windows instance has necessary access to the S3 Bucket."
+    },
+    "FSxSecurityGroupId": {
+      "type": "String",
+      "description": "(Required) The security group ID of the Amazon FSx for Windows File Server.",
+      "allowedPattern": "^sg-[a-z0-9]{8,17}$"
+    },
+    "RetainCloudFormationStack": {
+      "type": "Boolean",
+      "description": "(Optional) Set it to `true` if you want to retain the AWS CloudFormation Stack created by this runbook.",
+      "default": false
+    },
+    "FSxId": {
+      "type": "String",
+      "description": "(Optional) The Amazon FSx for Windows File Server ID. Required for getting the configuration of an existing Amazon FSx for Windows File Server. If this parameter is provided, the other Amazon FSx input parameters are ignored.",
+      "default": "",
+      "allowedPattern": "^$|(fs-[0-9a-f]{8,})$"
+    },
+    "TestServiceAccountPermissions": {
+      "type": "Boolean",
+      "description": "(Optional) Enable service account permission validation. This validation will create test Active Directory computer objects in the Microsoft Active Directory Organizational Unit. The resources are cleaned up by the script unless delete permissions are not properly configured on the provided service account in which case manual cleanup may be necessary.",
+      "default": true
+    },
+    "DomainName": {
+      "type": "String",
+      "description": "(Conditional) The fully qualified domain name of your self-managed Microsoft Active Directory domain. Required if the `FSxId` parameter is not specified.",
+      "default": "",
+      "allowedPattern": "^$|[a-zA-Z0-9\\\\_.@\\-+]{1,255}$"
+    },
+    "DnsIpAddresses": {
+      "type": "String",
+      "description": "(Conditional) A list of up to two DNS server or domain controller IP addresses in your self-managed AD domain. Required if the `FSxId` parameter is not specified. For up to two IPs, enter them separated by a comma.",
+      "default": "",
+      "allowedPattern": "^$|(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\,(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))?$"
+    },
+    "FSxPreferredSubnetId": {
+      "type": "String",
+      "description": "(Conditional) The Amazon FSx for Windows File Server preferred subnet. Amazon FSx serves traffic from this subnet except in the event of a failover to the secondary file server. Required if the `FSxId` parameter is not specified.",
+      "default": "",
+      "allowedPattern": "^$|subnet-[a-z0-9]{8,17}$"
+    },
+    "FSxSecondarySubnetId": {
+      "type": "String",
+      "description": "(Conditional) The Amazon FSx for Windows File Server secondary subnet. Amazon FSx serves traffic from this subnet except in the event of a failover to the secondary file server. Optional if the `FSxId` parameter is not specified.",
+      "default": "",
+      "allowedPattern": "^$|subnet-[a-z0-9]{8,17}$"
+    },
+    "FSxAdminsGroup": {
+      "type": "String",
+      "description": "(Conditional) The Amazon FSx for Windows File Server delegated file system administrators group. Optional if the `FSxId` parameter is not specified. By default, this is `Domain Admins`.",
+      "default": "Domain Admins",
+      "allowedPattern": "^$|^[a-zA-Z0-9\\_.@\\-+ ]{1,256}$"
+    },
+    "FSxOrganizationalUnit": {
+      "type": "String",
+      "description": "(Conditional) The Organizational Unit (OU) within which you want to join your file system. Provide the distinguished path name of the OU. Example: `OU=org,DC=example,DC=com`. Optional if the `FSxId` parameter is not specified.",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z0-9\\\\_.,@\\-+= ]{1,2000}$"
+    },
+    "InstanceKeyPairName": {
+      "type": "String",
+      "description": "(Conditional) An existing Amazon EC2 key pair you want to associate to the temporary Amazon EC2 instance. Optional when the `InstanceId` parameter is not specified.",
+      "allowedPattern": "^$|^[a-zA-Z0-9\\\\_.@\\-+]{1,100}$",
+      "default": ""
+    },
+    "InstanceEncryptionKeyId": {
+      "type": "String",
+      "description": "(Conditional) An existing AWS Key Management Service (AWS KMS) ID to encrypt the Amazon EC2 instance EBS volume. Optional when the `InstanceId` parameter is not specified.",
+      "allowedPattern": "^$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "default": ""
+    },
+    "InstanceProfileName": {
+      "type": "String",
+      "description": "(Conditional) The name of the IAM instance profile for the temporary Amazon EC2 instance. Optional when the `InstanceId` parameter is not specified.",
+      "default": "",
+      "allowedPattern": "^$|[\\w+=,.@-]{1,128}"
+    },
+    "InstanceType": {
+      "type": "String",
+      "description": "(Conditional) The instance type for the temporary Amazon EC2 instance. Optional when the `InstanceId` parameter is not specified.",
+      "default": "t3.small",
+      "allowedValues": [
+        "t2.micro",
+        "t2.small",
+        "t2.medium",
+        "t2.large",
+        "t3.micro",
+        "t3.small",
+        "t3.medium",
+        "t3.large"
+      ]
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Optional) The ID of an existing AWS Systems Manager managed Windows Server Amazon EC2 instance where you intend to run the validation script. The instance requires the [AWS Tools for PowerShell](https://docs.aws.amazon.com/powershell/) to be installed. **Caution**: The script will temporarily modify the DNS configuration of the instance, which may result in loss of network connectivity. To avoid disruptions, **do not use a production instance**. Ensure the selected instance is designated for testing purposes only. Please ensure that access to the contents of the instance's volume is not exposed to parties that do not need to access the logs.",
+      "default": ""
+    }
+  },
+  "variables": {
+    "TargetInstanceId": {
+      "type": "String",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckBucketPublicStatus",
+      "action": "aws:executeScript",
+      "description": "Checks if the target Amazon S3 bucket potentially grants **read** and/or **write** `public` access to its objects.",
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ BucketName }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.8",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "BucketLocation",
+          "Selector": "$.Payload.location",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort",
+      "isCritical": true,
+      "nextStep": "BranchOnInputParameters"
+    },
+    {
+      "name": "BranchOnInputParameters",
+      "action": "aws:branch",
+      "description": "Branches on the provided input parameters. You must provide the `FSxId` or valid values for `DomainName`, `DnsIpAddresses`, and `FSxPreferredSubnetId`.",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "Not": {
+              "Variable": "{{ FSxId }}",
+              "StringEquals": ""
+            },
+            "NextStep": "AssertFileSystemTypeIsWindows"
+          },
+          {
+            "And": [
+              {
+                "Not": {
+                  "Variable": "{{ DomainName }}",
+                  "StringEquals": ""
+                }
+              },
+              {
+                "Not": {
+                  "Variable": "{{ DnsIpAddresses }}",
+                  "StringEquals": ""
+                }
+              },
+              {
+                "Not": {
+                  "Variable": "{{ FSxPreferredSubnetId }}",
+                  "StringEquals": ""
+                }
+              }
+            ],
+            "NextStep": "GetValidationInputs"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AssertFileSystemTypeIsWindows",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Asserts the `FileSystemType` is Amazon FSx for Windows File Server (`WINDOWS`).",
+      "nextStep": "GetValidationInputs",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "fsx",
+        "Api": "DescribeFileSystems",
+        "FileSystemIds": [
+          "{{ FSxId }}"
+        ],
+        "PropertySelector": "$.FileSystems[0].FileSystemType",
+        "DesiredValues": [
+          "WINDOWS",
+          "Windows"
+        ]
+      }
+    },
+    {
+      "name": "GetValidationInputs",
+      "action": "aws:executeScript",
+      "description": "Returns the self-managed Microsoft Active Directory configuration required by the AWS CloudFormation template to create the EC2 instance. If the parameter `FSxId` was provided, describes the Amazon FSx for Windows File Server configuration by calling the `DescribeFileSystems` Amazon FSx API, else returns the configuration based on the runbook input parameters.",
+      "onFailure": "Abort",
+      "nextStep": "BranchOnInstanceId",
+      "inputs": {
+        "InputPayload": {
+          "FSxId": "{{ FSxId }}",
+          "InstanceId": "{{ InstanceId }}",
+          "ParamPreferredSubnetId": "{{ FSxPreferredSubnetId }}",
+          "ParamSecondarySubnetId": "{{ FSxSecondarySubnetId }}",
+          "ParamDnsIpAddresses": "{{ DnsIpAddresses }}",
+          "ParamDomainName": "{{ DomainName }}",
+          "ParamOrganizationalUnit": "{{ FSxOrganizationalUnit }}",
+          "ParamAdministratorsGroup": "{{ FSxAdminsGroup }}",
+          "InstanceKeyPairName": "{{ InstanceKeyPairName }}",
+          "TestServiceAccountPermissions": "{{ TestServiceAccountPermissions }}"
+        },
+        "Handler": "function_handler",
+        "Runtime": "python3.8",
+        "Attachment": "AmazonFSxADValidation.zip",
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\nec2_client = boto3.client(\"ec2\")\nfsx_client = boto3.client(\"fsx\")\n\n\nclass FileSystemDetails:\n    def __init__(\n        self, fsx_id, preferred_subnet_id, vpc_id, dns_ips, subnet_ids, domain_name, organizational_unit, admins_group\n    ):\n        self.fsx_id = fsx_id\n        self.preferred_subnet_id = preferred_subnet_id\n        self.vpc_id = vpc_id\n        self.dns_ips = dns_ips\n        self.subnet_ids = subnet_ids\n        self.domain_name = domain_name\n        self.organizational_unit = organizational_unit\n        self.admins_group = admins_group\n\n\ndef check_key_pair_exists(key_pair_name):\n    try:\n        ec2_client.describe_key_pairs(KeyNames=[key_pair_name])\n    except Exception as e:\n        raise RuntimeError(\n            f\"An error occurred when trying to describe the key pair {key_pair_name}: {str(e)}\"\n        ) from None\n\n\ndef describe_fsx_file_systems(fsx_id):\n    try:\n        response = fsx_client.describe_file_systems(FileSystemIds=[fsx_id])\n\n        if \"FileSystems\" not in response or not response[\"FileSystems\"]:\n            raise RuntimeError(f\"No file system found with id {fsx_id}\")\n\n        file_system = response[\"FileSystems\"][0]\n\n        if file_system[\"FileSystemType\"] != \"WINDOWS\":\n            raise ValueError(f\"File system {fsx_id} is not a Windows file system\")\n\n        windows_configuration = file_system.get(\"WindowsConfiguration\", {})\n\n        if \"SelfManagedActiveDirectoryConfiguration\" not in windows_configuration:\n            raise ValueError(f\"File system {fsx_id} is not configured for self-managed Active Directory.\")\n\n        self_managed_ad_configuration = windows_configuration[\"SelfManagedActiveDirectoryConfiguration\"]\n\n        params = dict(\n            fsx_id=fsx_id,\n            preferred_subnet_id=windows_configuration[\"PreferredSubnetId\"],\n            vpc_id=file_system[\"VpcId\"],\n            dns_ips=self_managed_ad_configuration[\"DnsIps\"],\n            subnet_ids=file_system[\"SubnetIds\"],\n            domain_name=self_managed_ad_configuration[\"DomainName\"],\n            organizational_unit=self_managed_ad_configuration.get(\"OrganizationalUnitDistinguishedName\", \"\"),\n            admins_group=self_managed_ad_configuration.get(\"FileSystemAdministratorsGroup\", \"\"),\n        )\n        return FileSystemDetails(**params)\n    except Exception as e:\n        raise RuntimeError(f\"An error occurred when trying to describe the file system: {str(e)}.\") from None\n\n\ndef function_handler(events, context):\n    # Get input parameters\n    fsx_id = events[\"FSxId\"]\n    key_pair_name = events[\"InstanceKeyPairName\"]\n    instance_id = events[\"InstanceId\"]\n    test_service_account_permissions = events[\"TestServiceAccountPermissions\"]\n\n    if not instance_id:\n        if key_pair_name:\n            check_key_pair_exists(key_pair_name)\n\n    try:\n        if fsx_id:\n            file_system = describe_fsx_file_systems(fsx_id)\n\n            subnet_1, subnet_2 = (file_system.subnet_ids + [\"\", \"\"])[:2]\n            preferred_subnet = subnet_1 if file_system.preferred_subnet_id == subnet_1 else subnet_2\n            target_vpc = file_system.vpc_id\n            dns_ip_1, dns_ip_2 = (file_system.dns_ips + [\"\", \"\"])[:2]\n            domain_name = file_system.domain_name\n            organizational_unit = file_system.organizational_unit\n            admins_group = file_system.admins_group\n        else:\n            subnet_1 = events[\"ParamPreferredSubnetId\"]\n            subnet_2 = events[\"ParamSecondarySubnetId\"]\n            preferred_subnet = events[\"ParamPreferredSubnetId\"]\n\n            try:\n                subnet_for_vpc = subnet_1\n                target_vpc = ec2_client.describe_subnets(SubnetIds=[subnet_for_vpc])[\"Subnets\"][0][\"VpcId\"]\n                subnet_for_vpc = subnet_2\n                ec2_client.describe_subnets(SubnetIds=[subnet_for_vpc])[\"Subnets\"][0][\"VpcId\"]\n            except Exception as e:\n                raise ValueError(f\"An error occurred when trying to get the VPC ID for {subnet_for_vpc}: {str(e)}\")\n\n            dns_ip_1, dns_ip_2 = ([x.strip() for x in events[\"ParamDnsIpAddresses\"].split(\",\")] + [\"\", \"\"])[:2]\n            domain_name = events[\"ParamDomainName\"]\n            organizational_unit = events[\"ParamOrganizationalUnit\"]\n            admins_group = events[\"ParamAdministratorsGroup\"]\n\n    except Exception as e:\n        raise ValueError(f\"An error occurred when returning the input parameters: {str(e)}\") from None\n\n    return {\n        \"PreferredSubnetId\": preferred_subnet,\n        \"VpcId\": target_vpc,\n        \"Subnet1\": subnet_1,\n        \"Subnet2\": subnet_2,\n        \"DnsIp1\": dns_ip_1,\n        \"DnsIp2\": dns_ip_2,\n        \"DomainName\": domain_name,\n        \"OrganizationalUnit\": organizational_unit,\n        \"AdministratorsGroup\": admins_group,\n        \"TestServiceAccountPermissions\": str(test_service_account_permissions),\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "PreferredSubnetId",
+          "Selector": "$.Payload.PreferredSubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Payload.VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "Subnet1",
+          "Selector": "$.Payload.Subnet1",
+          "Type": "String"
+        },
+        {
+          "Name": "Subnet2",
+          "Selector": "$.Payload.Subnet2",
+          "Type": "String"
+        },
+        {
+          "Name": "DnsIp1",
+          "Selector": "$.Payload.DnsIp1",
+          "Type": "String"
+        },
+        {
+          "Name": "DnsIp2",
+          "Selector": "$.Payload.DnsIp2",
+          "Type": "String"
+        },
+        {
+          "Name": "DomainName",
+          "Selector": "$.Payload.DomainName",
+          "Type": "String"
+        },
+        {
+          "Name": "OrganizationalUnit",
+          "Selector": "$.Payload.OrganizationalUnit",
+          "Type": "String"
+        },
+        {
+          "Name": "AdministratorsGroup",
+          "Selector": "$.Payload.AdministratorsGroup",
+          "Type": "String"
+        },
+        {
+          "Name": "TestServiceAccountPermissions",
+          "Selector": "$.Payload.TestServiceAccountPermissions",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnInstanceId",
+      "action": "aws:branch",
+      "description": "Branches on the provided input `InstanceId`. If `InstanceId` is provided, the validation script runs on the target EC2 instance.",
+      "nextStep": "UpdateTargetInstanceId",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ InstanceId }}",
+            "StringEquals": "",
+            "NextStep": "CreateEC2InstanceStack"
+          }
+        ],
+        "Default": "UpdateTargetInstanceId"
+      }
+    },
+    {
+      "name": "UpdateTargetInstanceId",
+      "action": "aws:updateVariable",
+      "description": "Updates the `TargetInstanceId` variable from the input `InstanceId`.",
+      "nextStep": "WaitForEC2InstanceToBeManaged",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:TargetInstanceId",
+        "Value": "{{ InstanceId }}"
+      }
+    },
+    {
+      "name": "CreateEC2InstanceStack",
+      "action": "aws:createStack",
+      "description": "Creates the Amazon EC2 instance in the preferred subnet using AWS CloudFormation where the *AmazonFSxADValidation* tool will be executed.",
+      "nextStep": "WaitForStackCreation",
+      "onFailure": "step:DescribeErrorsFromStackEvents",
+      "inputs": {
+        "StackName": "AWSSupport-ValidateFSxWindowsADConfig-{{ automation:EXECUTION_ID }}",
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nDescription: Creates a security group, IAM instance profile, and EC2 instance for AWSSupport-ValidateFSxWindowsADConfig\nParameters:\n  FSxPreferredSubnetId:\n    Type: AWS::EC2::Subnet::Id\n    Description: The FSx preferred subnet\n  VPCId:\n    Type: String\n    Description: FSx VPC ID\n  FSxSecurityGroup:\n    Type: AWS::EC2::SecurityGroup::Id\n    Description: FSx security group ID\n  InstanceKeyPairName:\n    Type: String\n    Description: The existing key pair name for the instance\n    Default: ''\n  LatestWindowsAmiId:\n    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>\n    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base\n    Description: Public AWS Systems Manager parameter for the latest Windows Server 2019 AMI\n  AutomationExecutionId:\n    Type: String\n    Description: Current Automation execution ID\n  InstanceProfile:\n    Type: String\n    Description: Get the Instance Profile if provided\n    Default: ''\n  InstanceType:\n    Type: String\n    Description: The Amazon EC2 instance type\n  SecretArn:\n    Type: String\n    Description: The AWS Secrets Manager secret ARN for the FSx service account\n  InstanceEncryptionKeyId:\n    Type: String\n    Description: KMS Key ID for EBS encryption. Leave blank to use the default AWS-managed encryption key\n    Default: ''\nConditions:\n  CreateIAMRole: !Equals\n    - !Ref InstanceProfile\n    - ''\n  UseCustomKMSKey: !Not [!Equals [!Ref InstanceEncryptionKeyId, '']]\n  UseCustomKeyPair: !Not [!Equals [!Ref InstanceKeyPairName, '']]\nResources:\n  InstanceLaunchTemplate:\n    Type: AWS::EC2::LaunchTemplate\n    Properties:\n      LaunchTemplateData:\n        MetadataOptions:\n          HttpEndpoint: enabled\n          HttpTokens: required\n          HttpPutResponseHopLimit: 1\n      TagSpecifications:\n        - ResourceType: launch-template\n          Tags:\n            - Key: Name\n              Value: !Sub AWSSupport-ValidateFSxWindowsADConfig-${AutomationExecutionId}\n            - Key: CreatedBy\n              Value: AWSSupport-ValidateFSxWindowsADConfig\n  EC2InstanceIAMRole:\n    Type: AWS::IAM::Role\n    Condition: CreateIAMRole\n    Properties:\n      RoleName: !Sub ValidateFSxWindowsADConfig-${AutomationExecutionId}\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: ec2.amazonaws.com\n            Action:\n              - sts:AssumeRole\n      Path: /\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ReadOnlyAccess'\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'\n      Policies:\n        - PolicyDocument:\n            Version: '2012-10-17'\n            Statement:\n              - Effect: Allow\n                Action:\n                  - secretsmanager:GetSecretValue\n                Resource:\n                  - !Ref SecretArn\n          PolicyName: GetSecretPolicy\n  EC2InstanceProfile:\n    Type: AWS::IAM::InstanceProfile\n    Condition: CreateIAMRole\n    Properties:\n      InstanceProfileName: !Sub ValidateFSxWindowsADConfig-${AutomationExecutionId}\n      Path: /\n      Roles:\n        - !Ref EC2InstanceIAMRole\n  EC2InstanceSecurityGroup:\n    Type: AWS::EC2::SecurityGroup\n    Properties:\n      GroupDescription: Security group to allow TCP outbound access on port 443 (HTTPS).\n      VpcId: !Ref VPCId\n      SecurityGroupEgress:\n        - CidrIp: 0.0.0.0/0\n          IpProtocol: tcp\n          FromPort: 443\n          ToPort: 443\n      Tags:\n        - Key: Name\n          Value: !Sub AWSSupport-ValidateFSxWindowsADConfig-${AutomationExecutionId}\n        - Key: CreatedBy\n          Value: AWSSupport-ValidateFSxWindowsADConfig\n  EC2Instance:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: !Ref InstanceType\n      KeyName: !If [UseCustomKeyPair, !Ref InstanceKeyPairName, !Ref 'AWS::NoValue']\n      ImageId: !Ref LatestWindowsAmiId\n      LaunchTemplate:\n        LaunchTemplateId: !Ref InstanceLaunchTemplate\n        Version: !GetAtt InstanceLaunchTemplate.LatestVersionNumber\n      BlockDeviceMappings:\n        - DeviceName: /dev/sda1\n          Ebs:\n            VolumeSize: 30\n            DeleteOnTermination: true\n            Encrypted: true\n            KmsKeyId: !If [UseCustomKMSKey, !Ref InstanceEncryptionKeyId, !Ref 'AWS::NoValue']\n      Monitoring: true\n      NetworkInterfaces:\n        - DeviceIndex: '0'\n          GroupSet:\n            - !Ref FSxSecurityGroup\n            - !Ref EC2InstanceSecurityGroup\n          SubnetId: !Ref FSxPreferredSubnetId\n      IamInstanceProfile: !If\n        - CreateIAMRole\n        - !Ref EC2InstanceProfile\n        - !Ref InstanceProfile\n      PropagateTagsToVolumeOnCreation: true\n      Tags:\n        - Key: Name\n          Value: !Sub AWSSupport-ValidateFSxWindowsADConfig-${AutomationExecutionId}\n        - Key: CreatedBy\n          Value: AWSSupport-ValidateFSxWindowsADConfig\nOutputs:\n  InstanceId:\n    Description: EC2 instance ID\n    Value: !Ref EC2Instance",
+        "TimeoutInMinutes": 20,
+        "OnFailure": "DELETE",
+        "ClientRequestToken": "AWSSupport-ValidateFSxWindowsADConfig-{{ automation:EXECUTION_ID }}",
+        "Parameters": [
+          {
+            "ParameterKey": "FSxPreferredSubnetId",
+            "ParameterValue": "{{ GetValidationInputs.PreferredSubnetId }}"
+          },
+          {
+            "ParameterKey": "InstanceKeyPairName",
+            "ParameterValue": "{{ InstanceKeyPairName }}"
+          },
+          {
+            "ParameterKey": "VPCId",
+            "ParameterValue": "{{ GetValidationInputs.VpcId }}"
+          },
+          {
+            "ParameterKey": "FSxSecurityGroup",
+            "ParameterValue": "{{ FSxSecurityGroupId }}"
+          },
+          {
+            "ParameterKey": "AutomationExecutionId",
+            "ParameterValue": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "InstanceProfile",
+            "ParameterValue": "{{ InstanceProfileName }}"
+          },
+          {
+            "ParameterKey": "InstanceType",
+            "ParameterValue": "{{ InstanceType }}"
+          },
+          {
+            "ParameterKey": "SecretArn",
+            "ParameterValue": "{{ SecretArn }}"
+          },
+          {
+            "ParameterKey": "InstanceEncryptionKeyId",
+            "ParameterValue": "{{ InstanceEncryptionKeyId }}"
+          }
+        ],
+        "Capabilities": [
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-ValidateFSxWindowsADConfig-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-ValidateFSxWindowsADConfig",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "CreatedBy",
+            "Value": "AWSSupport-ValidateFSxWindowsADConfig"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CloudFormationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitForStackCreation",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the CloudFormation stack to complete.",
+      "nextStep": "DescribeStackResources",
+      "onFailure": "step:DescribeErrorsFromStackEvents",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ CreateEC2InstanceStack.CloudFormationStackId }}",
+        "PropertySelector": "$.Stacks[0].StackStatus",
+        "DesiredValues": [
+          "UPDATE_COMPLETE",
+          "CREATE_COMPLETE"
+        ]
+      }
+    },
+    {
+      "name": "DescribeStackResources",
+      "action": "aws:executeAwsApi",
+      "description": "Describes the CloudFormation stack to get the temporary EC2 instance ID.",
+      "nextStep": "UpdateTargetInstanceIdFromStackResources",
+      "onFailure": "step:BranchOnRetainCloudFormationStack",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ CreateEC2InstanceStack.CloudFormationStackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Stacks[0].Outputs[0].OutputValue",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "UpdateTargetInstanceIdFromStackResources",
+      "action": "aws:updateVariable",
+      "description": "Updates the `TargetInstanceId` variable from the output of the step `DescribeStackResources`.",
+      "nextStep": "WaitForEC2InstanceToBeManaged",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:TargetInstanceId",
+        "Value": "{{ DescribeStackResources.InstanceId }}"
+      }
+    },
+    {
+      "name": "WaitForEC2InstanceToBeManaged",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 600,
+      "onFailure": "step:BranchOnRetainCloudFormationStack",
+      "nextStep": "DescribeInstanceIdAndSubnet",
+      "description": "Waits until the EC2 instance is managed by AWS Systems Manager in order to run the validation script using AWS Systems Manager Run Command.",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ variable:TargetInstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      }
+    },
+    {
+      "name": "DescribeInstanceIdAndSubnet",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 600,
+      "onFailure": "step:BranchOnRetainCloudFormationStack",
+      "nextStep": "GetAmazonFSxADValidationAttachment",
+      "description": "Gets the ID and subnet ID of the EC2 instance used to run the validation tool.",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ variable:TargetInstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Reservations[0].Instances[0].InstanceId",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.InstanceInformationList[0].SubnetId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetAmazonFSxADValidationAttachment",
+      "description": "Gets the *AmazonFSxADValidation* tool URL from the runbook attachments.",
+      "onFailure": "step:BranchOnRetainCloudFormationStack",
+      "action": "aws:executeAwsApi",
+      "nextStep": "RunValidationScript",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetDocument",
+        "Name": "AWSSupport-ValidateFSxWindowsADConfig"
+      },
+      "outputs": [
+        {
+          "Name": "URL",
+          "Selector": "$.AttachmentsContent[0].Url",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "RunValidationScript",
+      "action": "aws:runCommand",
+      "description": "Runs the *AmazonFSxADValidation* tool on the temporary EC2 instance and stores the result in the Amazon S3 bucket specified in the `BucketName` parameter.",
+      "onFailure": "step:BranchOnRetainCloudFormationStack",
+      "isCritical": true,
+      "timeoutSeconds": 1800,
+      "nextStep": "BranchOnRetainCloudFormationStack",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ variable:TargetInstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License http://aws.amazon.com/asl/",
+            "",
+            "$ErrorActionPreference = \"Stop\"",
+            "$ScriptName = \"AmazonFSxADValidation\"",
+            "$ZipFileName = \"$ScriptName.zip\"",
+            "$ProgramDataPath = \"$env:ProgramData\\Amazon\"",
+            "$WorkingDirectoryPath = \"$ProgramDataPath\\$ScriptName\"",
+            "$ExecutionId = \"{{ automation:EXECUTION_ID }}\"",
+            "$OutputDirectoryPath = \"$WorkingDirectoryPath\\$ExecutionId\"",
+            "$FailuresFileName = \"failures.txt\"",
+            "$WarningsFileName = \"warnings.txt\"",
+            "$LogFileName = \"log.txt\"",
+            "$OutputFileName = \"output.txt\"",
+            "",
+            "$AttachmentURL = \"{{ GetAmazonFSxADValidationAttachment.URL }}\"",
+            "$PreferredSubnetId = \"{{ GetValidationInputs.PreferredSubnetId }}\"",
+            "$InputSubnet1 = \"{{ GetValidationInputs.Subnet1 }}\"",
+            "$InputSubnet2 = \"{{ GetValidationInputs.Subnet2 }}\"",
+            "$InputDnsIp1 = \"{{ GetValidationInputs.DnsIp1 }}\"",
+            "$InputDnsIp2 = \"{{ GetValidationInputs.DnsIp2 }}\"",
+            "$InputDomainName = \"{{ GetValidationInputs.DomainName }}\"",
+            "$InputOrganizationalUnit = \"{{ GetValidationInputs.OrganizationalUnit }}\"",
+            "$InputAdministratorsGroup = \"{{ GetValidationInputs.AdministratorsGroup }}\"",
+            "$InputSecretArn = \"{{ SecretArn }}\"",
+            "$TestServiceAccountPermissions = \"{{ GetValidationInputs.TestServiceAccountPermissions }}\"",
+            "$BucketName = \"{{ BucketName }}\"",
+            "",
+            "# Test the path and remove it if it exists",
+            "if (Test-Path -Path $WorkingDirectoryPath) {",
+            "    Remove-Item $WorkingDirectoryPath -Force -Recurse -ErrorAction SilentlyContinue",
+            "}",
+            "",
+            "$WorkingDirectory = New-Item -ItemType Directory -Path $ProgramDataPath -Name $ScriptName -Force",
+            "$OutputDirectory = New-Item -ItemType Directory -Path $WorkingDirectoryPath -Name $ExecutionId -Force",
+            "",
+            "# Function to download the FSx Validation script and expand the archive",
+            "function Get-Script {",
+            "    param(",
+            "        [Parameter(Mandatory = $true)]",
+            "        [string]$S3Url",
+            "    )",
+            "",
+            "    # Download the script to the folder",
+            "    try {",
+            "        Invoke-WebRequest -Uri $S3Url -OutFile \"$WorkingDirectory\\$ZipFileName\" -ErrorAction $ErrorActionPreference -UseBasicParsing | Out-Null",
+            "    } catch {",
+            "        Write-Output \"An error occurred downloading the AmazonFSxADValidation tool: $($_.Exception.Message)\"",
+            "        Exit 1",
+            "    }",
+            "",
+            "    # Expand the Archive",
+            "    try {",
+            "        Start-Sleep 3",
+            "        Set-Location $WorkingDirectory",
+            "        Expand-Archive -Path $ZipFileName -DestinationPath $WorkingDirectory -Force -ErrorAction $ErrorActionPreference | Out-Null",
+            "        Write-Output \"AmazonFSxADValidation tool downloaded and extracted successfully.\"",
+            "    } catch {",
+            "        Write-Output \"An error occurred while expanding the ZIP file: $($_.Exception.Message)\"",
+            "        Exit 1",
+            "    }",
+            "}",
+            "",
+            "# Function to install the RSAT for AD PowerShell feature",
+            "function Install-RSAT-AD-PowerShellFeature {",
+            "    $FeatureName = \"RSAT-AD-PowerShell\"",
+            "",
+            "    try {",
+            "        # Check if RSAT is already installed",
+            "        $RSATState = Get-WindowsFeature -Name $FeatureName",
+            "        if (-not $RSATState.Installed) {",
+            "            Install-WindowsFeature -Name $FeatureName -ErrorAction $ErrorActionPreference | Out-Null",
+            "            Write-Output \"RSAT-AD-PowerShell installed successfully.\"",
+            "        } else {",
+            "            Write-Output \"RSAT-AD-PowerShell tools already installed.\"",
+            "        }",
+            "    } catch {",
+            "        Write-Output \"An error occurred while installing RSAT-AD-PowerShell: $($_.Exception.Message)\"",
+            "        Exit 1",
+            "    }",
+            "}",
+            "",
+            "# Function to run the validation script with the required parameters",
+            "function Invoke-FSx-ValidateScript {",
+            "    param(",
+            "        [Parameter(Mandatory = $true)]",
+            "        [ValidateNotNullOrEmpty()]",
+            "        [string]$DomainName,",
+            "",
+            "        [Parameter(Mandatory = $true)]",
+            "        [ValidateNotNullOrEmpty()]",
+            "        [string]$DnsIp1,",
+            "",
+            "        [Parameter(Mandatory = $false)]",
+            "        [string]$DnsIp2,",
+            "",
+            "        [Parameter(Mandatory = $true)]",
+            "        [ValidateNotNullOrEmpty()]",
+            "        [string]$FSxSubnet1,",
+            "",
+            "        [Parameter(Mandatory = $false)]",
+            "        [string]$FSxSubnet2,",
+            "",
+            "        [Parameter(Mandatory = $false)]",
+            "        [string]$FSxAdminGroup,",
+            "",
+            "        [Parameter(Mandatory = $false)]",
+            "        [string]$FSxOU,",
+            "",
+            "        [Parameter(Mandatory = $true)]",
+            "        [ValidateNotNullOrEmpty()]",
+            "        [string]$SecretArn",
+            "    )",
+            "",
+            "    # Retrieve the FSx credentials from Secrets Manager and convert to secure string",
+            "    try {",
+            "        $Password = (ConvertFrom-Json -InputObject (Get-SECSecretValue -SecretId $SecretArn).SecretString).password | ConvertTo-SecureString -AsPlainText -Force",
+            "        $Username = (ConvertFrom-Json -InputObject (Get-SECSecretValue -SecretId $SecretArn).SecretString).username",
+            "    } catch {",
+            "        throw \"An error occurred while retrieving the service account credentials: $($_.Exception.Message)\"",
+            "    }",
+            "",
+            "    $FSxCredential = New-Object System.Management.Automation.PSCredential($Username, $Password)",
+            "",
+            "    # FSx validation script parameters",
+            "    $FSxADValidationArgs = @{",
+            "        DomainDNSRoot = $DomainName",
+            "        DnsIpAddresses = @($DnsIp1)",
+            "        SubnetIds = @($FSxSubnet1)",
+            "        TestServiceAccountPermissions = [bool]$TestServiceAccountPermissions",
+            "        Credential = $FSxCredential",
+            "        TranscriptDirectory = $OutputDirectory",
+            "    }",
+            "",
+            "    # If two subnets/DNS IPs are provided, update the input hash table",
+            "    if ($FSxSubnet2) {",
+            "        $FSxADValidationArgs.SubnetIds += $FSxSubnet2",
+            "    }",
+            "    if ($DnsIp2) {",
+            "        $FSxADValidationArgs.DnsIpAddresses += $DnsIp2",
+            "    }",
+            "",
+            "    # Add FSx admin group and OU if provided as input",
+            "    if ($FSxAdminGroup) {",
+            "        $FSxADValidationArgs.AdminGroup = $FSxAdminGroup",
+            "    }",
+            "    if ($FSxOU) {",
+            "        $FSxADValidationArgs.OrganizationalUnit = $FSxOU",
+            "    }",
+            "",
+            "    # Run the validation script",
+            "    try {",
+            "        Set-Location \"$WorkingDirectory\"",
+            "        Write-Output \"Importing ActiveDirectory module\"",
+            "        Import-Module ActiveDirectory -WarningAction SilentlyContinue",
+            "        Write-Output \"Importing AWSPowerShell module\"",
+            "        Import-Module AWSPowerShell -WarningAction SilentlyContinue",
+            "        Write-Output \"Importing AmazonFSxADValidation module\"",
+            "        Import-Module .\\AmazonFSxADValidation.psm1",
+            "        # Test DNS Server Network Connectivity",
+            "        Write-Output \"Running Test-FSxADConfiguration to check DNS connectivity on $DnsIp1.\"",
+            "        $TestDnsResult = Test-FSxADDnsConnection -ADDnsIp $DnsIp1",
+            "        if ($TestDnsResult.FailedTcpPorts) {",
+            "            throw \"Connectivity to DNS server failed for $DnsIp1. Verify security group and firewall settings on both client and DNS server.\"",
+            "        }",
+            "",
+            "        # Set the DNS to customer provided DNS",
+            "        Update-DNS -DnsIp1 $DnsIp1 -DnsIp2 $DnsIp2",
+            "        Write-Output \"Running Test-FSxADConfiguration with parameters:\"",
+            "        foreach ($key in $FSxADValidationArgs.Keys) {",
+            "            $value = $FSxADValidationArgs[$key]",
+            "            # Handling specific types of values for better readability",
+            "            if ($value -is [System.Management.Automation.PSCredential]) {",
+            "                Write-Output \"$key`: Username: $Username, Password: *********\"",
+            "            } elseif ($value -is [array]) {",
+            "                # Join array elements for display",
+            "                $arrayDisplay = ($value -join \", \")",
+            "                Write-Output \"$key`: $arrayDisplay\"",
+            "            } else {",
+            "                Write-Output \"$key`: $value\"",
+            "            }",
+            "        }",
+            "",
+            "        $Result = Test-FSxADConfiguration @FSxADValidationArgs",
+            "        return $Result",
+            "",
+            "    } catch {",
+            "        throw \"An error occurred while running the AmazonFSxADValidation script: $($_.Exception.Message)\"",
+            "    }",
+            "}",
+            "",
+            "# Function to update the DNS IP to the customer provided FSx DNS",
+            "function Update-DNS {",
+            "    param(",
+            "        [Parameter(Mandatory = $true)]",
+            "        [string]$DnsIp1,",
+            "",
+            "        [Parameter(Mandatory = $false)]",
+            "        [string]$DnsIp2",
+            "    )",
+            "",
+            "    # Get the interface index of the network card and update the DNS IP",
+            "    try {",
+            "        $InterfaceIndex = (Get-NetAdapter).InterfaceIndex",
+            "        Set-DnsClientServerAddress -InterfaceIndex $InterfaceIndex -ServerAddresses @($DnsIp1, $DnsIp2) -ErrorAction $ErrorActionPreference",
+            "        Write-Output \"The local DNS has been updated successfully to $DnsIp1 $DnsIp2\"",
+            "    } catch {",
+            "        Write-Output \"An error occurred while setting the local DNS server to $DnsIp1 $DnsIp2`: $($_.Exception.Message)\"",
+            "        throw $Message",
+            "    }",
+            "}",
+            "",
+            "function Reset-DNS {",
+            "    # Reset the DNS to use DHCP",
+            "    try {",
+            "        $InterfaceIndex = (Get-NetAdapter).InterfaceIndex",
+            "        Set-DnsClientServerAddress -InterfaceIndex $InterfaceIndex -ResetServerAddresses -ErrorAction $ErrorActionPreference",
+            "        Write-Output \"The local DNS configuration has been reset successfully.\"",
+            "    } catch {",
+            "        Write-Output \"An error occurred while resetting the DNS server: $($_.Exception.Message)\"",
+            "        exit 1",
+            "    }",
+            "}",
+            "",
+            "function Upload-FolderToS3 {",
+            "    param(",
+            "        [Parameter(Mandatory=$true)]",
+            "        [string]$BucketName,",
+            "",
+            "        [string]$Prefix = \"\",",
+            "",
+            "        [Parameter(Mandatory=$true)]",
+            "        [string]$FolderPath",
+            "    )",
+            "",
+            "    try {",
+            "        if (-not (Test-Path $FolderPath -PathType Container)) {",
+            "            throw \"Folder '$FolderPath' does not exist or is not accessible.\"",
+            "        }",
+            "",
+            "        $files = Get-ChildItem -Path $FolderPath -File -Recurse",
+            "",
+            "        foreach ($file in $files) {",
+            "            $key = if (-not [string]::IsNullOrEmpty($Prefix)) {",
+            "                $Prefix + \"/\" + $file.Name",
+            "            } else {",
+            "                $file.Name",
+            "            }",
+            "",
+            "            Write-S3Object -BucketName $BucketName -Key $key -File $file.FullName",
+            "        }",
+            "    }",
+            "    catch {",
+            "        Write-Output \"An error occurred when uploading the folder to the bucket: $_\"",
+            "    }",
+            "}",
+            "",
+            "function CleanUpFolder {",
+            "    if (Test-Path -Path $logDir) {",
+            "        Remove-Item -Recurse -Force $logDir -ErrorAction Ignore",
+            "    } else {",
+            "        Write-Host \"Log directory: $logDir does not exist. Skipping cleanup.\"",
+            "    }",
+            "}",
+            "",
+            "# Call the function to download the script and expand the archive",
+            "Get-Script -S3Url $AttachmentURL",
+            "",
+            "# Install the RSAT AD PowerShell feature",
+            "Install-RSAT-AD-PowerShellFeature",
+            "",
+            "$LogFile = Join-Path -Path $OutputDirectory -ChildPath \"$LogFileName\"",
+            "$OutputFile = Join-Path -Path $OutputDirectory -ChildPath \"$OutputFileName\"",
+            "$FailuresFile = Join-Path -Path $OutputDirectory -ChildPath \"$FailuresFileName\"",
+            "$WarningsFile = Join-Path -Path $OutputDirectory -ChildPath \"$WarningsFileName\"",
+            "",
+            "$TroubleshootingFile = Join-Path -Path \"$WorkingDirectory\" -ChildPath \"$ScriptName\\TROUBLESHOOTING.md\"",
+            "$ReadmeFile = Join-Path -Path \"$WorkingDirectory\" -ChildPath \"$ScriptName\\README.md\"",
+            "",
+            "# Override Write-Host, Write-Error, and Write-Warning to avoid sending the Test-FSxADConfiguration output to the console",
+            "function Write-Host {",
+            "    [CmdletBinding()]",
+            "    param(",
+            "        [Parameter(Mandatory = $false, ValueFromRemainingArguments = $true, ValueFromPipeline = $true)]",
+            "        [string[]]$Message = @(\"No message provided\")",
+            "    )",
+            "    $OutputMessage = \"[Info] \" + $Message -join ' '",
+            "    $OutputMessage | Out-File -Append -FilePath $LogFile",
+            "}",
+            "",
+            "function Write-Warning {",
+            "    [CmdletBinding()]",
+            "    param(",
+            "        [Parameter(Mandatory = $false, ValueFromRemainingArguments = $true, ValueFromPipeline = $true)]",
+            "        [string[]]$Message = @(\"No error message provided\")",
+            "    )",
+            "    $OutputMessage = \"[Warning] \" + $Message -join ' '",
+            "    $OutputMessage | Out-File -Append -FilePath $LogFile",
+            "}",
+            "",
+            "function Write-Error {",
+            "    [CmdletBinding()]",
+            "    param(",
+            "        [Parameter(Mandatory = $false, ValueFromRemainingArguments = $true, ValueFromPipeline = $true)]",
+            "        [string[]]$Message = @(\"No warning message provided\")",
+            "    )",
+            "    $OutputMessage = \"[Error] \" + $Message -join ' '",
+            "    $OutputMessage | Out-File -Append -FilePath $LogFile",
+            "}",
+            "",
+            "try {",
+            "    Write-Output \"`nRunning Test-FSxADConfiguration with parameters:\"",
+            "    Write-Output \"DomainDNSRoot`: $InputDomainName\"",
+            "    Write-Output \"DnsIpAddresses`: $InputDnsIp1 $InputDnsIp2\"",
+            "    Write-Output \"SubnetIds`: $InputSubnet1 $InputSubnet2\"",
+            "    Write-Output \"TestServiceAccountPermissions`: $TestServiceAccountPermissions\"",
+            "    Write-Output \"TranscriptDirectory`: $OutputDirectory\"",
+            "    Write-Output \"AdminGroup`: $InputAdministratorsGroup\"",
+            "    Write-Output \"OrganizationalUnit`: $InputOrganizationalUnit`n\"",
+            "",
+            "    $ValidateScriptOutput = Invoke-FSx-ValidateScript -DomainName $InputDomainName -DnsIp1 $InputDnsIp1 -DnsIp2 $InputDnsIp2 -FSxSubnet1 $InputSubnet1 -FSxSubnet2 $InputSubnet2 -FSxAdminGroup $InputAdministratorsGroup -FSxOU $InputOrganizationalUnit -SecretArn $InputSecretArn",
+            "    $ValidateScriptOutput | Out-File -Append -FilePath $OutputFile",
+            "    $ShowHelpMessage = $false",
+            "",
+            "    Write-Output (\"=\" * 110)",
+            "    Write-Output \"The validation details and logs can be found in the bucket $BucketName.\"",
+            "    Write-Output \"\"",
+            "    if ($ValidateScriptOutput.Failures -and $ValidateScriptOutput.Failures.Count -gt 0) {",
+            "        Write-Output \"ERRORS: $($ValidateScriptOutput.Failures.Count)\"",
+            "        $ShowHelpMessage = $true",
+            "        $ValidateScriptOutput.Failures.Keys | Out-File -Append -FilePath $FailuresFile",
+            "        foreach ($IssueFound in $ValidateScriptOutput.Failures.Keys) {",
+            "            Write-Output \"- $IssueFound\"",
+            "        }",
+            "    } else {",
+            "        Write-Output \"ERRORS: 0\"",
+            "        \"\" | Out-File -Append -FilePath $FailuresFile",
+            "    }",
+            "    Write-Output \"\"",
+            "    if ($ValidateScriptOutput.Warnings -and $ValidateScriptOutput.Warnings.Count -gt 0) {",
+            "        Write-Output \"WARNINGS: $($ValidateScriptOutput.Warnings.Count)\"",
+            "        $ShowHelpMessage = $true",
+            "        $ValidateScriptOutput.Warnings.Keys | Out-File -Append -FilePath $WarningsFile",
+            "        foreach ($IssueFound in $ValidateScriptOutput.Warnings.Keys) {",
+            "            Write-Output \"- $IssueFound\"",
+            "        }",
+            "    } else {",
+            "        Write-Output \"WARNINGS: 0\"",
+            "        \"\" | Out-File -Append -FilePath $WarningsFile",
+            "    }",
+            "",
+            "    Upload-FolderToS3 -BucketName $BucketName -Prefix \"$ScriptName/$ExecutionId\" -FolderPath $OutputFile",
+            "",
+            "    if ($ShowHelpMessage) {",
+            "        Write-Output \"`nFor detailed information about a given warning or error, see $TroubleshootingFile.`n\"",
+            "    } else {",
+            "        Write-Output \"`nSUCCESS - All tests passed!`n\"",
+            "    }",
+            "    Write-Output (\"=\" * 110)",
+            "",
+            "} catch {",
+            "    Write-Output \"An error occurred while running the validation script: $($_.Exception.Message)\".",
+            "    Write-Output \"Review the logs in the folder $OutputDirectory.\"",
+            "    Exit 1",
+            "} finally {",
+            "    Reset-DNS",
+            "    Remove-Item function:\\Write-Host",
+            "    Remove-Item function:\\Write-Warning",
+            "    Remove-Item function:\\Write-Error",
+            "    Exit 0",
+            "}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "DescribeErrorsFromStackEvents",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to create the AWS CloudFormation stack.",
+      "nextStep": "DeleteCloudFormationStack",
+      "onFailure": "step:DeleteCloudFormationStack",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "InputPayload": {
+          "StackName": "{{ CreateEC2InstanceStack.CloudFormationStackId }}",
+          "ExpectedStackStatus": "CREATE_COMPLETE",
+          "NonExpectedStackStatus": "ROLLBACK_COMPLETE,CREATE_FAILED,ROLLBACK_FAILED"
+        },
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nimport textwrap\n\nimport boto3\nimport botocore.exceptions\n\ncloudformation = boto3.client(\"cloudformation\")\n\n\ndef function_handler(events, context):\n    partition = context[\"global:AWS_PARTITION\"]\n    region = context[\"global:REGION\"]\n    stack_name = events[\"StackName\"]\n    expected_stack_status = events[\"ExpectedStackStatus\"]\n    non_expected_resource_status = events[\"NonExpectedStackStatus\"].split(\",\")\n    console_url = get_stack_url(stack_name, partition, region)\n    stackfailurereasons(stack_name, console_url, expected_stack_status, non_expected_resource_status)\n\n\ndef stackfailurereasons(\n    stack_name,\n    console_url,\n    expected_stack_status,\n    non_expected_resource_status,\n):\n    # Find events different than 'DELETE_COMPLETE' in the list of recent stack events\n    # to get failure reason\n    stack_failure_msg = []\n    stack_failure_msg.append(\n        f\"\\n\\nThe AWS CloudFormation '{stack_name}' stack is not in '{expected_stack_status}' status.\\n\"\n    )\n    if expected_stack_status == \"DELETE_COMPLETE\":\n        stack_failure_msg.append(\"Try to delete the CloudFormation stack from the AWS CloudFormation console.\\n\\n\")\n        stack_failure_msg.append(f\"CloudFormation stack: {console_url}\\n\")\n        stack_failure_msg.append(\"For more information on deleting a stack see \")\n        stack_failure_msg.append(\n            \"https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html\\n\"\n        )\n\n    elif expected_stack_status == \"CREATE_COMPLETE\":\n        stack_failure_msg.append(\"Check for the stack associated events in the AWS CloudFormation console.\\n\\n\")\n        stack_failure_msg.append(f\"CloudFormation stack: {console_url}\\n\")\n        stack_failure_msg.append(\"For more information see \")\n        stack_failure_msg.append(\n            \"https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/troubleshooting.html\\n\"\n        )\n\n    try:\n        stack_status = cloudformation.describe_stacks(StackName=stack_name).get(\"Stacks\", [{}])[0].get(\"StackStatus\")\n        if stack_status == expected_stack_status:\n            stack_success_msg = (\n                f\"AWS CloudFormation '{stack_name}' stack successfully in '{expected_stack_status}' status.\\n\"\n            )\n            stack_success_msg += f\"CloudFormation stack: {console_url}\\n\"\n            print(repr(stack_success_msg))\n            return stack_success_msg\n\n        paginator = cloudformation.get_paginator(\"describe_stack_events\")\n        params = {\"StackName\": stack_name}\n\n        for page in paginator.paginate(**params):\n            stack_failure_msg.append(\"\\nThe following stack events are associated with the stack:\\n\")\n            events = page.get(\"StackEvents\", [])\n            for event in events:\n                if event.get(\"ResourceStatus\") in non_expected_resource_status:\n                    line = textwrap.dedent(event.get(\"ResourceStatusReason\", \"\"))\n                    text = \"\\n\".join(textwrap.wrap(line, width=120))\n                    stack_failure_msg.append(f\"> {event.get('LogicalResourceId')}:\\n{text}\\n\\n\")\n\n        stack_failure_msg.append(\"\\n\")\n        print(\"\".join(stack_failure_msg))\n        return stack_failure_msg\n\n    except botocore.exceptions.ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"ValidationError\" and \"does not exist\" in str(e):\n            stack_success_msg = (\n                f\"AWS CloudFormation Stack '{stack_name}' has been successfully deleted by the Automaton.\\n\"\n            )\n            print(repr(stack_success_msg))\n            return stack_success_msg\n        else:\n            print(f\"An error occurred when trying to describe the CloudFormation stack '{stack_name}': {str(e)}\\n\")\n        print(\"\".join(stack_failure_msg))\n        sys.exit(1)\n\n\n# Function that gets the CloudFormation url\ndef get_stack_url(stack_name: str, partition: str, aws_region: str) -> str:\n    domain_url_mapping = {\n        \"aws\": \"aws.amazon.com\",\n        \"aws-cn\": \"amazonaws.cn\",\n        \"aws-us-gov\": \"amazonaws-us-gov.com\",\n    }\n    domain_url = domain_url_mapping[partition]\n    return (\n        f\"https://console.{domain_url}/cloudformation/home?region={aws_region}#/stacks/stackinfo?stackId={stack_name}\"\n    )\n",
+        "Handler": "function_handler",
+        "Runtime": "python3.8"
+      },
+      "outputs": [
+        {
+          "Name": "ErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnRetainCloudFormationStack",
+      "action": "aws:branch",
+      "description": "Branch on the `RetainCloudFormationStack` and `InstanceId` parameters to determine if the AWS CloudFormation stack should be deleted.",
+      "onFailure": "step:DeleteCloudFormationStack",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ RetainCloudFormationStack }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ InstanceId }}",
+                "StringEquals": ""
+              }
+            ],
+            "NextStep": "DeleteCloudFormationStack"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DeleteCloudFormationStack",
+      "action": "aws:deleteStack",
+      "description": "Deletes the AWS CloudFormation stack.",
+      "onFailure": "Abort",
+      "isEnd": true,
+      "isCritical": true,
+      "maxAttempts": 3,
+      "timeoutSeconds": 1800,
+      "inputs": {
+        "StackName": "{{ CreateEC2InstanceStack.CloudFormationStackId }}"
+      }
+    }
+  ],
+  "outputs": [
+    "RunValidationScript.Output",
+    "DescribeInstanceIdAndSubnet.InstanceId",
+    "CreateEC2InstanceStack.CloudFormationStackId"
+  ],
+  "files": {
+    "AmazonFSxADValidation.zip": {
+      "checksums": {
+        "SHA256": "fd0f1ab83b048bae8fc83c97bc0c5bc8beb1af98f8d745c7d8f84c4217ac6f6c"
+      }
+    },
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "e303420d655fab9f4f93aae981e761bcf31b514433d1138e23142595daf4d31b"
+      }
+    }
+  }
+}
