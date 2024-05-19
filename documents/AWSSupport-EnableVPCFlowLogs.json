@@ -1,20 +1,30 @@
 {
-  "description": "The AWSSupport-EnableVPCFlowLogs runbook allows you to automate the creation of Amazon Virtual Private Cloud (Amazon VPC) flow logs for the following type of resources: subnets, network interfaces and/or VPCs in your AWS account. If you create a flow log for a subnet or VPC, each network interface in that subnet or VPC is monitored. Flow log data is published to the Amazon CloudWatch Logs or Amazon Simple Storage Service (Amazon S3) you choose. After you've created a flow log, you can retrieve and view its data in the chosen destination. For more information, see [VPC Flow Logs](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html)\n\n### Additional Information\nVPC Flow Logs is a feature that enables you to capture network internet protocol (IP) traffic flow going to and from network interfaces in your VPC/subnet. The data can be used for investigating and troubleshooting connectivity issues.\n### Important\nThe creation of VPC Flow Logs will add extra costs for storing the logs both in S3 and CloudWatch Logs. For more information see [Flow logs pricing]( https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html#flow-logs-pricing)\n\n``Note: If you don’t specify a value for LogGroupName and LogDestinationARN is 'cloud-watch-logs', the runbook tries to create a new CloudWatch Log Group with the name ‘AWSSupport-EnableVPCFlowLogs-<automation:EXECUTION_ID>’. When the automation creates the new Log Group, it sets the number of days to retain the log data to 14 days.``",
+  "description": "The **AWSSupport-EnableVPCFlowLogs** runbook allows you to automate the creation of Amazon Virtual Private Cloud (Amazon VPC) flow logs for the following resource types: subnets, elastic network interfaces, VPCs, transit gateways, and/or transit gateway attachments in your AWS account. The runbook allows you to specify the location where the flow log data is published: Amazon CloudWatch Logs or Amazon Simple Storage Service (Amazon S3). After you've created a flow log, you can retrieve and view its data in the chosen destination.\nFor more information, see [Logging IP traffic using VPC Flow Logs](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html).\n\n### Important:\n> * If you create a flow log for a subnet or VPC, every network interface in that subnet or VPC is monitored.\n> * The creation of VPC Flow Logs will add extra costs for storing the logs both in Amazon S3 and/or Amazon CloudWatch Logs. For more information see [VPC Flow Logs pricing](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html#flow-logs-pricing).\n\n### Important:\n> * If you set `LogDestinationType` to `cloud-watch-logs` and you don't specify a value for `LogGroupName` or `LogDestinationArn`, the runbook tries to create a new Amazon CloudWatch Log Group with the name `AWSSupport-EnableVPCFlowLogs-<automation:EXECUTION_ID>`. When the automation creates the new Log Group, it sets the retention of the log data to 14 days.\n> * If you set `LogDestinationType` to `cloud-watch-logs` and you don't specify a value for `DeliverLogsPermissionArn`, the runbook tries to create a new AWS Identity and Access Management (IAM) role with the name `AWSSupportCreateFlowLogsRole` with permissions to allow the flow logs service (`vpc-flow-logs.amazonaws.com`) to assume the new role (`sts:AssumeRole`).\n> * Additional permissions must be granted to AWS to enable the logs to be sent. AWS can automatically create those permissions when the logs are set up, or you can create them yourself first before you set up the logging. For more information see [Enabling logging from AWS services](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/AWS-logs-and-resource-policy.html).",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
-    "CreateFlowLogs.message"
+    "CreateFlowLogs.Message",
+    "CreateFlowLogs.FlowLogIds",
+    "CreateFlowLogs.IamRoleCreated",
+    "CreateFlowLogs.LogGroupCreated"
   ],
   "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
     "ResourceIds": {
       "type": "StringList",
-      "allowedPattern": "(vpc-[a-z0-9]{8,17}|eni-[a-z0-9]{8,17}|subnet-[a-z0-9]{8,17})",
-      "description": "(Required) Comma separated list with of the ID(s) of the subnet, network interface, or VPC for which you want to create a flow log (e.g: subnet-123a351e)"
+      "allowedPattern": "(vpc|eni|subnet|tgw|tgw-attach)-[0-9a-f]{8,17}",
+      "description": "(Required) Comma separated list with of the ID(s) of the supported resources: subnets, elastic network interfaces, VPCs, transit gateways, and/or transit gateway attachments in your AWS account for which you want to create a flow log (e.g.: `subnet-01234567890abcdef`). The maximum number of resources that can be added is `25`.",
+      "minItems": 1,
+      "maxItems": 25
     },
     "TrafficType": {
       "type": "String",
       "default": "ALL",
-      "description": "(Required) The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.",
+      "description": "(Optional) The type of traffic to log. You can log traffic that the resource `ACCEPT`, `REJECT`, or `ALL` traffic. Default is `ALL`.",
       "allowedValues": [
         "ACCEPT",
         "REJECT",
@@ -24,132 +34,231 @@
     "LogDestinationType": {
       "type": "String",
       "default": "cloud-watch-logs",
-      "description": "(Required) Specifies the destination type to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3. To publish flow log data to CloudWatch Logs, specify cloud-watch-logs. To publish flow log data to Amazon S3, specify s3.",
+      "description": "(Optional) Specifies the destination type to which the flow log data is published. Flow log data can be published to Amazon CloudWatch Logs or Amazon S3. To publish flow log data to Amazon CloudWatch Logs, specify `cloud-watch-logs`. To publish flow log data to Amazon S3, specify `s3`. Default is `cloud-watch-logs`. **Important**: When selecting `s3`, ensure that the bucket follows Amazon S3 security best practices, and ensure that you follow data privacy laws and regulations for your company and region. For more information: https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html.",
       "allowedValues": [
         "cloud-watch-logs",
         "s3"
       ]
     },
     "DeliverLogsPermissionArn": {
-      "type": "String",
+      "type": "AWS::IAM::Role::Arn",
       "default": "",
-      "description": "(Depends on LogDestinationType) The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify *LogDestinationType* as 's3', do not specify *DeliverLogsPermissionArn* or *LogGroupName*.",
-      "allowedPattern": "(^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$)?"
+      "description": "(Conditional) The ARN for the IAM role that allows `vpc-flow-logs` to publish flow logs to an Amazon CloudWatch Logs log group in your account. If you specify `LogDestinationType` as `s3`, the parameters `DeliverLogsPermissionArn` or `LogGroupName` are omitted. See [IAM role for publishing flow logs to CloudWatch Logs](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs-cwl.html#flow-logs-iam-role)."
     },
-    "LogDestinationARN": {
+    "LogDestinationArn": {
       "type": "String",
       "default": "",
-      "description": "(Optional) Specifies the destination to which the flow log data is to be published. Flow log data can be published to a CloudWatch Logs log group or an Amazon S3 bucket. The value specified for this parameter depends on the value specified for LogDestinationType. If LogDestinationType is 'cloud-watch-logs', specify the ARN of the CloudWatch Logs log group. Otherwise specify the ARN of the Amazon S3 bucket. You can also specify a subfolder in the bucket: bucket_ARN/subfolder_name/. *Note*: `if nothing is specified, the automation will create a CloudWatch Log Group, stream and the IAM role to put data in it on behalf of VPC Flow Logs.`",
-      "allowedPattern": "(^arn:(aws[a-zA-Z-]*)?:(logs|s3):([\\w+-]+)?:(\\d{12})?:[\\w+-]+(:|\\/)?[\\w+=,.@\\-:\\/*]+$)?"
+      "description": "(Optional) Specifies the destination to which the flow log data is published. Flow log data can be published to an Amazon CloudWatch Logs log group or an Amazon S3 bucket. The value specified for this parameter depends on the value specified for `LogDestinationType`. If `LogDestinationType` is `cloud-watch-logs`, specify the ARN of the Amazon CloudWatch Logs log group. For `s3` specify the ARN of the Amazon S3 bucket. For `s3` you can also specify an optional subfolder, example: `arn:aws:s3:::my_bucket/my_subfolder/`. **Note**: if no value is specified and `LogDestinationType` is `cloud-watch-logs`, the automation will create an Amazon CloudWatch log group.",
+      "allowedPattern": "^$|^arn:(aws[a-zA-Z-]*):s3:::([a-z0-9\\/\\-.]+)$|^arn:(aws[a-zA-Z-]*):logs:([a-z0-9-]+):(\\d{12}):log-group:([\\w+=,.@\\-:\\/]+)(:\\*)?$"
     },
     "LogFormat": {
       "type": "String",
       "default": "${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}",
-      "description": "(Optional) The fields to include in the flow log record, in the order in which they should appear. For a list of available fields, see Flow Log Records. If you omit this parameter, the flow log is created using the default format. If you specify this parameter, you must specify at least one field.",
-      "allowedPattern": "(\\$\\{[a-z\\-\\s?]+\\}\\s?)+"
+      "description": "(Optional) The fields to include in the flow log record, in the order in which they should appear. For a list of available fields, see Flow Log records https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html#flow-logs-fields. If you omit this parameter, the flow log is created using the default format. If you specify this parameter, you must specify at least one field.",
+      "allowedPattern": "^$|(\\$\\{[a-z\\-\\s?]+\\}\\s?)+"
+    },
+    "LogFormatTransitGateway": {
+      "type": "String",
+      "default": "${version} ${resource-type} ${account-id} ${tgw-id} ${tgw-attachment-id} ${tgw-src-vpc-account-id} ${tgw-dst-vpc-account-id} ${tgw-src-vpc-id} ${tgw-dst-vpc-id} ${tgw-src-subnet-id} ${tgw-dst-subnet-id} ${tgw-src-eni} ${tgw-dst-eni} ${tgw-src-az-id} ${tgw-dst-az-id} ${tgw-pair-attachment-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${log-status} ${type} ${packets-lost-no-route} ${packets-lost-blackhole} ${packets-lost-mtu-exceeded} ${packets-lost-ttl-expired} ${tcp-flags} ${region} ${flow-direction} ${pkt-src-aws-service} ${pkt-dst-aws-service}",
+      "description": "(Optional) The fields to include in the transit gateway flow log record, in the order in which they should appear. For a list of available fields, see Transit Gateway Flow Log records https://docs.aws.amazon.com/vpc/latest/tgw/tgw-flow-logs.html. If you omit this parameter, the flow log is created using the default format. If you specify this parameter, you must specify at least one field.",
+      "allowedPattern": "^$|(\\$\\{[a-z\\-\\s?]+\\}\\s?)+"
     },
     "LogGroupName": {
       "type": "String",
-      "description": "(Depends on LogDestinationType) The name of the CloudWatch Logs log group you want to publish flow log data to. This parameter is required only if the parameter *LogDestinationType* is set to cloud-watch-logs",
+      "description": "(Conditional) The name of the Amazon CloudWatch Logs log group you want to publish flow log data to. This parameter is required if the parameter `LogDestinationType` is set to `cloud-watch-logs`. if this parameter is provided, the `LogDestinationArn` is omitted.",
       "default": "",
-      "allowedPattern": "^$|[\\.\\-_/#A-Za-z0-9]+"
-    },
-    "AutomationAssumeRole": {
-      "type": "String",
-      "default": "",
-      "description": "(Optional) The ARN of the role that allows the Automation runbook to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your current IAM user permissions context to execute this runbook.",
-      "allowedPattern": "(^arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role/[\\w+=,.@-]+$)?"
+      "allowedPattern": "^$|[\\.\\-_/#A-Za-z0-9]{1,512}"
     }
   },
   "mainSteps": [
     {
-      "name": "CheckDestinationType",
+      "name": "BranchOnDestinationType",
       "action": "aws:branch",
+      "description": "Branches on the required input parameters for `LogDestinationType`: *cloud-watch-logs* or *s3*.",
+      "nextStep": "CheckLogDestination",
       "inputs": {
         "Choices": [
           {
             "NextStep": "CheckLogDestination",
-            "Variable": "{{ LogDestinationType }}",
-            "Contains": "cloud-watch-logs"
+            "And": [
+              {
+                "Variable": "{{ LogDestinationType }}",
+                "StringEquals": "cloud-watch-logs"
+              },
+              {
+                "Not": {
+                  "Variable": "{{ LogDestinationArn }}",
+                  "Contains": ":s3:::"
+                }
+              }
+            ]
           },
           {
-            "NextStep": "CreateFlowLogs",
-            "Variable": "{{ LogDestinationType }}",
-            "Contains": "s3"
+            "NextStep": "CheckSourceS3BucketPublicStatus",
+            "And": [
+              {
+                "Variable": "{{ LogDestinationType }}",
+                "StringEquals": "s3"
+              },
+              {
+                "Variable": "{{ LogDestinationArn }}",
+                "Contains": ":s3:::"
+              }
+            ]
           }
-        ]
-      },
-      "description": "Checks the parameter: 'LogDestinationType' if it's \"cloud-watch-logs\"\n"
+        ],
+        "Default": "CheckLogDestination"
+      }
     },
     {
       "name": "CheckLogDestination",
       "action": "aws:executeScript",
+      "description": "Checks the `LogDestinationArn` and `LogGroupName` parameters. If not provided, creates a new Amazon CloudWatch Logs log group with the name `AWSSupport-EnableVPCFlowLogs-<automation:EXECUTION_ID>`.",
+      "nextStep": "CheckLogsPermissionIamRole",
+      "isCritical": true,
+      "onFailure": "Abort",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "script_handler",
         "InputPayload": {
-          "LogDestinationType": "{{ LogDestinationType }}",
-          "DeliverLogsPermissionArn": "{{ DeliverLogsPermissionArn }}",
-          "LogDestinationARN": "{{ LogDestinationARN }}",
+          "LogDestinationArn": "{{ LogDestinationArn }}",
           "LogGroupName": "{{ LogGroupName }}"
         },
-        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport boto3\n\nlogs = boto3.client('logs')\n\n# function to create a log group with a given log group name\ndef create_log_group(logGroupName):\n  \"\"\"\n  Creates a log group in CloudWatch logs if a log group does not exist.\n\n  Args:\n    logGroupName (str): The name of the log group to be created\n\n  Raises:\n    - Exception if the API call fails\n\n  Returns:\n    - The response after creating the log group (request meta data only)\n    \n  \"\"\"\n  \n  try:\n    response = logs.create_log_group(\n      logGroupName=logGroupName,\n      tags={'Author': 'Created by AWSSupport-EnableVPCFlowLogs automation'}\n    )\n  except Exception as e:\n    raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n  \n  return response\n\n\n# function to put rentention policy on created log group\ndef put_retention_policy(logGroupName, retentionDays):\n  \"\"\"\n  Creates a retention policy and puts it on the created log group.\n\n  Args:\n    logGroupName (str): The name of the log group to be created\n\n  Raises:\n    - Exception if the API call fails\n\n  Returns:\n    - The response after creating the log group (request meta data only)\n    \n  \"\"\"\n  try:\n    response = logs.put_retention_policy(\n      logGroupName=logGroupName,\n      retentionInDays=retentionDays\n    )\n  except Exception as e:\n    raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n\n  return response\n\ndef script_handler(events, context):\n  \"\"\"\n  Checks if a log group name was provided. If not, it checks if the log destination was provided. \n    - If neither are provided, then a new log group is created and a retention policy is put on the new log group.\n  \n  Creates an IAM role to be used in the next step of creating the flow logs if a value for DeliverLogsPermissionArn is not provided\n    - Adds the required permissions needed to create flow logs to a policy for the newly created IAM \n\n\n  Args:\n    events: A dictionary of values passed in from the SSM Document by the user.\n\n  Raises:\n    - Exception if the API calls to create the log group or add retention policy fails\n    - Exception if the log group already exits when it tries to create a new one\n    - Exception if an IAM role already exits when it tries to create a new one\n\n  Returns:\n    - Values for:\n      - DeliverLogsPermissionArn\n      - LogDestinationARN\n      - LogGroupName\n    \n  \"\"\"\n\n  import time\n  import re\n  \n  RETENTION_DAYS = 14\n  ACCOUNT_ID = context[\"global:ACCOUNT_ID\"]\n  PARTITION = context[\"global:AWS_PARTITION\"]\n  region = context[\"global:REGION\"]\n  ExecutionId = context[\"automation:EXECUTION_ID\"]\n  DeliverLogsPermissionArn = events[\"DeliverLogsPermissionArn\"]\n  LogDestinationARN = events[\"LogDestinationARN\"]\n  LogGroupName = events[\"LogGroupName\"]\n\n  iam = boto3.client('iam')\n\n  if LogGroupName == '':\n    if LogDestinationARN == '':\n      try:\n        logGroupName=f'AWSSupport-EnableVPCFlowLogs-{ExecutionId}'\n        response = create_log_group(logGroupName)\n        if response['ResponseMetadata'][\"HTTPStatusCode\"] == 200:\n          time.sleep(3)\n          response = put_retention_policy(logGroupName, RETENTION_DAYS)\n          LogDestinationARN = f'arn:{PARTITION}:logs:{region}:{ACCOUNT_ID}:log-group:{logGroupName}:*'\n      except Exception as e:\n        if \"ResourceAlreadyExistsException\" in str(e):\n          LogDestinationARN = f'arn:{PARTITION}:logs:{region}:{ACCOUNT_ID}:log-group:{logGroupName}:*'\n        else:\n          raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n    else:\n      # Log Destination ARN is given - validate this actually exists\n      try:\n        # Pulls out the name of the log group from the given ARN\n        name = LogDestinationARN.split(':')[6]\n        response = logs.describe_log_groups(logGroupNamePrefix=name)\n        if response['logGroups']:\n          logGroupARN = response['logGroups'][0].get('arn')\n          if logGroupARN == LogDestinationARN:\n            LogDestinationARN = LogDestinationARN\n        else:\n          try:\n            response = create_log_group(name)\n            if response['ResponseMetadata'][\"HTTPStatusCode\"] == 200:\n              time.sleep(3)\n              response = put_retention_policy(name, RETENTION_DAYS)\n              LogDestinationARN = f'arn:{PARTITION}:logs:{region}:{ACCOUNT_ID}:log-group:{logGroupName}:*'\n          except:\n            if \"ResourceAlreadyExistsException\" in str(e):\n              LogDestinationARN = f'arn:{PARTITION}:logs:{region}:{ACCOUNT_ID}:log-group:{logGroupName}:*'\n            else:\n              raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n            \n      except Exception as e:\n          raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n      \n  else:\n    # LogGroupName has been provided - validate this actually exists\n    try:\n      response = logs.describe_log_groups(logGroupNamePrefix=LogGroupName)\n      if response['logGroups']:\n        LogDestinationARN = response['logGroups'][0].get('arn')\n      else:\n        try:\n          response = create_log_group(LogGroupName)\n          if response['ResponseMetadata'][\"HTTPStatusCode\"] == 200:\n            time.sleep(3)\n            response = put_retention_policy(LogGroupName, RETENTION_DAYS)\n            LogDestinationARN = f'arn:{PARTITION}:logs:{region}:{ACCOUNT_ID}:log-group:{LogGroupName}:*'\n        except:\n          if \"ResourceAlreadyExistsException\" in str(e):\n            LogDestinationARN = f'arn:{PARTITION}:logs:{region}:{ACCOUNT_ID}:log-group:{LogGroupName}:*'\n          else:\n            raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n          \n    except Exception as e:\n        raise Exception(\"Something went wrong on Log Group Creation, please check: \"+\"\\n\"+str(e))\n            \n  if DeliverLogsPermissionArn == '':\n\n    ## Create the IAM role \n    try: \n      response = iam.create_role(\n          RoleName='AWSSupportCreateFlowLogsRole',\n          AssumeRolePolicyDocument=\"{\\n  \\\"Version\\\": \\\"2012-10-17\\\",\\n  \\\"Statement\\\": [\\n    {\\n      \\\"Sid\\\": \\\"\\\",\\n      \\\"Effect\\\": \\\"Allow\\\",\\n      \\\"Principal\\\": {\\n        \\\"Service\\\": \\\"vpc-flow-logs.amazonaws.com\\\"\\n      },\\n      \\\"Action\\\": \\\"sts:AssumeRole\\\"\\n    }\\n  ]\\n}\",\n          Tags=[\n              {\n                  'Key': 'Author',\n                  'Value': 'Created by AWSSupport-EnableVPCFlowLogs automation'\n              },\n          ]\n      )\n      if response[\"ResponseMetadata\"][\"HTTPStatusCode\"] == 200:\n          DeliverLogsPermissionArn = response[\"Role\"][\"Arn\"]\n    except Exception as e:\n      if \"EntityAlreadyExists\" in str(e):\n          DeliverLogsPermissionArn = f'arn:{PARTITION}:iam::{ACCOUNT_ID}:role/AWSSupportCreateFlowLogsRole'\n      else:\n          response = logs.delete_log_group(\n              logGroupName='AWSSupport-EnableVPCFlowLogs-'+ExecutionId\n          )\n          raise Exception(\"Something went wrong, please check: \"+\"\\n\"+str(e))\n    ## Create and attach policy\n    try: \n      time.sleep(3)\n      response = iam.put_role_policy(\n          RoleName='AWSSupportCreateFlowLogsRole',\n          PolicyName='AWSSupportCreateFlowLogsPolicy',\n          PolicyDocument=\"{\\n    \\\"Version\\\": \\\"2012-10-17\\\",\\n    \\\"Statement\\\": [\\n        {\\n            \\\"Action\\\": [\\n                \\\"logs:CreateLogGroup\\\",\\n                \\\"logs:CreateLogStream\\\",\\n                \\\"logs:PutLogEvents\\\",\\n                \\\"logs:DescribeLogGroups\\\",\\n                \\\"logs:DescribeLogStreams\\\"\\n            ],\\n            \\\"Effect\\\": \\\"Allow\\\",\\n            \\\"Resource\\\": \\\"*\\\"\\n        }\\n    ]\\n}\",\n      )\n    except Exception as e:\n      response = iam.delete_role(\n          RoleName='AWSSupportCreateFlowLogsRole'\n      )\n      response = logs.delete_log_group(\n          logGroupName='AWSSupport-EnableVPCFlowLogs-'+ExecutionId\n      )\n      raise Exception(\"Something went wrong, please check: \"+\"\\n\"+str(e))\n  else:\n    try:\n        response = iam.get_role(RoleName=re.sub(r'arn:(aws[a-zA-Z-]*)?:iam::\\d{12}:role\\/', '', DeliverLogsPermissionArn))\n    except Exception as e:\n        raise Exception(\"Identity Doesn't Exist in this account \\n\"+str(e))\n  return {\n    \"DeliverLogsPermissionArn\": DeliverLogsPermissionArn,\n    \"LogDestinationARN\": LogDestinationARN,\n    \"LogGroupName\": LogGroupName\n  }\n"
+        "Attachment": "attachment.zip",
+        "Handler": "CreateLogGroup.script_handler",
+        "Runtime": "python3.8"
       },
-      "description": "Checks the LogDestinationARN parameter and creates a new CloudWatch Log group and the IAM role to put data in it.",
-      "isCritical": true,
-      "timeoutSeconds": 30,
+      "timeoutSeconds": 300,
       "outputs": [
         {
-          "Name": "DeliverLogsPermissionArn",
-          "Selector": "$.Payload.DeliverLogsPermissionArn",
-          "Type": "String"
-        },
-        {
-          "Name": "LogDestinationARN",
-          "Selector": "$.Payload.LogDestinationARN",
+          "Name": "LogGroupArn",
+          "Selector": "$.Payload.LogGroupArn",
           "Type": "String"
         },
         {
           "Name": "LogGroupName",
           "Selector": "$.Payload.LogGroupName",
           "Type": "String"
+        },
+        {
+          "Name": "LogGroupCreated",
+          "Selector": "$.Payload.LogGroupCreated",
+          "Type": "String"
         }
-      ],
-      "isEnd": false,
-      "nextStep": "CreateFlowLogs"
+      ]
+    },
+    {
+      "name": "CheckLogsPermissionIamRole",
+      "action": "aws:executeScript",
+      "description": "Checks the `DeliverLogsPermissionArn` parameter. If not provided, creates an IAM role `AWSSupportCreateFlowLogsRole` with permissions to allow the flow logs service (`vpc-flow-logs.amazonaws.com`) to assume the new role (`sts:AssumeRole`). If the `DeliverLogsPermissionArn` is provided or already exists, describes and returns the IAM role name and ARN.",
+      "nextStep": "CreateFlowLogs",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "DeliverLogsPermissionArn": "{{ DeliverLogsPermissionArn }}",
+          "CloudWatchLogName": "{{ CheckLogDestination.LogGroupName }}",
+          "CloudWatchLogCreated": "{{ CheckLogDestination.LogGroupCreated }}"
+        },
+        "Attachment": "attachment.zip",
+        "Handler": "CreateIamRole.script_handler",
+        "Runtime": "python3.8"
+      },
+      "timeoutSeconds": 300,
+      "outputs": [
+        {
+          "Name": "IamRoleArn",
+          "Selector": "$.Payload.IamRoleArn",
+          "Type": "String"
+        },
+        {
+          "Name": "IamRoleName",
+          "Selector": "$.Payload.IamRoleName",
+          "Type": "String"
+        },
+        {
+          "Name": "IamRoleCreated",
+          "Selector": "$.Payload.IamRoleCreated",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckSourceS3BucketPublicStatus",
+      "action": "aws:executeScript",
+      "description": "Checks if the target Amazon Simple Storage Service (Amazon S3) potentially grants **read** or **write** `public` access to its objects.",
+      "nextStep": "CreateFlowLogs",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ LogDestinationArn }}",
+          "BucketOwnerAccount": "{{ global:ACCOUNT_ID }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.8",
+        "Attachment": "check_bucket_public_status.zip"
+      }
     },
     {
       "name": "CreateFlowLogs",
-      "description": "Creates the flow logs on the selected destination.",
       "action": "aws:executeScript",
-      "timeoutSeconds": 180,
+      "description": "Creates the flow logs on the selected destination. If the action fails, the runbook will try to clean-up any resources created.",
       "onFailure": "Abort",
-      "onCancel": "Abort",
+      "isEnd": true,
+      "timeoutSeconds": 600,
       "isCritical": true,
       "inputs": {
         "Runtime": "python3.8",
-        "Handler": "script_handler",
+        "Handler": "CreateFlowLogs.script_handler",
         "InputPayload": {
           "ResourceIds": "{{ ResourceIds }}",
           "TrafficType": "{{ TrafficType }}",
           "LogDestinationType": "{{ LogDestinationType }}",
-          "DeliverLogsPermissionArn": "{{ DeliverLogsPermissionArn }}",
-          "LogDestinationARN": "{{ LogDestinationARN }}",
+          "LogDestinationArn": "{{ LogDestinationArn }}",
           "LogFormat": "{{ LogFormat }}",
-          "LogGroupName": "{{ LogGroupName }}",
-          "LogDestinationARNFromPrevStep": "{{CheckLogDestination.LogDestinationARN}}",
-          "DeliverLogsPermissionArnFromPrevStep": "{{CheckLogDestination.DeliverLogsPermissionArn}}"
+          "LogFormatTransitGateway": "{{ LogFormatTransitGateway }}",
+          "CloudWatchIamRoleArn": "{{ CheckLogsPermissionIamRole.IamRoleArn }}",
+          "CloudWatchIamRoleName": "{{ CheckLogsPermissionIamRole.IamRoleName }}",
+          "CloudWatchIamRoleCreated": "{{ CheckLogsPermissionIamRole.IamRoleCreated }}",
+          "CloudWatchLogName": "{{ CheckLogDestination.LogGroupName }}",
+          "CloudWatchLogArn": "{{ CheckLogDestination.LogGroupArn }}",
+          "CloudWatchLogCreated": "{{ CheckLogDestination.LogGroupCreated }}"
         },
-        "Script": "def script_handler(events, context):\n    \"\"\"\n    Validates S3 related input if the value for LogDestinationType was originally 's3'\n\n    Creates Flow Logs for each of the resources listed.\n\n    Args:\n        events: A dictionary of values passed in from the SSM Document by the user or from the previous step if the LogDestinationType was originally 'cloud-watch-logs'\n\n    Raises:\n        - Exception if the value for LogDestinationARN is not a valid S3 ARN if the LogDestinationType was set to 's3'\n        - Exception if there is an issue when making the create flow logs API call\n\n    Returns:\n        - Values for:\n        - FlowLogIds\n        - ResourceId\n        - Destination (of FlowLogs)\n            \n    \"\"\"\n\n    import boto3\n    import time\n    import re\n    \n    def get_flow_logs_id(flow):\n        if flow['FlowLogIds'][0] != '':\n            return flow['FlowLogIds'][0]\n\n    def rollback(output, ExecutionId):\n        flow_logs_ids = list(map(get_flow_logs_id, output))\n        try:\n            logs = boto3.client('logs')\n            iam = boto3.client('iam')\n            response = logs.delete_log_group(\n                logGroupName='AWSSupport-EnableVPCFlowLogs-'+ExecutionId\n            )\n            response = iam.delete_role(\n                RoleName='AWSSupportCreateFlowLogsRole'\n            )\n        except Exception as e:\n            pass\n        try:\n            ec2 = boto3.client('ec2')\n            \n            response = ec2.delete_flow_logs(\n                FlowLogIds=flow_logs_ids\n            )\n            return response[\"HTTPStatusCode\"]\n        except Exception as e:\n            pass\n\n    ACCOUNT_ID = context[\"global:ACCOUNT_ID\"]\n    region = context[\"global:REGION\"]\n    ExecutionId = context[\"automation:EXECUTION_ID\"]\n    # @Parameters\n    ResourceIds = events[\"ResourceIds\"]\n    TrafficType = events[\"TrafficType\"]\n    LogDestinationType = events[\"LogDestinationType\"]\n    DeliverLogsPermissionArn = events[\"DeliverLogsPermissionArn\"]\n    LogDestinationARN = events[\"LogDestinationARN\"]\n    LogFormat = events[\"LogFormat\"]\n    LogGroupName = events[\"LogGroupName\"]\n    ec2 = boto3.client('ec2')\n\n    # required params passed in from the previous step (where the log destination type - 'cloud-watch-logs')\n    CWLogDestinationARN = events[\"LogDestinationARNFromPrevStep\"]\n    CWDeliverLogsPermissionArn = events[\"DeliverLogsPermissionArnFromPrevStep\"]\n    \n    # @ Input Validation\n    # validate only when destination type is s3, the other inputs are dealt with in the previous step\n    output = []\n    s3 = boto3.client('s3')\n    if LogDestinationType == \"s3\":\n        try:\n            BucketName = re.sub(r'arn:(aws[a-zA-Z-]*)?:(logs|s3):([\\\\w+-]+)?:(\\\\d{12})?:|(\\/.*)?', '', LogDestinationARN)\n            response = s3.get_bucket_acl(Bucket=BucketName)\n        except Exception as e:\n            raise Exception(\"S3 Bucket destination not valid: \\n\"+str(e))            \n\n# @ Flowlogs creation\n    for ResourceId in ResourceIds:\n        ResourceType = ''\n        message = ''\n        if \"vpc\" in ResourceId:\n            ResourceType = 'VPC'\n        if \"eni\" in ResourceId:\n            ResourceType = 'NetworkInterface'\n        if \"subnet\" in ResourceId:\n            ResourceType = 'Subnet'\n        try:\n            if LogDestinationType == 'cloud-watch-logs':\n                if LogGroupName == '':\n                    response = ec2.create_flow_logs(DeliverLogsPermissionArn=CWDeliverLogsPermissionArn,\n                        ResourceIds=[ResourceId],\n                        ResourceType=ResourceType,\n                        TrafficType=TrafficType,\n                        LogDestinationType=LogDestinationType,\n                        LogDestination=CWLogDestinationARN,\n                        LogFormat=LogFormat)\n                    message = response\n                else:\n                    response = ec2.create_flow_logs(DeliverLogsPermissionArn=CWDeliverLogsPermissionArn,\n                        ResourceIds=[ResourceId],\n                        ResourceType=ResourceType,\n                        TrafficType=TrafficType,\n                        LogDestinationType=LogDestinationType,\n                        LogFormat=LogFormat,\n                        LogGroupName=LogGroupName)\n                    message = response\n            else:\n                response = ec2.create_flow_logs(\n                        ResourceIds=[ResourceId],\n                        ResourceType=ResourceType,\n                        TrafficType=TrafficType,\n                        LogDestinationType=LogDestinationType,\n                        LogDestination=LogDestinationARN,\n                        LogFormat=LogFormat)\n                message = response\n                \n# @ Exeptions and rollback         \n            if len(message[\"FlowLogIds\"]) != 0:\n                if LogDestinationType == 's3':\n                  output.append({'FlowLogIds': message[\"FlowLogIds\"], 'error': '', 'ResourceId': ResourceId, 'Destination': LogDestinationARN})\n                else:\n                    # LogDestinationType == 'cloud-watch-logs'\n                    output.append({'FlowLogIds': message[\"FlowLogIds\"], 'error': '', 'ResourceId': ResourceId, 'Destination': CWLogDestinationARN})\n            else:\n                if rollback(output, ExecutionId) == 200:\n                    output.append({'FlowLogIds': [''], 'error': 'Rollback Successfull: all the pending flow logs have been cleaned', 'ResourceId': '', 'Destination': LogDestinationARN})\n                else:\n                    output.append({'FlowLogIds': [''], 'error': 'Rollback FAILED', 'ResourceId': '', 'Destination': LogDestinationARN})\n                output.append({'FlowLogIds': [''], 'error': message, 'ResourceId': ResourceId, 'Destination': LogDestinationARN})\n                raise Exception(\"ClientError - \" + str(output))\n\n        except Exception as e:\n            rollback_status = rollback(output, ExecutionId)\n            if  rollback_status == 200:\n                output.append({'FlowLogIds': [''], 'error': 'Rollback Successfull: all the pending flow logs have been cleaned', 'ResourceId': '', 'Destination': LogDestinationARN})\n            else: \n                output.append({'FlowLogIds': [''], 'error': 'Rollback FAILED: \\n'+str(e), 'ResourceId': '', 'Destination': LogDestinationARN})\n            output.append({'FlowLogIds': [''], 'error': e, 'ResourceId': ResourceId, 'Destination': LogDestinationARN})\n            raise Exception(\"Something went wrong, please check: \"+ResourceId + \"\\n\"+str(e)+\"\\n\"+str(output))\n       \n    return {\"message\": output}\n\n"
+        "Attachment": "attachment.zip"
       },
       "outputs": [
         {
-          "Name": "message",
+          "Name": "Message",
           "Selector": "$.Payload.message",
           "Type": "MapList"
+        },
+        {
+          "Name": "FlowLogIds",
+          "Selector": "$.Payload.flow_logs_ids",
+          "Type": "StringList"
+        },
+        {
+          "Name": "IamRoleCreated",
+          "Selector": "$.Payload.iam_role_created",
+          "Type": "String"
+        },
+        {
+          "Name": "LogGroupCreated",
+          "Selector": "$.Payload.log_created",
+          "Type": "String"
         }
-      ],
-      "isEnd": true
+      ]
     }
-  ]
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "c920d23a9c971361765703be8e409cc629749cf47d90d4c80449a8db021c953f"
+      }
+    },
+    "check_bucket_public_status.zip": {
+      "checksums": {
+        "SHA256": "e303420d655fab9f4f93aae981e761bcf31b514433d1138e23142595daf4d31b"
+      }
+    }
+  }
 }

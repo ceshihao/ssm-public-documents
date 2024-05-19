@@ -57,9 +57,93 @@
       "type": "String",
       "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
       "default": ""
+    },
+    "TargetObjectKeyPartitionDateSource": {
+      "type": "String",
+      "default": "",
+      "allowedValues": [
+        "EventTime",
+        "DeliveryTime",
+        ""
+      ],
+      "description": "(Optional) Specifies the partition date source for the partitioned prefix."
+    },
+    "TargetObjectKeyPrefix": {
+      "type": "String",
+      "default": "",
+      "allowedValues": [
+        "Partitioned",
+        "Simple",
+        ""
+      ],
+      "description": "(Optional) Amazon S3 key format for log objects."
     }
   },
   "mainSteps": [
+    {
+      "name": "Branch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetPutBucketLoggingPayload",
+            "Not": {
+              "Variable": "{{ TargetObjectKeyPrefix }}",
+              "StringEquals": ""
+            }
+          }
+        ],
+        "Default": "CheckGrantee"
+      }
+    },
+    {
+      "name": "GetPutBucketLoggingPayload",
+      "action": "aws:executeScript",
+      "nextStep": "PutBucketLoggingWithTargetObjectKeyPrefix",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "Script": "import boto3\n\ndef script_handler(events, context):\n  loggingStatus = {\n    'TargetBucket': events['TargetBucket'],\n    'TargetPrefix': events['TargetPrefix'],\n  }\n  if events['TargetObjectKey']['Prefix']:\n    if events['TargetObjectKey']['Prefix'] == 'Partitioned':\n      loggingStatus['TargetObjectKeyFormat'] = {\n        'PartitionedPrefix': {\n          'PartitionDateSource': events['TargetObjectKey']['PartitionDateSource']\n        }\n      }\n    else:\n      loggingStatus['TargetObjectKeyFormat'] = {\n        'SimplePrefix': {}\n      }\n  if events['GrantedPermission'] and events['Grantee']['Type']:\n    loggingStatus['TargetGrants'] = [{\n      'Grantee': {\n        'Type': events['Grantee']['Type'],\n      },\n      'Permission': events['GrantedPermission'],\n    }]\n    if events['Grantee']['Type'] == 'Group':\n      loggingStatus['TargetGrants'][0]['Grantee']['URI'] = events['Grantee']['URI']\n    elif events['Grantee']['Type'] == 'CanonicalUser':\n      loggingStatus['TargetGrants'][0]['Grantee']['ID'] = events['Grantee']['ID']\n    else:\n      loggingStatus['TargetGrants'][0]['Grantee']['EmailAddress'] = events['Grantee']['EmailAddress']\n  return loggingStatus",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "TargetBucket": "{{TargetBucket}}",
+          "TargetPrefix": "{{TargetPrefix}}",
+          "Grantee": {
+            "Type": "{{GranteeType}}",
+            "URI": "{{GranteeUri}}",
+            "ID": "{{GranteeId}}",
+            "EmailAddress": "{{GranteeEmailAddress}}"
+          },
+          "GrantedPermission": "{{GrantedPermission}}",
+          "TargetObjectKey": {
+            "Prefix": "{{ TargetObjectKeyPrefix }}",
+            "PartitionDateSource": "{{ TargetObjectKeyPartitionDateSource }}"
+          }
+        }
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "LoggingStatus",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "PutBucketLoggingWithTargetObjectKeyPrefix",
+      "action": "aws:executeAwsApi",
+      "nextStep": "End",
+      "isEnd": false,
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutBucketLogging",
+        "Bucket": "{{ BucketName }}",
+        "BucketLoggingStatus": {
+          "LoggingEnabled": "{{ GetPutBucketLoggingPayload.LoggingStatus }}"
+        }
+      }
+    },
     {
       "name": "CheckGrantee",
       "action": "aws:branch",
@@ -84,9 +168,10 @@
     },
     {
       "name": "PutBucketLogging",
-      "isCritical": true,
       "action": "aws:executeAwsApi",
       "nextStep": "End",
+      "isCritical": true,
+      "isEnd": false,
       "inputs": {
         "Service": "s3",
         "Api": "PutBucketLogging",
@@ -101,10 +186,11 @@
     },
     {
       "name": "PutBucketLoggingByUri",
-      "isCritical": false,
       "action": "aws:executeAwsApi",
-      "onFailure": "step:PutBucketLoggingById",
       "nextStep": "End",
+      "isCritical": false,
+      "isEnd": false,
+      "onFailure": "step:PutBucketLoggingById",
       "inputs": {
         "Service": "s3",
         "Api": "PutBucketLogging",
@@ -128,10 +214,11 @@
     },
     {
       "name": "PutBucketLoggingById",
-      "isCritical": false,
       "action": "aws:executeAwsApi",
-      "onFailure": "step:PutBucketLoggingByEmailAddress",
       "nextStep": "End",
+      "isCritical": false,
+      "isEnd": false,
+      "onFailure": "step:PutBucketLoggingByEmailAddress",
       "inputs": {
         "Service": "s3",
         "Api": "PutBucketLogging",
@@ -155,10 +242,11 @@
     },
     {
       "name": "PutBucketLoggingByEmailAddress",
-      "isCritical": true,
-      "onFailure": "Abort",
       "action": "aws:executeAwsApi",
       "nextStep": "End",
+      "isCritical": true,
+      "isEnd": false,
+      "onFailure": "Abort",
       "inputs": {
         "Service": "s3",
         "Api": "PutBucketLogging",
@@ -183,10 +271,10 @@
     {
       "name": "End",
       "action": "aws:sleep",
+      "isEnd": true,
       "inputs": {
         "Duration": "PT1S"
-      },
-      "isEnd": true
+      }
     }
   ]
 }
