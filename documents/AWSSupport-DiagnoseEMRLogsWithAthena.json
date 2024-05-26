@@ -1,0 +1,383 @@
+{
+  "description": "The **AWSSupport-DiagnoseEMRLogsWithAthena** runbook helps diagnose Amazon EMR logs using Amazon Athena in integration with AWS Glue Data Catalog. Amazon Athena is used to query the Amazon EMR log files for containers, node logs, or both, with optional parameters for specific date ranges or keyword-based searches. The runbook can automatically retrieve the Amazon EMR log location for an existing cluster, or you can specify the Amazon Simple Storage Service (Amazon S3) log location. To analyze the logs, the runbook creates an AWS Glue database and executes Amazon Athena Data Definition Language (DDL) queries on the Amazon EMR S3 log location to create tables for cluster logs and a list of known issues. It then executes Data Manipulation Language (DML) queries to search for known issue patterns in the EMR logs. The queries return a list of detected issues, their occurrence count, and the number of matched keywords by Amazon S3 file path. The results are uploaded to an Amazon S3 bucket you specify under the prefix `saw_diagnose_emr_known_issues`. The runbook returns the Amazon Athena query results, highlighting findings, recommendations, and references to Amazon Knowledge Center (KC) articles sourced from a predefined subset. Upon completion, the AWS Glue database and the known issues files uploaded to the Amazon S3 bucket are deleted.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "printAthenaQueriesMessage.QueriesLinksMessage"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ClusterID": {
+      "type": "String",
+      "description": "(Required) The Amazon EMR cluster ID.",
+      "allowedPattern": "^j-[A-Z0-9]{1,13}$"
+    },
+    "S3LogLocation": {
+      "type": "String",
+      "description": "(Optional) The Amazon S3 Amazon EMR log location. Input the Path-style URL S3 location, example `s3://mybucket/myfolder/j-1K48XXXXXXHCB/`. Provide this parameter if the Amazon EMR cluster has been terminated for more than 30 days.",
+      "default": "",
+      "allowedPattern": "^$|^s3:\\//[_a-zA-Z0-9][-._a-zA-Z0-9]{2,62}\\/(j-[A-Z0-9]{1,13}\\/$|[a-zA-Z0-9][-.\\/a-zA-Z0-9]{0,255}\\/j-[A-Z0-9]{1,13}\\/)$"
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The Amazon S3 bucket name to upload a list of known issues, and the output of Amazon Athena queries. The bucket should have [Block Public Access Enabled](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html) and be in the same AWS region and account as the Amazon EMR cluster."
+    },
+    "Approvers": {
+      "type": "StringList",
+      "description": "(Required) The list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of the following formats: user name, user ARN, IAM role ARN, or IAM assume role ARN.",
+      "allowedPattern": "^[a-z0-9A-Z+=,.@_-]{1,64}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):iam::[0-9]{12,14}:(role/|user/|assumed-role/)[a-z0-9A-Z+=,.@_-]{1,64}(/[a-z0-9A-Z+=,.@_-]{1,64})?$"
+    },
+    "FetchNodeLogsOnly": {
+      "type": "Boolean",
+      "description": "(Optional) If set to `true`, the automation queries the Amazon EMR node logs.",
+      "allowedValues": [
+        true,
+        false
+      ],
+      "default": false
+    },
+    "FetchContainersLogsOnly": {
+      "type": "Boolean",
+      "description": "(Optional) If set to `true`, the automation queries the Amazon EMR application containers logs.",
+      "allowedValues": [
+        true,
+        false
+      ],
+      "default": false
+    },
+    "EndSearchDate": {
+      "type": "String",
+      "description": "(Optional) The end date for log searches. If provided, the automation will exclusively search for logs generated up to the specified date in the format *YYYY-MM-DD* (for example: `2024-12-30`).",
+      "default": "",
+      "allowedPattern": "^$|^\\d{4}(-)(0[1-9]|1[0-1,2])(-)(0[1-9]|[12][0-9]|3[01])$"
+    },
+    "DaysToCheck": {
+      "default": "1",
+      "type": "String",
+      "description": "(Optional) When `EndSearchDate` is provided, this parameter is required to determine the number of days to retrospectively search for logs from the specified `EndSearchDate`. The maximum value is `30` days.",
+      "allowedPattern": "^$|^([1-9]|[12]\\d|30)$"
+    },
+    "SearchKeywords": {
+      "type": "StringList",
+      "description": "(Optional) The list of keywords to search in the logs, separated by commas. The keywords cannot contain single or double quotes.",
+      "default": [
+        ""
+      ],
+      "allowedPattern": "^$|^[a-zA-Z0-9! `@#%&$^*()_+{}:\\[\\];<>,.?~\\/-]{1,256}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getLogLocation",
+      "action": "aws:executeScript",
+      "description": "Retrieves the Amazon S3 log location by querying the specified Amazon EMR `ClusterID`. If the automation is unable to query the log location from the EMR cluster ID, the runbook uses the `S3LogLocation` input parameter.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "cluster_id": "{{ ClusterID }}",
+          "s3_log_location": "{{ S3LogLocation }}",
+          "fetch_node_logs_only": "{{ FetchNodeLogsOnly }}",
+          "fetch_containers_logs_only": "{{ FetchContainersLogsOnly }}",
+          "outputs_bucket": "{{ S3BucketName }}"
+        },
+        "Handler": "get_emr_cluster_details.script_handler",
+        "Runtime": "python3.8",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "LogLocation",
+          "Selector": "$.Payload.LogLocation",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterLogLocationPrefix",
+          "Selector": "$.Payload.ClusterLogLocationPrefix",
+          "Type": "String"
+        },
+        {
+          "Name": "LogsLocationPrefix",
+          "Selector": "$.Payload.LogsLocationPrefix",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterExist",
+          "Selector": "$.Payload.ClusterExist",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "IsValidLogLocation",
+          "Selector": "$.Payload.IsValidLogLocation",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "LogLocationSizeMB",
+          "Selector": "$.Payload.LogLocationSizeMB",
+          "Type": "Integer"
+        },
+        {
+          "Name": "Bucket",
+          "Selector": "$.Payload.Bucket",
+          "Type": "String"
+        },
+        {
+          "Name": "BucketRegion",
+          "Selector": "$.Payload.BucketRegion",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnValidLog"
+    },
+    {
+      "name": "branchOnValidLog",
+      "action": "aws:branch",
+      "isEnd": true,
+      "description": "Verifies the Amazon EMR logs location. If the location is valid, proceed to estimate the Amazon Athena potential costs when executing queries on the Amazon EMR logs.",
+      "timeoutSeconds": 60,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "estimateAthenaCosts",
+            "Variable": "{{ getLogLocation.IsValidLogLocation }}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "estimateAthenaCosts",
+      "action": "aws:executeScript",
+      "description": "Determines the size of Amazon EMR logs and provides a cost estimate for executing Amazon Athena scans on the log dataset. For non-commercial regions (non `aws` partitions), this step just provides the log size without estimating costs. Costs can be calculated using the Athena pricing documentation in the specified region.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "s3_log_location": "{{ getLogLocation.LogsLocationPrefix }}",
+          "is_valid_log_location": "{{ getLogLocation.IsValidLogLocation }}",
+          "log_location_size_mb": "{{ getLogLocation.LogLocationSizeMB }}",
+          "bucket": "{{ getLogLocation.Bucket }}",
+          "bucket_region": "{{ getLogLocation.BucketRegion }}",
+          "outputs_bucket": "{{ S3BucketName }}"
+        },
+        "Handler": "estimate_athena_cost.script_handler",
+        "Runtime": "python3.8",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AthenaCostMessage",
+          "Selector": "$.Payload.AthenaCostMessage",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "approveAutomation"
+    },
+    {
+      "name": "approveAutomation",
+      "action": "aws:approve",
+      "description": "Waits for the designated AWS IAM principals approval to proceed with the next steps of the automation. The approve notification contains the estimated cost of Amazon Athena scan on the Amazon EMR logs, and details about the resources being provisioned by the automation.",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Message": "{{ estimateAthenaCosts.AthenaCostMessage }}.",
+        "Approvers": [
+          "{{ Approvers }}"
+        ]
+      },
+      "nextStep": "uploadKnownIssuesAndExecuteAthenaQueries"
+    },
+    {
+      "name": "uploadKnownIssuesAndExecuteAthenaQueries",
+      "description": "Uploads the predefined known issues to the Amazon S3 bucket specified in the `S3BucketName` parameter. Creates an AWS Glue database and tables. Executes Amazon Athena queries in the AWS Glue database based on the input parameters.",
+      "action": "aws:executeScript",
+      "inputs": {
+        "InputPayload": {
+          "cluster_id": "{{ ClusterID }}",
+          "cluster_log_location_prefix": "{{ getLogLocation.LogsLocationPrefix }}",
+          "bucket": "{{ getLogLocation.Bucket }}",
+          "end_search_date": "{{ EndSearchDate }}",
+          "days_to_check": "{{ DaysToCheck }}",
+          "search_keywords": "{{SearchKeywords }}",
+          "outputs_bucket": "{{ S3BucketName }}"
+        },
+        "Handler": "upload_known_issues_to_s3_execute_athena_queries.script_handler",
+        "Runtime": "python3.8",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "QueryExecutionIds",
+          "Selector": "$.Payload.QueryExecutionIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "QueryExecutionId",
+          "Selector": "$.Payload.QueryExecutionId",
+          "Type": "String"
+        }
+      ],
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "onFailure": "step:cleanupResources",
+      "isCritical": true,
+      "nextStep": "getQueryExecutionStatus"
+    },
+    {
+      "name": "getQueryExecutionStatus",
+      "timeoutSeconds": 1800,
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits until the Amazon Athena query execution is in `SUCCEEDED` state. The Amazon Athena DML query searches for errors and exceptions in EMR cluster logs.",
+      "isCritical": true,
+      "onFailure": "step:cleanupResources",
+      "nextStep": "analyzeAthenaResults",
+      "inputs": {
+        "Service": "athena",
+        "Api": "GetQueryExecution",
+        "QueryExecutionId": "{{uploadKnownIssuesAndExecuteAthenaQueries.QueryExecutionId}}",
+        "PropertySelector": "$.QueryExecution.Status.State",
+        "DesiredValues": [
+          "SUCCEEDED"
+        ]
+      }
+    },
+    {
+      "name": "analyzeAthenaResults",
+      "description": "Analyzes the Amazon Athena results to provide findings, recommendations, and Knowledge Center (KC) articles sourced from a predefined set of mappings.",
+      "action": "aws:executeScript",
+      "inputs": {
+        "InputPayload": {
+          "cluster_id": "{{ ClusterID }}",
+          "outputs_bucket": "{{ S3BucketName }}",
+          "cluster_log_location_prefix": "{{ getLogLocation.ClusterLogLocationPrefix }}",
+          "search_keywords": "{{SearchKeywords }}"
+        },
+        "Handler": "analyse_athena_results.script_handler",
+        "Runtime": "python3.8",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "QueryExecutionIds",
+          "Selector": "$.Payload.QueryExecutionIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "Query1ExecutionId",
+          "Selector": "$.Payload.Query1ExecutionId",
+          "Type": "String"
+        },
+        {
+          "Name": "Query2ExecutionId",
+          "Selector": "$.Payload.Query2ExecutionId",
+          "Type": "String"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:cleanupResources",
+      "nextStep": "getAnalyseResultsQuery1ExecutionStatus",
+      "isCritical": true
+    },
+    {
+      "name": "getAnalyseResultsQuery1ExecutionStatus",
+      "timeoutSeconds": 1800,
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits until the query execution is in `SUCCEEDED` state. The Amazon Athena DML query analyzes the results from the previous DML query. This analysis query will return matched exceptions with resolutions and KC articles.",
+      "isCritical": true,
+      "onFailure": "step:cleanupResources",
+      "nextStep": "getAnalyseResultsQuery2ExecutionStatus",
+      "inputs": {
+        "Service": "athena",
+        "Api": "GetQueryExecution",
+        "QueryExecutionId": "{{analyzeAthenaResults.Query1ExecutionId}}",
+        "PropertySelector": "$.QueryExecution.Status.State",
+        "DesiredValues": [
+          "SUCCEEDED"
+        ]
+      }
+    },
+    {
+      "name": "getAnalyseResultsQuery2ExecutionStatus",
+      "timeoutSeconds": 1800,
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits until the query execution is in `SUCCEEDED` state. The Amazon Athena DML query analyzes the results from the previous DML query. This analysis query will return a list of exceptions/errors detected in each S3 log path.",
+      "isCritical": true,
+      "onFailure": "step:cleanupResources",
+      "nextStep": "printAthenaQueriesMessage",
+      "inputs": {
+        "Service": "athena",
+        "Api": "GetQueryExecution",
+        "QueryExecutionId": "{{analyzeAthenaResults.Query2ExecutionId}}",
+        "PropertySelector": "$.QueryExecution.Status.State",
+        "DesiredValues": [
+          "SUCCEEDED"
+        ]
+      }
+    },
+    {
+      "name": "printAthenaQueriesMessage",
+      "action": "aws:executeScript",
+      "description": "Prints links for the Amazon Athena DML queries results.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:cleanupResources",
+      "isCritical": true,
+      "nextStep": "cleanupResources",
+      "inputs": {
+        "InputPayload": {
+          "bucket_region": "{{ getLogLocation.BucketRegion }}",
+          "query_executions_ids": "{{uploadKnownIssuesAndExecuteAthenaQueries.QueryExecutionIds}}",
+          "analyse_results_query_execution_ids": "{{ analyzeAthenaResults.QueryExecutionIds }}"
+        },
+        "Handler": "print_athena_queries_message.script_handler",
+        "Runtime": "python3.8",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "QueriesLinksMessage",
+          "Selector": "$.Payload.QueriesLinksMessage",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "cleanupResources",
+      "action": "aws:executeScript",
+      "description": "Clean-ups resources by deleting the created AWS Glue database and delete known issues files that were created in the EMR logs bucket.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "s3_log_location": "{{ getLogLocation.LogLocation }}",
+          "outputs_bucket": "{{ S3BucketName }}"
+        },
+        "Handler": "cleanup_resources.script_handler",
+        "Runtime": "python3.8",
+        "Attachment": "attachments.zip"
+      }
+    }
+  ],
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "SHA256": "e1bcbe5c97cbad1109b71ecc206d9a31d21f31ef3d796624a53e929c8e18011f"
+      }
+    }
+  }
+}
