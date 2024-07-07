@@ -1,26 +1,31 @@
 {
   "schemaVersion": "0.3",
-  "description": "AWSSupport-SetupIPMonitoringFromVPC creates an Amazon Elastic Compute Cloud (Amazon EC2) instance in the specified subnet and monitors selected target IPs (IPv4 or IPv6) by continuously running ping, MTR, traceroute and tracetcp tests. The results are stored in Amazon CloudWatch Logs logs, and metric filters are applied to quickly visualize latency and packet loss statistics in a CloudWatch dashboard. \n\nThe CloudWatch Logs data can be used for network troubleshooting and analysis of pattern/trends. Additionally, you can configure CloudWatch alarms with Amazon SNS notifications when packet loss and/or latency reach a threshold. The data can also be used when opening a case with AWS Support, to help isolate an issue quickly and reduce time to resolution when investigating a network issue.\n\nUsing this runbook incurs costs to your account for the running time of Amazon EC2 instance, Amazon CloudWatch logs and dashboard. For more details, see [Amazon EC2 Pricing](https://aws.amazon.com/ec2/pricing/) and [Amazon CloudWatch Pricing](https://aws.amazon.com/cloudwatch/pricing).\n\nTTo clean up resources created by created by this runbook, you can use **AWSSupport-TerminateIPMonitoringFromVPC**.\n",
+  "description": "The **AWSSupport-SetupIPMonitoringFromVPC** runbook helps to monitor a set of targets IPv4 and/or IPv6 addresses by continuously running `ping`, `MTR`, `traceroute`, and `tracetcp` tests on a specific interval. The runbook performs the tests by creating an Amazon Elastic Compute Cloud (Amazon EC2) instance in a specified subnet using AWS CloudFormation. The test results are processed by the Amazon CloudWatch agent which pushes the log events to Amazon CloudWatch Logs. The runbook creates metric filters and an Amazon CloudWatch dashboard so you can visualize average `ping` latency (using the average round-trip time) and `ping` packet loss statistics.\n\nThe CloudWatch Logs data can be used for network troubleshooting and analysis of pattern/trends. You can manually configure Amazon CloudWatch alarms with Amazon SNS notifications when ping packet loss and/or latency reach a specific threshold. The data can also be used when opening an AWS Support case to help isolate and reduce the time to resolution when investigating a network issue.\n\nUsing this runbook incurs costs to your AWS account for the running time of the Amazon EC2 instance, the Amazon CloudWatch Logs, and the Amazon CloudWatch dashboard. For more details, see [Amazon EC2 Pricing](https://aws.amazon.com/ec2/pricing/) and [Amazon CloudWatch Pricing](https://aws.amazon.com/cloudwatch/pricing).\n\nTo clean up resources created by this runbook, you can manually delete the AWS CloudFormation stack that is used to provision the Amazon EC2 instance, the Amazon CloudWatch logs, and the Amazon CloudWatch dashboard.\n\n#### Important:\n> * By default, this runbook creates an AWS Identity and Access Management (IAM) instance profile, and a security group that are used by the EC2 instance. You can optionally specify an existing IAM instance profile and/or security group.\n> * By default, the Amazon CloudWatch dashboard and logs are retained when the AWS CloudFormation stack is deleted. You can change this behavior by setting the `RetainDashboardAndLogsOnDeletion` parameter to `False`.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
     "SubnetId": {
       "type": "String",
-      "description": "(Required) The subnet ID for the monitor instance. NOTE: If you specify a private subnet, make sure there is Internet access to allow the monitor instance to setup the test (i.e. install the Amazon CloudWatch Logs agent, interact with Systems Manager and CloudWatch).",
-      "allowedPattern": "^subnet-[a-z0-9]{8,17}$"
+      "description": "(Required) The subnet ID for the monitor instance. **Note:** If you specify a private subnet, make sure it allows access for the test instance to connect to the monitoring IPs, and to the Amazon CloudWatch and AWS Systems Manager service endpoints.",
+      "allowedPattern": "^subnet-[a-f0-9]{8,17}$"
     },
     "TargetIPs": {
       "type": "String",
-      "description": "(Required) Comma separated list of IPv4s and/or IPv6s to monitor. No spaces allowed. Maximum size is 255 characters. NOTE: If you provide an invalid IP, the automation will fail and rollback the test setup.",
+      "description": "(Required) The comma separated list of IPv4s and/or IPv6s to monitor. No spaces allowed. Maximum size is 255 characters. **Note**: If you provide an invalid or duplicated IP, the automation will fail and rollback the test setup.",
       "allowedPattern": "^[0-9a-fA-F.:,]{6,255}$"
     },
     "CloudWatchLogGroupNamePrefix": {
-      "description": "(Optional) Prefix used for each CloudWatch log group created for the test results.",
+      "description": "(Optional) The prefix name that will be used for the Amazon CloudWatch Logs log groups for the test results.",
       "type": "String",
       "default": "/AWSSupport-SetupIPMonitoringFromVPC",
       "allowedPattern": "^[0-9a-zA-Z_.#/\\-]{1,512}$"
     },
     "CloudWatchLogGroupRetentionInDays": {
-      "description": "(Optional) Number of days you want to keep the network monitoring results for.",
+      "description": "(Optional) The number of days you want to set the log data retention setting for the Amazon CloudWatch logs. **Note:** The CloudWatch Logs log retention feature deletes the log events in a stream based on retention policy. It doesn't delete log streams or log groups.",
       "type": "String",
       "allowedValues": [
         "1",
@@ -45,8 +50,8 @@
     },
     "InstanceType": {
       "type": "String",
-      "description": "(Optional) The EC2 instance type for the test instance. Recommended size: t2.micro.",
-      "default": "t2.micro",
+      "description": "(Optional) The Amazon EC2 instance type for the test instance. Default size: `t3.micro`.",
+      "default": "t3.micro",
       "allowedValues": [
         "t2.micro",
         "t2.small",
@@ -62,16 +67,55 @@
         "t4g.large"
       ]
     },
-    "AutomationAssumeRole": {
-      "type": "AWS::IAM::Role::Arn",
-      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
-      "default": ""
+    "TestInstanceSecurityGroupId": {
+      "type": "String",
+      "description": "(Optional) The security group ID for the test instance. If not specified, the automation creates one during the instance creation. Make sure the security group allows outbound access to the monitoring IPs.",
+      "default": "",
+      "allowedPattern": "^$|^sg-[a-f0-9]{8,17}$"
+    },
+    "TestInstanceProfileName": {
+      "type": "String",
+      "description": "(Optional) The name of an existing IAM instance profile for the test instance. If not specified, the automation creates one during the instance creation. The role must have the following permissions: `logs:CreateLogStream`, `logs:DescribeLogGroups`, `logs:DescribeLogStreams`, and `logs:PutLogEvents` and the AWS Managed Policy `AmazonSSMManagedInstanceCore`. For more information, see [Create IAM roles to use with the CloudWatch agent on Amazon EC2 instances](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/install-CloudWatch-Agent-on-EC2-Instance.html).",
+      "default": "",
+      "allowedPattern": "^$|^[\\w+=,.@-]{1,128}$"
+    },
+    "TestInterval": {
+      "type": "String",
+      "description": "(Optional) The number of minutes between test intervals. The default value is `1` minute and the maximum is `10` minutes.",
+      "allowedValues": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "default": "1"
+    },
+    "SleepTime": {
+      "type": "String",
+      "description": "(Optional) The number of minutes this runbook should wait before deleting the test results (the AWS CloudFormation stack). The default value is `24` hours (`1,440` minutes), and the maximum is less than `7` days (`10,080` minutes). If you set this value to `0` the stack is not deleted automatically.",
+      "allowedPattern": "^(?:[0-9]|[1-9]\\d{1,3}|100[0-7][0-9])$",
+      "default": "1440"
+    },
+    "RetainDashboardAndLogsOnDeletion": {
+      "type": "String",
+      "description": "(Optional) Specify `False` to delete the Amazon CloudWatch dashboard and Logs when deleting the AWS CloudFormation stack. The default value is `True`. By default, the dashboard and logs are retained and will need to be manually deleted when they are no longer needed.",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
     }
   },
   "mainSteps": [
     {
       "name": "describeSubnet",
-      "description": "Describes the provided subnet to get associated Amazon Virtual Private Cloud(VPC) Id",
+      "description": "Describes the provided subnet to get the associated Amazon Virtual Private Cloud (VPC) ID and its associated IPv6 address pool.",
       "action": "aws:executeAwsApi",
       "onFailure": "Abort",
       "inputs": {
@@ -85,60 +129,30 @@
         {
           "Name": "VpcId",
           "Selector": "$.Subnets[0].VpcId"
+        },
+        {
+          "Name": "Ipv6CidrBlockAssociationState",
+          "Selector": "$.Subnets[0].Ipv6CidrBlockAssociationSet[0].Ipv6CidrBlockState.State"
         }
       ],
-      "isCritical": "true",
-      "nextStep": "branchOnTargetIPs"
+      "isCritical": true,
+      "nextStep": "validateIPAddresses"
     },
     {
-      "name": "branchOnTargetIPs",
-      "description": "Evaluates the TargetIPs input",
-      "action": "aws:branch",
-      "onFailure": "Abort",
-      "inputs": {
-        "Choices": [
-          {
-            "NextStep": "assertSubnetHasIPv6CidrBlock",
-            "Variable": "{{ TargetIPs }}",
-            "Contains": ":"
-          }
-        ],
-        "Default": "getInstanceArchitecture"
-      },
-      "isCritical": "true"
-    },
-    {
-      "name": "assertSubnetHasIPv6CidrBlock",
-      "description": "Checks the provided subnet has an IPv6 pool associated ",
-      "action": "aws:assertAwsResourceProperty",
-      "onFailure": "Abort",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeSubnets",
-        "SubnetIds": [
-          "{{ SubnetId }}"
-        ],
-        "PropertySelector": "$.Subnets[0].Ipv6CidrBlockAssociationSet[0].Ipv6CidrBlockState.State",
-        "DesiredValues": [
-          "associated"
-        ]
-      },
-      "isCritical": "true",
-      "nextStep": "getInstanceArchitecture"
-    },
-    {
-      "name": "getInstanceArchitecture",
-      "description": "Gets the architecture of the selected InstanceType",
+      "name": "validateIPAddresses",
+      "description": "Validates the provided target IPs are syntactically correct IPv4 and/or IPv6 addresses, gets the architecture of the selected `InstanceType`, and if the target subnet has an IPv6 pool association. If any IP is IPv6, the subnet requires an IPv6 pool association.",
       "action": "aws:executeScript",
       "onFailure": "Abort",
-      "nextStep": "getLatestLinuxAMI",
+      "nextStep": "createTestInstance",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "script_handler",
-        "Script": " # Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n # SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n # Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport boto3\nfrom botocore.exceptions import ClientError\nimport sys\n\nsys.tracebacklimit = 0\n\nSUPPORTED_ARCH =  {\n    \"x86_64\": \"/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2\",\n    \"arm64\": \"/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2\"\n    }\n\ndef script_handler(events,context):\n   \"\"\"\n   Gets architecture of the EC2 instance\n   \"\"\"\n   try:\n       ec2 = boto3.client('ec2')\n       supported_architectures = ec2.describe_instance_types(\n           InstanceTypes=[events.get('InstanceType')]\n           )['InstanceTypes'][0]['ProcessorInfo']['SupportedArchitectures']\n       \n       if \"arm64\" in supported_architectures:\n            instance_architecture = \"arm64\"        \n       elif \"x86_64\" in supported_architectures:\n            instance_architecture = \"x86_64\"\n       else:\n           sys.exit(f\"Unsupported architecture: {supported_architectures}\")\n    \n       return {\n            \"architecture\": instance_architecture,\n            \"latestLinuxAMIPath\": SUPPORTED_ARCH.get(instance_architecture)\n       }\n        \n   except ClientError as e:\n       c = e.response['Error']['Code']\n       m = e.response['Error']['Message']\n       sys.exit(f\"An error occurred when describing instance types: {c}:{m}\")\n",
         "InputPayload": {
-          "InstanceType": "{{InstanceType}}"
-        }
+          "TargetIPs": "{{ TargetIPs }}",
+          "InstanceType": "{{ InstanceType }}",
+          "Ipv6CidrBlockAssociationState": "{{ describeSubnet.Ipv6CidrBlockAssociationState }}"
+        },
+        "Handler": "validate_ips_and_get_instance_arch.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
       },
       "outputs": [
         {
@@ -147,269 +161,184 @@
           "Type": "String"
         },
         {
-          "Name": "LatestLinuxAMIPath",
-          "Selector": "$.Payload.latestLinuxAMIPath",
+          "Name": "Ipv6CidrBlockAssociationState",
+          "Selector": "$.Payload.ipv6association",
+          "Type": "String"
+        },
+        {
+          "Name": "IPsList",
+          "Selector": "$.Payload.ips",
+          "Type": "String"
+        },
+        {
+          "Name": "IPsNames",
+          "Selector": "$.Payload.ip_names",
           "Type": "String"
         }
       ]
     },
     {
-      "name": "getLatestLinuxAMI",
-      "description": "Gets the latest Amazon Linux 2 AMI from AWS Systems Manager Parameter Store",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Abort",
+      "name": "createTestInstance",
+      "action": "aws:createStack",
+      "description": "Creates an AWS CloudFormation stack that provisions the Amazon CloudWatch dashboard, the Log Groups, and a test EC2 instance including an IAM instance profile, and security group that will be used for the tests.",
+      "isCritical": true,
+      "timeoutSeconds": 600,
       "inputs": {
-        "Service": "ssm",
-        "Api": "GetParameter",
-        "Name": "{{getInstanceArchitecture.LatestLinuxAMIPath}}"
-      },
-      "outputs": [
-        {
-          "Name": "ImageId",
-          "Selector": "$.Parameter.Value",
-          "Type": "String"
-        }
-      ],
-      "isCritical": "true",
-      "nextStep": "createSecurityGroup"
-    },
-    {
-      "name": "createSecurityGroup",
-      "description": "Creates a security group for the test in the subnet's VPC",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:deleteSecurityGroup",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "CreateSecurityGroup",
-        "VpcId": "{{ describeSubnet.VpcId }}",
-        "GroupName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}",
-        "Description": "Security group used by the test instance created by AWSSupport-SetupIPMonitoringFromVPC Automation execution {{ automation:EXECUTION_ID }}."
-      },
-      "outputs": [
-        {
-          "Name": "GroupId",
-          "Selector": "$.GroupId"
-        }
-      ],
-      "isCritical": "true",
-      "nextStep": "allowAllOutboundTrafficInSecurityGroup"
-    },
-    {
-      "name": "allowAllOutboundTrafficInSecurityGroup",
-      "description": "Allows all outbound traffic in the test security group",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:deleteSecurityGroup",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "AuthorizeSecurityGroupEgress",
-        "GroupId": "{{ createSecurityGroup.GroupId }}",
-        "IpPermissions": [
+        "StackName": "AWSSupport-SetupIPMonitoringFromVPC-{{ automation:EXECUTION_ID }}",
+        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nTransform: AWS::LanguageExtensions\nDescription: Creates the temporary monitoring instance in the specified subnet\nParameters:\n  RetainDashboardAndLogsOnDeletion:\n    Type: String\n    Default: 'False'\n    AllowedValues:\n      - 'True'\n      - 'False'\n    Description: \"Specify if the CloudWatch Dashboard and logs should be retained after stack deletion.\"\n  Architecture:\n    Type: String\n    AllowedValues:\n      - arm64\n      - x86_64\n  VpcId:\n    Description: Existing VPC ID\n    Type: 'AWS::EC2::VPC::Id'\n  SubnetId:\n    Description: 'Existing subnet ID. If specified, no VPC is created.'\n    Type: String\n    Default: ''\n  InstanceProfileName:\n    Description: The name of an existing IAM instance profile.\n    Type: String\n    Default: ''\n  InstanceSecurityGroup:\n    Description: The ID of an existing security group.\n    Type: String\n    Default: ''\n  ExecutionId:\n    Description: Systems Manager Automation Execution ID.\n    Type: String\n    Default: ''\n  LinuxAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2\n  ARMLinuxAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2\n  InstanceType:\n    Type: String\n    Default: t3.micro\n  CreateHelperInstance:\n    Description: Confirm that you want to create the helper instance.\n    Type: String\n    Default: 'False'\n    AllowedValues:\n      - 'True'\n      - 'False'\n  IPv6CidrBlockAssociationState:\n    Description: Assign a primary IPv6 address to the instance\n    Type: String\n  CloudWatchLogGroupNamePrefix:\n    Description: The name of the prefix used for each CloudWatch log group created\n    Type: String\n  LogGroupRetention:\n    Description: LogGroupRetention\n    Type: Number\n    Default: 7\n  IPsNames:\n    Description: List of IPs to be used for the monitoring instance. Example 192_168_1_1,2001_0db8_85a3_0000_0000_8a2e_0370_7334,...\n    Type: CommaDelimitedList\nConditions:\n  ArchitectureIsARM: !Equals\n    - !Ref Architecture\n    - arm64\n  CreateHelperInstance: !Equals\n    - !Ref CreateHelperInstance\n    - 'True'\n  CreateInstanceProfile: !Equals\n    - !Ref InstanceProfileName\n    - ''\n  CreateSecurityGroup: !Equals\n    - !Ref InstanceSecurityGroup\n    - ''\n  EnablePrimaryIpv6: !Equals\n    - !Ref IPv6CidrBlockAssociationState\n    - 'True'\n  RetainDashboard: !Equals\n    - !Ref RetainDashboardAndLogsOnDeletion\n    - 'True'\nResources:\n  Fn::ForEach::MtrLogGroup:\n    - IP\n    - !Ref IPsNames\n    - 'LogGroupMtr&{IP}':\n        Type: AWS::Logs::LogGroup\n        DeletionPolicy: !If [RetainDashboard, Retain, Delete]\n        UpdateReplacePolicy: !If [RetainDashboard, Retain, Delete]\n        Properties:\n          LogGroupName: !Sub '${CloudWatchLogGroupNamePrefix}/mtr-from-${SubnetId}-to-${IP}'\n          RetentionInDays: !Ref LogGroupRetention\n  Fn::ForEach::Ping1500LogGroup:\n    - IP\n    - !Ref IPsNames\n    - 'LogGroupPing1500&{IP}':\n        Type: AWS::Logs::LogGroup\n        DeletionPolicy: !If [RetainDashboard, Retain, Delete]\n        UpdateReplacePolicy: !If [RetainDashboard, Retain, Delete]\n        Properties:\n          LogGroupName: !Sub '${CloudWatchLogGroupNamePrefix}/ping1500-from-${SubnetId}-to-${IP}'\n          RetentionInDays: !Ref LogGroupRetention\n  Fn::ForEach::Ping64LogGroup:\n    - IP\n    - !Ref IPsNames\n    - 'LogGroupPing64&{IP}':\n        Type: AWS::Logs::LogGroup\n        DeletionPolicy: !If [RetainDashboard, Retain, Delete]\n        UpdateReplacePolicy: !If [RetainDashboard, Retain, Delete]\n        Properties:\n          LogGroupName: !Sub '${CloudWatchLogGroupNamePrefix}/ping64-from-${SubnetId}-to-${IP}'\n          RetentionInDays: !Ref LogGroupRetention\n  Fn::ForEach::TracepathLogGroup:\n    - IP\n    - !Ref IPsNames\n    - 'LogGroupTracepath&{IP}':\n        Type: AWS::Logs::LogGroup\n        DeletionPolicy: !If [RetainDashboard, Retain, Delete]\n        UpdateReplacePolicy: !If [RetainDashboard, Retain, Delete]\n        Properties:\n          LogGroupName: !Sub '${CloudWatchLogGroupNamePrefix}/tracepath-from-${SubnetId}-to-${IP}'\n          RetentionInDays: !Ref LogGroupRetention\n  Fn::ForEach::TracerouteLogGroup:\n    - IP\n    - !Ref IPsNames\n    - 'LogGroupTraceroute&{IP}':\n        Type: AWS::Logs::LogGroup\n        DeletionPolicy: Delete\n        UpdateReplacePolicy: Delete\n        Properties:\n          LogGroupName: !Sub '${CloudWatchLogGroupNamePrefix}/traceroutetcp-from-${SubnetId}-to-${IP}'\n          RetentionInDays: !Ref LogGroupRetention\n  SetupIPMonitoringFromVPCEC2Role:\n    Condition: CreateInstanceProfile\n    Type: 'AWS::IAM::Role'\n    Properties:\n      RoleName: !Sub 'SetupIPMonitoringFromVPC-${ExecutionId}'\n      AssumeRolePolicyDocument:\n        Version: 2012-10-17\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: ec2.amazonaws.com\n            Action: 'sts:AssumeRole'\n      Policies:\n        - PolicyName: SetupIPMonitoringFromVPC-EC2Role_CW_Permissions\n          PolicyDocument:\n            Version: 2012-10-17\n            Statement:\n              - Sid: CloudWatchLogsPermissions\n                Action:\n                  - 'logs:CreateLogStream'\n                  - 'logs:DescribeLogGroups'\n                  - 'logs:DescribeLogStreams'\n                  - 'logs:PutLogEvents'\n                Resource:\n                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudWatchLogGroupNamePrefix}/*\n                Effect: Allow\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMPatchAssociation'\n  SetupIPMonitoringFromVPCInstanceProfile:\n    Condition: CreateInstanceProfile\n    Type: 'AWS::IAM::InstanceProfile'\n    Properties:\n      Roles:\n        - !Ref SetupIPMonitoringFromVPCEC2Role\n      InstanceProfileName: !Sub 'SetupIPMonitoringFromVPC-${ExecutionId}'\n  LaunchTemplate:\n    Type: 'AWS::EC2::LaunchTemplate'\n    Properties:\n      LaunchTemplateData:\n        MetadataOptions:\n          HttpEndpoint: enabled\n          HttpTokens: required\n          HttpPutResponseHopLimit: 1\n  HelperSecurityGroup:\n    Condition: CreateSecurityGroup\n    Type: 'AWS::EC2::SecurityGroup'\n    Properties:\n      GroupDescription: !Sub >-\n        Security group created by AWSSupport-SetupIPMonitoringFromVPC Automation\n        execution ${ExecutionId}.\n      VpcId: !Ref VpcId\n      SecurityGroupEgress:\n        - CidrIp: 0.0.0.0/0\n          IpProtocol: '-1'\n        - CidrIpv6: '::/0'\n          IpProtocol: '-1'\n  HelperInstance:\n    Condition: CreateHelperInstance\n    Type: 'AWS::EC2::Instance'\n    Properties:\n      ImageId: !If\n        - ArchitectureIsARM\n        - !Ref ARMLinuxAMI\n        - !Ref LinuxAMI\n      LaunchTemplate:\n        LaunchTemplateId: !Ref LaunchTemplate\n        Version: !GetAtt\n          - LaunchTemplate\n          - LatestVersionNumber\n      InstanceType: !Ref InstanceType\n      PropagateTagsToVolumeOnCreation: true\n      NetworkInterfaces:\n        - Description: !Sub >-\n            Network Interface created by AWSSupport-SetupIPMonitoringFromVPC\n            Automation execution ${ExecutionId}.\n          DeleteOnTermination: true\n          DeviceIndex: '0'\n          SubnetId: !Ref SubnetId\n          GroupSet:\n            - !If\n              - CreateSecurityGroup\n              - !Ref HelperSecurityGroup\n              - !Ref InstanceSecurityGroup\n          Ipv6AddressCount: !If\n            - EnablePrimaryIpv6\n            - 1\n            - 0\n      IamInstanceProfile: !If\n        - CreateInstanceProfile\n        - !Ref SetupIPMonitoringFromVPCInstanceProfile\n        - !Ref InstanceProfileName\n  CloudWatchDashboard:\n    Type: AWS::CloudWatch::Dashboard\n    Condition: CreateHelperInstance\n    DeletionPolicy: !If [RetainDashboard, Retain, Delete]\n    UpdateReplacePolicy: !If [RetainDashboard, Retain, Delete]\n    Properties:\n      DashboardName: !Sub \"${SubnetId}_${HelperInstance}\"\n      DashboardBody: !Sub |\n        {\n            \"widgets\": [\n                {\n                    \"type\": \"text\",\n                    \"properties\": {\n                        \"markdown\": \"\\n# AWSSupport-SetupIPMonitoringFromVPC\\nThis dashboard was created by the AWSSupport-SetupIPMonitoringFromVPC runbook automation for ${SubnetId} ${HelperInstance}\"\n                    }\n                }\n            ]\n        }\nOutputs:\n  HelperInstanceId:\n    Condition: CreateHelperInstance\n    Value: !Ref HelperInstance\n  HelperSecurityGroupId:\n    Value: !If\n      - CreateSecurityGroup\n      - !Ref HelperSecurityGroup\n      - !Ref InstanceSecurityGroup\n  DashboardName:\n    Condition: CreateHelperInstance\n    Value: !Sub \"${SubnetId}_${HelperInstance}\"\n  StackName:\n    Value: !Sub \"${AWS::StackName}\"\n  IamRole:\n    Value: !If [CreateInstanceProfile, !Ref SetupIPMonitoringFromVPCEC2Role, '']\n  InstanceProfile:\n    Value: !If [CreateInstanceProfile, !Ref SetupIPMonitoringFromVPCInstanceProfile, !Ref InstanceProfileName]",
+        "TimeoutInMinutes": 20,
+        "OnFailure": "DELETE",
+        "ClientRequestToken": "AWSSupport-SetupIPMonitoringFromVPC-{{ automation:EXECUTION_ID }}",
+        "Parameters": [
           {
-            "IpProtocol": "-1"
-          }
-        ]
-      },
-      "isCritical": "true",
-      "nextStep": "createEC2Role"
-    },
-    {
-      "name": "createEC2Role",
-      "description": "Creates an AWS Identity and Access Management (IAM) role for the test EC2 instance",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:deleteEC2Role",
-      "inputs": {
-        "Service": "iam",
-        "Api": "CreateRole",
-        "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}",
-        "Path": "/AWSSupport/",
-        "Description": "Role used by the test instance created by AWSSupport-SetupIPMonitoringFromVPC Automation execution {{ automation:EXECUTION_ID }}.",
-        "AssumeRolePolicyDocument": "{\"Version\": \"2012-10-17\",\"Statement\": [ { \"Effect\": \"Allow\", \"Principal\": { \"Service\": \"ec2.amazonaws.com\" }, \"Action\": \"sts:AssumeRole\" } ] }"
-      },
-      "outputs": [
-        {
-          "Name": "Name",
-          "Selector": "$.Role.RoleName"
-        }
-      ],
-      "isCritical": "true",
-      "nextStep": "attachSSMManagedPolicyToEC2Role"
-    },
-    {
-      "name": "attachSSMManagedPolicyToEC2Role",
-      "description": "Attaches the AmazonSSMManagedInstanceCore managed policy to the role created",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:detachSSMManagedPolicyFromEC2Role",
-      "inputs": {
-        "Service": "iam",
-        "Api": "AttachRolePolicy",
-        "PolicyArn": "arn:{{global:AWS_PARTITION}}:iam::aws:policy/AmazonSSMManagedInstanceCore",
-        "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}"
-      },
-      "isCritical": "true",
-      "nextStep": "addCloudWatchInlinePolicyToEC2Role"
-    },
-    {
-      "name": "addCloudWatchInlinePolicyToEC2Role",
-      "description": "Attaches an inline policy to allow setting Amazon CloudWatch log group retentions and creating a CloudWatch dashboard",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:removeCloudWatchInlinePolicyFromEC2Role",
-      "inputs": {
-        "Service": "iam",
-        "Api": "PutRolePolicy",
-        "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}",
-        "PolicyName": "SetupIPMonitoringFromVPC_CWPermissions",
-        "PolicyDocument": "{    \"Version\": \"2012-10-17\",    \"Statement\": [        {            \"Effect\": \"Allow\",            \"Action\": [                \"logs:PutMetricFilter\",                \"logs:PutRetentionPolicy\",                \"logs:CreateLogGroup\",                \"logs:CreateLogStream\",                \"logs:DescribeLogGroups\",                \"logs:DescribeLogStreams\",                \"logs:PutLogEvents\"            ],            \"Resource\": \"arn:aws:logs:{{ global:REGION }}:{{ global:ACCOUNT_ID }}:log-group:/AWSSupport-SetupIPMonitoringFromVPC/*\"        },        {            \"Effect\": \"Allow\",            \"Action\": \"cloudwatch:PutDashboard\",            \"Resource\": \"*\"        }    ]}"
-      },
-      "isCritical": "true",
-      "nextStep": "createIAMInstanceProfile"
-    },
-    {
-      "name": "createIAMInstanceProfile",
-      "description": "Creates an IAM instance profile",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:deleteIAMInstanceProfile",
-      "inputs": {
-        "Service": "iam",
-        "Api": "CreateInstanceProfile",
-        "InstanceProfileName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}",
-        "Path": "/AWSSupport/"
-      },
-      "outputs": [
-        {
-          "Name": "Name",
-          "Selector": "$.InstanceProfile.InstanceProfileName"
-        },
-        {
-          "Name": "Arn",
-          "Selector": "$.InstanceProfile.Arn"
-        }
-      ],
-      "isCritical": "true",
-      "nextStep": "addIAMRoleToInstanceProfile"
-    },
-    {
-      "name": "addIAMRoleToInstanceProfile",
-      "description": "Associates the IAM instance profile to the IAM role",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:removeIAMRoleFromInstanceProfile",
-      "inputs": {
-        "Service": "iam",
-        "Api": "AddRoleToInstanceProfile",
-        "RoleName": "{{ createEC2Role.Name }}",
-        "InstanceProfileName": "{{ createIAMInstanceProfile.Name }}"
-      },
-      "isCritical": "true",
-      "nextStep": "waitForInstanceProfileToBeAvailable"
-    },
-    {
-      "name": "waitForInstanceProfileToBeAvailable",
-      "description": "Waits for the instance profile to become available",
-      "action": "aws:sleep",
-      "onFailure": "Continue",
-      "inputs": {
-        "Duration": "PT60S"
-      },
-      "isCritical": "false",
-      "nextStep": "createManagedInstance"
-    },
-    {
-      "name": "createManagedInstance",
-      "description": "Creates the test instance in the specified subnet, and with the instance profile created earlier attached",
-      "action": "aws:executeAwsApi",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "RunInstances",
-        "ImageId": "{{ getLatestLinuxAMI.ImageId }}",
-        "InstanceType": "{{ InstanceType }}",
-        "MinCount": 1,
-        "MaxCount": 1,
-        "IamInstanceProfile": {
-          "Arn": "{{ createIAMInstanceProfile.Arn }}"
-        },
-        "NetworkInterfaces": [
+            "ParameterKey": "RetainDashboardAndLogsOnDeletion",
+            "ParameterValue": "{{ RetainDashboardAndLogsOnDeletion }}"
+          },
           {
-            "AssociatePublicIpAddress": true,
-            "DeleteOnTermination": true,
-            "DeviceIndex": 0,
-            "SubnetId": "{{ SubnetId }}",
-            "Groups": [
-              "{{ createSecurityGroup.GroupId }}"
-            ]
+            "ParameterKey": "CreateHelperInstance",
+            "ParameterValue": "True"
+          },
+          {
+            "ParameterKey": "IPv6CidrBlockAssociationState",
+            "ParameterValue": "{{ validateIPAddresses.Ipv6CidrBlockAssociationState }}"
+          },
+          {
+            "ParameterKey": "Architecture",
+            "ParameterValue": "{{ validateIPAddresses.Architecture }}"
+          },
+          {
+            "ParameterKey": "VpcId",
+            "ParameterValue": "{{ describeSubnet.VpcId }}"
+          },
+          {
+            "ParameterKey": "SubnetId",
+            "ParameterValue": "{{ SubnetId }}"
+          },
+          {
+            "ParameterKey": "InstanceProfileName",
+            "ParameterValue": "{{ TestInstanceProfileName }}"
+          },
+          {
+            "ParameterKey": "InstanceSecurityGroup",
+            "ParameterValue": "{{ TestInstanceSecurityGroupId }}"
+          },
+          {
+            "ParameterKey": "InstanceType",
+            "ParameterValue": "{{ InstanceType }}"
+          },
+          {
+            "ParameterKey": "ExecutionId",
+            "ParameterValue": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "CloudWatchLogGroupNamePrefix",
+            "ParameterValue": "{{ CloudWatchLogGroupNamePrefix }}"
+          },
+          {
+            "ParameterKey": "IPsNames",
+            "ParameterValue": "{{ validateIPAddresses.IPsNames }}"
+          },
+          {
+            "ParameterKey": "LogGroupRetention",
+            "ParameterValue": "{{ CloudWatchLogGroupRetentionInDays }}"
           }
         ],
-        "TagSpecifications": [
+        "Capabilities": [
+          "CAPABILITY_NAMED_IAM",
+          "CAPABILITY_AUTO_EXPAND"
+        ],
+        "Tags": [
           {
-            "ResourceType": "instance",
-            "Tags": [
-              {
-                "Key": "Name",
-                "Value": "AWSSupport-SetupIPMonitoringFromVPC - {{ SubnetId }}"
-              },
-              {
-                "Key": "AutomationExecutionId",
-                "Value": "{{ automation:EXECUTION_ID }}"
-              },
-              {
-                "Key": "TargetIPs",
-                "Value": "{{ TargetIPs }}"
-              }
-            ]
+            "Key": "Name",
+            "Value": "AWSSupport-SetupIPMonitoringFromVPC-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-SetupIPMonitoringFromVPC-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
           }
         ]
       },
       "outputs": [
         {
-          "Name": "InstanceId",
-          "Selector": "$.Instances[0].InstanceId",
-          "Type": "String"
-        },
-        {
-          "Name": "NetworkInterfaceId",
-          "Selector": "$.Instances[0].NetworkInterfaces[0].NetworkInterfaceId",
+          "Name": "CloudFormationStackId",
+          "Selector": "$.StackId",
           "Type": "String"
         }
       ],
-      "isCritical": "true",
-      "nextStep": "branchOnTargetIPsToAssignIPv6ToInstance"
+      "nextStep": "waitForStackCreation",
+      "onFailure": "step:describeStackCreationErrors"
     },
     {
-      "name": "branchOnTargetIPsToAssignIPv6ToInstance",
-      "description": "Evaluates If TargetIPs input contains an IPv6",
-      "action": "aws:branch",
-      "onFailure": "Abort",
+      "name": "waitForStackCreation",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the AWS CloudFormation stack to complete.",
+      "isCritical": true,
+      "timeoutSeconds": 600,
       "inputs": {
-        "Choices": [
-          {
-            "NextStep": "assignIPv6ToInstance",
-            "Variable": "{{ TargetIPs }}",
-            "Contains": ":"
-          }
-        ],
-        "Default": "waitForInstanceToBeManaged"
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ createTestInstance.CloudFormationStackId }}",
+        "PropertySelector": "$.Stacks[0].StackStatus",
+        "DesiredValues": [
+          "UPDATE_COMPLETE",
+          "CREATE_COMPLETE"
+        ]
       },
-      "isCritical": "true"
+      "nextStep": "describeStackResources",
+      "onFailure": "step:describeStackCreationErrors"
     },
     {
-      "name": "assignIPv6ToInstance",
-      "description": "Assigns an IPv6 to the test instance",
+      "name": "describeStackResources",
       "action": "aws:executeAwsApi",
-      "onFailure": "step:terminateInstance",
+      "description": "Describes the AWS CloudFormation stack resources.",
+      "isCritical": true,
+      "onFailure": "step:describeStackCreationErrors",
+      "timeoutSeconds": 180,
       "inputs": {
-        "Service": "ec2",
-        "Api": "AssignIpv6Addresses",
-        "NetworkInterfaceId": "{{ createManagedInstance.NetworkInterfaceId }}",
-        "Ipv6AddressCount": 1
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ createTestInstance.CloudFormationStackId }}"
       },
-      "isCritical": "true",
+      "outputs": [
+        {
+          "Name": "HelperInstanceId",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'HelperInstanceId')].OutputValue",
+          "Type": "String"
+        },
+        {
+          "Name": "HelperSecurityGroupId",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'HelperSecurityGroupId')].OutputValue",
+          "Type": "String"
+        },
+        {
+          "Name": "HelperInstanceIamRole",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'IamRole')].OutputValue",
+          "Type": "String"
+        },
+        {
+          "Name": "HelperInstanceProfile",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'InstanceProfile')].OutputValue",
+          "Type": "String"
+        },
+        {
+          "Name": "DashboardName",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'DashboardName')].OutputValue",
+          "Type": "String"
+        },
+        {
+          "Name": "StackName",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'StackName')].OutputValue",
+          "Type": "String"
+        }
+      ],
       "nextStep": "waitForInstanceToBeManaged"
     },
     {
       "name": "waitForInstanceToBeManaged",
-      "description": "Waits for the test instance to become a managed instance",
+      "description": "Waits for the test EC2 instance to become managed by AWS Systems Manager.",
       "action": "aws:waitForAwsResourceProperty",
       "timeoutSeconds": 600,
-      "onFailure": "step:terminateInstance",
+      "onFailure": "step:deleteStack",
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -417,7 +346,7 @@
           {
             "key": "InstanceIds",
             "valueSet": [
-              "{{ createManagedInstance.InstanceId }}"
+              "{{ describeStackResources.HelperInstanceId }}"
             ]
           }
         ],
@@ -426,840 +355,678 @@
           "Online"
         ]
       },
-      "isCritical": "true",
-      "nextStep": "installPrerequisites"
+      "isCritical": true,
+      "nextStep": "installCloudWatchAgent"
     },
     {
-      "name": "installPrerequisites",
-      "description": "Installs test pre-requisites",
+      "name": "installCloudWatchAgent",
+      "description": "Installs the Amazon CloudWatch Agent.",
+      "maxAttempts": 3,
       "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
+      "onFailure": "step:deleteStack",
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
+          "{{ describeStackResources.HelperInstanceId }}"
         ],
         "Parameters": {
           "commands": [
-            "#!/bin/bash",
+            "#!/bin/sh",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
             "",
-            "sudo yum update -y &> /dev/null",
-            "sudo yum install -y python3 &> /dev/null",
-            "sudo yum install -y amazon-cloudwatch-agent &> /dev/null"
-          ]
-        }
-      },
-      "isCritical": "true",
-      "nextStep": "validateIPs"
-    },
-    {
-      "name": "validateIPs",
-      "description": "Validates the provided IPs are syntactically correct IPv4 and/or IPv6 addresses",
-      "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
-            "",
-            "error_trap()",
-            "{",
-            "    if test -n \"$1\" ; then",
+            "# Function to handle errors",
+            "error_trap() {",
+            "    if [ -n \"$1\" ]; then",
             "        printf \"%s\\\\n\" \"$1\"",
             "    fi",
-            "",
             "    printf \"%.s=\" $(seq 1 80)",
-            "    printf \"\\\\nThe input parameter TargetIPs contains one or more invalid IPs. Please review your input and run this automation again.\\\\n\"",
-            "",
+            "    printf \"\\\\nThe CloudWatch Agent installation failed. Please try running this automation again.\\\\n\"",
             "    exit 1",
             "}",
             "",
-            "# Check that Python3 interpreter is available in the host environment",
-            "if command -v python3 > /dev/null; then",
-            "    PYTHON=python3",
-            "else",
-            "    error_trap \"Python3 is not installed!\"",
-            "fi",
+            "# Install the Amazon CloudWatch Agent",
+            "echo \"Installing the Amazon CloudWatch Agent...\"",
+            "sudo yum install -y amazon-cloudwatch-agent || error_trap \"Error installing Amazon CloudWatch Agent\"",
             "",
-            "printf \"Target IPs: {{ TargetIPs }}\\\\n\"",
-            "",
-            "# Verify all IPs are syntactically correct",
-            "printf \"Verifying IP addresses\\\\n\"",
-            "OUTPUT=\"$(${PYTHON} -c \"",
-            "import ipaddress",
-            "import sys",
-            "",
-            "def run():",
-            "    target_ips_input = '{{ TargetIPs }}'",
-            "    ip_addresses = target_ips_input.split(',')",
-            "    invalid_ip_addresses = []",
-            "    duplicate_ip_addresses = []",
-            "    error_message = ''",
-            "    for ip_address in ip_addresses:",
-            "        try:",
-            "            if ip_addresses.count(ip_address) > 1:",
-            "                if not ip_address in duplicate_ip_addresses:",
-            "                    duplicate_ip_addresses.append(ip_address)",
-            "            ipaddress.ip_address(ip_address)",
-            "        except ValueError as error:",
-            "            invalid_ip_addresses.append(ip_address)",
-            "    ",
-            "    if invalid_ip_addresses:",
-            "        error_message = 'The following IP addresses are invalid: {}\\n'.format(','.join(invalid_ip_addresses))",
-            "",
-            "    if duplicate_ip_addresses:",
-            "        error_message += 'The following IP addresses have been provided more than once: {}'.format(','.join(duplicate_ip_addresses))",
-            "    ",
-            "    if error_message:",
-            "        raise ValueError(error_message)",
-            "",
-            "if __name__ == '__main__':",
-            "    sys.exit(run())",
-            "\")\" || error_trap",
-            "printf \"All IPs passed validation\\\\n\""
+            "echo \"Amazon CloudWatch Agent installation completed successfully.\""
           ]
         }
       },
-      "isCritical": "true",
-      "nextStep": "defineMTRTest"
+      "isCritical": true,
+      "nextStep": "defineNetworkTests"
     },
     {
-      "name": "defineMTRTest",
-      "description": "Defines the MTR test for each of the provided IPs",
+      "name": "defineNetworkTests",
+      "description": "Defines the `MTR`, `ping`, `tracepath`, and `traceroute` tests scripts for each of the provided IPs.",
       "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
+      "onFailure": "step:deleteStack",
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
+          "{{ describeStackResources.HelperInstanceId }}"
         ],
         "Parameters": {
           "commands": [
-            "#!/bin/bash",
+            "#!/bin/sh",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
             "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "logPath='/home/ec2-user/logs'",
+            "# Set the list of target IPs and types",
+            "TARGET_IPS=\"{{ validateIPAddresses.IPsList }}\" # Example: \"192.168.1.1|4|192_168_1_1,2001:0db8:85a3:0000:0000:8a2e:0370:7334|6,8.8.8.8|4\"",
+            "INTERVAL=\"{{ TestInterval }}\"",
+            "LOG_PATH='/home/ec2-user/logs'",
             "",
-            "for ip in ${ipList[@]}; do",
-            "    touch /home/ec2-user/mtr_${ip}.sh",
-            "    if [[ ! $ip = *\":\"* ]]; then",
-            "        # MTR IPv4 Test",
-            "        cat <<EOT >> /home/ec2-user/mtr_${ip}.sh",
+            "# Generic function to create scripts",
+            "create_script() {",
+            "    local ip=$1",
+            "    local name=$2",
+            "    local cmd=$3",
+            "    local parse_cmd=$4",
+            "    local ip_name",
+            "    ip_name=$(echo \"$ip\" | sed 's/[:.]/_/g')",
+            "",
+            "    local script_path=\"/home/ec2-user/${name}_${ip_name}.sh\"",
+            "    cat <<EOT > \"$script_path\"",
             "#!/bin/bash",
-            "sudo /sbin/mtr -rn -c 30 $ip | sed 's/Start: //g' |  sed -e \"2,\\$ s/^/     /\" >> $logPath/mtr-to-$ip.txt",
+            "$cmd $ip | $parse_cmd",
             "EOT",
-            "    else",
-            "        # MTR IPv6 Test",
-            "        cat <<EOT >> /home/ec2-user/mtr_${ip}.sh",
-            "#!/bin/bash",
-            "sudo /sbin/mtr -6 -rn -c 30 $ip | sed 's/Start: //g' |  sed -e \"2,\\$ s/^/     /\" >> $logPath/mtr-to-$ip.txt",
-            "EOT",
-            "    fi",
-            "    chmod u+x /home/ec2-user/mtr_${ip}.sh && chown ec2-user:ec2-user /home/ec2-user/mtr_${ip}.sh",
-            "done"
-          ]
-        }
-      },
-      "isCritical": "true",
-      "nextStep": "definePing64Test"
-    },
-    {
-      "name": "definePing64Test",
-      "description": "Defines the first ping test for each of the provided IPs",
-      "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
             "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "logPath='/home/ec2-user/logs'",
-            "",
-            "for ip in ${ipList[@]}; do",
-            "    touch /home/ec2-user/ping64_${ip}.sh",
-            "    if [[ ! $ip = *\":\"* ]]; then",
-            "        # Ping IPv4 Test",
-            "        cat <<EOT >> /home/ec2-user/ping64_${ip}.sh",
-            "#!/bin/bash",
-            "ping -s 56 -c 30 $ip | sed -e \"1,$ s/^/     /\" | sed \"s/%//g\" | tail -n 3 | sed \"s#/# #g\"  >> $logPath/ping64-to-$ip.txt",
-            "EOT",
-            "    else",
-            "        # Ping IPv6 Test",
-            "        cat <<EOT >> /home/ec2-user/ping64_${ip}.sh",
-            "#!/bin/bash",
-            "ping6 -s 56 -c 30 $ip | sed -e \"1,$ s/^/     /\" | sed \"s/%//g\" | tail -n 3 | sed \"s#/# #g\"  >> $logPath/ping64-to-$ip.txt",
-            "EOT",
-            "    fi",
-            "    chmod u+x /home/ec2-user/ping64_${ip}.sh && chown ec2-user:ec2-user /home/ec2-user/ping64_${ip}.sh",
-            "done"
-          ]
-        }
-      },
-      "isCritical": "true",
-      "nextStep": "definePing1500Test"
-    },
-    {
-      "name": "definePing1500Test",
-      "description": "Defines the second ping test for each of the provided IPs",
-      "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
-            "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "logPath='/home/ec2-user/logs'",
-            "",
-            "for ip in ${ipList[@]}; do",
-            "    touch /home/ec2-user/ping1500_${ip}.sh",
-            "    if [[ ! $ip = *\":\"* ]]; then",
-            "        # Ping IPv4 Test",
-            "        cat <<EOT >> /home/ec2-user/ping1500_${ip}.sh",
-            "#!/bin/bash",
-            "ping -s 1492 -c 30 $ip | sed -e \"1,$ s/^/     /\" | sed \"s/%//g\" | tail -n 3 | sed \"s#/# #g\"  >> $logPath/ping1500-to-$ip.txt",
-            "EOT",
-            "    else",
-            "        # Ping IPv6 Test",
-            "        cat <<EOT >> /home/ec2-user/ping1500_${ip}.sh",
-            "#!/bin/bash",
-            "ping6 -s 1492 -c 30 $ip | sed -e \"1,$ s/^/     /\" | sed \"s/%//g\" | tail -n 3 | sed \"s#/# #g\"  >> $logPath/ping1500-to-$ip.txt",
-            "EOT",
-            "    fi",
-            "    chmod u+x /home/ec2-user/ping1500_${ip}.sh && chown ec2-user:ec2-user /home/ec2-user/ping1500_${ip}.sh",
-            "done"
-          ]
-        }
-      },
-      "isCritical": "true",
-      "nextStep": "defineTracepathTest"
-    },
-    {
-      "name": "defineTracepathTest",
-      "description": "Defines the tracepath test for each of the provided IPs",
-      "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
-            "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "logPath='/home/ec2-user/logs'",
-            "",
-            "for ip in ${ipList[@]}; do",
-            "    touch /home/ec2-user/tracepath_${ip}.sh",
-            "    if [[ ! $ip = *\":\"* ]]; then",
-            "        # Tracepath IPv4 Test",
-            "        cat <<EOT >> /home/ec2-user/tracepath_${ip}.sh",
-            "#!/bin/bash",
-            "tracepath -n $ip | grep -v \"Too many hops\" | sed -e \"$ ! s/^/     /\" >> $logPath/tracepath-to-$ip.txt",
-            "EOT",
-            "    else",
-            "        # Tracepath IPv6 Test",
-            "        cat <<EOT >> /home/ec2-user/ping64_${ip}.sh",
-            "#!/bin/bash",
-            "tracepath6 -n $ip | grep -v \"Too many hops\" | sed -e \"$ ! s/^/     /\" >> $logPath/tracepath-to-$ip.txt",
-            "EOT",
-            "    fi",
-            "    chmod u+x /home/ec2-user/tracepath_${ip}.sh && chown ec2-user:ec2-user /home/ec2-user/tracepath_${ip}.sh",
-            "done"
-          ]
-        }
-      },
-      "isCritical": "true",
-      "nextStep": "defineTracerouteTCPTest"
-    },
-    {
-      "name": "defineTracerouteTCPTest",
-      "description": "Defines the traceroute test for each of the provided IPs",
-      "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
-            "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "logPath='/home/ec2-user/logs'",
-            "",
-            "for ip in ${ipList[@]}; do",
-            "    touch /home/ec2-user/traceroutetcp_${ip}.sh",
-            "    cat <<EOT >> /home/ec2-user/traceroutetcp_${ip}.sh",
-            "#!/bin/bash",
-            "sudo traceroute -n $ip -q 2 -A -T -p 80 | sed -e \"s/^/     /\" >> $logPath/traceroutetcp-to-$ip.txt",
-            "EOT",
-            "    chmod u+x /home/ec2-user/traceroutetcp_${ip}.sh && chown ec2-user:ec2-user /home/ec2-user/traceroutetcp_${ip}.sh",
-            "done"
-          ]
-        }
-      },
-      "isCritical": "true",
-      "nextStep": "configureCloudWatchLogsForTestResults"
-    },
-    {
-      "name": "configureCloudWatchLogsForTestResults",
-      "description": "Configures CloudWatch logs",
-      "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
-            "",
-            "error_trap()",
-            "{",
-            "    if test -n \"$1\" ; then",
-            "        printf \"%s\\\\n\" \"$1\"",
-            "    fi",
-            "",
-            "    printf \"%.s=\" $(seq 1 80)",
-            "    printf \"\\\\nThe CloudWatch logs agent configuration failed. Please try to run this automation again.\\\\n\"",
-            "",
-            "    exit 1",
+            "    chmod u+x \"$script_path\"",
+            "    chown ec2-user:ec2-user \"$script_path\"",
+            "    echo \"Script created: $script_path\"",
             "}",
             "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
+            "create_mtr_script() {",
             "",
-            "# Creating logs folder",
-            "mkdir /home/ec2-user/logs || error_trap",
-            "chown ec2-user:ec2-user /home/ec2-user/logs || error_trap",
+            "    # Options:",
+            "    # -rn: Raw output, do not resolve hostnames",
+            "    # -c 30: Send 30 pings",
+            "    # --interval $INTERVAL: Wait $INTERVAL seconds between pings",
+            "    # -Z $INTERVAL: Set the ping timeout to $INTERVAL seconds",
             "",
-            "# For each IP in the list, create corresponding configuration",
-            "# in Amazon CloudWatch Agent Configuration file",
-            "# IPv4 Tests - MTR, 1500-byte Ping, 64-byte Ping, Tracepath, TCP Traceroute",
-            "# IPv6 Tests - MTR, 1500-byte Ping, 64-byte Ping, TCP Traceroute",
+            "    local ip=$1",
+            "    local type=$2",
+            "    local cmd=\"sudo /sbin/mtr -rn -c 30 --interval $INTERVAL -Z $INTERVAL\"",
+            "    if [[ \"$type\" -eq 6 ]]; then",
+            "        cmd=\"sudo /sbin/mtr -6 -rn -c 30 --interval $INTERVAL -Z $INTERVAL\"",
+            "    fi",
             "",
-            "retentionInDays=\"{{ CloudWatchLogGroupRetentionInDays }}\"",
+            "    create_script \"$ip\" \"mtr\" \"$cmd\" \"sed 's/Start: //g' |  sed -e '2,\\$ s/^/     /'\"",
+            "}",
             "",
-            "for ip in ${ipList[@]}; do",
-            "    # CloudWatch log group doesn't support \":\" in the name, which is typical of IPv6.",
-            "    # Replacing any occurrence of \":\" with \".\"",
-            "    ipmod=`echo $ip | sed 's/:/./g'`",
-            "    touch /home/ec2-user/cloudwatchagent-$ipmod.json",
-            "    cat <<EOT >> /home/ec2-user/cloudwatchagent-$ipmod.json",
-            "    {",
-            "      \"logs\": {",
-            "        \"logs_collected\": {",
-            "          \"files\": {",
-            "            \"collect_list\": [",
-            "              {",
-            "                \"file_path\": \"/home/ec2-user/logs/mtr-to-$ip.txt\",",
-            "                \"log_group_name\": \"{{ CloudWatchLogGroupNamePrefix }}/mtr-from-{{ SubnetId }}-to-$ipmod\",",
-            "                \"log_stream_name\": \"{{ automation:EXECUTION_ID }}\",",
-            "                \"timezone\": \"UTC\",",
-            "                \"retention_in_days\": $retentionInDays",
-            "              },",
-            "              {",
-            "                \"file_path\": \"/home/ec2-user/logs/ping1500-to-$ip.txt\",",
-            "                \"log_group_name\": \"{{ CloudWatchLogGroupNamePrefix }}/ping1500-from-{{ SubnetId }}-to-$ipmod\",",
-            "                \"log_stream_name\": \"{{ automation:EXECUTION_ID }}\",",
-            "                \"timezone\": \"UTC\",",
-            "                \"multi_line_start_pattern\": \"---.*\",",
-            "                \"retention_in_days\": $retentionInDays",
-            "              },",
-            "              {",
-            "                \"file_path\": \"/home/ec2-user/logs/ping64-to-$ip.txt\",",
-            "                \"log_group_name\": \"{{ CloudWatchLogGroupNamePrefix }}/ping64-from-{{ SubnetId }}-to-$ipmod\",",
-            "                \"log_stream_name\": \"{{ automation:EXECUTION_ID }}\",",
-            "                \"timezone\": \"UTC\",",
-            "                \"multi_line_start_pattern\": \"---.*\",",
-            "                \"retention_in_days\": $retentionInDays",
-            "              },",
-            "              {",
-            "                \"file_path\": \"/home/ec2-user/logs/tracepath-to-$ip.txt\",",
-            "                \"log_group_name\": \"{{ CloudWatchLogGroupNamePrefix }}/tracepath-from-{{ SubnetId }}-to-$ipmod\",",
-            "                \"log_stream_name\": \"{{ automation:EXECUTION_ID }}\",",
-            "                \"timezone\": \"UTC\",",
-            "                \"multi_line_start_pattern\": \"1?:.*\",",
-            "                \"retention_in_days\": $retentionInDays",
-            "              },",
-            "              {",
-            "                \"file_path\": \"/home/ec2-user/logs/traceroutetcp-to-$ip.txt\",",
-            "                \"log_group_name\": \"{{ CloudWatchLogGroupNamePrefix }}/traceroutetcp-from-{{ SubnetId }}-to-$ipmod\",",
-            "                \"log_stream_name\": \"{{ automation:EXECUTION_ID }}\",",
-            "                \"timezone\": \"UTC\",",
-            "                \"multi_line_start_pattern\": \"traceroute\",",
-            "                \"retention_in_days\": $retentionInDays",
-            "              }",
-            "            ]",
-            "          }",
-            "        }",
-            "      }",
-            "    }",
-            "EOT",
-            "    # Starting Amazon CloudWatch Agent",
-            "   if [[ \"$ipmod\" = \"${ipList[0]}\" ]]; then",
-            "    sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/home/ec2-user/cloudwatchagent-$ipmod.json",
-            "   else",
-            "    sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a append-config -m ec2 -s -c file:/home/ec2-user/cloudwatchagent-$ipmod.json",
-            "   fi",
-            "done"
+            "create_ping_scripts() {",
+            "",
+            "    # Options:",
+            "    # -s 56: Set the packet size to 56 bytes (64 bytes total with header)",
+            "    # -c 30: Send 30 pings",
+            "",
+            "    local ip=$1",
+            "    local type=$2",
+            "    local cmd=\"ping\"",
+            "    if [[ \"$type\" -eq 6 ]]; then",
+            "        cmd=\"ping6\"",
+            "    fi",
+            "",
+            "    create_script \"$ip\" \"ping64\" \"$cmd -s 56 -c 30\" \"sed -e '1,\\$ s/^/     /' | sed 's/%//g' | tail -n 3 | sed 's#/# #g'\"",
+            "    create_script \"$ip\" \"ping1500\" \"$cmd -s 1492 -c 30\" \"sed -e '1,\\$ s/^/     /' | sed 's/%//g' | tail -n 3 | sed 's#/# #g'\"",
+            "}",
+            "",
+            "create_tracepath_script() {",
+            "",
+            "    # Options:",
+            "    # -n: Show numeric IP addresses",
+            "",
+            "    local ip=$1",
+            "    local type=$2",
+            "    local cmd=\"tracepath\"",
+            "    if [[ \"$type\" -eq 6 ]]; then",
+            "        cmd=\"tracepath6\"",
+            "    fi",
+            "",
+            "    create_script \"$ip\" \"tracepath\" \"$cmd -n\" \"grep -v 'Too many hops' | sed -e '$ ! s/^/     /'\"",
+            "}",
+            "",
+            "create_traceroutetcp_script() {",
+            "",
+            "    # Options:",
+            "    # -n: Show numeric IP addresses",
+            "    # -q 2: Send 2 queries per hop",
+            "    # -A: Show AS (Autonomous System) numbers",
+            "    # -T: Use TCP packets",
+            "    # -p 80: Use port 80",
+            "",
+            "    local ip=$1",
+            "    local type=$2",
+            "    create_script \"$ip\" \"traceroutetcp\" \"sudo traceroute -n -q 2 -A -T -p 80\" \"sed -e 's/^/     /'\"",
+            "}",
+            "",
+            "# Loop through each IP and type in the TARGET_IPS variable",
+            "IFS=',' read -ra ADDR <<< \"$TARGET_IPS\"",
+            "for ip_with_type in \"${ADDR[@]}\"; do",
+            "    IFS='|' read -r ip type <<< \"$ip_with_type\"",
+            "    create_mtr_script \"$ip\" \"$type\"",
+            "    create_ping_scripts \"$ip\" \"$type\"",
+            "    create_tracepath_script \"$ip\" \"$type\"",
+            "    create_traceroutetcp_script \"$ip\" \"$type\"",
+            "done",
+            "",
+            "# Create the logs directory",
+            "mkdir -p $LOG_PATH || error_trap \"Error creating $LOG_PATH folder\"",
+            "chown ec2-user:ec2-user $LOG_PATH || error_trap \"Error setting permissions for $LOG_PATH folder\"",
+            "",
+            "# MTR Command",
+            "# sudo /sbin/mtr -rn -c 30 --interval 1 -Z 1 8.8.8.8 | sed 's/Start: //g' | sed -e '2,$ s/^/     /'",
+            "# Example output:",
+            "# 2024-05-31T16:03:54+0000",
+            "#      HOST: ip-10-0-30-122.eu-west-1.co Loss%   Snt   Last   Avg  Best  Wrst StDev",
+            "#        1.|-- 3.248.240.11               0.0%    30    2.3  20.5   1.0  97.6  26.4",
+            "#        2.|-- ???                       100.0    30    0.0   0.0   0.0   0.0   0.0",
+            "#        3.|-- ???                       100.0    30    0.0   0.0   0.0   0.0   0.0",
+            "#       ...",
+            "#       10.|-- 216.239.43.223             0.0%    30    2.3   2.4   2.3   2.6   0.1",
+            "#       11.|-- 209.85.143.81              0.0%    30    2.4   2.6   2.2   7.8   1.0",
+            "#       12.|-- 8.8.8.8                    0.0%    30    1.3   1.3   1.2   1.3   0.0",
+            "",
+            "# Ping 64-byte Command",
+            "# ping -s 56 -c 30 8.8.8.8 | sed -e '1,$ s/^/     /' | sed 's/%//g' | tail -n 3 | sed 's#/# #g'",
+            "# Example output:",
+            "# --- 8.8.8.8 ping statistics ---",
+            "# 30 packets transmitted, 30 received, 0 packet loss, time 29036ms",
+            "# rtt min avg max mdev = 1.183 1.199 1.218 0.032 ms",
+            "",
+            "# Ping 1500-byte Command",
+            "# ping -s 1492 -c 30 8.8.8.8 | sed -e '1,$ s/^/     /' | sed 's/%//g' | tail -n 3 | sed 's#/# #g'",
+            "# Example output:",
+            "# --- 8.8.8.8 ping statistics ---",
+            "# 30 packets transmitted, 0 received, +1 errors, 100 packet loss, time 29665ms",
+            "",
+            "# Tracepath Command",
+            "# tracepath -n 8.8.8.8 | grep -v 'Too many hops' | sed -e '$ ! s/^/     /'",
+            "# Example output:",
+            "# 1?: [LOCALHOST]                                         pmtu 9001",
+            "# 1:  10.0.0.1                                              3.379ms pmtu 1500",
+            "# 1:  no reply",
+            "# 2:  240.1.92.12                                           0.724ms",
+            "# 3:  240.1.108.10                                          1.301ms asymm  4",
+            "# 4:  100.100.2.12                                          1.802ms asymm  6",
+            "# 5:  99.82.176.23                                          3.051ms asymm 10",
+            "# ...",
+            "# 10:  no reply",
+            "# 11:  no reply",
+            "# 29:  no reply",
+            "# 30:  no reply",
+            "# Resume: pmtu 1500",
+            "",
+            "# Traceroute TCP Command",
+            "# sudo traceroute -n 8.8.8.8 -q 2 -A -T -p 80 | sed -e 's/^/     /'",
+            "# Example output:",
+            "# traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets",
+            "# 1  * *",
+            "# 2  240.1.92.13 [*]  0.293 ms 240.1.92.15 [*]  0.689 ms",
+            "# 3  * *",
+            "# 4  * *",
+            "# 5  241.0.6.69 [*]  0.665 ms 99.82.176.189 [*]  1.174 ms",
+            "# 6  * 240.1.108.8 [*]  0.745 ms",
+            "# ...",
+            "# 28  * *",
+            "# 29  * *"
           ]
         }
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "startNetworkTests"
     },
     {
       "name": "startNetworkTests",
-      "description": "Schedules cronjobs to run each test every minute",
+      "description": "Starts the tests and schedules subsequent executions using cronjobs that run every `TestInterval` minutes. The tests logs are stored in the test instance folder `/home/ec2-user/logs/`",
       "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
+      "onFailure": "step:deleteStack",
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
+          "{{ describeStackResources.HelperInstanceId }}"
         ],
         "Parameters": {
           "commands": [
-            "#!/bin/bash",
+            "#!/bin/sh",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
             "",
-            "error_trap()",
-            "{",
-            "    if test -n \"$1\" ; then",
+            "# Function to handle errors",
+            "error_trap() {",
+            "    if test -n \"$1\"; then",
             "        printf \"%s\\\\n\" \"$1\"",
             "    fi",
-            "",
             "    printf \"%.s=\" $(seq 1 80)",
-            "    printf \"\\\\nThe crontab configuration failed. Please try to run this automation again.\\\\n\"",
-            "",
+            "    printf \"\\\\nThe crontab configuration failed. Please try running this automation again.\\\\n\"",
             "    exit 1",
             "}",
             "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "touch /home/ec2-user/cronConf.txt || error_trap",
+            "# Set the list of target IPs",
+            "TARGET_IPS=\"{{ validateIPAddresses.IPsList }}\" # Example: \"192.168.1.1|4,2001:0db8:85a3:0000:0000:8a2e:0370:7334|6,8.8.8.8|4\"",
+            "CRON_CONF_FILE=\"/home/ec2-user/cronConf.txt\"",
+            "INTERVAL=\"{{ TestInterval }}\" # From 1 to 10 minutes",
+            "LOG_PATH=\"/home/ec2-user/logs\"",
             "",
-            "for ip in ${ipList[@]}; do",
-            "    echo \"* * * * * /home/ec2-user/mtr_${ip}.sh\" >> /home/ec2-user/cronConf.txt",
-            "    echo \"* * * * * /home/ec2-user/ping1500_${ip}.sh\" >> /home/ec2-user/cronConf.txt",
-            "    echo \"* * * * * /home/ec2-user/ping64_${ip}.sh\" >> /home/ec2-user/cronConf.txt",
-            "    echo \"* * * * * /home/ec2-user/traceroutetcp_${ip}.sh\" >> /home/ec2-user/cronConf.txt",
-            "    echo \"* * * * * /home/ec2-user/tracepath_${ip}.sh\" >> /home/ec2-user/cronConf.txt",
+            "# Create and open cron configuration file",
+            "touch $CRON_CONF_FILE || error_trap \"Error creating crontab configuration file\"",
+            "",
+            "# Loop through each IP in the TARGET_IPS variable to create the crontab configuration",
+            "IFS=',' read -ra ADDR <<< \"$TARGET_IPS\"",
+            "for ip_with_type in \"${ADDR[@]}\"; do",
+            "    IFS='|' read -r ip _ <<< \"$ip_with_type\"",
+            "    ip_name=$(echo \"$ip\" | sed 's/[:.]/_/g')",
+            "    {",
+            "        echo \"*/$INTERVAL * * * * /home/ec2-user/mtr_${ip_name}.sh >> $LOG_PATH/mtr-to-$ip_name.txt 2>&1\";",
+            "        echo \"*/$INTERVAL * * * * /home/ec2-user/ping1500_${ip_name}.sh >> $LOG_PATH/ping1500-to-$ip_name.txt 2>&1\";",
+            "        echo \"*/$INTERVAL * * * * /home/ec2-user/ping64_${ip_name}.sh >> $LOG_PATH/ping64-to-$ip_name.txt\";",
+            "        echo \"*/$INTERVAL * * * * /home/ec2-user/traceroutetcp_${ip_name}.sh >> $LOG_PATH/traceroutetcp-to-$ip_name.txt 2>&1\";",
+            "        echo \"*/$INTERVAL * * * * /home/ec2-user/tracepath_${ip_name}.sh >> $LOG_PATH/tracepath-to-$ip_name.txt 2>&1\";",
+            "    } >> $CRON_CONF_FILE",
             "done",
-            "crontab -u ec2-user /home/ec2-user/cronConf.txt || error_trap",
-            ""
+            "",
+            "# Apply the new crontab configuration",
+            "crontab -u ec2-user $CRON_CONF_FILE || error_trap \"Error applying crontab configuration\""
           ]
         }
       },
-      "isCritical": "true",
-      "nextStep": "sleepBeforeSettingRetentions"
+      "isCritical": true,
+      "nextStep": "configureCloudWatchLogsForTestResults"
     },
     {
-      "name": "sleepBeforeSettingRetentions",
-      "description": "Waits for the tests to generate some data",
-      "action": "aws:sleep",
-      "onFailure": "Continue",
+      "name": "configureCloudWatchLogsForTestResults",
+      "description": "Configures the Amazon CloudWatch Agent to push the test results located in `/home/ec2-user/logs/` to the Amazon CloudWatch Logs.",
+      "action": "aws:runCommand",
+      "onFailure": "step:deleteStack",
       "inputs": {
-        "Duration": "PT240S"
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ describeStackResources.HelperInstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "#!/bin/sh",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "# Function to handle errors",
+            "error_trap() {",
+            "    if test -n \"$1\" ; then",
+            "        printf \"%s\\\\n\" \"$1\"",
+            "    fi",
+            "    printf \"%.s=\" $(seq 1 80)",
+            "    printf \"\\\\nThe CloudWatch logs agent configuration failed. Please try running this automation again.\\\\n\"",
+            "    exit 1",
+            "}",
+            "",
+            "# Set the list of target IPs",
+            "TARGET_IPS=\"{{ validateIPAddresses.IPsList }}\" # Example: \"192.168.1.1|4,2001:0db8:85a3:0000:0000:8a2e:0370:7334|6,8.8.8.8|4\"",
+            "LOG_PATH='/home/ec2-user/logs'",
+            "RETENTION_DAYS=\"{{ CloudWatchLogGroupRetentionInDays }}\"",
+            "EXECUTION_ID=\"{{ automation:EXECUTION_ID }}\"",
+            "CLOUDWATCH_PREFIX=\"{{ CloudWatchLogGroupNamePrefix }}\"",
+            "CLOUDWATCH_AGENT_CTL=\"/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl\"",
+            "SUBNET_ID=\"{{ SubnetId }}\"",
+            "CONFIG_PATH=\"/home/ec2-user/config\"",
+            "",
+            "# Function to configure log collection for each IP",
+            "configure_log() {",
+            "    local ip_name=$1",
+            "    local index=$2",
+            "    local config_file=\"$CONFIG_PATH/cloudwatchagent-$ip_name.json\"",
+            "",
+            "    cat <<EOT > \"$config_file\"",
+            "{",
+            "  \"logs\": {",
+            "    \"logs_collected\": {",
+            "      \"files\": {",
+            "        \"collect_list\": [",
+            "          {",
+            "            \"file_path\": \"$LOG_PATH/mtr-to-$ip_name.txt\",",
+            "            \"log_group_name\": \"$CLOUDWATCH_PREFIX/mtr-from-$SUBNET_ID-to-$ip_name\",",
+            "            \"log_stream_name\": \"$EXECUTION_ID\",",
+            "            \"timezone\": \"UTC\",",
+            "            \"retention_in_days\": $RETENTION_DAYS",
+            "          },",
+            "          {",
+            "            \"file_path\": \"$LOG_PATH/ping1500-to-$ip_name.txt\",",
+            "            \"log_group_name\": \"$CLOUDWATCH_PREFIX/ping1500-from-$SUBNET_ID-to-$ip_name\",",
+            "            \"log_stream_name\": \"$EXECUTION_ID\",",
+            "            \"timezone\": \"UTC\",",
+            "            \"multi_line_start_pattern\": \"---.*\",",
+            "            \"retention_in_days\": $RETENTION_DAYS",
+            "          },",
+            "          {",
+            "            \"file_path\": \"$LOG_PATH/ping64-to-$ip_name.txt\",",
+            "            \"log_group_name\": \"$CLOUDWATCH_PREFIX/ping64-from-$SUBNET_ID-to-$ip_name\",",
+            "            \"log_stream_name\": \"$EXECUTION_ID\",",
+            "            \"timezone\": \"UTC\",",
+            "            \"multi_line_start_pattern\": \"---.*\",",
+            "            \"retention_in_days\": $RETENTION_DAYS",
+            "          },",
+            "          {",
+            "            \"file_path\": \"$LOG_PATH/tracepath-to-$ip_name.txt\",",
+            "            \"log_group_name\": \"$CLOUDWATCH_PREFIX/tracepath-from-$SUBNET_ID-to-$ip_name\",",
+            "            \"log_stream_name\": \"$EXECUTION_ID\",",
+            "            \"timezone\": \"UTC\",",
+            "            \"multi_line_start_pattern\": \"1?:.*\",",
+            "            \"retention_in_days\": $RETENTION_DAYS",
+            "          },",
+            "          {",
+            "            \"file_path\": \"$LOG_PATH/traceroutetcp-to-$ip_name.txt\",",
+            "            \"log_group_name\": \"$CLOUDWATCH_PREFIX/traceroutetcp-from-$SUBNET_ID-to-$ip_name\",",
+            "            \"log_stream_name\": \"$EXECUTION_ID\",",
+            "            \"timezone\": \"UTC\",",
+            "            \"multi_line_start_pattern\": \"traceroute\",",
+            "            \"retention_in_days\": $RETENTION_DAYS",
+            "          }",
+            "        ]",
+            "      }",
+            "    }",
+            "  }",
+            "}",
+            "EOT",
+            "",
+            "    # Start or append configuration to the Amazon CloudWatch Agent",
+            "    if [[ $index -eq 0 ]]; then",
+            "        sudo $CLOUDWATCH_AGENT_CTL -a fetch-config -m ec2 -s -c file:\"$config_file\"",
+            "        echo \"Fetched $config_file for the CloudWatch logs agent configuration.\"",
+            "    else",
+            "        sudo $CLOUDWATCH_AGENT_CTL -a append-config -m ec2 -s -c file:\"$config_file\"",
+            "        echo \"Appended $config_file for the CloudWatch logs agent configuration.\"",
+            "    fi",
+            "}",
+            "",
+            "# Create the logs directory",
+            "mkdir -p $CONFIG_PATH || error_trap \"Error creating $CONFIG_PATH folder\"",
+            "chown ec2-user:ec2-user $CONFIG_PATH || error_trap \"Error setting permissions for $CONFIG_PATH folder\"",
+            "",
+            "# Loop through each IP in the TARGET_IPS variable",
+            "IFS=',' read -ra ADDR <<< \"$TARGET_IPS\"",
+            "index=0",
+            "for ip_with_type in \"${ADDR[@]}\"; do",
+            "    IFS='|' read -r ip _ <<< \"$ip_with_type\"",
+            "    ip_name=$(echo \"$ip\" | sed 's/[:.]/_/g')",
+            "    configure_log \"$ip_name\" $index",
+            "    index=$((index + 1))",
+            "done"
+          ]
+        }
       },
-      "isCritical": "false",
+      "isCritical": true,
       "nextStep": "configureLocalLogRotation"
     },
     {
       "name": "configureLocalLogRotation",
-      "description": "Sets the desired CloudWatch log group retentions",
+      "description": "Sets rotation to the logs generated in the `/home/ec2-user/logs/` folder.",
       "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
+      "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWS-RunShellScript",
         "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
+          "{{ describeStackResources.HelperInstanceId }}"
         ],
         "Parameters": {
           "commands": [
-            "#!/bin/bash",
+            "#!/bin/sh",
+            "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
             "",
-            "error_trap()",
-            "{",
-            "    if test -n \"$1\" ; then",
+            "# Function to handle errors",
+            "error_trap() {",
+            "    if test -n \"$1\"; then",
             "        printf \"%s\\\\n\" \"$1\"",
             "    fi",
-            "",
             "    printf \"%.s=\" $(seq 1 80)",
-            "    printf \"\\\\nThe logrotate configuration failed. Please try to run this automation again.\\\\n\"",
-            "",
+            "    printf \"\\\\nThe logrotate configuration failed. Please try running this automation again.\\\\n\"",
             "    exit 1",
             "}",
             "",
-            "touch /etc/logrotate.d/logrotateConfig.conf || error_trap",
+            "LOG_ROTATE_CONFIG=\"/etc/logrotate.d/logrotateConfig.conf\"",
+            "CONFIG_PATH=\"/home/ec2-user/config\"",
             "",
-            "# Disabling dateext feature from default logrotate config file",
-            "sed -i 's/dateext/#dateext/g' /etc/logrotate.conf",
+            "# Set the list of target IPs",
+            "TARGET_IPS=\"{{ validateIPAddresses.IPsList }}\" # Example: \"192.168.1.1|4,2001:0db8:85a3:0000:0000:8a2e:0370:7334|6,8.8.8.8|4\"",
+            "CLOUDWATCH_AGENT_CTL=\"/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl\"",
             "",
-            "cat << EOF >> /etc/logrotate.d/logrotateConfig.conf",
+            "# Create and open the logrotate configuration file",
+            "touch $LOG_ROTATE_CONFIG || error_trap \"Error creating logrotate configuration file\"",
+            "",
+            "# Disable dateext feature from the default logrotate config file",
+            "sed -i 's/dateext/#dateext/g' /etc/logrotate.conf || error_trap \"Error disabling dateext feature\"",
+            "",
+            "# Add log rotation configuration",
+            "cat << EOT > $LOG_ROTATE_CONFIG",
             "/home/ec2-user/logs/*.txt {",
             "    daily",
             "    missingok",
             "    size 5M",
             "    start 1",
             "    rotate 4",
+            "    notifempty",
+            "    create 0660 ec2-user ec2-user",
             "}",
-            "EOF",
+            "EOT",
             "",
-            "#logrotate -vf /etc/logrotate.d/logrotateConfig.conf || error_trap"
-          ]
-        }
-      },
-      "isCritical": "true",
-      "nextStep": "setCloudWatchLogsMetricFilters"
-    },
-    {
-      "name": "setCloudWatchLogsMetricFilters",
-      "description": "Sets the CloudWatch log group metric filters",
-      "action": "aws:runCommand",
-      "onFailure": "step:terminateInstance",
-      "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
+            "# Comments for the configuration",
+            "# /home/ec2-user/logs/*.txt {",
+            "#    daily                 # Rotate logs daily",
+            "#    missingok             # If the log file is missing, go on to the next one without issuing an error",
+            "#    size 5M               # Rotate logs if they grow bigger than 5M",
+            "#    start 1               # Start with log file 1",
+            "#    rotate 4              # Keep 4 rotated logs only",
+            "#    notifempty            # Do not rotate the log if it is empty",
+            "#    create 0660 ec2-user ec2-user # Create new log files with specific permissions and owner",
+            "# }",
             "",
-            "error_trap()",
-            "{",
-            "    if test -n \"$1\" ; then",
-            "        printf \"%s\\\\n\" \"$1\"",
+            "# Apply the new logrotate configuration",
+            "logrotate -v $LOG_ROTATE_CONFIG || error_trap \"Error applying logrotate configuration\"",
+            "",
+            "",
+            "configure_log() {",
+            "    local ip_name=$1",
+            "    local index=$2",
+            "    local config_file=\"$CONFIG_PATH/cloudwatchagent-$ip_name.json\"",
+            "",
+            "    # Start or append configuration to the Amazon CloudWatch Agent",
+            "    if [[ $index -eq 0 ]]; then",
+            "        sudo $CLOUDWATCH_AGENT_CTL -a fetch-config -m ec2 -s -c file:\"$config_file\"",
+            "        echo \"Fetched $config_file for the CloudWatch logs agent configuration.\"",
+            "    else",
+            "        sudo $CLOUDWATCH_AGENT_CTL -a append-config -m ec2 -s -c file:\"$config_file\"",
+            "        echo \"Appended $config_file for the CloudWatch logs agent configuration.\"",
             "    fi",
-            "",
-            "    printf \"%.s=\" $(seq 1 80)",
-            "    printf \"\\\\nThe CloudWatch logs metric filters configuration failed. Please try to run this automation again.\\\\n\"",
-            "",
-            "    exit 1",
             "}",
             "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "test_instance=\"{{ createManagedInstance.InstanceId }}\"",
-            "",
-            "# For each IP in the list, create corresponding metric filters",
-            "for ip in ${ipList[@]}; do",
-            "    # CloudWatch log group doesn't support \":\" in the name, which is typical of IPv6.",
-            "    # Replacing any occurrence of \":\" with \".\"",
-            "    ipmod=`echo $ip | sed 's/:/./g'`",
-            "    touch packet_loss_metric_filter-$ipmod.json || error_trap",
-            "    touch latency_metric_filter-$ipmod.json || error_trap",
-            "    log_group_name=\"{{ CloudWatchLogGroupNamePrefix }}/ping64-from-{{ SubnetId }}-to-$ipmod\"",
-            "    cat <<EOT >> packet_loss_metric_filter-$ipmod.json",
-            "    [",
-            "        {",
-            "            \"metricName\": \"$ipmod Packet Loss\",",
-            "            \"metricNamespace\": \"AWSSupport-SetupIPMonitoringFromVPC/{{ SubnetId }}/$test_instance\",",
-            "            \"metricValue\": \"\\$LOSS\",",
-            "            \"defaultValue\": 100",
-            "        }",
-            "    ]",
-            "EOT",
-            "    aws logs put-metric-filter --log-group-name $log_group_name \\",
-            "        --filter-name \"packet_loss\"  \\",
-            "        --filter-pattern \"[r1,r2,r3,,r4,r5,r6,r7,r8,r9,LOSS,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,AVG,r24]\" \\",
-            "        --metric-transformations file://packet_loss_metric_filter-$ipmod.json \\",
-            "        --region \"{{ global:REGION }}\" || error_trap",
-            "",
-            "    cat <<EOT >> latency_metric_filter-$ipmod.json",
-            "    [",
-            "    {",
-            "        \"metricName\": \"$ipmod Latency\",",
-            "        \"metricNamespace\": \"AWSSupport-SetupIPMonitoringFromVPC/{{ SubnetId }}/$test_instance\",",
-            "        \"metricValue\": \"\\$AVG\",",
-            "        \"defaultValue\": 0",
-            "    }",
-            "    ]",
-            "EOT",
-            "    aws logs put-metric-filter --log-group-name $log_group_name \\",
-            "        --filter-name \"latency\"  \\",
-            "        --filter-pattern \"[r1,r2,r3,,r4,r5,r6,r7,r8,r9,LOSS,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,AVG,r24]\" \\",
-            "        --metric-transformations file://latency_metric_filter-$ipmod.json \\",
-            "        --region \"{{ global:REGION }}\" || error_trap",
+            "# Loop through each IP in the TARGET_IPS variable",
+            "IFS=',' read -ra ADDR <<< \"$TARGET_IPS\"",
+            "index=0",
+            "for ip_with_type in \"${ADDR[@]}\"; do",
+            "    IFS='|' read -r ip _ <<< \"$ip_with_type\"",
+            "    ip_name=$(echo \"$ip\" | sed 's/[:.]/_/g')",
+            "    configure_log \"$ip_name\" $index",
+            "    index=$((index + 1))",
             "done"
           ]
         }
       },
-      "isCritical": "true",
-      "nextStep": "createCloudWatchDashboard"
+      "isCritical": true,
+      "nextStep": "setCloudWatchLogsMetricFilters"
     },
     {
-      "name": "createCloudWatchDashboard",
-      "description": "Creates the CloudWatch dashboard",
-      "action": "aws:runCommand",
-      "onFailure": "step:deleteDashboard",
+      "name": "setCloudWatchLogsMetricFilters",
+      "description": "Sets the Amazon CloudWatch log group metric filters for ping latency and ping packet loss.",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteStack",
       "inputs": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "Parameters": {
-          "commands": [
-            "#!/bin/bash",
-            "",
-            "error_trap()",
-            "{",
-            "    if test -n \"$1\" ; then",
-            "        printf \"%s\\\\n\" \"$1\"",
-            "    fi",
-            "",
-            "    printf \"%.s=\" $(seq 1 80)",
-            "    printf \"\\\\nThe dashboard creation failed. Please try to run this automation again.\\\\n\"",
-            "",
-            "    exit 1",
-            "}",
-            "",
-            "IFS=', ' read -r -a ipList <<< \"{{ TargetIPs }}\"",
-            "dashboard_name=\"{{ SubnetId }}_{{ createManagedInstance.InstanceId }}\"",
-            "touch /home/ec2-user/dashboard.json || error_trap",
-            "cat <<EOT >> /home/ec2-user/dashboard.json",
-            "    {",
-            "        \"widgets\": [",
-            "            {",
-            "                \"type\": \"text\",",
-            "                \"x\": 0,",
-            "                \"y\": 0,",
-            "                \"width\": 24,",
-            "                \"height\": 6,",
-            "                \"properties\": {",
-            "                    \"markdown\": \"\\n# AWSSupport-SetupIPMonitoringFromVPC\\n[button:Pause test](https://{{ global:REGION }}.console.aws.amazon.com/systems-manager/automation/execute/AWS-StopEC2Instance?region={{ global:REGION }}#documentVersion=%24LATEST&InstanceId={{ createManagedInstance.InstanceId }}) \\n[button:Resume test](https://{{ global:REGION }}.console.aws.amazon.com/systems-manager/automation/execute/AWS-StartEC2Instance?region={{ global:REGION }}#documentVersion=%24LATEST&InstanceId={{ createManagedInstance.InstanceId }}) \\n[button:Terminate test](https://{{ global:REGION }}.console.aws.amazon.com/systems-manager/automation/execute/AWSSupport-TerminateIPMonitoringFromVPC?region={{ global:REGION }}#documentVersion=%24LATEST&AutomationExecutionId={{ automation:EXECUTION_ID }}&SubnetId={{ SubnetId }}&InstanceId={{ createManagedInstance.InstanceId }}) \\n[button:primary:Start a new test](https://{{ global:REGION }}.console.aws.amazon.com/systems-manager/automation/execute/AWSSupport-SetupIPMonitoringFromVPC?region={{ global:REGION }})\\n\\nThis dashboard was generated by the [AWSSupport-SetupIPMonitoringFromVPC](https://{{ global:REGION }}.console.aws.amazon.com/systems-manager/documents/AWSSupport-SetupIPMonitoringFromVPC/description?region={{ global:REGION }}) Automation document (execution ID: [{{ automation:EXECUTION_ID }}](https://{{ global:REGION }}.console.aws.amazon.com/systems-manager/automation/execution/277cab73-7484-4566-a63a-b54e74261960?region={{ global:REGION }})).\\n\\n## Pause/Resume the test\\nYou can pause and resume the test by using the buttons above. These actions will stop or start the underlying test [EC2 instance](https://{{ global:REGION }}.console.aws.amazon.com/ec2/v2/home?region={{ global:REGION }}#Instances:instanceId={{ createManagedInstance.InstanceId }};sort=desc:tag:Name) that runs the tests against the provided IPs ({{ TargetIPs }}).\\n\\n## Terminate the test\\nIf you decide to terminate the test, this dashboard, the EC2 instance and the associated IAM resources created by the Automation will be permanently terminated. CloudWatch logs will be retained for the number of days you specified during the test setup ({{ CloudWatchLogGroupRetentionInDays }} days).\\n\"",
-            "                }",
-            "            },",
-            "EOT",
-            "count=0",
-            "",
-            "# For each IP in the list, create corresponding CloudWatch widgets in the dashboard",
-            "for ip in ${ipList[@]}; do",
-            "    ipmod=`echo $ip | sed 's/:/./g'`",
-            "    y1=$(($count * 8))",
-            "    y2=$(($y1 + 6))",
-            "",
-            "    cat <<EOT >> /home/ec2-user/dashboard.json",
-            "            {",
-            "                \"type\": \"metric\",",
-            "                \"x\": 0,",
-            "                \"y\": $y1,",
-            "                \"width\": 12,",
-            "                \"height\": 6,",
-            "                \"properties\": {",
-            "                    \"metrics\": [",
-            "                        [ \"AWSSupport-SetupIPMonitoringFromVPC/{{ SubnetId }}/{{ createManagedInstance.InstanceId }}\", \"$ipmod Packet Loss\", { \"color\": \"#d62728\", \"yAxis\": \"left\" } ]",
-            "                    ],",
-            "                    \"view\": \"timeSeries\",",
-            "                    \"stacked\": true,",
-            "                    \"region\": \"{{ global:REGION }}\",",
-            "                    \"start\": \"-PT5M\",",
-            "                    \"end\": \"P0D\",",
-            "                    \"stat\": \"Maximum\",",
-            "                    \"period\": 60,",
-            "                    \"title\": \"{{ SubnetId }} {{ createManagedInstance.InstanceId }} - $ip Loss (%)\",",
-            "                    \"legend\": {",
-            "                        \"position\": \"bottom\"",
-            "                    },",
-            "                    \"yAxis\": {",
-            "                        \"left\": {",
-            "                            \"label\": \"%\",",
-            "                            \"showUnits\": false",
-            "                        }",
-            "                    }",
-            "                }",
-            "            },",
-            "            {",
-            "                \"type\": \"metric\",",
-            "                \"x\": 12,",
-            "                \"y\": $y1,",
-            "                \"width\": 12,",
-            "                \"height\": 6,",
-            "                \"properties\": {",
-            "                    \"metrics\": [",
-            "                        [ \"AWSSupport-SetupIPMonitoringFromVPC/{{ SubnetId }}/{{ createManagedInstance.InstanceId }}\", \"$ipmod Latency\" ]",
-            "                    ],",
-            "                    \"view\": \"timeSeries\",",
-            "                    \"stacked\": true,",
-            "                    \"region\": \"{{ global:REGION }}\",",
-            "                    \"stat\": \"Maximum\",",
-            "                    \"period\": 60,",
-            "                    \"title\": \"{{ SubnetId }} {{ createManagedInstance.InstanceId }} - $ip Latency (ms)\",",
-            "                    \"yAxis\": {",
-            "                        \"left\": {",
-            "                            \"label\": \"ms\",",
-            "                            \"showUnits\": false",
-            "                        }",
-            "                    }",
-            "                }",
-            "            },",
-            "            {",
-            "                \"type\": \"text\",",
-            "                \"x\": 0,",
-            "                \"y\": $y2,",
-            "                \"width\": 24,",
-            "                \"height\": 2,",
-            "                \"properties\": {",
-            "                    \"markdown\": \"\\nTarget IP | MTR | ping64 | ping1500 | traceroute (TCP) | tracepath\\n----|-----|-----|-----|-----|-----\\n$ip | [1h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/mtr-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT1H) [3h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/mtr-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT3H) | [1h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/ping64-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT1H) [3h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/ping64-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT3H) | [1h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/ping1500-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT1H) [3h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/ping1500-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT3H) | [1h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/traceroutetcp-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT1H) [3h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/traceroutetcp-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT3H) | [1h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/tracepath-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT1H) [3h](https://{{ global:REGION }}.console.aws.amazon.com/cloudwatch/home?region={{ global:REGION }}#logEventViewer:group={{ CloudWatchLogGroupNamePrefix }}/tracepath-from-{{ SubnetId }}-to-$ipmod;stream={{ automation:EXECUTION_ID }};start=PT3H)\\n\"",
-            "                }",
-            "            },",
-            "EOT",
-            "    count=$((count+1))",
-            "done",
-            "",
-            "# Remove the extra comma at the end. To do so, I remove the last two characters",
-            "# (trailing new line and the comma), and add the trailing new line back",
-            "truncate -s-2 /home/ec2-user/dashboard.json || error_trap",
-            "echo \"\" >> /home/ec2-user/dashboard.json",
-            "",
-            "cat <<EOT >> /home/ec2-user/dashboard.json",
-            "        ]",
-            "    }",
-            "EOT",
-            "",
-            "chown ec2-user:ec2-user /home/ec2-user/dashboard.json",
-            "",
-            "dashboard=$(aws cloudwatch put-dashboard --dashboard-name $dashboard_name \\",
-            "    --dashboard-body file:///home/ec2-user/dashboard.json \\",
-            "    --region \"{{ global:REGION }}\") || error_trap",
-            "",
-            "echo \"https://{{ global:REGION }}.console.aws.amazon.com/systems-manager/resource-groups/cloudwatch?region={{ global:REGION }}&dashboard=${dashboard_name}\""
-          ]
-        }
+        "InputPayload": {
+          "InstanceId": "{{ describeStackResources.HelperInstanceId }}",
+          "SubnetId": "{{ SubnetId }}",
+          "TargetIPs": "{{ validateIPAddresses.IPsList }}",
+          "CloudWatchLogGroupNamePrefix": "{{ CloudWatchLogGroupNamePrefix }}"
+        },
+        "Handler": "add_metrics_filters.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
       },
-      "isCritical": "true",
-      "isEnd": "true"
+      "isCritical": true,
+      "nextStep": "updateCloudWatchDashboard"
     },
     {
-      "name": "deleteDashboard",
-      "description": "DeleteS the CloudWatch dashboard, if it exists",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Continue",
+      "name": "updateCloudWatchDashboard",
+      "description": "Updates the Amazon CloudWatch dashboard to include the test results widgets for ping latency and ping packet loss.",
+      "action": "aws:executeScript",
+      "onFailure": "step:deleteStack",
       "inputs": {
-        "Service": "cloudwatch",
-        "Api": "DeleteDashboards",
-        "DashboardNames": [
-          "{{ SubnetId }}_{{ createManagedInstance.InstanceId }}"
+        "InputPayload": {
+          "InstanceId": "{{ describeStackResources.HelperInstanceId }}",
+          "SubnetId": "{{ SubnetId }}",
+          "TargetIPs": "{{ validateIPAddresses.IPsList }}",
+          "CloudWatchLogGroupRetentionInDays": "{{ CloudWatchLogGroupRetentionInDays }}",
+          "CloudWatchLogGroupNamePrefix": "{{ CloudWatchLogGroupNamePrefix }}",
+          "StackName": "{{ describeStackResources.StackName }}",
+          "RetainDashboardAndLogsOnDeletion": "{{ RetainDashboardAndLogsOnDeletion }}"
+        },
+        "Handler": "update_cw_dashboard.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "StackUrl",
+          "Selector": "$.Payload.stack_url",
+          "Type": "String"
+        },
+        {
+          "Name": "DashboardUrl",
+          "Selector": "$.Payload.dashboard_url",
+          "Type": "String"
+        },
+        {
+          "Name": "DashboardName",
+          "Selector": "$.Payload.name",
+          "Type": "String"
+        },
+        {
+          "Name": "LogGroups",
+          "Selector": "$.Payload.log_groups",
+          "Type": "StringList"
+        }
+      ],
+      "isCritical": true,
+      "nextStep": "branchOnSleepTime"
+    },
+    {
+      "name": "describeStackCreationErrors",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "maxAttempts": 3,
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to create the stack.",
+      "inputs": {
+        "InputPayload": {
+          "StackName": "{{ createTestInstance.CloudFormationStackId }}",
+          "ExpectedStackStatus": "CREATE_COMPLETE",
+          "NonExpectedResourceStatus": "ROLLBACK_COMPLETE,CREATE_FAILED,ROLLBACK_FAILED"
+        },
+        "Handler": "check_stack_status.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DeletionErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "isCritical": false,
+      "nextStep": "deleteStack"
+    },
+    {
+      "name": "branchOnSleepTime",
+      "description": "Branches on the value of `SleepTime`. If the value is set to `0`, the automation ends and the AWS CloudFormation stack is not automatically deleted.",
+      "action": "aws:branch",
+      "onFailure": "step:deleteStack",
+      "inputs": {
+        "Choices": [
+          {
+            "Not": {
+              "Variable": "{{ SleepTime }}",
+              "StringEquals": "0"
+            },
+            "NextStep": "sleepBeforeDeleteCloudFormationStack"
+          }
         ]
       },
-      "isCritical": "true",
-      "nextStep": "terminateInstance"
+      "isCritical": true,
+      "isEnd": true
     },
     {
-      "name": "terminateInstance",
-      "description": "Terminates the test EC2 instance",
-      "action": "aws:changeInstanceState",
+      "name": "sleepBeforeDeleteCloudFormationStack",
+      "action": "aws:sleep",
       "onFailure": "Continue",
+      "onCancel": "step:deleteStack",
+      "description": "Waits `SleepTime` minutes before deleting the AWS CloudFormation stack.",
       "inputs": {
-        "InstanceIds": [
-          "{{ createManagedInstance.InstanceId }}"
-        ],
-        "CheckStateOnly": false,
-        "DesiredState": "terminated"
+        "Duration": "PT{{SleepTime}}M"
       },
-      "isCritical": "true",
-      "nextStep": "removeIAMRoleFromInstanceProfile"
+      "nextStep": "deleteStack"
     },
     {
-      "name": "removeIAMRoleFromInstanceProfile",
-      "description": "Removes the IAM instance profile from the role",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Continue",
+      "name": "deleteStack",
+      "action": "aws:deleteStack",
+      "onFailure": "step:describeStackDeletionErrors",
+      "description": "Deletes the CloudFormation stack created by this automation in your account.",
       "inputs": {
-        "Service": "iam",
-        "Api": "RemoveRoleFromInstanceProfile",
-        "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}",
-        "InstanceProfileName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}"
+        "StackName": "{{ createTestInstance.CloudFormationStackId }}"
       },
-      "isCritical": "true",
-      "nextStep": "deleteIAMInstanceProfile"
+      "isEnd": true
     },
     {
-      "name": "deleteIAMInstanceProfile",
-      "description": "Deletes the IAM instance profile created by the automation",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Continue",
+      "name": "describeStackDeletionErrors",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to delete the stack.",
+      "onFailure": "Abort",
       "inputs": {
-        "Service": "iam",
-        "Api": "DeleteInstanceProfile",
-        "InstanceProfileName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}"
+        "InputPayload": {
+          "StackName": "{{ createTestInstance.CloudFormationStackId }}",
+          "ExpectedStackStatus": "DELETE_COMPLETE",
+          "NonExpectedResourceStatus": "DELETE_FAILED"
+        },
+        "Handler": "check_stack_status.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
       },
-      "isCritical": "true",
-      "nextStep": "removeCloudWatchInlinePolicyFromEC2Role"
-    },
-    {
-      "name": "removeCloudWatchInlinePolicyFromEC2Role",
-      "description": "Deletes the CloudWatch inline policy from the role created by the automation",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Continue",
-      "inputs": {
-        "Service": "iam",
-        "Api": "DeleteRolePolicy",
-        "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}",
-        "PolicyName": "SetupIPMonitoringFromVPC_CWPermissions"
-      },
-      "isCritical": "true",
-      "nextStep": "detachSSMManagedPolicyFromEC2Role"
-    },
-    {
-      "name": "detachSSMManagedPolicyFromEC2Role",
-      "description": "Detaches the AmazonSSMManagedInstanceCore managed policy from the role created by the automation",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Continue",
-      "inputs": {
-        "Service": "iam",
-        "Api": "DetachRolePolicy",
-        "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
-        "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}"
-      },
-      "isCritical": "true",
-      "nextStep": "deleteEC2Role"
-    },
-    {
-      "name": "deleteEC2Role",
-      "description": "Deletes the IAM role created by the automation",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Continue",
-      "inputs": {
-        "Service": "iam",
-        "Api": "DeleteRole",
-        "RoleName": "SetupIPMonitoringFromVPC_{{ automation:EXECUTION_ID }}"
-      },
-      "isCritical": "true",
-      "nextStep": "deleteSecurityGroup"
-    },
-    {
-      "name": "deleteSecurityGroup",
-      "description": "Deletes the security group created by the automation, if it exists",
-      "action": "aws:executeAwsApi",
-      "onFailure": "Continue",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DeleteSecurityGroup",
-        "GroupId": "{{ createSecurityGroup.GroupId }}"
-      },
-      "isCritical": "true",
-      "isEnd": "true"
+      "outputs": [
+        {
+          "Name": "DeletionErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
     }
   ],
   "outputs": [
-    "createCloudWatchDashboard.Output",
-    "createManagedInstance.InstanceId"
-  ]
+    "updateCloudWatchDashboard.StackUrl",
+    "updateCloudWatchDashboard.DashboardUrl",
+    "updateCloudWatchDashboard.DashboardName",
+    "updateCloudWatchDashboard.LogGroups",
+    "describeStackResources.HelperInstanceId",
+    "describeStackResources.StackName"
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "272e980fc14e807de1f1c11e843885612182c41bfa213d82f3c52660b0b4a7c3"
+      }
+    }
+  }
 }
