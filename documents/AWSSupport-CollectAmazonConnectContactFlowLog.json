@@ -8,17 +8,15 @@
       "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
       "default": ""
     },
+    "ConnectInstanceId": {
+      "type": "String",
+      "description": "(Required) The ID of your Amazon Connect instance.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
     "ContactId": {
       "type": "String",
       "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "description": "(Required) The ID of the contact that you want to collect Contact Flow Log for."
-    },
-    "ConnectInstanceAlias": {
-      "type": "String",
-      "description": "(Required) The Amazon Connect Instance alias.",
-      "allowedPattern": "^(?!d-)([\\da-zA-Z]+)([-]*[\\da-zA-Z])*$",
-      "maxChars": 45,
-      "minChars": 1
     },
     "S3BucketName": {
       "type": "AWS::S3::Bucket::Name",
@@ -31,67 +29,79 @@
       "allowedPattern": "^$|^[a-zA-Z0-9\\.\\-_\\\\!*'()/]{1,994}$",
       "maxChars": 994
     },
-    "S3BucketOwnerAccountId": {
+    "S3BucketOwnerAccount": {
       "type": "String",
       "description": "(Optional) The AWS Account Number that owns the Amazon S3 bucket where you want to upload the Contact Flow Log. If you do not specify this parameter, the runbooks uses the AWS account ID of the user or role in which the Automation runs.",
       "allowedPattern": "^$|^[0-9]{12}$",
       "default": ""
     },
-    "StartTimestamp": {
-      "type": "String",
-      "description": "(Optional) The start date and time for querying the CloudWatch Logs. The format must be 'yyyy-MM-ddTHH:mm:ss' and timezone needs to be UTC. For example, 2023-01-20T00:00:00. It will be 5 days before the current date and time if this parameter is not specified.",
-      "default": "",
-      "allowedPattern": "^$|^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])T(2[0-3]|[01][0-9]):[0-5][0-9]:[0-5][0-9]$"
-    },
-    "EndTimestamp": {
-      "type": "String",
-      "description": "(Optional) The end date and time for querying the CloudWatch Logs. The format must be 'yyyy-MM-ddTHH:mm:ss' and timezone needs to be UTC. For example, 2023-01-25T00:00:00. It will be the current date and time if this parameter is not specified.",
-      "default": "",
-      "allowedPattern": "^$|^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])T(2[0-3]|[01][0-9]):[0-5][0-9]:[0-5][0-9]$"
+    "S3BucketOwnerRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the IAM role with permissions to get the Amazon S3 bucket and account block public access settings, bucket encryption configuration, the bucket ACLs, the bucket policy status, and upload objects to the bucket. If this parameter is not specified, the runbook uses the `AutomationAssumeRole` (if specified) or user that starts this runbook (if `AutomationAssumeRole` is not specified). Please see the required permissions section in the runbook description.",
+      "default": ""
     }
   },
   "mainSteps": [
     {
-      "name": "CheckS3BucketPublicStatus",
-      "description": "Checks if the Amazon S3 bucket specified in the \"S3BucketName\" allows anonymous, or public read or write access permissions.",
-      "action": "aws:executeScript",
-      "timeoutSeconds": 600,
+      "name": "CheckConnectInstanceExistance",
+      "description": "Checks if the Amazon Connect instance provided in the `ConnectInstanceId` is `ACTIVE`.",
+      "action": "aws:assertAwsResourceProperty",
       "onFailure": "Abort",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "handler",
-        "InputPayload": {
-          "S3BucketName": "{{ S3BucketName }}",
-          "S3BucketOwnerAccountId": "{{ S3BucketOwnerAccountId }}"
-        },
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport boto3\nimport sys\nfrom botocore.errorfactory import ClientError\n\nsys.tracebacklimit = 0\ns3 = boto3.client(\"s3\")\n\n\ndef get_public_access_settings(account_id, bucket_name=None):\n    try:\n        default_value = {\n            # Assumes by default that the configuration allows public access policies\n            \"BlockPublicAcls\": False,\n            \"IgnorePublicAcls\": False,\n            \"BlockPublicPolicy\": False,\n            \"RestrictPublicBuckets\": False,\n        }\n        if bucket_name is None:\n            settings = boto3.client(\"s3control\").get_public_access_block(\n                AccountId=account_id\n            )\n        else:\n            settings = s3.get_public_access_block(\n                Bucket=bucket_name, ExpectedBucketOwner=account_id\n            )\n\n        return settings.get(\"PublicAccessBlockConfiguration\", default_value)\n\n    except ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"NoSuchPublicAccessBlockConfiguration\":\n            return default_value\n        else:\n            raise Exception(\n                \"Error: An error occurred when retrieving the Amazon S3 Public Access\"\n                \" Settings - {}\".format(e.response[\"Error\"][\"Message\"])\n            )\n\n    except Exception as e:\n        print(\n            \"Error: An error occurred when retrieving the Amazon S3 Public Access Settings - {}.\"\n            \" The runbook will assume that Public Access Settings are all set to False.\".format(\n                str(e)\n            )\n        )\n        return default_value\n\n\ndef get_block_public_access(bucket_name, account_id):\n    # Assumes by default that the configuration allows public access policies\n    block_ignore_public_acl = False\n    block_ignore_public_policy = False\n\n    try:\n        # Get Block public access settings for Account (account_id)\n        account_settings = get_public_access_settings(account_id)\n\n        if account_settings.get(\"IgnorePublicAcls\"):\n            block_ignore_public_acl = True\n        if account_settings.get(\"RestrictPublicBuckets\"):\n            block_ignore_public_policy = True\n\n        # Get Block public access settings for Bucket (bucket_name)\n        settings = get_public_access_settings(account_id, bucket_name)\n\n        if settings.get(\"IgnorePublicAcls\"):\n            block_ignore_public_acl = block_ignore_public_acl or True\n        if settings.get(\"RestrictPublicBuckets\"):\n            block_ignore_public_policy = block_ignore_public_policy or True\n\n        if block_ignore_public_policy:\n            print(\n                \"Info: Amazon S3 Block Public Access Settings are configured to ignore\"\n                \" any public bucket policy.\"\n            )\n\n        if block_ignore_public_acl:\n            print(\n                \"Info: Amazon S3 Block Public Access Settings are configured to ignore\"\n                \" public ACLs.\"\n            )\n\n        return block_ignore_public_acl, block_ignore_public_policy\n\n    except Exception as e:\n        print(f\"Error: {str(e)}\")\n        return block_ignore_public_acl, block_ignore_public_policy\n\n\ndef is_bucket_policy_public(bucket_name, account_id):\n    # When evaluating a bucket, the code assumes that the bucket is public.\n    try:\n        is_public = s3.get_bucket_policy_status(\n            Bucket=bucket_name, ExpectedBucketOwner=account_id\n        )[\"PolicyStatus\"][\"IsPublic\"]\n\n        if is_public:\n            print(\"Warning: The Amazon S3 bucket policy is marked as public.\")\n            return True\n        else:\n            print(\"Info: The Amazon S3 bucket policy is marked as private.\")\n            return False\n\n    except ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"NoSuchBucketPolicy\":\n            print(\"Info: The Amazon S3 bucket has no policy associated.\")\n            return False\n        else:\n            print(\n                \"Error: An error occurred when retrieving the Amazon S3 Bucket Policy Status - {}.\"\n                \" The runbook will assume that the Bucket policy is marked as public.\".format(\n                    str(e)\n                )\n            )\n            return True\n\n    except Exception as e:\n        print(f\"Error: {str(e)}\")\n        return True\n\n\ndef is_bucket_acl_public(bucket_name, account_id):\n    PUBLIC_GROUP = {\"http://acs.amazonaws.com/groups/global/AllUsers\": \"All Users\"}\n    # Anonymous canonical user ID https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html\n    ANONYMOUS_USER = \"65a011a29cdf8ec533ec3d1ccaae921c\"\n    READ_WRITE_PERMISSIONS = (\"READ\", \"FULL_CONTROL\", \"WRITE\")\n    try:\n        bucket_acl_response = s3.get_bucket_acl(\n            Bucket=bucket_name, ExpectedBucketOwner=account_id\n        )\n\n        for grant in bucket_acl_response[\"Grants\"]:\n            uri = grant[\"Grantee\"].get(\"URI\")\n            uid = grant[\"Grantee\"].get(\"ID\")\n\n            if (\n                uri in PUBLIC_GROUP.keys()\n                and grant[\"Permission\"] in READ_WRITE_PERMISSIONS\n            ):\n                print(\"Warning: Bucket ACL is marked as public for All Users.\")\n                return True\n            if uid == ANONYMOUS_USER and grant[\"Permission\"] in READ_WRITE_PERMISSIONS:\n                print(\"Warning: Bucket ACL is marked as public for Anonymous users.\")\n                return True\n\n        print(\"Info: Bucket ACL is marked as private.\")\n        return False\n\n    except ClientError as e:\n        print(\n            \"Error: An error occurred when retrieving the Amazon S3 ACLs - {}.\"\n            \" The runbook will assume the ACL grants public access.\".format(\n                str(e)\n            )\n        )\n        return True\n    except Exception as e:\n        print(f\"Error: {str(e)}\")\n        return True\n\n\ndef handler(event, context):\n    bucket_name = event.get(\"S3BucketName\", \"\")\n    account_id = event.get(\"S3BucketOwnerAccountId\", \"\")\n    \n    if not account_id:\n        account_id = context[\"global:ACCOUNT_ID\"]\n\n    if not bucket_name:\n        return\n\n    try:\n        block_public_policy, block_public_acl = get_block_public_access(\n            bucket_name, account_id\n        )\n\n        if block_public_policy and block_public_acl:\n            # Block and/or account public access settings are configured to ignore both public ACLs and any public bucket policy.'\n            return\n\n        policy_is_public = is_bucket_policy_public(bucket_name, account_id)\n        acl_is_public = is_bucket_acl_public(bucket_name, account_id)\n\n        if (not policy_is_public or block_public_policy) and not acl_is_public:\n            return\n\n        if block_public_acl and not policy_is_public:\n            return\n\n        raise Exception(\n            \"Error: The runbook has found that the S3 bucket could be publicly accessible.\"\n            \" This runbook prevents a file from being uploaded to S3 if it can be potentially\"\n            \" exposed to unauthorized people.\"\n        )\n\n    except Exception as e:\n        raise Exception(f\"Error: An error ocurred when checking if the Amazon S3 bucket allows anonymous, or public read or write access permissions {str(e)}.\")\n"
+        "Service": "connect",
+        "Api": "DescribeInstance",
+        "InstanceId": "{{ ConnectInstanceId }}",
+        "PropertySelector": "$.Instance.InstanceStatus",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
       },
-      "nextStep": "GetUnixTimestamp"
+      "nextStep": "CheckS3BucketPublicStatus"
     },
     {
-      "name": "GetUnixTimestamp",
-      "description": "Checks if the timestamps provided in \"StartTimestamp\" or \"EndTimestamp\" are valid and get the Unix date and time representation for both.",
+      "name": "CheckS3BucketPublicStatus",
+      "description": "Checks if the Amazon S3 bucket specified in the `S3BucketName` allows anonymous, or public read or write access permissions.",
       "action": "aws:executeScript",
       "timeoutSeconds": 600,
       "onFailure": "Abort",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "handler",
         "InputPayload": {
-          "StartTimestamp": "{{ StartTimestamp }}",
-          "EndTimestamp": "{{ EndTimestamp }}"
+          "Bucket": "{{ S3BucketName }}",
+          "BucketOwnerRoleArn": "{{ S3BucketOwnerRoleArn }}",
+          "BucketOwnerAccount": "{{ S3BucketOwnerAccount }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
         },
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nimport datetime\n\nsys.tracebacklimit = 0\n\n\ndef is_timestamp_valid(timestamp):\n    iso_format = \"%Y-%m-%dT%H:%M:%S\"\n    try:\n        datetime.datetime.strptime(timestamp, iso_format)\n        return True\n    except ValueError:\n        return False\n\n\ndef get_unix_time(timestamp):\n    iso_format = \"%Y-%m-%dT%H:%M:%S\"\n    return int(datetime.datetime.strptime(timestamp, iso_format).timestamp())\n\n\ndef handler(event, context):\n    start_timestamp = event[\"StartTimestamp\"]\n    end_timestamp = event[\"EndTimestamp\"]\n\n    # Check both are in ISO format (yyyy-MM-ddTHH:mm:ss)\n    if len(start_timestamp) != 0 and not is_timestamp_valid(start_timestamp):\n        raise Exception(\n            f\"Error: The provided 'StartTimestamp' {start_timestamp} is not in the\"\n            \" format of 'yyyy-MM-ddTHH:mm:ss'.\"\n        )\n\n    if len(end_timestamp) != 0 and not is_timestamp_valid(end_timestamp):\n        raise Exception(\n            f\"Error: The provided 'EndTimestamp' {end_timestamp} is not in the\"\n            \" format of 'yyyy-MM-ddTHH:mm:ss'.\"\n        )\n\n    # Checks if EndTimestamp is larger than StartTimestamp\n    now = datetime.datetime.now()\n    unix_start_timestamp = int((now - datetime.timedelta(days=5)).timestamp())\n    unix_end_timestamp = int(now.timestamp())\n\n    if len(start_timestamp) != 0:\n        unix_start_timestamp = get_unix_time(start_timestamp)\n    if len(end_timestamp) != 0:\n        unix_end_timestamp = get_unix_time(end_timestamp)\n\n    if unix_start_timestamp >= unix_end_timestamp:\n        raise Exception(\"Error: 'StartTimestamp' must be before 'EndTimestamp'.\")\n\n    # Return UNIX timestamps\n    return {\n        \"UnixStartTimestamp\": unix_start_timestamp,\n        \"UnixEndTimestamp\": unix_end_timestamp,\n    }\n"
+        "Script": "%PYTHONSCRIPT%",
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.11",
+        "Attachment": "check_bucket_public_status.zip"
+      },
+      "nextStep": "GenerateLogSearchTimeRange"
+    },
+    {
+      "name": "GenerateLogSearchTimeRange",
+      "description": "Generates `StartTime` and `EndTime` for the `StartQuery` step based on `InitiationTimestamp` and `LastUpdateTimestamp` returned by `DescribeContact` API. `StartTime` will be an hour before `InitiationTimestamp` and `EndTime` will be an hour after `LastUpdateTimestamp`.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ConnectInstanceId": "{{ ConnectInstanceId }}",
+          "ContactId": "{{ ContactId }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport datetime\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\ndef get_contact_timestamps(instance_id, contact_id):\n    \"\"\"Retrieves InitiationTimestamp and LastUpdateTimestamp.\n\n    Retrives InitiationTimestamp and LastUpdateTimestamp for a certain contact.\n    DisconnectTimestampisn't usedas the contact may not be disconnected yet.\n\n    Args:\n        instance_id: The ID of Amazon Connect Instance\n        contact_id: The ID of a contact\n\n    Raises:\n        botocore.exceptions.ClientError: An error occurred when calling DescribeContact API.\n        When returned error code is 'ResourceNotFoundException', it asumes the provided Contact ID\n        does not exist. If not, it assumes other failure happens such as service unavailability.\n    \"\"\"\n\n    connect = boto3.client(\"connect\")\n\n    try:\n        response = connect.describe_contact(InstanceId=instance_id, ContactId=contact_id)\n        initiation_timestamp = response[\"Contact\"][\"InitiationTimestamp\"]\n        last_update_timestamp = response[\"Contact\"][\"LastUpdateTimestamp\"]\n\n        return initiation_timestamp, last_update_timestamp\n\n    except ClientError as error:\n        if error.response[\"Error\"][\"Code\"] == \"ResourceNotFoundException\":\n            print(\n                f\"Error: The ContactId '{contact_id}' does not exist for your instance '{instance_id}'. Please check if the Contact ID you provide is accurate\"\n            )\n            raise error\n        else:\n            print(f\"Error: An error occured when retrieving contact information for the ContactId '{contact_id}'\")\n            raise error\n\n\ndef generate_time_range(initiation_timestamp, last_update_timestamp):\n    \"\"\"Generates time range for log search\n\n    Generate time range (StartTime and EndTime) for Contact Flow Log search. Additional one hour to be\n    reduced from initiation_timestamp and added to last_update_timestamp as buffers.\n\n    Args:\n        initiation_timestamp: The timestamp when the contact was initaited\n        last_update_timestamp: The timestamp when the contact was updated last\n    \"\"\"\n\n    start_time = int((initiation_timestamp + datetime.timedelta(hours=-1)).timestamp())\n    end_time = int((last_update_timestamp + datetime.timedelta(hours=1)).timestamp())\n\n    return start_time, end_time\n\n\ndef handler(event, context):\n    \"\"\"Handler function\n\n    This is a handler function that is specified in SSM document step 'GenerateLogSearchTimeRange'.\n    It generates StartTime and EndTime for CloudWatch Logs StartQuery API based on InitiationTimestamp\n    and LastUpdateTimestamp returned by Amazon Connect DescribeContact API.\n\n    Args:\n        events: Events passed by SSM document\n        context: context objects\n    \"\"\"\n\n    instance_id = event.get(\"ConnectInstanceId\", \"\")\n    contact_id = event.get(\"ContactId\", \"\")\n\n    initiation_timestamp, last_update_timestamp = get_contact_timestamps(instance_id, contact_id)\n    start_time, end_time = generate_time_range(initiation_timestamp, last_update_timestamp)\n\n    return {\"StartTime\": start_time, \"EndTime\": end_time}\n",
+        "Handler": "handler",
+        "Runtime": "python3.11"
       },
       "outputs": [
         {
-          "Name": "UnixStartTimestamp",
-          "Selector": "$.Payload.UnixStartTimestamp",
+          "Name": "StartTime",
+          "Selector": "$.Payload.StartTime",
           "Type": "Integer"
         },
         {
-          "Name": "UnixEndTimestamp",
-          "Selector": "$.Payload.UnixEndTimestamp",
+          "Name": "EndTime",
+          "Selector": "$.Payload.EndTime",
           "Type": "Integer"
         }
       ],
@@ -99,20 +109,20 @@
     },
     {
       "name": "StartQuery",
-      "description": "Starts a query log for the provided \"ContactId\" in CloudWatch Logs log group associated with Amazon Connect instance provided in \"ConnectInstanceAlias\". Queries time out after 60 minutes of runtime. If your query times out, reduce the time range being searched. You can view the queries currently in progress as well as your recent query history in the CloudWatch console. For more information see [View running queries or query history](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs-Insights-Query-History.html).",
+      "description": "Starts a query log for the provided `ContactId` in the CloudWatch Logs log group associated with the Amazon Connect instance provided in `ConnectInstanceId`. Queries time out after 60 minutes of runtime. If your query times out, reduce the time range being searched. You can view the queries currently in progress as well as your recent query history in the CloudWatch console. For more information see [View running queries or query history](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs-Insights-Query-History.html).",
       "action": "aws:executeScript",
       "timeoutSeconds": 600,
       "onFailure": "Abort",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "handler",
         "InputPayload": {
-          "StartTime": "{{ GetUnixTimestamp.UnixStartTimestamp }}",
-          "EndTime": "{{ GetUnixTimestamp.UnixEndTimestamp }}",
-          "ConnectInstanceAlias": "{{ ConnectInstanceAlias }}",
-          "ContactId": "{{ ContactId }}"
+          "ConnectInstanceId": "{{ ConnectInstanceId }}",
+          "ContactId": "{{ ContactId }}",
+          "StartTime": "{{ GenerateLogSearchTimeRange.StartTime }}",
+          "EndTime": "{{ GenerateLogSearchTimeRange.EndTime }}"
         },
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nimport boto3\n\nsys.tracebacklimit = 0\nlogs = boto3.client(\"logs\")\n\n\ndef start_query(contact_id, instance_alias, starttime, endtime):\n    log_group_name = \"/aws/connect/{}\".format(instance_alias)\n    query_string = 'fields @timestamp, @message | sort @timestamp asc | filter ContactId = \"{}\" | limit 10000'.format(\n        contact_id\n    )\n\n    try:\n        response = logs.start_query(\n            logGroupName=log_group_name,\n            startTime=starttime,\n            endTime=endtime,\n            queryString=query_string,\n            limit=10000,\n        )\n\n        return response[\"queryId\"]\n\n    except Exception as e:\n        raise Exception(f\"Error: {str(e)}\")\n\n\ndef handler(event, context):\n    contact_id = event[\"ContactId\"]\n    instance_alias = event[\"ConnectInstanceAlias\"]\n    starttime = event[\"StartTime\"]\n    endtime = event[\"EndTime\"]\n    query_id = start_query(contact_id, instance_alias, starttime, endtime)\n\n    return {\"QueryId\": query_id}\n"
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\ndef get_log_group_name(instance_id):\n    \"\"\"Get CloudWatch Logs log group name\n\n    Get CloudWatch Logs log group name for storing Contact Flow log.\n    Since the log group name is in the format of \"/aws/connect/{ConnectInstanceAlias}\", it calls\n    DescribeInstance API to retrieve Amazon Connect Instance Alias to return the log group name.\n\n    Args:\n        instance_id: The ID of Amazon Connect Instance\n\n    Raises:\n        botocore.exceptions.ClientError: An error occurred when calling DescribeInstance API.\n    \"\"\"\n\n    connect = boto3.client(\"connect\")\n\n    try:\n        response = connect.describe_instance(InstanceId=instance_id)\n        log_group_name = \"/aws/connect/{}\".format(response[\"Instance\"][\"InstanceAlias\"])\n\n        return log_group_name\n\n    except ClientError as error:\n        print(f\"Error: An error occured when executing DescribeInstance API against the instance '{instance_id}'\")\n        raise error\n\n\ndef start_query(instance_id, contact_id, start_time, end_time):\n    \"\"\"Start query\n\n    Start CloudWatch Logs insight query with the obtained Log Group name and provided start time/end time.\n\n    Args:\n        intsance_id: The ID of Amazon Connect Instance\n        contact_id: The ID of the contact\n        start_time: The query start time\n        end_time: The query end time\n\n    Raises:\n        botocore.exceptions.ClientError: An error occurred when calling StartQuery API.\n    \"\"\"\n\n    logs = boto3.client(\"logs\")\n\n    log_group_name = get_log_group_name(instance_id)\n    query_string = 'fields @timestamp, @message | sort @timestamp asc | filter ContactId = \"{}\" | limit 10000'.format(\n        contact_id\n    )\n\n    try:\n        response = logs.start_query(\n            logGroupName=log_group_name,\n            startTime=start_time,\n            endTime=end_time,\n            queryString=query_string,\n            limit=10000,\n        )\n\n        return response[\"queryId\"]\n\n    except ClientError as error:\n        print(\"Error: An error occured when starting a query for Contact Flow Log search.\")\n        raise error\n\n\ndef handler(event, context):\n    \"\"\"Handler function\n\n    This is a handler function that is specified in SSM document step 'StartQuery'.\n    It executes a query against CloudWatch Logs log group that stores Contact Flow log.\n\n    Args:\n        events: Events passed by SSM document\n        context: context objects\n    \"\"\"\n\n    instance_id = event.get(\"ConnectInstanceId\")\n    contact_id = event.get(\"ContactId\", \"\")\n    start_time = event.get(\"StartTime\", \"\")\n    end_time = event.get(\"EndTime\", \"\")\n\n    query_id = start_query(instance_id, contact_id, start_time, end_time)\n\n    return {\"QueryId\": query_id}\n",
+        "Handler": "handler",
+        "Runtime": "python3.11"
       },
       "outputs": [
         {
@@ -125,7 +135,7 @@
     },
     {
       "name": "WaitForQueryCompletion",
-      "description": "Waits for the CloudWatch Logs query log for the provided \"ContactId\" to be completed. Queries time out after 60 minutes of runtime. If your query times out, reduce the time range being searched. You can view the queries currently in progress as well as your recent query history in the CloudWatch console. For more information see [View running queries or query history](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs-Insights-Query-History.html).",
+      "description": "Waits for the CloudWatch Logs query log for the provided `ContactId` to complete. Please notice that the query times out after `60` minutes of runtime. If your query times out, reduce the time range being searched. You can view the queries currently in progress as well as your recent query history in the CloudWatch console. For more information see [View running queries or query history](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs-Insights-Query-History.html).",
       "action": "aws:waitForAwsResourceProperty",
       "onFailure": "Continue",
       "timeoutSeconds": 3900,
@@ -146,21 +156,21 @@
     },
     {
       "name": "UploadContactFlowLog",
-      "description": "Gets query result and upload Contact flow log to the S3 bucket specified in the \"S3BucketName\".",
+      "description": "Gets the query result and uploads the Contact flow log to the Amazon S3 bucket specified in `S3BucketName`.",
       "action": "aws:executeScript",
       "timeoutSeconds": 600,
       "onFailure": "Abort",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "handler",
         "InputPayload": {
           "ContactId": "{{ ContactId }}",
           "QueryId": "{{ StartQuery.QueryId }}",
           "S3BucketName": "{{ S3BucketName }}",
           "S3ObjectPrefix": "{{ S3ObjectPrefix }}",
-          "S3BucketOwnerAccountId": "{{ S3BucketOwnerAccountId }}"
+          "S3BucketOwnerAccount": "{{ S3BucketOwnerAccount }}"
         },
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport os\nimport sys\nimport boto3\nimport gzip\nimport json\nimport tempfile\n\n\nsys.tracebacklimit = 0\ns3 = boto3.client(\"s3\")\nlogs = boto3.client(\"logs\")\n\n\ndef check_log_events_status(query_id):\n    response = logs.get_query_results(queryId=query_id)\n\n    query_status = response[\"status\"]\n    if query_status == \"Complete\":\n        return\n    else:\n        raise Exception(\n            f\"Error: CloudWatch Logs Insight query failed with status {query_status}.\"\n            \" You can view the queries currently in progress as well as your recent query history\"\n            \" in the CloudWatch console. For more information see [View running queries or query history]\"\n            \"(https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs-Insights-Query-History.html).\"\n        )\n\n\ndef get_log_events(query_id):\n    log_events = []\n    try:\n        response = logs.get_query_results(queryId=query_id)\n\n        for event in response[\"results\"]:\n            for event_object in event:\n                if event_object[\"field\"] == \"@message\":\n                    try:\n                        log_events.append(json.loads(event_object[\"value\"]))\n\n                    # Append an event as string if it cannot be parsed\n                    except json.decoder.JSONDecodeError as e:\n                        log_events.append(event_object[\"value\"])\n        return log_events\n\n    except Exception as e:\n        raise Exception(f\"Error: {str(e)}\")\n\n\ndef write_compressed_logs_gzip(log_events, dst_file_path):\n    print(f\"Saving logs to {dst_file_path}\")\n    with gzip.open(dst_file_path, \"wt\") as zipfile:\n        for log_event in log_events:\n            if type(log_event) is dict:\n                json.dump(log_event, zipfile, ensure_ascii=False, indent=2)\n            else:\n                zipfile.write(log_event)\n            zipfile.write(\"\\n\")\n\n\ndef upload_contact_flow_log(filename, bucket, key, account_id):\n    try:\n        args = {\"ExpectedBucketOwner\": account_id, \"ACL\": \"bucket-owner-full-control\"}\n        print(f\"Uploading {filename} to {bucket}/{key} with args {args}\")\n        s3.upload_file(filename, bucket, key, ExtraArgs=args)\n    except Exception as e:\n        raise Exception(\n            f\"Error: An error ocurred when trying to upload the file {str(e)}.\"\n            \" You can view the queries currently in progress as well as your recent query history \"\n            \" in the CloudWatch console. For more information see [View running queries or query history]\"\n            \"(https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs-Insights-Query-History.html).\"\n        )\n\n\ndef handler(event, context):\n    contact_id = event[\"ContactId\"]\n    query_id = event[\"QueryId\"]\n    s3_bucket = event[\"S3BucketName\"]\n    object_path = event.get(\"S3ObjectPrefix\", \"\").strip(\"/ \")\n    account_id = event.get(\"S3BucketOwnerAccountId\", \"\")\n\n    if not account_id:\n        account_id = context[\"global:ACCOUNT_ID\"]\n\n    if not object_path:\n        object_path = context[\"automation:EXECUTION_ID\"]\n\n    check_log_events_status(query_id)\n    log_events = get_log_events(query_id)\n    if len(log_events) == 0:\n        raise Exception(\"Error: No entry found for Contact ID: {}\".format(contact_id))\n\n    file_name = \"ContactFlowLog_{}_{}.gz\".format(\n        contact_id, context[\"global:ACCOUNT_ID\"]\n    )\n    temp_dir = tempfile.TemporaryDirectory()\n    tmp_file_path = os.path.join(temp_dir.name, file_name)\n    write_compressed_logs_gzip(log_events, tmp_file_path)\n    s3_object_key = \"{}/{}\".format(object_path, file_name)\n    upload_contact_flow_log(tmp_file_path, s3_bucket, s3_object_key, account_id)\n\n    s3_uri = \"s3://{}/{}\".format(s3_bucket, s3_object_key)\n\n    s3_console_uri = \"https://s3.console.aws.amazon.com/s3/object\"\n    if context[\"global:AWS_PARTITION\"] == \"aws-cn\":\n        s3_console_uri = \"https://console.amazonaws.cn/s3/object\"\n    elif context[\"global:AWS_PARTITION\"] == \"aws-us-gov\":\n        s3_console_uri = \"https://console.amazonaws-us-gov.com/s3/object\"\n\n    s3_console_url = \"{}/{}?region={}&prefix={}\".format(\n        s3_console_uri,\n        s3_bucket,\n        context[\"global:REGION\"],\n        s3_object_key,\n    )\n\n    return {\"S3Uri\": s3_uri, \"S3ConsoleUrl\": s3_console_url}\n"
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport gzip\nimport json\nimport os\nimport tempfile\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\ndef get_log_events(query_id):\n    \"\"\"Get log events\n\n    Get log events for Contact Flow log entries. First check the query status and\n    if it's 'Completed', retrieve log events from GetQueryResults API response\n\n    Args:\n        query_id: THe ID of CloudWatch Logs Insights query\n\n    Raises:\n        ValueError: An error with query status other than \"Completed\"\n        botocore.exceptions.ClientError: An error occured when executing GetQueryResults API\n    \"\"\"\n\n    logs = boto3.client(\"logs\")\n    log_events = []\n\n    try:\n        response = logs.get_query_results(queryId=query_id)\n        query_status = response[\"status\"]\n\n        if query_status != \"Complete\":\n            raise ValueError(\n                f\"Error: CloudWatch Logs Insight query failed with status {query_status}.\"\n                \" You can view the queries currently in progress as well as your recent query history\"\n                \" in the CloudWatch console. For more information see [View running queries or query history]\"\n                \"(https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs-Insights-Query-History.html).\"\n            )\n\n        for event in response[\"results\"]:\n            for event_object in event:\n                if event_object[\"field\"] == \"@message\":\n                    try:\n                        log_events.append(json.loads(event_object[\"value\"]))\n\n                    # Append an event as string if it cannot be parsed\n                    except json.decoder.JSONDecodeError:\n                        log_events.append(event_object[\"value\"])\n        return log_events\n\n    except ClientError as error:\n        print(\"Error: An error occured when executing GetQueryResults API.\")\n        raise error\n\n\ndef write_compressed_logs_gzip(log_events, dst_file_path):\n    \"\"\"Write logs with GZIP\n    Write Contact Flow log entries to a GZIP compressed file.\n\n    Args:\n        log_events: Contact Flow log entries\n        dst_file_path: The file path for the compressed file\n    \"\"\"\n\n    print(f\"Saving logs to {dst_file_path}\")\n    with gzip.open(dst_file_path, \"wt\") as zipfile:\n        for log_event in log_events:\n            if type(log_event) is dict:\n                json.dump(log_event, zipfile, ensure_ascii=False, indent=2)\n            else:\n                zipfile.write(log_event)\n            zipfile.write(\"\\n\")\n\n\ndef upload_contact_flow_log(filename, bucket, key, account_id):\n    \"\"\"Upload Contact Flow log\n\n    Upload a GZIP compressed Contact Flow log file to a S3 bucket.\n\n    Args:\n        filename: The name of the file that is uploaded\n        bucket: The name of S3 bucket\n        key: The object key for the uploaded file\n        account_id: The account ID of the expected bucket owner\n\n    Raises:\n        botocore.exceptions.ClientError: An error occured while uploading the file to the S3 bucket\n    \"\"\"\n\n    s3 = boto3.client(\"s3\")\n\n    try:\n        args = {\"ExpectedBucketOwner\": account_id, \"ACL\": \"bucket-owner-full-control\"}\n        print(f\"Uploading {filename} to {bucket}/{key} with args {args}\")\n        s3.upload_file(filename, bucket, key, ExtraArgs=args)\n\n    except ClientError as error:\n        print(\"Error: An error ocurred when trying to upload the file.\")\n        raise error\n\n\ndef handler(event, context):\n    \"\"\"Handler function\n\n    This is a handler function that is specified in SSM document step 'UploadContactFlowLog'.\n    It uploads a GZIP compressed Contact Flow log to the specified S3 bucket.\n\n    Args:\n        events: Events passed by SSM document\n        context: context objects\n    \"\"\"\n\n    contact_id = event.get(\"ContactId\", \"\")\n    query_id = event.get(\"QueryId\", \"\")\n    s3_bucket = event.get(\"S3BucketName\", \"\")\n    object_path = event.get(\"S3ObjectPrefix\", \"\").strip(\"/ \")\n    account_id = event.get(\"S3BucketOwnerAccountId\", \"\")\n\n    if not account_id:\n        account_id = context[\"global:ACCOUNT_ID\"]\n\n    if not object_path:\n        object_path = context[\"automation:EXECUTION_ID\"]\n\n    log_events = get_log_events(query_id)\n\n    if not log_events:\n        raise RuntimeError(\"Error: No entry found for Contact ID: {}\".format(contact_id))\n\n    file_name = \"ContactFlowLog_{}_{}.gz\".format(contact_id, context[\"global:ACCOUNT_ID\"])\n    temp_dir = tempfile.TemporaryDirectory()\n    tmp_file_path = os.path.join(temp_dir.name, file_name)\n    write_compressed_logs_gzip(log_events, tmp_file_path)\n    s3_object_key = \"{}/{}\".format(object_path, file_name)\n    upload_contact_flow_log(tmp_file_path, s3_bucket, s3_object_key, account_id)\n\n    s3_uri = \"s3://{}/{}\".format(s3_bucket, s3_object_key)\n\n    s3_console_uri = \"https://s3.console.aws.amazon.com/s3/object\"\n    if context[\"global:AWS_PARTITION\"] == \"aws-cn\":\n        s3_console_uri = \"https://console.amazonaws.cn/s3/object\"\n    elif context[\"global:AWS_PARTITION\"] == \"aws-us-gov\":\n        s3_console_uri = \"https://console.amazonaws-us-gov.com/s3/object\"\n\n    s3_console_url = \"{}/{}?region={}&prefix={}\".format(\n        s3_console_uri,\n        s3_bucket,\n        context[\"global:REGION\"],\n        s3_object_key,\n    )\n\n    return {\"S3Uri\": s3_uri, \"S3ConsoleUrl\": s3_console_url}\n",
+        "Handler": "handler",
+        "Runtime": "python3.11"
       },
       "outputs": [
         {
@@ -173,11 +183,36 @@
           "Selector": "$.Payload.S3ConsoleUrl",
           "Type": "String"
         }
-      ]
+      ],
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "GenerateReport",
+      "description": "Returns the Amazon S3 Console URL where the Contact Flow log was uploaded and an example AWS CLI command that you can use to download the log file.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ContactId": "{{ ContactId }}",
+          "S3Uri": "{{ UploadContactFlowLog.S3Uri }}",
+          "S3ConsoleUrl": "{{ UploadContactFlowLog.S3ConsoleUrl }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\ndef handler(event, context):\n    \"\"\"Handler function\n\n    This is a handler function that is specified in SSM document step 'GenerateReport'.\n    Shows the location of the uploaded Contact Flow log and how to download it.\n\n    Args:\n        events: Events passed by SSM document\n        context: context objects\n    \"\"\"\n\n    contact_id = event.get(\"ContactId\", \"\")\n    s3_uri = event.get(\"S3Uri\", \"\")\n    s3_console_url = event.get(\"S3ConsoleUrl\", \"\")\n\n    aws_cli_command = \"aws s3 cp {} . --region {}\".format(s3_uri, context[\"global:REGION\"])\n\n    return_data = \"\"\n    return_data += (\n        \"\\n\\n{:=<50}\".format(\"\")\n        + \"\\n{:^50}\".format(\"Amazon Connect Contact Flow Log Collector Result\")\n        + \"\\n{:=<50}\".format(\"\")\n        + \"\\n\\n\"\n    )\n    return_data += \"Successfully retrieved Contact Flow log for the contact '{}'.\\n\\n\".format(contact_id)\n    return_data += \"You can access the log file from the S3 Console URL below:\\n\\n\"\n    return_data += \"- S3 Console URL for the Contact Flow Log file\\n\"\n    return_data += s3_console_url\n    return_data += \"\\n\\n\\n\"\n    return_data += \"Alternatively, you can download the log file by using the AWS CLI command below:\\n\"\n    return_data += \"```\\n\"\n    return_data += aws_cli_command\n    return_data += \"\\n```\\n\\n\\n\"\n\n    return return_data\n",
+        "Handler": "handler",
+        "Runtime": "python3.11"
+      },
+      "isEnd": true
     }
   ],
   "outputs": [
-    "UploadContactFlowLog.S3Uri",
-    "UploadContactFlowLog.S3ConsoleUrl"
-  ]
+    "GenerateReport.OutputPayload"
+  ],
+  "files": {
+    "check_bucket_public_status.zip": {
+      "checksums": {
+        "SHA256": "e303420d655fab9f4f93aae981e761bcf31b514433d1138e23142595daf4d31b"
+      }
+    }
+  }
 }

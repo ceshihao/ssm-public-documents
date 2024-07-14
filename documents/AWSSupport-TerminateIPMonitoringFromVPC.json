@@ -1,21 +1,23 @@
 {
   "schemaVersion": "0.3",
-  "description": "AWSSupport-TerminateIPMonitoringFromVPC terminates an IP monitoring test previously started by AWSSupport-SetupIPMonitoringFromVPC. Data related to the specified test ID will be deleted.",
+  "description": "The **AWSSupport-TerminateIPMonitoringFromVPC** runbook terminates an IP monitoring test previously started by the [AWSSupport-SetupIPMonitoringFromVPC](https://console.aws.amazon.com/systems-manager/documents/AWSSupport-SetupIPMonitoringFromVPC) runbook. Data related to the specified test is deleted.\n\n**Note**: The `AWSSupport-SetupIPMonitoringFromVPC` latest version uses an AWS CloudFormation stack to create the Amazon Elastic Compute Cloud (Amazon EC2) instance, the Amazon CloudWatch logs, and the Amazon CloudWatch dashboard. For the latest version you can delete the corresponding AWS CloudFormation stack and its associated AWS resources from the AWS CloudFormation console. For more information refer to the [AWSSupport-SetupIPMonitoringFromVPC](https://console.aws.amazon.com/systems-manager/documents/AWSSupport-SetupIPMonitoringFromVPC) description.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "AutomationExecutionId": {
       "type": "String",
-      "description": "(Required) AWSSupport-SetupIPMonitoringFromVPC automation execution ID of the test you want to terminate."
-    },
-    "SubnetId": {
-      "type": "String",
-      "description": "(Required) The subnet ID for the monitor instance.",
-      "allowedPattern": "^subnet-[a-z0-9]{8,17}$"
+      "description": "(Required) The `AWSSupport-SetupIPMonitoringFromVPC` automation execution ID of the test you want to terminate.",
+      "allowedPattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
     },
     "InstanceId": {
       "type": "String",
       "description": "(Required) The instance ID for the monitor instance.",
       "allowedPattern": "^i-[a-z0-9]{8,17}$"
+    },
+    "SubnetId": {
+      "type": "String",
+      "description": "(Conditional) The subnet ID for the monitor instance. Only required if the `AWSSupport-SetupIPMonitoringFromVPC` automation execution is not associated with an AWS CloudFormation stack.",
+      "allowedPattern": "^$|^subnet-[a-z0-9]{8,17}$",
+      "default": ""
     },
     "AutomationAssumeRole": {
       "type": "AWS::IAM::Role::Arn",
@@ -25,8 +27,54 @@
   },
   "mainSteps": [
     {
+      "name": "assertInstanceIdIsAssociatedToTestStack",
+      "description": "Checks if the `InstanceId` is associated with an `AWSSupport-SetupIPMonitoringFromVPC` stack",
+      "action": "aws:assertAwsResourceProperty",
+      "onFailure": "step:assertInstanceIdIsAssociatedToTest",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeTags",
+        "Filters": [
+          {
+            "Name": "resource-type",
+            "Values": [
+              "instance"
+            ]
+          },
+          {
+            "Name": "resource-id",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          },
+          {
+            "Name": "key",
+            "Values": [
+              "aws:cloudformation:stack-name"
+            ]
+          }
+        ],
+        "PropertySelector": "$.Tags[0].Value",
+        "DesiredValues": [
+          "AWSSupport-SetupIPMonitoringFromVPC-{{ AutomationExecutionId }}"
+        ]
+      },
+      "isCritical": false,
+      "nextStep": "deleteStack"
+    },
+    {
+      "name": "deleteStack",
+      "action": "aws:deleteStack",
+      "onFailure": "Abort",
+      "description": "Deletes the AWS CloudFormation stack created by the `AWSSupport-SetupIPMonitoringFromVPC` automation.",
+      "inputs": {
+        "StackName": "AWSSupport-SetupIPMonitoringFromVPC-{{ AutomationExecutionId }}"
+      },
+      "isEnd": true
+    },
+    {
       "name": "assertInstanceIdIsAssociatedToTest",
-      "description": "Checks AutomationExecutionId and InstanceId are related to the same test",
+      "description": "Checks if the `AutomationExecutionId` and `InstanceId` are related to the same test.",
       "action": "aws:assertAwsResourceProperty",
       "onFailure": "Abort",
       "inputs": {
@@ -34,24 +82,37 @@
         "Api": "DescribeTags",
         "Filters": [
           {
-            "Name": "tag:AutomationExecutionId",
+            "Name": "resource-type",
             "Values": [
-              "{{ AutomationExecutionId }}"
+              "instance"
+            ]
+          },
+          {
+            "Name": "resource-id",
+            "Values": [
+              "{{ InstanceId }}"
+            ]
+          },
+          {
+            "Name": "key",
+            "Values": [
+              "AutomationExecutionId"
             ]
           }
         ],
-        "PropertySelector": "$.Tags[0].ResourceId",
+        "PropertySelector": "$.Tags[0].Value",
         "DesiredValues": [
-          "{{ InstanceId }}"
+          "{{ AutomationExecutionId }}"
         ]
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "assertSubnetIdIsAssociatedToTest"
     },
     {
       "name": "assertSubnetIdIsAssociatedToTest",
-      "description": "Checks SubnetId and InstanceId are related to the same test",
+      "description": "Checks if the `SubnetId` and `InstanceId` are related to the same test.",
       "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 3,
       "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
@@ -64,12 +125,12 @@
           "{{ SubnetId }}"
         ]
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "describeTestSecurityGroup"
     },
     {
       "name": "describeTestSecurityGroup",
-      "description": "Retrieves the test security group",
+      "description": "Retrieves the test security group.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -90,12 +151,12 @@
           "Selector": "$.SecurityGroups[0].GroupId"
         }
       ],
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "deleteDashboard"
     },
     {
       "name": "deleteDashboard",
-      "description": "Deletes the CloudWatch dashboard",
+      "description": "Deletes the Amazon CloudWatch dashboard.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -105,12 +166,12 @@
           "{{ SubnetId }}_{{ InstanceId }}"
         ]
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "terminateInstance"
     },
     {
       "name": "terminateInstance",
-      "description": "Terminates the test instance",
+      "description": "Terminates the test instance.",
       "action": "aws:changeInstanceState",
       "onFailure": "Continue",
       "inputs": {
@@ -120,12 +181,12 @@
         "CheckStateOnly": false,
         "DesiredState": "terminated"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "removeIAMRoleFromInstanceProfile"
     },
     {
       "name": "removeIAMRoleFromInstanceProfile",
-      "description": "Removes the IAM instance profile from the role",
+      "description": "Removes the IAM instance profile from the IAM role.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -134,12 +195,12 @@
         "RoleName": "SetupIPMonitoringFromVPC_{{ AutomationExecutionId }}",
         "InstanceProfileName": "SetupIPMonitoringFromVPC_{{ AutomationExecutionId }}"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "deleteIAMInstanceProfile"
     },
     {
       "name": "deleteIAMInstanceProfile",
-      "description": "Deletes the IAM instance profile created by the automation",
+      "description": "Deletes the IAM instance profile created by the automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -147,12 +208,12 @@
         "Api": "DeleteInstanceProfile",
         "InstanceProfileName": "SetupIPMonitoringFromVPC_{{ AutomationExecutionId }}"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "removeCloudWatchInlinePolicyFromEC2Role"
     },
     {
       "name": "removeCloudWatchInlinePolicyFromEC2Role",
-      "description": "Deletes the CloudWatch inline policy from the role created by the automation",
+      "description": "Deletes the CloudWatch inline policy from the IAM role created by the automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -161,12 +222,12 @@
         "RoleName": "SetupIPMonitoringFromVPC_{{ AutomationExecutionId }}",
         "PolicyName": "SetupIPMonitoringFromVPC_CWPermissions"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "detachSSMManagedPolicyFromEC2Role"
     },
     {
       "name": "detachSSMManagedPolicyFromEC2Role",
-      "description": "Detaches the AmazonSSMManagedInstanceCore managed policy from the role created by the automation",
+      "description": "Detaches the `AmazonSSMManagedInstanceCore` managed policy from the role created by the automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -175,7 +236,7 @@
         "PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
         "RoleName": "SetupIPMonitoringFromVPC_{{ AutomationExecutionId }}"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "deleteEC2Role"
     },
     {
@@ -188,7 +249,7 @@
         "Api": "DeleteRole",
         "RoleName": "SetupIPMonitoringFromVPC_{{ AutomationExecutionId }}"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "deleteSecurityGroup"
     },
     {
@@ -201,8 +262,8 @@
         "Api": "DeleteSecurityGroup",
         "GroupId": "{{ describeTestSecurityGroup.GroupId }}"
       },
-      "isCritical": "true",
-      "isEnd": "true"
+      "isCritical": true,
+      "isEnd": true
     }
   ]
 }
