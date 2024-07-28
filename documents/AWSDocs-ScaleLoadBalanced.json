@@ -1,31 +1,49 @@
 {
   "assumeRole": "{{ AutomationAssumeRole }}",
-  "description": "Tutorial: Set up a scaled and load-balanced application\n===\n\nThis Automation document creates a launch template, creates a launch configuration, creates an Auto Scaling group and associates that Auto Scaling group with specified Load Balancer.\n\nPrerequisites\n---\n\nTo run the following Automation document, you must have permissions to run Automation workflows. The Automation workflow runs in the context of the current Amazon Identity and Access Management (IAM) user. Additionally, you must have created a load balancer to use.\n\nOutput\n---\n\nUse the Load balancer name to view your website. For example:\n\n>my-lb-xxxxxxxxxx.us-west-2.elb.amazonaws.com\n\n*Provide feedback [here](https://docs.aws.amazon.com/forms/aws-doc-feedback?feedback_destination_id=fdb9de10-9bb3-4e90-b330-df8c2533c9dd&topic_url=http://docs.aws.amazon.com/AutomatedTutorials/AWSDocs-ScaleLoadBalanced).*",
+  "description": "Tutorial: Set up a scaled and load-balanced application\n===\n\nThis Automation document creates a launch template, creates a launch configuration, creates an Auto Scaling group and associates that Auto Scaling group with specified Load Balancer. It automates the [Set up a scale and load-balanced application](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-register-lbs-with-asg.html) tutorial\n\nPrerequisites\n---\n\nTo run the following Automation document, you must have permissions to run Automation workflows. The Automation workflow runs in the context of the current Amazon Identity and Access Management (IAM) user.\nAdditionally you must have a Subnet to use. If you have not created one, you may use a default subnet.\n\nTo clean up resources make sure to delete the created LaunchTemplate, AutoScalingGroup, and TargetGroup.\n\nOutput\n---\n\nUse the Load balancer name to view your website. For example:\n\n>my-lb-xxxxxxxxxx.us-west-2.elb.amazonaws.com\n\n*Provide feedback [here](https://docs.aws.amazon.com/forms/aws-doc-feedback?feedback_destination_id=fdb9de10-9bb3-4e90-b330-df8c2533c9dd&topic_url=http://docs.aws.amazon.com/AutomatedTutorials/AWSDocs-ScaleLoadBalanced).*",
   "mainSteps": [
     {
       "action": "aws:executeAwsApi",
       "inputs": {
-        "Api": "CreateLaunchTemplate",
-        "LaunchTemplateData": "{'ImageId': \" {{ getLatestLinuxAMI.ImageId }} \", 'InstanceType': \" {{ InstanceType }} \", 'NetworkInterfaces': [ { 'AssociatePublicIpAddress': True, 'DeviceIndex': 0, 'Ipv6AddressCount': 1, 'SubnetId': 'subnet-7b16de0c', }, ]}",
-        "LaunchTemplateName": "{{ LaunchTemplateName }}",
-        "Service": "ec2"
+        "Api": "GetParameter",
+        "Name": "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+        "Service": "ssm"
       },
       "isCritical": "true",
-      "name": "createLaunchTemplate",
-      "nextStep": "createLaunchConfiguration",
-      "onFailure": "Abort"
+      "name": "getLatestLinuxAMI",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Parameter.Value",
+          "Type": "String"
+        }
+      ]
     },
     {
       "action": "aws:executeAwsApi",
       "inputs": {
-        "Api": "deleteLaunchTemplate",
-        "LaunchTemplateName": "{{ LaunchTemplateName }}",
+        "Api": "DescribeVpcs",
+        "Filters": [
+          {
+            "Name": "isDefault",
+            "Values": [
+              "true"
+            ]
+          }
+        ],
         "Service": "ec2"
       },
       "isCritical": "true",
-      "isEnd": "true",
-      "name": "deleteLaunchTemplate",
-      "onFailure": "Continue"
+      "name": "getDefaultVpc",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "VpcId",
+          "Selector": "$.Vpcs[0].VpcId",
+          "Type": "String"
+        }
+      ]
     },
     {
       "action": "aws:executeAwsApi",
@@ -38,57 +56,90 @@
       },
       "isCritical": "true",
       "name": "describeSubnet",
-      "onFailure": "Abort"
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "VpcId",
+          "Selector": "$.Subnets[0].VpcId",
+          "Type": "String"
+        }
+      ]
     },
     {
       "action": "aws:executeAwsApi",
       "inputs": {
-        "Api": "CreateLaunchConfiguration",
-        "ImageId": "{{ getLatestLinuxAMI.ImageId }}",
-        "InstanceType": "{{ InstanceType }}",
-        "LaunchConfigurationName": "{{ LaunchConfigurationName }}",
-        "SecurityGroups": [
-          "{{ createSecurityGroup.GroupId }}"
-        ],
-        "Service": "autoscaling"
+        "Api": "CreateTargetGroup",
+        "Name": "TutorialScaleLoadBalancer",
+        "Port": 80,
+        "Protocol": "HTTP",
+        "Service": "elbv2",
+        "VpcId": "{{ describeSubnet.VpcId }}"
       },
       "isCritical": "true",
-      "name": "createLaunchConfiguration",
+      "name": "createTargetGroup",
+      "onFailure": "step:deleteLaunchTemplate",
+      "outputs": [
+        {
+          "Name": "TargetGroupArn",
+          "Selector": "$.TargetGroups[0].TargetGroupArn",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Api": "CreateLaunchTemplate",
+        "LaunchTemplateData": {
+          "ImageId": "{{ getLatestLinuxAMI.ImageId }}",
+          "InstanceType": "{{ InstanceType }}",
+          "NetworkInterfaces": [
+            {
+              "AssociatePublicIpAddress": true,
+              "DeviceIndex": 0,
+              "SubnetId": "{{ SubnetId }}"
+            }
+          ]
+        },
+        "LaunchTemplateName": "{{ LaunchTemplateName }}",
+        "Service": "ec2"
+      },
+      "isCritical": "true",
+      "name": "createLaunchTemplate",
       "nextStep": "createAutoScalingGroup",
-      "onFailure": "step:deleteLaunchConfiguration"
-    },
-    {
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Api": "DeleteLaunchConfiguration",
-        "LaunchConfigurationName": "{{ LaunchConfigurationName }}",
-        "Service": "autoscaling"
-      },
-      "isCritical": "true",
-      "name": "deleteLaunchConfiguration",
-      "nextStep": "deleteLaunchTemplate",
-      "onFailure": "Continue"
+      "onFailure": "step:deleteLaunchTemplate"
     },
     {
       "action": "aws:executeAwsApi",
       "inputs": {
         "Api": "CreateAutoScalingGroup",
         "AutoScalingGroupName": "AutoScalingGroupName",
-        "LaunchConfigurationName": "LaunchConfigurationName",
-        "LoadBalancerNames": [
-          "{{ LoadBalancerName }} "
-        ],
-        "MaxSize": "3",
-        "MinSize": "1",
+        "LaunchTemplate": {
+          "LaunchTemplateName": "{{ LaunchTemplateName }}"
+        },
+        "MaxSize": 3,
+        "MinSize": 1,
         "Service": "autoscaling",
-        "VPCZoneIdentifier": [
-          "{{ SubnetId }}"
-        ]
+        "TargetGroupARNs": [
+          "{{ createTargetGroup.TargetGroupArn }}"
+        ],
+        "VPCZoneIdentifier": "{{ SubnetId }}"
       },
       "isCritical": "true",
       "isEnd": "true",
       "name": "createAutoScalingGroup",
-      "onFailure": "step:deleteAutoScalingGroup"
+      "onFailure": "step:deleteLaunchTemplate"
+    },
+    {
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Api": "deleteLaunchTemplate",
+        "LaunchTemplateName": "{{ LaunchTemplateName }}",
+        "Service": "ec2"
+      },
+      "isCritical": "true",
+      "name": "deleteLaunchTemplate",
+      "onFailure": "Continue"
     },
     {
       "action": "aws:executeAwsApi",
@@ -99,36 +150,23 @@
       },
       "isCritical": "true",
       "name": "deleteAutoScalingGroup",
-      "nextStep": "deleteLaunchConfiguration",
       "onFailure": "Continue"
     },
     {
       "action": "aws:executeAwsApi",
       "inputs": {
-        "Api": "GetParameter",
-        "Name": "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
-        "Service": "ssm"
+        "Api": "DeleteTargetGroup",
+        "Service": "elbv2",
+        "TargetGroupArn": "{{ createTargetGroup.TargetGroupArn }}"
       },
       "isCritical": "true",
-      "name": "getLatestLinuxAMI",
-      "onFailure": "Abort"
-    },
-    {
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Api": "CreateSecurityGroup",
-        "Description": "Security group used by the test instance created by Automation execution {{ automation:EXECUTION_ID }}.",
-        "GroupName": " {{ SecurityGroupName }} ",
-        "Service": "ec2",
-        "VpcId": "{{ describeSubnet.VpcId }}"
-      },
-      "isCritical": "true",
-      "name": "createSecurityGroup",
-      "onFailure": "Abort"
+      "name": "deleteTargetGroup",
+      "onFailure": "Continue"
     }
   ],
   "parameters": {
     "AutoScalingGroupName": {
+      "allowedPattern": "[\\u0020-\\uD7FF\\uE000-\\uFFFD\\uD800\\uDC00-\\uDBFF\\uDFFF\\r\\n\\t]*",
       "default": "my-auto-scaling-group",
       "description": "(Optional) The name for the Auto Scaling Group",
       "type": "String"
@@ -136,7 +174,7 @@
     "AutomationAssumeRole": {
       "default": "",
       "description": "(Optional) The IAM role for this execution. If no role is specified, Amazon Web Services Systems Manager Automation will use the permissions of the user that executes this document.",
-      "type": "String"
+      "type": "AWS::IAM::Role::Arn"
     },
     "InstanceType": {
       "allowedValues": [
@@ -149,23 +187,10 @@
       "description": "(Optional) The EC2 instance type for the test instance. Recommended size: t2.micro.",
       "type": "String"
     },
-    "LaunchConfigurationName": {
-      "default": "my-launch-config",
-      "description": "(Optional) The name for the Launch Configuration",
-      "type": "String"
-    },
     "LaunchTemplateName": {
+      "allowedPattern": "[a-zA-Z0-9\\(\\)\\.\\-/_]+",
       "default": "my-launch-template",
       "description": "(Optional) The name for the Launch Template",
-      "type": "String"
-    },
-    "LoadBalancerName": {
-      "description": "(Required) The name for the Load Balancer",
-      "type": "String"
-    },
-    "SecurityGroupName": {
-      "default": "my-security-group",
-      "description": "(Optional) The name for the Security Group",
       "type": "String"
     },
     "SubnetId": {
