@@ -1,0 +1,825 @@
+{
+  "description": "The **AWSSupport-TroubleshootGlueConnections** runbook helps troubleshoot AWS Glue connection issues. The target of the tested connection must be reached through a JDBC connection and can be either an Amazon Relational Database Service (Amazon RDS) cluster/instance, an Amazon Redshift cluster, or any other target accessible through JDBC. In the first two cases, the reachability analyser tool is used to determine if the connectivity between the source (AWS Glue) and the target (Amazon RDS or Amazon Redshift ) is granted. If the target of the connection is not Amazon RDS nor Amazon Redshift, connectivity is still tested by creating an AWS Lambda function in the same subnet of the AWS Glue connection (a network point of presence) and checking if the target name is resolvable and if it's reachable in the target port. For the connectivity one, the following checks are also performed:\n\n- Check if the security group of the connection has a self referencing rule enabling in-bound connections.\n- Check AWS Identity and Access Management (IAM) permissions on the IAM role used for the connection test.\n- Check Amazon Simple Storage Service (Amazon S3) connectivity/access.\n- Check AWS Key Management System (AWS KMS) access.\n\n**Important note:** To run connectivity checks, this automation will require one IP in the AWS Glue connection's subnet and in each of the connection target's subnets. For example, if the connection was created in a `subnet-a` and the target is an Amazon RDS cluster spun across `subnet-b` and `subnet-c`, for this automation to succeed, `subnet-a`, `subnet-b`, and `subnet-c` should have at least one free IP.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ConnectionName": {
+      "type": "String",
+      "description": "(Required) The name of the AWS Glue Connection you want to troubleshoot the failed test connection attempt.",
+      "allowedPattern": "^[a-zA-Z0-9_-]{1,255}$"
+    },
+    "TestConnectionRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that is used during the connection test."
+    },
+    "PersistReachabilityAnalyzerResults": {
+      "type": "Boolean",
+      "description": "(Optional) The flag informing if the results of the VPC Reachability Analyzer execution should be kept or not. Default: `false`.",
+      "default": false
+    },
+    "PointOfPresenceLogRetentionPeriod": {
+      "type": "Integer",
+      "description": "(Optional) The number of days the logs for the point of presence AWS Lambda will be stored for. Default: 7.",
+      "default": 7,
+      "allowedValues": [
+        1,
+        3,
+        5,
+        7,
+        14,
+        30,
+        60,
+        90,
+        120,
+        150,
+        180,
+        365,
+        400,
+        545,
+        731,
+        1096,
+        1827,
+        2192,
+        2557,
+        2922,
+        3288,
+        3653
+      ]
+    },
+    "DatasourceSubnets": {
+      "type": "StringList",
+      "description": "(Optional) If the original datasource is not available, use this parameter to provide the subnets that it used so that the connectivity tests are still performed. **Must** be used with `DatasourceSecurityGroups`. Example: subnet-1,subnet-2.",
+      "default": [],
+      "allowedPattern": "^subnet-\\w{8,17}(,\\s*subnet-\\w{8,17})*$"
+    },
+    "DatasourceSecurityGroups": {
+      "type": "StringList",
+      "description": "(Optional) If the original datasource is not available, use this parameter to provide the security groups it used so that the connectivity tests are still performed. **Must** be used with `DatasourceSubnets`. Example: sg-1,sg-2.",
+      "default": [],
+      "allowedPattern": "^(?:sg-[0-9a-f]{8,}|sg-[0-9a-f]{17})(?:,(?:sg-[0-9a-f]{8,}|sg-[0-Aa-f]{17}))*$"
+    }
+  },
+  "variables": {
+    "VariableDatasourceSubnets": {
+      "type": "StringList",
+      "default": []
+    },
+    "VariableDatasourceSecurityGroups": {
+      "type": "StringList",
+      "default": []
+    }
+  },
+  "mainSteps": [
+    {
+      "isCritical": false,
+      "name": "ParseInputs",
+      "action": "aws:executeScript",
+      "onFailure": "step:GenerateReport",
+      "nextStep": "GetConnectionDetails",
+      "description": "Validates the combination of inputs. If both `DatasourceSecurityGroups` and `DatasourceSubnets` are provided, they are valid and returned as is. If none are provided, two empty lists are returned. If just one of them is provided, the step raises a `ValueException`.",
+      "inputs": {
+        "InputPayload": {
+          "subnets": "{{ DatasourceSubnets }}",
+          "security_groups": "{{ DatasourceSecurityGroups }}"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Handler": "parse_inputs.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroups",
+          "Selector": "$.Payload.security_groups",
+          "Type": "StringList"
+        },
+        {
+          "Name": "Subnets",
+          "Selector": "$.Payload.subnets",
+          "Type": "StringList"
+        },
+        {
+          "Name": "ParameterCheck",
+          "Selector": "$.Payload.parameter_check",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "GetConnectionDetails",
+      "action": "aws:executeAwsApi",
+      "description": "Returns the details of the provided AWS Glue connection.",
+      "maxAttempts": 3,
+      "nextStep": "ParseSecurityGroupList",
+      "onFailure": "step:GenerateReport",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Service": "glue",
+        "Api": "GetConnection",
+        "Name": "{{ ConnectionName }}"
+      },
+      "outputs": [
+        {
+          "Name": "ConnectionProperty",
+          "Selector": "$.Connection.ConnectionProperties.JDBC_CONNECTION_URL",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Connection.PhysicalConnectionRequirements.SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIdList",
+          "Selector": "$.Connection.PhysicalConnectionRequirements.SecurityGroupIdList",
+          "Type": "StringList"
+        },
+        {
+          "Name": "BasicConnectionType",
+          "Selector": "$.Connection.ConnectionType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ParseSecurityGroupList",
+      "action": "aws:executeScript",
+      "onFailure": "step:GenerateReport",
+      "nextStep": "GetConnectionData",
+      "description": "Concatenates the `SecurityhGroupIdList` in a String for future utilization in this automation.",
+      "inputs": {
+        "InputPayload": {
+          "SecurityGroupIdList": "{{ GetConnectionDetails.SecurityGroupIdList }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\ndef script_handler(events: dict, _) -> dict:\n    \"\"\"Script responsible for concatenating a list of security groups in a single string.\"\"\"\n    sg_list = events.get(\"SecurityGroupIdList\", [])\n    return {\"sg_list\": \",\".join(sg_list)}\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroupIdListString",
+          "Selector": "$.Payload.sg_list",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetConnectionData",
+      "action": "aws:executeScript",
+      "onFailure": "step:GenerateReport",
+      "nextStep": "BranchOnConnectionType",
+      "description": "Determines based on the JDBC URL,the connection type between: RedShift, RdsInstance, RdsCluster, or Other. In addition, the domain and port used in the JDBC connection, the connection's VPC, and its domain name servers are returned.",
+      "inputs": {
+        "InputPayload": {
+          "ConnectionURL": "{{ GetConnectionDetails.ConnectionProperty }}",
+          "ConnectionSubnet": "{{ GetConnectionDetails.SubnetId }}",
+          "BasicConnectionType": "{{GetConnectionDetails.BasicConnectionType}}"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Handler": "get_connection_data.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "connectionType",
+          "Selector": "$.Payload.connection_type",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterId",
+          "Selector": "$.Payload.cluster_name",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectionTarget",
+          "Selector": "$.Payload.connection_target",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "ConnectionPort",
+          "Selector": "$.Payload.connection_port",
+          "Type": "Integer"
+        },
+        {
+          "Name": "ConnectionSubnetIsPublic",
+          "Selector": "$.Payload.subnet_is_public",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ConnectionSubnetHasNat",
+          "Selector": "$.Payload.subnet_has_nat",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ConnectionVPC",
+          "Selector": "$.Payload.connection_vpc",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectionVPCDomainNameServers",
+          "Selector": "$.Payload.connection_vpc_domain_name_servers",
+          "Type": "StringList"
+        },
+        {
+          "Name": "EnableDnsHostnames",
+          "Selector": "$.Payload.enable_dns_hostnames",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "EnableDnsSupport",
+          "Selector": "$.Payload.enable_dns_support",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnConnectionType",
+      "action": "aws:branch",
+      "onFailure": "step:GenerateReport",
+      "isEnd": false,
+      "description": "If the connection type is RdsInstance, RdsCluster, or Redshift the document proceeds to the reachability analyser check. Otherwise, it proceeds to the creation of the network point of presence.",
+      "inputs": {
+        "Choices": [
+          {
+            "Or": [
+              {
+                "Variable": "{{GetConnectionData.connectionType}}",
+                "StringEquals": "RedShift"
+              },
+              {
+                "Variable": "{{GetConnectionData.connectionType}}",
+                "StringEquals": "RdsCluster"
+              },
+              {
+                "Variable": "{{GetConnectionData.connectionType}}",
+                "StringEquals": "RdsInstance"
+              }
+            ],
+            "NextStep": "BranchOnParameterPresence"
+          }
+        ],
+        "Default": "CreateNetworkPointOfPresence"
+      }
+    },
+    {
+      "name": "BranchOnParameterPresence",
+      "action": "aws:branch",
+      "onFailure": "step:GenerateReport",
+      "isEnd": false,
+      "description": "Decides if the datasource subnets and security groups were provided as a parameter or if subsequent API calls are needed to capture this information.",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ ParseInputs.ParameterCheck }}",
+            "BooleanEquals": true,
+            "NextStep": "UpdateSubnetFromParameter"
+          }
+        ],
+        "Default": "GetNetworkDetails"
+      }
+    },
+    {
+      "name": "UpdateSubnetFromParameter",
+      "action": "aws:updateVariable",
+      "description": "Updates the `VariableDatasourceSubnets` variable from the `DatasourceSubnets` parameter.",
+      "nextStep": "UpdateSecurityGroupFromParameter",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Name": "variable:VariableDatasourceSubnets",
+        "Value": "{{ DatasourceSubnets }}"
+      }
+    },
+    {
+      "name": "UpdateSecurityGroupFromParameter",
+      "action": "aws:updateVariable",
+      "description": "Updates the `VariableDatasourceSecurityGroups` variable from the `DatasourceSecurityGroups` parameter.",
+      "nextStep": "CreateENITemplate",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Name": "variable:VariableDatasourceSecurityGroups",
+        "Value": "{{ DatasourceSecurityGroups }}"
+      }
+    },
+    {
+      "name": "GetNetworkDetails",
+      "action": "aws:executeScript",
+      "onFailure": "step:GenerateReport",
+      "nextStep": "UpdateSubnetFromApi",
+      "description": "Gets the subnet and security group information from the Amazon RDS or Amazon Redshift target.",
+      "inputs": {
+        "InputPayload": {
+          "ClusterId": "{{GetConnectionData.ClusterId}}",
+          "ConnectionType": "{{GetConnectionData.connectionType}}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\nimport boto3\n\nredshift_client = boto3.client(\"redshift\")\nrds_client = boto3.client(\"rds\")\n\n\ndef get_rds_instance_subnet(instance_id):\n    \"\"\"Get Amazon RDS instance subnets and security groups\n\n    Get the subnets and the security groups of the Amazon RDS instance\n    Args:\n        Instance_Id : Id of the instance to retrieve subnets and security groups\n    Returns:\n          subnets and security group in a form of a JSON\n\n    \"\"\"\n    response = rds_client.describe_db_instances(DBInstanceIdentifier=instance_id)\n    db_subnet_group_name = response[\"DBInstances\"][0][\"DBSubnetGroup\"][\"DBSubnetGroupName\"]\n    subnet_group_response = rds_client.describe_db_subnet_groups(DBSubnetGroupName=db_subnet_group_name)\n    subnets = subnet_group_response[\"DBSubnetGroups\"][0][\"Subnets\"]\n    subnets = [subnet[\"SubnetIdentifier\"] for subnet in subnets]\n    security_groups = response[\"DBInstances\"][0][\"VpcSecurityGroups\"]\n    security_groups = [security_group[\"VpcSecurityGroupId\"] for security_group in security_groups]\n    return {\"subnets\": subnets, \"security_groups\": security_groups}\n\n\ndef get_rds_cluster_subnet(cluster_id):\n    \"\"\"Get Amazon RDS cluster subnets and security groups\n\n    Get the subnets and the security groups of the Amazon RDS cluster\n    Args:\n        cluster_Id : Id of the RDS cluster to retrieve subnets and security groups\n    Returns:\n          subnets and security group in a form of a JSON\n\n    \"\"\"\n    response = rds_client.describe_db_clusters(DBClusterIdentifier=cluster_id)\n    db_subnet_group_name = response[\"DBClusters\"][0][\"DBSubnetGroup\"]\n    subnet_group_response = rds_client.describe_db_subnet_groups(DBSubnetGroupName=db_subnet_group_name)\n    subnets_response = subnet_group_response[\"DBSubnetGroups\"][0][\"Subnets\"]\n    subnets = [subnet[\"SubnetIdentifier\"] for subnet in subnets_response]\n    security_groups = response[\"DBClusters\"][0][\"VpcSecurityGroups\"]\n    security_groups = [security_groups[\"VpcSecurityGroupId\"] for security_groups in security_groups]\n    return {\"subnets\": subnets, \"security_groups\": security_groups}\n\n\ndef get_redshift_cluster_subnet(cluster_id):\n    \"\"\"Get Amazon Redshifte subnets and security groups\n\n    Get the subnets and the security groups of the Amazon RedShift cluster\n    Args:\n        cluster_Id : Id of the RedShift cluster to retrieve subnets and security groups\n    Returns:\n          subnets and security group in a form of a JSON\n    \"\"\"\n    describe_cluster_response = redshift_client.describe_clusters(ClusterIdentifier=cluster_id)\n    subnet_group_name = describe_cluster_response[\"Clusters\"][0][\"ClusterSubnetGroupName\"]\n    describe_subnet_group_response = redshift_client.describe_cluster_subnet_groups(\n        ClusterSubnetGroupName=subnet_group_name\n    )\n    subnets = describe_subnet_group_response[\"ClusterSubnetGroups\"][0][\"Subnets\"]\n    subnets = [subnet[\"SubnetIdentifier\"] for subnet in subnets]\n    security_groups = describe_cluster_response[\"Clusters\"][0][\"VpcSecurityGroups\"]\n    security_groups = [security_group[\"VpcSecurityGroupId\"] for security_group in security_groups]\n    return {\"subnets\": subnets, \"security_groups\": security_groups}\n\n\ndef script_handler(events, _):\n    try:\n        results = {}\n        cluster_id = events[\"ClusterId\"]\n        connection_type = events[\"ConnectionType\"]\n        if connection_type == \"RedShift\":\n            results = get_redshift_cluster_subnet(cluster_id)\n        elif connection_type == \"RdsInstance\":\n            results = get_rds_instance_subnet(cluster_id)\n        elif connection_type == \"RdsCluster\":\n            results = get_rds_cluster_subnet(cluster_id)\n        subnets = results.get(\"subnets\")\n        security_group = results.get(\"security_groups\")\n        return {\"subnets\": subnets, \"security_groups\": security_group}\n    except Exception as e:\n        raise RuntimeError(f\"The error {e} was experienced when retrieving subnets and security groups\") from None\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "Subnets",
+          "Selector": "$.Payload.subnets",
+          "Type": "StringList"
+        },
+        {
+          "Name": "SecurityGroups",
+          "Selector": "$.Payload.security_groups",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "UpdateSubnetFromApi",
+      "action": "aws:updateVariable",
+      "description": "Updates the `VariableDatasourceSubnets` variable from the `GetNetworkDetails` step.",
+      "nextStep": "UpdateSecurityGroupFromApi",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Name": "variable:VariableDatasourceSubnets",
+        "Value": "{{ GetNetworkDetails.Subnets }}"
+      }
+    },
+    {
+      "name": "UpdateSecurityGroupFromApi",
+      "action": "aws:updateVariable",
+      "description": "Updates the `VariableDatasourceSecurityGroups` variable from the `GetNetworkDetails` step.",
+      "nextStep": "CreateENITemplate",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Name": "variable:VariableDatasourceSecurityGroups",
+        "Value": "{{ GetNetworkDetails.SecurityGroups }}"
+      }
+    },
+    {
+      "name": "CreateENITemplate",
+      "action": "aws:executeScript",
+      "onFailure": "step:GenerateReport",
+      "nextStep": "CreateENIStack",
+      "description": "Generates the CloudFormation template used to create the network interfaces that are used to test connectivity. This is required to run the Reachability Analyzer tool.",
+      "inputs": {
+        "InputPayload": {
+          "ExecID": "{{ automation:EXECUTION_ID }}",
+          "SourceSubnet": "{{GetConnectionDetails.SubnetId}}",
+          "SourceSecurityGroups": "{{GetConnectionDetails.SecurityGroupIdList}}",
+          "TargetSubnets": "{{variable:VariableDatasourceSubnets}}",
+          "TargetSecurityGroups": "{{variable:VariableDatasourceSecurityGroups}}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport json\nfrom collections import defaultdict\nfrom typing import Any, Collection, Dict, List\n\n\ndef create_eni_object(subnet: str, security_groups: List[str], exec_id: str) -> Dict[str, Collection[str]]:\n    \"\"\"Function to create a CloudFormation ENI object\n    Args:\n        subnet: the subnet in which the ENI will be created\n        security_groups: the security groups attached to the subnet\n        exec_id: execution id of the SSM automation responsible for creating the resources.\n    Returns:\n        JSON object for the ENI\n    \"\"\"\n\n    eni_object: Dict[str, Any] = {}\n    eni_object[\"Properties\"] = {}\n    eni_object[\"Type\"] = \"AWS::EC2::NetworkInterface\"\n    eni_object[\"Properties\"][\"SubnetId\"] = subnet\n    eni_object[\"Properties\"][\"GroupSet\"] = security_groups\n    eni_object[\"Properties\"][\"Tags\"] = [\n        {\"Key\": \"AWSSupport-TroubleshootGlueConnection\", \"Value\": \"true\"},\n        {\"Key\": \"AutomationExecutionId\", \"Value\": exec_id},\n    ]\n    return eni_object\n\n\ndef script_handler(events, _):\n    \"\"\"Create a CloudFormation template (JSON type)\n\n    Create a CloudFormation template for creating Networks Interface resources\n    Args:\n        Subnets : The list of subnets used to  create the Network Interfaces\n        SecurityGroups :  The list of security groups used to  create the Network Interfaces\n    Returns:\n        The JSON template\n    \"\"\"\n    try:\n        source_subnet = events[\"SourceSubnet\"]\n        source_security_groups = events[\"SourceSecurityGroups\"]\n        target_subnet_list = events[\"TargetSubnets\"]\n        target_security_groups = events[\"TargetSecurityGroups\"]\n        exec_id = events[\"ExecID\"]\n        template_dict: Dict[str, Dict[str, Collection[str]]] = defaultdict(dict)\n\n        \"\"\"Setting the source ENI object\"\"\"\n        source_network_interface = create_eni_object(source_subnet, source_security_groups, exec_id)\n        source_resource_logic_id = f\"SourceEni{source_subnet.split('-')[1].strip()}\"\n        source_output_logic_id = \"SourceEni\"\n        template_dict[\"Resources\"][source_resource_logic_id] = source_network_interface\n        template_dict[\"Outputs\"][source_output_logic_id] = {\"Value\": {\"Fn::GetAtt\": [source_resource_logic_id, \"Id\"]}}\n\n        \"\"\"Setting the target ENI objects\"\"\"\n        for position, subnet in enumerate(target_subnet_list):\n            resource_logic_id = f\"TargetEni{subnet.split('-')[1].strip()}\"\n            output_logic_id = f\"TargetEni{position}\"\n            template_dict[\"Resources\"][resource_logic_id] = create_eni_object(subnet, target_security_groups, exec_id)\n            template_dict[\"Outputs\"][output_logic_id] = {\"Value\": {\"Fn::GetAtt\": [resource_logic_id, \"Id\"]}}\n\n        final_template = json.dumps(template_dict)\n        return {\"template\": final_template}\n    except Exception as e:\n        raise RuntimeError(\n            f\"The following error has occurred when attempting to create the CloudFormation template for the source and target ENIs: {e}\"\n        )\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "Template",
+          "Selector": "$.Payload.template",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateENIStack",
+      "action": "aws:createStack",
+      "description": "Creates the Amazon CloudFormation stack from the template created in the `CreateENITemplate` step.",
+      "onFailure": "step:DescribeENIStackCreationErrors",
+      "nextStep": "GetStackDetails",
+      "maxAttempts": 1,
+      "inputs": {
+        "OnFailure": "DELETE",
+        "Capabilities": [
+          "CAPABILITY_IAM"
+        ],
+        "StackName": "AWSSupport-CreateENI-{{ automation:EXECUTION_ID }}",
+        "ClientRequestToken": "AWSSupport-CreateENI-{{ automation:EXECUTION_ID }}",
+        "TimeoutInMinutes": 10,
+        "TemplateBody": "{{CreateENITemplate.Template}}",
+        "Tags": [
+          {
+            "Key": "AWSSupport-TroubleshootGlueConnection",
+            "Value": "true"
+          },
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-CreateENI-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-CreateENI-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CloudFormationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        },
+        {
+          "Name": "CloudFormationStackStatus",
+          "Selector": "$.StackStatus",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DescribeENIStackCreationErrors",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to delete the AWS CloudFormation stack.",
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "check_stack_status.function_handler",
+        "InputPayload": {
+          "StackName": "{{ CreateENIStack.CloudFormationStackId }}",
+          "ExpectedStackStatus": "CREATE_COMPLETE",
+          "NonExpectedStackStatus": "CREATE_FAILED,ROLLBACK_FAILED,DELETE_FAILED"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "CreationErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "GetStackDetails",
+      "action": "aws:executeScript",
+      "onFailure": "step:DeleteENIStack",
+      "nextStep": "RunSourceToTargetCheck",
+      "description": "Step responsible for describing the CloudFormation stack created in the previous stack and retrieve the `SourceNetworkInterface` and `TargetNetworkInterfaces` information.",
+      "inputs": {
+        "InputPayload": {
+          "StackId": "{{ CreateENIStack.CloudFormationStackId }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nfrom typing import List, Optional\n\nimport boto3\n\ncfn_client = boto3.client(\"cloudformation\")\n\n\ndef script_handler(events, _):\n    \"\"\"Describe the stack resources\n\n    Describe resources that are created by the stack.\n    Args:\n        StackId : The stack Id whom resources are described.\n    Returns:\n          The list of network interfaces created by the stack.\n\n    \"\"\"\n    source_eni: str = \"\"\n    target_enis: List[Optional[str]] = []\n    try:\n        stack_id = events.get(\"StackId\")\n        stack_response = cfn_client.describe_stacks(StackName=stack_id)\n\n        for output in stack_response[\"Stacks\"][0][\"Outputs\"]:\n            output_logical_id = output.get(\"OutputKey\")\n            output_value = output.get(\"OutputValue\")\n            if output_logical_id == \"SourceEni\":\n                source_eni = output_value\n            elif \"TargetEni\" in output_logical_id:\n                target_enis.append(output_value)\n        return {\"SourceNetworkInterface\": source_eni, \"TargetNetworkInterfaces\": target_enis}\n    except Exception as e:\n        raise RuntimeError(\n            f\"The following error has occurred when trying to create source and target ENIs: {e}\"\n        ) from None\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "TargetNetworkInterfaces",
+          "Selector": "$.Payload.TargetNetworkInterfaces",
+          "Type": "StringList"
+        },
+        {
+          "Name": "SourceNetworkInterface",
+          "Selector": "$.Payload.SourceNetworkInterface",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "RunSourceToTargetCheck",
+      "action": "aws:executeScript",
+      "nextStep": "DeleteENIStack",
+      "description": "Step responsible for running the reachability analyser tool. It runs checks between the source and targets ENIs created in the previous step.",
+      "inputs": {
+        "InputPayload": {
+          "PersistReachabilityAnalyzerResults": "{{ PersistReachabilityAnalyzerResults }}",
+          "Region": "{{ global:REGION }}",
+          "Port": "{{ GetConnectionData.ConnectionPort }}",
+          "SourceNetworkInterface": "{{ GetStackDetails.SourceNetworkInterface }}",
+          "TargetNetworkInterfaces": "{{ GetStackDetails.TargetNetworkInterfaces }}"
+        },
+        "Handler": "source_to_target_check_orchestrator.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact_2.zip"
+      },
+      "onFailure": "step:DeleteENIStack",
+      "outputs": [
+        {
+          "Name": "ReachabilityAnalyserResults",
+          "Selector": "$.Payload",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "DeleteENIStack",
+      "action": "aws:deleteStack",
+      "nextStep": "CreateNetworkPointOfPresence",
+      "description": "Deletes the AWS CloudFormation stack that create Network Interfaces",
+      "onFailure": "step:DescribeENIStackDeletionErrors",
+      "inputs": {
+        "StackName": "{{ CreateENIStack.CloudFormationStackId }}"
+      }
+    },
+    {
+      "name": "DescribeENIStackDeletionErrors",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to delete the AWS CloudFormation stack.",
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "check_stack_status.function_handler",
+        "InputPayload": {
+          "StackName": "{{ CreateENIStack.CloudFormationStackId }}",
+          "ExpectedStackStatus": "DELETE_COMPLETE",
+          "NonExpectedStackStatus": "DELETE_FAILED"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DeletionErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "CreateNetworkPointOfPresence",
+      "description": "This step uses AWS CloudFormation for creating the AWS Lambda function used as network point of presence.",
+      "action": "aws:createStack",
+      "nextStep": "GetFunctionName",
+      "onFailure": "step:DescribeNetworkPointOfPresenceStackCreationErrors",
+      "inputs": {
+        "Capabilities": [
+          "CAPABILITY_IAM",
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "StackName": "AWSSupport-TroubleshootGlueConnection-PointOfPresence-{{ automation:EXECUTION_ID }}",
+        "ClientRequestToken": "AWSSupport-TroubleshootGlueConnection-PointOfPresence-{{ automation:EXECUTION_ID }}",
+        "TimeoutInMinutes": 10,
+        "OnFailure": "DELETE",
+        "Parameters": [
+          {
+            "ParameterKey": "ExecID",
+            "ParameterValue": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "SubnetId",
+            "ParameterValue": "{{ GetConnectionDetails.SubnetId }}"
+          },
+          {
+            "ParameterKey": "SecurityGroupIds",
+            "ParameterValue": "{{ ParseSecurityGroupList.SecurityGroupIdListString }}"
+          },
+          {
+            "ParameterKey": "LogRetentionPeriod",
+            "ParameterValue": "{{ PointOfPresenceLogRetentionPeriod }}"
+          }
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\n\nParameters:\n  SubnetId:\n    Type: AWS::EC2::Subnet::Id\n    Default: ''\n  SecurityGroupIds:\n    Type: List<AWS::EC2::SecurityGroup::Id>\n    Default: ''\n  LogRetentionPeriod:\n    Type: Number\n    Default: 7\n  ExecID:\n    Type: String\n    AllowedPattern: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$\nResources:\n  LambdaRole:\n    Type: AWS::IAM::Role\n    Properties:\n      RoleName: !Sub \"point-of-presence-${ExecID}\"\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n        - Effect: Allow\n          Principal:\n            Service:\n            - lambda.amazonaws.com\n          Action:\n          - sts:AssumeRole\n      ManagedPolicyArns:\n      - !Sub \"arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole\"\n      Policies:\n      - PolicyDocument:\n          Statement:\n          - Sid: EC2RelatedPermissions\n            Effect: Allow\n            Action:\n            - ec2:CreateNetworkInterface\n            - ec2:DescribeNetworkInterfaces\n            - ec2:DeleteNetworkInterface\n            Resource: '*'\n        PolicyName: LambdaRolePermissions\n      Tags:\n      - Key: AWSSupport-TroubleshootGlueConnection\n        Value: 'true'\n      - Key: AutomationExecutionId\n        Value: !Ref ExecID\n  PointOfPresenceLambdaFunction:\n    Type: AWS::Lambda::Function\n    Properties:\n      FunctionName: !Sub \"point-of-presence-${ExecID}\"\n      Runtime: python3.11\n      Role: !GetAtt LambdaRole.Arn\n      Handler: index.run_point_of_presence_tests\n      Code:\n        ZipFile: |+\n          # Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved\n\n          # SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n\n          # Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\n\n          import json\n\n          import re\n\n          import socket\n\n          import urllib.error\n\n          import urllib.request\n\n          from http.client import BadStatusLine\n\n          from multiprocessing import Pipe, Process\n\n          from typing import Any, Dict, List\n\n\n\n\n\n          class SocketCaller:\n\n              \"\"\"Class to abstract a low level socket (BSD) tester\"\"\"\n\n\n\n              SUB_PROCESS_TIME_OUT = 10\n\n              CONNECTION_TIME_OUT = 5\n\n              MAX_PROC_NUMBER = 1024\n\n\n\n              def __init__(self, ip_list: list, port: int) -> None:\n\n                  \"\"\"SocketCaller constructor\n\n\n\n                  Args:\n\n                  1. ip_list[List]: list of IPs to be tested\n\n                  2. port[int]: port to be tested\"\"\"\n\n                  self._ip_list = ip_list\n\n                  self._port = port\n\n                  self._socket_status_list: List[Dict[str, str]] = []\n\n                  self._run_test()\n\n\n\n              @property\n\n              def socket_status_list(self) -> List:\n\n                  \"\"\"Property with the status of the current check.\n\n\n\n                  Returns:\n\n                      list: list of socket test results with 'ip' being the tested IP and 'status' (true/false)\n\n                      if the connection could be established or not.\n\n                  Example or return value:\n\n                  [{\n\n                      \"ip\": \"52.94.236.248\",\n\n                      \"status\": true\n\n                  }]\n\n                  \"\"\"\n\n                  return self._socket_status_list\n\n\n\n              @socket_status_list.setter\n\n              def socket_status_list(self, socket_status: dict) -> None:\n\n                  self._socket_status_list.append(socket_status)\n\n\n\n              def _run_test(self):\n\n                  \"\"\"Performs a connectivity check against each of the IPs provided in 'ip_list'\n\n\n\n                  As socket time outs are timely expensive, a multi-process approach is used\n\n                  to run the checks concurrently.\n\n\n\n                  Raises:\n\n                  1. RuntimeError: if the number of IPs to be processed is bigger than 1024.\n\n                  \"\"\"\n\n                  # Defining a safety net to avoid exploitations on the multi process approach\n\n                  # Adopting RHEL default limit for nproc\n\n                  if len(self._ip_list) > self.MAX_PROC_NUMBER:\n\n                      raise RuntimeError(\n\n                          f\"The maximum limit of {self.MAX_PROC_NUMBER} IPs per test has been breached. Please reduce your sample.\"\n\n                      )\n\n                  parent_connections = []\n\n                  processes = []\n\n                  for ip in self._ip_list:\n\n                      parent_connection, child_connection = Pipe()\n\n                      parent_connections.append(parent_connection)\n\n                      socket_checker_sub_process = Process(target=self._check_socket, args=(ip, self._port, child_connection))\n\n                      processes.append(socket_checker_sub_process)\n\n                      socket_checker_sub_process.start()\n\n                  for socket_checker_sub_process in processes:\n\n                      socket_checker_sub_process.join(self.SUB_PROCESS_TIME_OUT)\n\n                  for parent_connection in parent_connections:\n\n                      self.socket_status_list = parent_connection.recv()\n\n\n\n              def _check_socket(self, ip: str, port: int, conn):\n\n                  with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:\n\n                      sock.settimeout(self.CONNECTION_TIME_OUT)\n\n                      status = sock.connect_ex((ip, port))\n\n                  conn.send({\"ip\": str(ip), \"status\": True if status == 0 else False})\n\n                  conn.close\n\n\n\n\n\n          class NetworkPointOfPresence:\n\n              \"\"\"Class representing a network point of presence\n\n\n\n              The idea of this object is to perform connectivity tests between a source\n\n              and a target. If executed using the same network configuration as the source,\n\n              it would report if the target name was resolvable and reachable in the desired port.\"\"\"\n\n\n\n              def __init__(self, url: str, port: int) -> None:\n\n                  \"\"\"NetworkPointOfPresence constructor\n\n\n\n                  Args:\n\n                      1. url[str]: the URL to be tested. May include schema or not ('http' by default);\n\n                      2. port[int]: the port to be tested.\n\n                  \"\"\"\n\n                  self._port = port\n\n                  self._url = url\n\n\n\n                  self._endpoint_ip_list: List[str] = []\n\n                  self._scheme = \"\"\n\n                  self._is_name_valid = False\n\n                  self._is_name_resolvable = False\n\n                  self._socket_connectivity_result: List[dict] = []\n\n                  self._l7_connectivity_granted = False\n\n                  # Area of improvement: L7 can be checked using different protocols\n\n                  # possible implementation would be a L7 client factory supporting different types of client implementation\n\n                  self._l7_protocol = \"http\"\n\n                  self._http_code: int = 0\n\n                  self._ssl_connectivity_granted = False\n\n                  self._parse_url()\n\n\n\n              def __str__(self) -> str:\n\n                  return f\"URL: {self._url}, PORT: {self._port}, SCHEME: {self._scheme}\"\n\n\n\n              def _parse_url(self) -> None:\n\n                  \"\"\"Method responsible for parsing the 'url' parameter and extracting the scheme and domain name.\"\"\"\n\n                  try:\n\n                      url_regex = re.compile(\n\n                          r\"^(?:(?P<scheme>http|https)://)?\"  # Making scheme optional\n\n                          r\"(?:(?P<domain>(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\\.)+(?:[A-Z]{2,6}\\.?|[A-Z0-9-]{2,}\\.?)|localhost|\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}))\"\n\n                          r\"(?::(?P<port>6553[0-5]|655[0-2]\\d|65[0-4]\\d{2}|6[0-4]\\d{3}|[1-5]\\d{4}|[1-9]\\d{1,3}|[0-9]))?\"\n\n                          r\"(?P<path>/.*)?$\",\n\n                          re.IGNORECASE,\n\n                      )\n\n                      domain = re.search(\n\n                          url_regex,\n\n                          self._url,\n\n                      )\n\n                      assert domain is not None, f\"Could not extract the domain from {self._url}\"\n\n                      self._domain_name = domain.group(\"domain\")\n\n                      self._scheme = domain.group(\"scheme\") if domain.group(\"scheme\") else \"http\"\n\n                      self._is_name_valid = True\n\n                  except AssertionError:\n\n                      self._is_name_valid = False\n\n\n\n              def _resolve_name(self) -> None:\n\n                  \"\"\"Method responsible for reaching out to the resolver and getting the IPv4 addresses\n\n                  related with the domain name being tested.\"\"\"\n\n                  if not self._is_name_valid:\n\n                      # If no domain could be parsed out of the URL, it's pointless to try to resolve it\n\n                      self._is_name_resolvable = False\n\n                      return\n\n                  try:\n\n                      record = socket.getaddrinfo(self._domain_name, self._port, family=socket.AF_INET)\n\n                      for _, _, _, _, ipaddr in record:\n\n                          self._endpoint_ip_list.append(str(ipaddr[0]))\n\n                      self._is_name_resolvable = True\n\n                  except socket.gaierror:\n\n                      self._is_name_resolvable = False\n\n\n\n              def _check_socket_connectivity(self) -> None:\n\n                  \"\"\"Method responsible for checking socket connectivity against all hostname's resolved IPs.\"\"\"\n\n                  socket_caller = SocketCaller(self._endpoint_ip_list, self._port)\n\n                  self._socket_connectivity_result = socket_caller.socket_status_list\n\n\n\n              def _check_l7(self) -> None:\n\n                  \"\"\"Method responsible for testing L7 connectivity to the host:port being tested. For that, a GET request is performed.\"\"\"\n\n                  # Not running any L7 tests if name is not resolvable\n\n                  if not self._is_name_valid:\n\n                      return\n\n                  if self._l7_protocol == \"http\":\n\n                      try:\n\n                          # Disabling B310 because file schema is already ruled out by the name validation\n\n                          connection = urllib.request.urlopen(  # nosec B310\n\n                              f\"{self._scheme}://{self._domain_name}:{self._port}/\", timeout=3\n\n                          )\n\n                          self._l7_connectivity_granted = connection.status in range(100, 300)\n\n                          self._http_code = connection.status\n\n                          self._ssl_connectivity_granted = True if self._scheme == \"https\" else False\n\n                      except urllib.error.HTTPError as http_error:\n\n                          if http_error.code in range(400, 499):\n\n                              self._l7_connectivity_granted = True\n\n                              self._ssl_connectivity_granted = True if self._scheme == \"https\" else False\n\n                              self._http_code = http_error.code\n\n                      # If a protocol error happens, assume both L7 and SSL as False.\n\n                      except urllib.error.URLError:\n\n                          self._l7_connectivity_granted = False\n\n                          self._ssl_connectivity_granted = False\n\n                      # If an unknown status code is returned, L7 is not HTTP therefore, not supported\n\n                      except BadStatusLine:\n\n                          self._l7_connectivity_granted = False\n\n                          self._ssl_connectivity_granted = False\n\n                  else:\n\n                      raise NotImplementedError(\"Unsuported L7 protocol\")\n\n\n\n              def check_endpoint(self) -> dict:\n\n                  \"\"\"Method responsible for orchestrating the tests\n\n                  Returns:\n\n                      1. dict:\n\n                  Example of output:\n\n                  {\n\n                      'url': 'https://123456789.dkr.ecr.<region>.amazonaws.com/myimage:latest',\n\n                      'port': 443,\n\n                      'dns_state': True,\n\n                      'socket': [\n\n                          {'ip': '52.211.183.252', 'status': True},\n\n                          {'ip': '54.247.4.15', 'status': True}\n\n                          ],\n\n                      'l7_status': True,\n\n                      'ssl_validation': True\n\n                  }\n\n                  \"\"\"\n\n                  self._resolve_name()\n\n                  if self._is_name_resolvable:\n\n                      self._check_socket_connectivity()\n\n                      self._check_l7()\n\n                  result: Dict[str, Any] = {}\n\n                  result[\"url\"] = self._url\n\n                  result[\"port\"] = self._port\n\n                  result[\"dns_state\"] = self._is_name_resolvable\n\n                  result[\"socket\"] = self._socket_connectivity_result\n\n                  result[\"l7_status\"] = self._l7_connectivity_granted\n\n                  result[\"ssl_validation\"] = self._ssl_connectivity_granted\n\n                  result[\"http_code\"] = self._http_code\n\n                  return result\n\n\n\n              def format_error(self, error: Exception) -> dict:\n\n                  \"\"\"Method responsible for formatting the reply whenever an error has occurred\"\"\"\n\n                  return {\"url\": self._url, \"port\": self._port, \"error\": str(error)}\n\n\n\n\n\n          def run_point_of_presence_tests(event: dict, _) -> dict:\n\n              \"\"\"Wrapper function responsible for instantiating the NetworkPointOfPresence object.\n\n\n\n              Args:\n\n                  1. event[dict]: JSON.\n\n              Returns:\n\n                  1. dict: dictionary containing the results from the multiple calls to NetworkPointOfPresence's check_endpoint method.\n\n              Example of input:\n\n              {\n\n                   \"ecr_endpoint\": {\n\n                       \"url\": \"https://123456789.dkr.ecr.<region>.amazonaws.com/myimage:latest\",\n\n                       \"port\": 443,\n\n                   },\n\n                   \"another_endpoint\": {\n\n                       \"url\": \"amazon.com\",\n\n                       \"port\": 80,\n\n                   }\n\n              }\n\n              \"\"\"\n\n              inputs = event.get(\"inputs\", {}) if isinstance(event, dict) else {}\n\n              # Accepting a string as argument as well to ease utilisation\n\n              if isinstance(inputs, str):\n\n                  inputs = json.loads(inputs)\n\n              output = {}\n\n              for endpoint, parameters in inputs.items():\n\n                  network_point_of_presence = NetworkPointOfPresence(parameters.get(\"url\"), parameters.get(\"port\", 80))\n\n                  try:\n\n                      output[endpoint] = network_point_of_presence.check_endpoint()\n\n                  except Exception as e:\n\n                      output[endpoint] = network_point_of_presence.format_error(e)\n\n              return output\n\n      Timeout: 90\n      LoggingConfig:\n        LogGroup: !Ref LambdaLogGroup\n      VpcConfig:\n        SecurityGroupIds: !Ref SecurityGroupIds\n        SubnetIds:\n        - !Ref SubnetId\n      Tags:\n      - Key: AWSSupport-TroubleshootGlueConnection\n        Value: 'true'\n      - Key: AutomationExecutionId\n        Value: !Ref ExecID\n  LambdaLogGroup:\n    Type: AWS::Logs::LogGroup\n    DeletionPolicy: Retain\n    Properties:\n      RetentionInDays: !Ref LogRetentionPeriod\n      Tags:\n      - Key: AWSSupport-TroubleshootGlueConnection\n        Value: 'true'\n      - Key: AutomationExecutionId\n        Value: !Ref ExecID\nOutputs:\n  LambdaName:\n    Description: The name of the network point of presence lambda created by this\n      stack.\n    Value: !Ref PointOfPresenceLambdaFunction\n",
+        "Tags": [
+          {
+            "Key": "AWSSupport-TroubleshootGlueConnection",
+            "Value": "true"
+          },
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootGlueConnection-PointOfPresence-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-TroubleshootGlueConnection-PointOfPresence",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CloudFormationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DescribeNetworkPointOfPresenceStackCreationErrors",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to delete the AWS CloudFormation stack.",
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "check_stack_status.function_handler",
+        "InputPayload": {
+          "StackName": "{{ CreateNetworkPointOfPresence.CloudFormationStackId }}",
+          "ExpectedStackStatus": "CREATE_COMPLETE",
+          "NonExpectedStackStatus": "CREATE_FAILED,ROLLBACK_FAILED,DELETE_FAILED"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "CreationErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "GetFunctionName",
+      "description": "This step performs a AWS CloudFormation describe stack API call to retrieve the name of the AWS Lambda function created in the previous step.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:DeletePointOfPresence",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ CreateNetworkPointOfPresence.CloudFormationStackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "NetworkPointOfPresenceLambdaName",
+          "Selector": "$.Stacks[0].Outputs[0].OutputValue",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "RunEndpointChecks"
+    },
+    {
+      "name": "RunEndpointChecks",
+      "action": "aws:invokeLambdaFunction",
+      "description": "Step responsible for using the network point of presence to determine if the endpoint present in the JDBC connection is resolvable and reachable in the declared port.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 120,
+      "onFailure": "step:DeletePointOfPresence",
+      "nextStep": "CheckS3Connectivity",
+      "inputs": {
+        "FunctionName": "{{ GetFunctionName.NetworkPointOfPresenceLambdaName }}",
+        "InputPayload": {
+          "inputs": "{{ GetConnectionData.ConnectionTarget }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "EndpointCheckResults",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CheckS3Connectivity",
+      "action": "aws:invokeLambdaFunction",
+      "nextStep": "DeletePointOfPresence",
+      "timeoutSeconds": 120,
+      "onFailure": "step:DeletePointOfPresence",
+      "description": "This step checks the network connectivity from the AWS Glue connection to the Amazon S3 service.",
+      "inputs": {
+        "FunctionName": "{{ GetFunctionName.NetworkPointOfPresenceLambdaName }}",
+        "InputPayload": {
+          "inputs": "{\"s3endpoint\":{\"url\": \"https://s3.amazonaws.com\", \"port\": 443}}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "S3CheckResults",
+          "Selector": "$",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "DeletePointOfPresence",
+      "action": "aws:deleteStack",
+      "nextStep": "TestIAMRolePermissions",
+      "description": "Deletes the AWS CloudFormation stack that creates the network point of presence Lambda.",
+      "onFailure": "step:DescribeNetworkPointOfPresenceStackDeletionErrors",
+      "inputs": {
+        "StackName": "{{ CreateNetworkPointOfPresence.CloudFormationStackId }}"
+      }
+    },
+    {
+      "name": "DescribeNetworkPointOfPresenceStackDeletionErrors",
+      "action": "aws:executeScript",
+      "description": "Describes the AWS CloudFormation stack events if the runbooks fails to delete the AWS CloudFormation stack.",
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "check_stack_status.function_handler",
+        "InputPayload": {
+          "StackName": "{{ CreateNetworkPointOfPresence.CloudFormationStackId }}",
+          "ExpectedStackStatus": "DELETE_COMPLETE",
+          "NonExpectedStackStatus": "DELETE_FAILED"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DeletionErrorsFromStackEvents",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "TestIAMRolePermissions",
+      "action": "aws:executeScript",
+      "nextStep": "CheckConnectionSecurityGroupReferencingRule",
+      "onFailure": "step:GenerateReport",
+      "description": "Checks if the IAM role used for the AWS Glue connection test has the needed permissions to execute it.",
+      "inputs": {
+        "InputPayload": {
+          "ConnectionRole": "{{TestConnectionRole}}",
+          "ConnectionType": "{{GetConnectionData.connectionType}}"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Handler": "check_connection_iam_role.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "OutputMessage",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckConnectionSecurityGroupReferencingRule",
+      "action": "aws:executeScript",
+      "onFailure": "step:GenerateReport",
+      "nextStep": "GenerateReport",
+      "description": "Checks if the security group used in the AWS Glue connection is allowing all ingress traffic from itself. It will return a list of the security groups without this rule, if any.",
+      "inputs": {
+        "InputPayload": {
+          "SecurityGroups": "{{ GetConnectionDetails.SecurityGroupIdList }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nfrom typing import Any, List\n\nimport boto3\n\nec2_client = boto3.client(\"ec2\")\n\n\ndef has_referencing_ingress_rule(security_group_id: str, security_group_rules: List[Any]) -> bool:\n    \"\"\"Checks if a rule has an inbound rule allowing traffic from the given\n    security group\n    Args:\n    - security_group_id: string containing the security group ID to be checked\n    - security_group_rules: list of security group rules to be checked\n    Returns:\n    - boolean: True if the rule has an ingress rule allowing traffic from the\n    security group, False otherwise\n    \"\"\"\n    for rule in security_group_rules:\n        referenced_security_group = rule.get(\"ReferencedGroupInfo\", {}).get(\"GroupId\")\n        ingress = not rule.get(\"IsEgress\")\n        if referenced_security_group and ingress and referenced_security_group == security_group_id:\n            return True\n    return False\n\n\ndef script_handler(events, _):\n    \"\"\"Checks if the security groups reference itself.\n\n    Checks if the provided security group has a rule in which it references itself.\n     Args:\n         SecurityGroup : The security group to check the rules for.\n     Returns:\n           The list of security groups that does not have a sef-referring rule.  - an error message if the conncetion is denied\n\n    \"\"\"\n    try:\n        not_self_referencing_security_groups: List[str] = []\n        self_referencing_security_groups: List[str] = []\n        connection_sg = events[\"SecurityGroups\"]\n        for security_group in connection_sg:\n            security_group_rules = ec2_client.describe_security_group_rules(\n                Filters=[\n                    {\"Name\": \"group-id\", \"Values\": [security_group]},\n                ]\n            ).get(\"SecurityGroupRules\", [])\n            if has_referencing_ingress_rule(security_group, security_group_rules):\n                self_referencing_security_groups.append(security_group)\n            else:\n                not_self_referencing_security_groups.append(security_group)\n        return {\n            \"not_self_referencing_security_groups\": not_self_referencing_security_groups,\n            \"self_referencing_security_groups\": self_referencing_security_groups,\n        }\n    except Exception as e:\n        raise RuntimeError(f\"The following error occurred when checking the connection's security group: {e}\") from None\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "GenerateReport",
+      "description": "Generate a report containing a list of findings (possible reasons for the failure in the connection test) and next steps (suggestions to resolve the connection test failure).",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ConnectionProperty": "{{ GetConnectionDetails.ConnectionProperty }}",
+          "ConnectionSubnetId": "{{ GetConnectionDetails.SubnetId }}",
+          "ConnectionSecurityGroups": "{{ GetConnectionDetails.SecurityGroupIdList }}",
+          "GetConnectionDataOutput": "{{ GetConnectionData.OutputPayload }}",
+          "GetNetworkDetailsOutput": "{{ GetNetworkDetails.OutputPayload }}",
+          "ENIStackCreationErrors": "{{ DescribeENIStackCreationErrors.OutputPayload }}",
+          "ENIStackDeletionErrors": "{{ DescribeENIStackDeletionErrors.OutputPayload }}",
+          "NetworkPointOfPresenceStackCreationErrors": "{{ DescribeNetworkPointOfPresenceStackCreationErrors.OutputPayload }}",
+          "NetworkPointOfPresenceStackDeletionErrors": "{{ DescribeNetworkPointOfPresenceStackDeletionErrors.OutputPayload }}",
+          "ReachabilityAnalyserResults": "{{ RunSourceToTargetCheck.OutputPayload }}",
+          "EndpointCheckResults": "{{ RunEndpointChecks.OutputPayload }}",
+          "IamTestsResults": "{{ TestIAMRolePermissions.OutputPayload }}",
+          "SelfReferencingRuleResults": "{{ CheckConnectionSecurityGroupReferencingRule.OutputPayload }}",
+          "S3ConnectivityResults": "{{ CheckS3Connectivity.OutputPayload }}",
+          "TestconnectionRole": "{{ TestConnectionRole }}",
+          "DatasourceSubnets": "{{variable:VariableDatasourceSubnets}}",
+          "DatasourceSecurityGroups": "{{variable:VariableDatasourceSecurityGroups}}"
+        },
+        "Script": "%PYTHONSCRIPT%",
+        "Handler": "generate_report.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact_2.zip"
+      },
+      "outputs": [
+        {
+          "Name": "FinalReport",
+          "Selector": "$.Payload.final_report",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateReport.FinalReport"
+  ],
+  "files": {
+    "artifact_2.zip": {
+      "checksums": {
+        "SHA256": "e00614707c317c124a55d3a1209abec7944be1c212188173d966e147ad55cf9e"
+      }
+    }
+  }
+}
