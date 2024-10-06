@@ -1,18 +1,24 @@
 {
-  "description": "# AWSSupport-ModifyEBSSnapshotPermission\n---\nThe AWSSupport-ModifyEBSSnapshotPermission will allow to automatically modify  permissions of multiple snapshots from Public to Private or share snapshots with other accounts. Snapshots encrypted with your default KMS key cannot be shared with other accounts automatically. For more information about modifying snapshot permissions, see Share a snapshot in the Amazon Elastic Compute Cloud User Guide.\n---\n",
+  "description": "The **AWSSupport-ModifyEBSSnapshotPermission** runbook helps you to modify permissions for multiple Amazon Elastic Block Store (Amazon EBS) snapshots. Using this runbook, you can make EBS snapshots **Private** (by removing the 'all' group permission from the specified snapshots they will not be publicly visible and publicly accessible) and optionally add or remove permissions for specific AWS accounts.\n\n### Important:\n> * Snapshots encrypted with a default AWS Key Management Service (AWS KMS) key can't be automatically shared with other AWS accounts using this runbook. For more information about modifying snapshot permissions, see [Share an EBS snapshot](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-modifying-snapshot-permissions.html).\n> * Adding or removing permissions to a **Public** EBS snapshot, does not make them **Private**. If you want to block public access to the snapshots, make sure you select `Yes` in the `Private` input parameter.\n\n### Note: To prevent public sharing of your snapshots at the account-level, you can optionally enable block public access for snapshots. For more information see [Block public access for snapshots](https://docs.aws.amazon.com/ebs/latest/userguide/block-public-access-snapshots.html).",
   "schemaVersion": "0.3",
-  "assumeRole": "{{AutomationAssumeRole}}",
+  "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
-    "ValidateSnapshots.EncryptedSnapshots",
-    "SharewithOtherAccounts.Result",
+    "ModifySnapshotPermissions.Result",
     "MakePrivate.Result",
-    "MakePrivate.Commands"
+    "ValidateSnapshots.Warning"
   ],
   "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
     "SnapshotIds": {
       "type": "StringList",
-      "description": "Enter Snapshot Ids",
-      "allowedPattern": "^snap-([0-9a-f]{8}|[0-9a-f]{17})$"
+      "description": "(Required) The EBS snapshot IDs to update permissions (maximum of `50` snapshot IDs).",
+      "allowedPattern": "^snap-([0-9a-f]){8,17}$",
+      "maxItems": 50,
+      "minItems": 1
     },
     "Private": {
       "type": "String",
@@ -20,121 +26,175 @@
         "Yes",
         "No"
       ],
-      "description": "Allowed Values: \"Yes\" or \"No\". Please select  no, if you want to share snapshot with specific account ids and you are providing input of AccountIds in \"AccountIds\" parameter section."
-    },
-    "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
-      "default": "",
-      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
-    },
-    "AccountIds": {
-      "type": "StringList",
-      "allowedPattern": "^[0-9]{12}(,[0-9]{12})*$|(^none$)",
-      "description": "AccountIds to Share Snapshot. This is applicable if you select \"No\" in \"Private\" parameter. Please keep this \"None\" if you have selected \"Yes\" in private parameters",
-      "default": [
-        "none"
-      ]
+      "description": "(Required) Choose `Yes` to make the snapshot 'Private' (Removes the 'all' group permission from the specified snapshots)."
     },
     "AccountPermissionOperation": {
       "type": "String",
-      "description": "Enter \"add\" or \"remove\"",
+      "description": "(Optional) Choose `add` or `remove` permissions to the snapshots with the specified AWS account IDs. Note: this option does not change the snapshots permissions to **Private**.",
       "default": "none",
       "allowedValues": [
         "add",
         "remove",
         "none"
       ]
+    },
+    "AccountIds": {
+      "type": "StringList",
+      "allowedPattern": "^[0-9]{12}|^$",
+      "description": "(Conditional) The AWS account IDs you want to share or unshare the EBS snapshots with. This is required if you have selected `add` or `remove` in the `AccountPermissionOperation` input parameter (maximum of `10` account IDs).",
+      "default": [],
+      "maxItems": 10
     }
   },
   "mainSteps": [
     {
       "name": "ValidateSnapshots",
       "action": "aws:executeScript",
+      "nextStep": "BranchOnMakeSnapshotsPrivate",
+      "description": "Describes the EBS snapshots provided in the `SnapshotIds` parameter and returns the encrypted snapshots and a warning if you are changing permissions to public snapshots without making them private first.",
+      "onFailure": "Abort",
+      "isCritical": false,
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "script_handler",
-        "Script": "import boto3\nimport botocore\ndef script_handler(events, context):\n    client = boto3.client('ec2')\n    SnapshotId= events['Snapshot_Id']\n    #Result = {}\n    response = client.describe_snapshots(SnapshotIds=SnapshotId)\n    SnapshotsArray = response[\"Snapshots\"]\n    #Results = []\n    message = \"Please follow document 'https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-modifying-snapshot-permissions.html#share-kms-key' to share KMS key with destination account. The following snapshot(s) are encrypted:  \"\n    for snaps in SnapshotsArray:\n        if snaps['Encrypted'] == True:\n            #print(snaps)\n            #Results.append(snaps['SnapshotId'])\n            message = message + snaps['SnapshotId'] + \", \"\n    message= message[:-2]\n    return{'EncryptedSnaps':message}\n",
         "InputPayload": {
-          "Snapshot_Id": "{{ SnapshotIds}}",
-          "Account_Id": "{{AccountIds}}",
-          "AccountOperation": "{{AccountPermissionOperation}}"
-        }
+          "SnapshotIds": "{{ SnapshotIds }}",
+          "AccountIds": "{{ AccountIds }}",
+          "AccountPermissionOperation": "{{ AccountPermissionOperation }}",
+          "Private": "{{ Private }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\nINFO_ICON = \"\\u2705 [INFO]\"\nERROR_ICON = \"\\u274C [ERROR]\"\nWARNING_ICON = \"\\u26A0 [WARNING]\"\n\n\ndef get_encrypted_snapshots(snapshot_ids: list[str], operation: str) -> list[str]:\n    ec2_client = boto3.client(\"ec2\")\n    try:\n        encrypted_snapshots = []\n        paginator = ec2_client.get_paginator(\"describe_snapshots\")\n        page_iterator = paginator.paginate(SnapshotIds=snapshot_ids, OwnerIds=[\"self\"])\n        for page in page_iterator:\n            for snapshot in page[\"Snapshots\"]:\n                if snapshot[\"Encrypted\"]:\n                    encrypted_snapshots.append(snapshot[\"SnapshotId\"])\n\n        return encrypted_snapshots\n\n    except ClientError as e:\n        # Not sharing EBS snapshot, so this is not required\n        if operation == \"add\":\n            raise RuntimeError(f\"{ERROR_ICON}: Unable to get information for the snapshots: {str(e)}\")\n        else:\n            print((f\"{ERROR_ICON}: Unable to get information for the snapshots: {str(e)}\"))\n            return []\n\n\ndef script_handler(events, context=None):\n    snapshot_ids: list[str] = events[\"SnapshotIds\"]\n    operation: str = events[\"AccountPermissionOperation\"]\n    account_ids: list[str] = events[\"AccountIds\"]\n    make_private: str = events[\"Private\"]\n\n    # Validate inputs\n    # If no accounts provided but operation == \"remove|add\"\n    if not account_ids and operation != \"none\":\n        raise ValueError(\n            f\"{ERROR_ICON}: 'AccountIds' input missing. Please provide the AWS account IDs to '{operation}' permissions.\"\n        )\n\n    encrypted_snapshots = get_encrypted_snapshots(snapshot_ids, operation)\n\n    warning = \"\"\n    # Adding or removing permissions without setting the snapshot as public\n    if operation.lower() != \"none\" and make_private.lower() == \"no\":\n        warning += f\"{WARNING_ICON}: Adding or removing permissions to a Public EBS snapshot, does not make them Private. If you want to block public access to the snapshots, make sure you select 'Yes' in the 'Private' input parameter.\\n\"\n\n    return {\"EncryptedSnapshots\": encrypted_snapshots, \"Warning\": warning}\n"
       },
       "outputs": [
         {
           "Name": "EncryptedSnapshots",
-          "Selector": "$.Payload.EncryptedSnaps",
+          "Selector": "$.Payload.EncryptedSnapshots",
+          "Type": "StringList"
+        },
+        {
+          "Name": "Warning",
+          "Selector": "$.Payload.Warning",
           "Type": "String"
         }
       ]
     },
     {
-      "name": "Branch",
+      "name": "BranchOnMakeSnapshotsPrivate",
+      "description": "Branches the automation based on the value of the `Private` input parameter.",
       "action": "aws:branch",
+      "onFailure": "Abort",
+      "nextStep": "BranchOnAccountPermissionOperation",
       "inputs": {
         "Choices": [
           {
-            "NextStep": "SharewithOtherAccounts",
-            "Variable": "{{Private}}",
-            "StringEquals": "No"
-          },
-          {
             "NextStep": "MakePrivate",
-            "Variable": "{{Private}}",
+            "Variable": "{{ Private }}",
             "StringEquals": "Yes"
           }
-        ]
-      },
-      "description": ""
-    },
-    {
-      "name": "SharewithOtherAccounts",
-      "action": "aws:executeScript",
-      "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "script_handler",
-        "Script": "import boto3\nimport botocore\ndef script_handler(events, context):\n    client = boto3.client('ec2')\n    SnapshotId= events['Snapshot_Id']\n    Accountpermissions= events['AccountOperation']\n    Accountids= events['Account_Id']\n    Result = {}\n    for snaps in SnapshotId:\n        if Accountids != ['none']:\n            try:\n                response = client.modify_snapshot_attribute(\n                    Attribute='createVolumePermission',\n                    OperationType=Accountpermissions,\n                    SnapshotId=snaps,\n                    UserIds=Accountids\n                )\n                if (response['ResponseMetadata']['HTTPStatusCode']==200):\n                    Result[snaps] = 'Account level Permissions modified'\n            except botocore.exceptions.ClientError as error:\n                Result[snaps] = 'Failed - ' + str(error)\n                raise error \n        else:\n            Result[snaps] = 'No Account Ids provided, Changing Snapshot permissions to Private'\n    return {'Result':Result}\n",
-        "InputPayload": {
-          "Snapshot_Id": "{{ SnapshotIds}}",
-          "Account_Id": "{{AccountIds}}",
-          "AccountOperation": "{{AccountPermissionOperation}}"
-        }
-      },
-      "outputs": [
-        {
-          "Name": "Result",
-          "Selector": "$.Payload.Result",
-          "Type": "StringMap"
-        }
-      ],
-      "isEnd": true
+        ],
+        "Default": "BranchOnAccountPermissionOperation"
+      }
     },
     {
       "name": "MakePrivate",
       "action": "aws:executeScript",
+      "description": "Modifies the permissions of the EBS snapshots by removing the 'all' group.",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "nextStep": "BranchOnAccountPermissionOperation",
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "script_handler",
-        "Script": "import boto3\nimport botocore\ndef script_handler(events, context):\n    client = boto3.client('ec2')\n    SnapshotId= events['Snapshot_Id']\n    permissions= events['PrivatePerm']\n    ModifiedPermission = {'Yes':'Remove'}\n    Result = {}\n    Commands = {}\n    response = client.describe_snapshots(SnapshotIds=SnapshotId)\n    for snaps in SnapshotId:\n            try:\n                response = client.modify_snapshot_attribute(\n                Attribute='createVolumePermission',\n                CreateVolumePermission={\n                    ModifiedPermission[permissions]: [\n                        {\n                            'Group': 'all'\n                        }\n                    ]\n                },\n                OperationType=permissions,\n                SnapshotId=snaps,\n                )\n                #print(response)\n                if (response['ResponseMetadata']['HTTPStatusCode']==200):\n                    #print(snaps + 'Snapshot is successful made ' + permissions)\n                    Result[snaps] = 'Snapshot is Successfully changed to Private'\n                    command = '\"aws ec2 modify-snapshot-attribute --snapshot-id '+ snaps +'--attribute createVolumePermission --operation-type add --group-names all\"'\n                    Commands[snaps] = 'You can use AWSCli command '+ command +' to make snapshot Public again'\n                #else:\n                    #print('Unsuccessul')\n            except botocore.exceptions.ClientError as error:\n                #print(error)\n                Result[snaps] = 'Failed - ' + str(error)\n    return {'Result':Result,'Commands':Commands}\n",
         "InputPayload": {
-          "Snapshot_Id": "{{ SnapshotIds}}",
-          "PrivatePerm": "{{Private}}"
-        }
+          "SnapshotIds": "{{ SnapshotIds }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\nimport sys\nfrom typing import Tuple\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\nINFO_ICON = \"\\u2705 [INFO]\"\nERROR_ICON = \"\\u274C [ERROR]\"\n\n\ndef modify_snapshot_permissions(snapshot_id: str) -> Tuple[str, bool, str]:\n    \"\"\"\n    Removes the 'all' group permission from the specified snapshot.\n\n    Args:\n        snapshot_id (str): The ID of the snapshot to modify.\n\n    Returns:\n        str: A message indicating the result of the operation.\n    \"\"\"\n    client = boto3.client(\"ec2\")\n    try:\n        response = client.modify_snapshot_attribute(\n            Attribute=\"createVolumePermission\",\n            CreateVolumePermission={\"Remove\": [{\"Group\": \"all\"}]},\n            OperationType=\"remove\",\n            SnapshotId=snapshot_id,\n        )\n        if response[\"ResponseMetadata\"][\"HTTPStatusCode\"] == 200:\n            return snapshot_id, True, INFO_ICON\n        else:\n            return snapshot_id, False, f\"{ERROR_ICON}: {response.get('Message')}\"\n    except ClientError as error:\n        message = str(error)\n        if error.response.get(\"Error\", {}).get(\"Message\"):\n            message = error.response[\"Error\"][\"Message\"]\n\n        return snapshot_id, False, f\"{ERROR_ICON}: {message}\"\n\n\ndef script_handler(events, context):\n    \"\"\"\n    Modifies the permissions of the specified snapshots to make them private.\n\n    Args:\n        events (dict): A dictionary containing the snapshot IDs to modify.\n        context (object): The Lambda function context object.\n\n    Returns:\n        dict: A dictionary containing the result of the operation.\n    \"\"\"\n    snapshot_ids: list[str] = events[\"SnapshotIds\"]\n    results = []\n    found_error = False\n    result_message = [\"Removed 'all' group permission from snapshots:\"]\n    result_message.append(\"\")\n\n    for snapshot_id in snapshot_ids:\n        results.append(modify_snapshot_permissions(snapshot_id))\n\n    for result in results:\n        result_message.append(f\"{result[0]} {result[2]}\")\n        # If one error is found, set found_error to True to return an error\n        if not result[1]:\n            found_error = True\n\n    message = f\"{ERROR_ICON if found_error else INFO_ICON }:\\n\\n\" + \"\\n\".join(result_message)\n    error = \"True\" if found_error else \"False\"\n    return {\"Result\": message, \"Error\": error}\n"
       },
       "outputs": [
         {
           "Name": "Result",
           "Selector": "$.Payload.Result",
-          "Type": "StringMap"
+          "Type": "String"
         },
         {
-          "Name": "Commands",
-          "Selector": "$.Payload.Commands",
-          "Type": "StringMap"
+          "Name": "Error",
+          "Selector": "$.Payload.Error",
+          "Type": "String"
         }
-      ],
-      "isEnd": true
+      ]
+    },
+    {
+      "name": "BranchOnAccountPermissionOperation",
+      "description": "Branches the automation based on the value of the `AccountPermissionOperation` input parameter.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "nextStep": "HandleError",
+      "inputs": {
+        "Choices": [
+          {
+            "Or": [
+              {
+                "Variable": "{{ AccountPermissionOperation }}",
+                "StringEquals": "add"
+              },
+              {
+                "Variable": "{{ AccountPermissionOperation }}",
+                "StringEquals": "remove"
+              }
+            ],
+            "NextStep": "ModifySnapshotPermissions"
+          }
+        ],
+        "Default": "HandleError"
+      }
+    },
+    {
+      "name": "ModifySnapshotPermissions",
+      "action": "aws:executeScript",
+      "description": "Modifies the permissions of the EBS snapshots by adding or removing permissions for the accounts specified in `AccountIds`.",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "nextStep": "HandleError",
+      "inputs": {
+        "InputPayload": {
+          "SnapshotIds": "{{ SnapshotIds }}",
+          "AccountIds": "{{ AccountIds }}",
+          "AccountPermissionOperation": "{{ AccountPermissionOperation }}",
+          "EncryptedSnapshots": "{{ ValidateSnapshots.EncryptedSnapshots }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nfrom typing import Tuple\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\nINFO_ICON = \"\\u2705 [INFO]\"\nERROR_ICON = \"\\u274C [ERROR]\"\nWARNING_ICON = \"\\u26A0 [WARNING]\"\n\n\ndef modify_snapshot_permission(\n    snapshot_id: str, account_permission: str, account_ids: list[str]\n) -> Tuple[str, bool, str]:\n    \"\"\"\n    Shares the snapshot with account IDs with createVolumePermission permission.\n\n    Args:\n        snapshot_id (str): The ID of the snapshot.\n        account_permission (str): The operation type, either 'add' or 'remove'.\n        account_ids (list): The AWS account IDs to share snapshot with.\n\n    Returns:\n        str: A status message indicating the success or failure of the operation.\n    \"\"\"\n    try:\n        client = boto3.client(\"ec2\")\n        response = client.modify_snapshot_attribute(\n            Attribute=\"createVolumePermission\",\n            OperationType=account_permission,\n            SnapshotId=snapshot_id,\n            UserIds=list(set(account_ids)),\n        )\n        if response[\"ResponseMetadata\"][\"HTTPStatusCode\"] == 200:\n            return snapshot_id, True, INFO_ICON\n        else:\n            return snapshot_id, False, f\"{ERROR_ICON} {response.get('Message')}\"\n\n    except ClientError as error:\n        message = str(error)\n        if error.response.get(\"Error\", {}).get(\"Message\"):\n            message = error.response[\"Error\"][\"Message\"]\n\n        return snapshot_id, False, f\"{ERROR_ICON} {message}\"\n\n\ndef script_handler(events, context):\n    \"\"\"\n    Handles the execution of the script.\n\n    Args:\n        events (dict): The input event data.\n        context (object): The AWS Lambda execution context.\n\n    Returns:\n        dict: The result of the script execution.\n    \"\"\"\n    snapshot_ids: list[str] = events[\"SnapshotIds\"]\n    operation: str = events[\"AccountPermissionOperation\"]\n    account_ids: list[str] = events[\"AccountIds\"]\n    encrypted_snapshots: list[str] = events[\"EncryptedSnapshots\"]\n    results = []\n    found_error = False\n    result_message = [\n        f\"{'Added' if operation == 'add' else 'Removed'} permissions for {', '.join(account_ids) } result:\"\n    ]\n    result_message.append(\"\")\n\n    for snapshot in snapshot_ids:\n        result = modify_snapshot_permission(snapshot, operation, account_ids)\n        results.append(result)\n\n    for result in results:\n        result_message.append(f\"{result[0]} {result[2]}\")\n        # If one error is found, set found_error to True to return an error\n        if not result[1]:\n            found_error = True\n\n    if operation == \"add\" and encrypted_snapshots:\n        result_message.append(f\"\\n{WARNING_ICON}: Encrypted EBS snapshots: {', '.join(encrypted_snapshots)}\")\n        result_message.append(\n            \"\\n\\nFollow the documentation 'https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-modifying-snapshot-permissions.html#share-kms-key' to share the KMS key with the destination accounts.\"\n        )\n\n    message = f\"{ERROR_ICON if found_error else INFO_ICON }:\\n\\n\" + \"\\n\".join(result_message)\n    error = \"True\" if found_error else \"False\"\n    return {\"Result\": message, \"Error\": error}\n"
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Payload.Result",
+          "Type": "String"
+        },
+        {
+          "Name": "Error",
+          "Selector": "$.Payload.Error",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "HandleError",
+      "action": "aws:executeScript",
+      "description": "Marks the automation as failed if any of the steps `MakePrivate` and `ModifySnapshotPermissions` returns an error.",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "ModifySnapshotPermissionsError": "{{ ModifySnapshotPermissions.Error }}",
+          "MakePrivateError": "{{ MakePrivate.Error }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nsys.tracebacklimit = 0\n\nERROR_ICON = \"\\u274C [ERROR]\"\n\n\ndef script_handler(events, context):\n    modify_permissions_error = events[\"ModifySnapshotPermissionsError\"]\n    make_private_error = events[\"MakePrivateError\"]\n\n    if modify_permissions_error == \"True\" or make_private_error == \"True\":\n        raise RuntimeError(\n            f\"{ERROR_ICON}: The automation found an error that requires your attention. Please refer to the automation execution outputs.\"\n        )\n"
+      }
     }
   ]
 }
