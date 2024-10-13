@@ -1,11 +1,12 @@
 {
   "schemaVersion": "0.3",
-  "description": "The **AWSSupport-ExecuteEC2Rescue** runbook uses the EC2Rescue tool to troubleshoot and where possible repair common connectivity issues with the specified Amazon Elastic Compute Cloud (Amazon EC2) instance.",
-  "assumeRole": "{{ AssumeRole }}",
+  "description": "The **AWSSupport-ExecuteEC2Rescue** runbook uses the Amazon EC2 [Rescue for Linux (ec2rl)](https://github.com/awslabs/aws-ec2rescue-linux) or [Rescue for Windows Server](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/Windows-Server-EC2Rescue.html) tool to troubleshoot and where possible repair common connectivity issues on the specified Amazon Elastic Compute Cloud (Amazon EC2) instance.\n\n### Prerequisites:\n> * For Linux instances, the Amazon EC2 Rescue for Linux (ec2rl) requires Python 2.7.9, 3.2, or a later version installed on the target instance.\n> * For Windows instances, the Amazon EC2 Rescue for Windows requires .NET Framework 3.5 SP1 or later installed on the target instance.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "UnreachableInstanceId": {
       "type": "AWS::EC2::Instance::Id",
-      "description": "(Required) The ID of your unreachable EC2 instance. IMPORTANT: AWS Systems Manager Automation stops this instance, and creates an Amazon Machine Image (AMI) before attempting any operations. Data stored in instance store volumes will be lost. The public IP address will change if you are not using an Elastic IP."
+      "description": "(Required) The ID of your EC2 instance. **Important**: AWS Systems Manager Automation stops this instance. When the instance is stopped, any data stored in the RAM or the instance store volumes is lost, and the automatic public IPv4 address is released if you are not using an Elastic IP.",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$"
     },
     "LogDestination": {
       "type": "AWS::S3::Bucket::Name",
@@ -14,8 +15,8 @@
     },
     "EC2RescueInstanceType": {
       "type": "String",
-      "description": "(Required) The EC2 instance type for the EC2Rescue instance. Recommended size: t2.medium.",
-      "default": "t2.medium",
+      "description": "(Conditional) The EC2 instance type for the EC2Rescue instance.",
+      "default": "t3.medium",
       "allowedValues": [
         "t2.small",
         "t2.medium",
@@ -32,7 +33,7 @@
       "default": "CreateNewVPC",
       "allowedPattern": "^SelectedInstanceSubnet$|^CreateNewVPC$|^subnet-[a-z0-9]{8,17}$"
     },
-    "AssumeRole": {
+    "AutomationAssumeRole": {
       "type": "AWS::IAM::Role::Arn",
       "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
       "default": ""
@@ -42,6 +43,30 @@
       "description": "(Optional) The name of an existing IAM instance profile for the EC2Rescue instance.",
       "default": "",
       "allowedPattern": "^$|^[\\w+=,.@-]{1,128}$"
+    },
+    "HelperInstanceSecurityGroupId": {
+      "type": "String",
+      "description": "(Optional) The security group ID that will be associated to the temporary EC2 instance. If not provided, the default VPC security group is used. NOTE: The helper instance security group must allow HTTPS (port 443) outbound traffic to the Amazon S3 and AWS Systems Manager endpoints.",
+      "allowedPattern": "^$|sg-[a-z0-9]{8,17}$",
+      "default": ""
+    },
+    "AllowEncryptedVolume": {
+      "type": "String",
+      "description": "(Optional) Set it to `True` to allow the runbook to perform the EC2Rescue actions on Amazon EBS encrypted root volumes. WARNING: Make sure the AWS KMS key used to encrypt the EBS volume is **enabled** and in a **valid** state. For more information see 'How Amazon Elastic Block Store (Amazon EBS) uses AWS KMS' in https://docs.aws.amazon.com/kms/latest/developerguide/services-ebs.html.",
+      "default": "False",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "AssociatePublicIpAddress": {
+      "type": "String",
+      "description": "(Optional) Set it to `False` to indicate that the runbook does not need to assign a public IP address to the helper instance.",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
     }
   },
   "mainSteps": [
@@ -61,7 +86,7 @@
           "windows"
         ]
       },
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "runEC2RescueForWindows"
     },
     {
@@ -75,10 +100,10 @@
             "{{ UnreachableInstanceId }}"
           ],
           "AutomationAssumeRole": [
-            "{{ AssumeRole }}"
+            "{{ AutomationAssumeRole }}"
           ],
           "OfflineScript": [
-            "SW52b2tlLUVDMlJlc2N1ZUZpeEFsbCAtQmxvY2tEZXZpY2VOYW1lICR7ZW52OkVDMlJFU0NVRV9PRkZMSU5FX0VCU19ERVZJQ0V9CldyaXRlLUhvc3QgIj09PT09IExvZyBDb2xsZWN0aW9uID09PT09YHIiCmlmKCR7ZW52OkVDMlJFU0NVRV9TM19CVUNLRVR9KXsKCVN0YXJ0LVNsZWVwIDMwCglXcml0ZS1Ib3N0ICJDb2xsZWN0aW5nIGxvZ3MgZnJvbSB0aGUgdW5yZWFjaGFibGUgV2luZG93cyBpbnN0YW5jZS5gciIKCSRkYXRlID0gKEdldC1EYXRlIC1VRm9ybWF0ICIlWV8lbV8lZC0lSF8lTSIpCgkkbG9nRmlsZU5hbWUgPSAoJGRhdGUgKyAiXyIgKyAkZW52OkVDMlJFU0NVRV9TT1VSQ0VfSU5TVEFOQ0UgKyAiX2FsbCIpCgkkbG9nRmlsZSA9IEludm9rZS1FQzJSZXNjdWVDb2xsZWN0TG9nQnVuZGxlIC1PZmZsaW5lIC1CbG9ja0RldmljZU5hbWUgJHtlbnY6RUMyUkVTQ1VFX09GRkxJTkVfRUJTX0RFVklDRX0gLUxvZ0ZpbGVOYW1lICRsb2dGaWxlTmFtZSAtTG9ncyAiYWxsIgoJV3JpdGUtSG9zdCAiTG9nIGNvbGxlY3Rpb24gY29tcGxldGVkLiBVcGxvYWRpbmcgbG9ncyB0byBTMyBidWNrZXQgJHtlbnY6RUMyUkVTQ1VFX1MzX0JVQ0tFVH0gdW5kZXIgcGF0aCAke2VudjpFQzJSRVNDVUVfUzNfUFJFRklYfS5gciIKCUNvcHktRUMyUmVzY3VlTG9nQnVuZGxlVG9TMyAtRmlsZVBhdGggJGxvZ0ZpbGUgLVMzQnVja2V0TmFtZSAke2VudjpFQzJSRVNDVUVfUzNfQlVDS0VUfSAtUzNQYXRoICIke2VudjpFQzJSRVNDVUVfUzNfUFJFRklYfS8iCglXcml0ZS1Ib3N0ICJMb2cgdXBsb2FkIGNvbXBsZXRlZC5gcmByIgp9ZWxzZXsKCVdyaXRlLUhvc3QgIk5vIFMzIGJ1Y2tldCBwcm92aWRlZC4gTG9ncyB3aWxsIG5vdCBiZSBjb2xsZWN0ZWQuYHJgciIKfQ=="
+            "IyBDb3B5cmlnaHQgMjAyNCBBbWF6b24uY29tLCBJbmMuIG9yIGl0cyBhZmZpbGlhdGVzLiBBbGwgUmlnaHRzIFJlc2VydmVkLgojIFNQRFgtTGljZW5zZS1JZGVudGlmaWVyOiBMaWNlbnNlUmVmLS5hbWF6b24uY29tLi1BbXpuU0wtMS4wCiMgTGljZW5zZWQgdW5kZXIgdGhlIEFtYXpvbiBTb2Z0d2FyZSBMaWNlbnNlOiBodHRwOi8vYXdzLmFtYXpvbi5jb20vYXNsLwoKSW52b2tlLUVDMlJlc2N1ZUZpeEFsbCAtQmxvY2tEZXZpY2VOYW1lICR7ZW52OkVDMlJFU0NVRV9PRkZMSU5FX0VCU19ERVZJQ0V9CldyaXRlLUhvc3QgIj09PT09IExvZyBDb2xsZWN0aW9uID09PT09YHIiCmlmKCR7ZW52OkVDMlJFU0NVRV9TM19CVUNLRVR9KXsKCVN0YXJ0LVNsZWVwIDMwCglXcml0ZS1Ib3N0ICJDb2xsZWN0aW5nIGxvZ3MgZnJvbSB0aGUgdW5yZWFjaGFibGUgV2luZG93cyBpbnN0YW5jZS5gciIKCSRkYXRlID0gKEdldC1EYXRlIC1VRm9ybWF0ICIlWV8lbV8lZC0lSF8lTSIpCgkkbG9nRmlsZU5hbWUgPSAoJGRhdGUgKyAiXyIgKyAkZW52OkVDMlJFU0NVRV9TT1VSQ0VfSU5TVEFOQ0UgKyAiX2FsbCIpCgkkbG9nRmlsZSA9IEludm9rZS1FQzJSZXNjdWVDb2xsZWN0TG9nQnVuZGxlIC1PZmZsaW5lIC1CbG9ja0RldmljZU5hbWUgJHtlbnY6RUMyUkVTQ1VFX09GRkxJTkVfRUJTX0RFVklDRX0gLUxvZ0ZpbGVOYW1lICRsb2dGaWxlTmFtZSAtTG9ncyAiYWxsIgoJV3JpdGUtSG9zdCAiTG9nIGNvbGxlY3Rpb24gY29tcGxldGVkLiBVcGxvYWRpbmcgbG9ncyB0byBTMyBidWNrZXQgJHtlbnY6RUMyUkVTQ1VFX1MzX0JVQ0tFVH0gdW5kZXIgcGF0aCAke2VudjpFQzJSRVNDVUVfUzNfUFJFRklYfS5gciIKCUNvcHktRUMyUmVzY3VlTG9nQnVuZGxlVG9TMyAtRmlsZVBhdGggJGxvZ0ZpbGUgLVMzQnVja2V0TmFtZSAke2VudjpFQzJSRVNDVUVfUzNfQlVDS0VUfSAtUzNQYXRoICIke2VudjpFQzJSRVNDVUVfUzNfUFJFRklYfS8iCglXcml0ZS1Ib3N0ICJMb2cgdXBsb2FkIGNvbXBsZXRlZC5gcmByIgp9ZWxzZXsKCVdyaXRlLUhvc3QgIk5vIFMzIGJ1Y2tldCBwcm92aWRlZC4gTG9ncyB3aWxsIG5vdCBiZSBjb2xsZWN0ZWQuYHJgciIKfQ=="
           ],
           "SubnetId": [
             "{{ SubnetId }}"
@@ -98,11 +123,20 @@
           "HelperInstanceProfileName": [
             "{{ HelperInstanceProfileName }}"
           ],
+          "HelperInstanceSecurityGroupId": [
+            "{{ HelperInstanceSecurityGroupId }}"
+          ],
+          "AllowEncryptedVolume": [
+            "{{ AllowEncryptedVolume }}"
+          ],
+          "AssociatePublicIpAddress": [
+            "{{ AssociatePublicIpAddress }}"
+          ],
           "UniqueId": "{{ automation:EXECUTION_ID }}"
         },
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "getWindowsBackupAmi"
     },
     {
@@ -122,7 +156,7 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "getEC2RescueForWindowsResult"
     },
     {
@@ -142,8 +176,8 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
-      "isEnd": "true"
+      "isCritical": false,
+      "isEnd": true
     },
     {
       "name": "runEC2RescueForLinux",
@@ -156,10 +190,10 @@
             "{{ UnreachableInstanceId }}"
           ],
           "AutomationAssumeRole": [
-            "{{ AssumeRole }}"
+            "{{ AutomationAssumeRole }}"
           ],
           "OfflineScript": [
-            "ZXJyb3JfdHJhcCgpCnsKICAgIGlmIHRlc3QgLW4gIiQxIiA7IHRoZW4KICAgICAgICBwcmludGYgIiVzXFxuIiAiJDEiCiAgICBmaQogICAgcHJpbnRmICIlLnM9IiAkKHNlcSAxIDgwKQogICAgcHJpbnRmICJcXG5UaGUgRUMyUmVzY3VlIGV4ZWN1dGlvbiBkaWQgbm90IGNvbXBsZXRlIHN1Y2Nlc3NmdWxseS5cXG4iCiAgICBleGl0IDEKfQoKcHJpbnRmICJTdGFydGluZyBjaHJvb3RcXG4iCmNocm9vdCAiJHtFQzJSRVNDVUVfT0ZGTElORV9TWVNURU1fUk9PVH0iIC9iaW4vYmFzaCA8PCAnQ0hST09UX0hFUkUnCiMhL2Jpbi9iYXNoCmVycm9yX3RyYXAoKQp7CiAgICBpZiB0ZXN0IC1uICIkMSIgOyB0aGVuCiAgICAgICAgcHJpbnRmICIlc1xcbiIgIiQxIgogICAgZmkKICAgIHByaW50ZiAiJS5zPSIgJChzZXEgMSA4MCkKICAgIHByaW50ZiAiXFxuVGhlIEVDMlJlc2N1ZSBleGVjdXRpb24gZGlkIG5vdCBjb21wbGV0ZSBzdWNjZXNzZnVsbHkuXFxuIgogICAgZXhpdCAxCn0KLiAvZXRjL3Byb2ZpbGUKCiMgQ2hlY2sgdGhhdCBhIGNvbXBhdGlibGUgUHl0aG9uIGludGVycHJldGVyIGlzIGF2YWlsYWJsZSBpbiB0aGUgY2hyb290IGVudmlyb25tZW50CmlmIGNvbW1hbmQgLXYgcHl0aG9uMyA+IC9kZXYvbnVsbDsgdGhlbgogICAgUFlUSE9OPXB5dGhvbjMKZWxpZiBjb21tYW5kIC12IHB5dGhvbjIuNyA+IC9kZXYvbnVsbDsgdGhlbgogICAgUFlUSE9OPXB5dGhvbjIuNwplbHNlCiAgICBlcnJvcl90cmFwICJGYWlsZWQgdG8gZmluZCBjb21wYXRpYmxlIFB5dGhvbiBlbnZpcm9ubWVudCEiCmZpCgpwcmludGYgIlJ1bm5pbmcgRUMyIFJlc2N1ZSBmb3IgTGludXhcXG4iCmVjMnJsIHJ1biAtLXJlbWVkaWF0ZSAtLWZzdGFiZmFpbHVyZXMgLS1yZWJ1aWxkaW5pdHJkIC0tc2VsaW51eHBlcm1pc3NpdmUgLS11ZGV2bmV0cGVyc2lzdGVudCAtLW5vPWR1cGxpY2F0ZWZzdXVpZCxkdXBsaWNhdGVwYXJ0dXVpZCB8fCBlcnJvcl90cmFwCkNIUk9PVF9IRVJFCgppZiB0ZXN0ICIkPyIgIT0gMDsgdGhlbgogICAgZXJyb3JfdHJhcCAiRXJyb3I6IGV4ZWN1dGlvbiBmYWlsdXJlIGluc2lkZSBjaHJvb3QgZW52aXJvbm1lbnQuIgpmaQoKaWYgdGVzdCAtbiAiJHtFQzJSRVNDVUVfUzNfQlVDS0VUfSI7IHRoZW4KICAgICMgTWFrZSBzdXJlIHRoZSBidWNrZXQgaXMgYWNjZXNzaWJsZSBiZWZvcmUgdHJ5aW5nIHRvIHVwbG9hZAogICAgYXdzIHMzYXBpIGhlYWQtYnVja2V0IC0tYnVja2V0ICIke0VDMlJFU0NVRV9TM19CVUNLRVR9IiB8fCBlcnJvcl90cmFwICJObyBTMyBidWNrZXQgY2FsbGVkICR7RUMyUkVTQ1VFX1MzX0JVQ0tFVH0gZm91bmQgaW4gdGhlIGN1cnJlbnQgQVdTIGFjY291bnQgb3IgYWNjZXNzIGRlbmllZC4gUGxlYXNlIHNwZWNpZnkgYW4gUzMgYnVja2V0IHlvdSBvd24gYW5kIHRoYXQgdGhpcyBpbnN0YW5jZSBoYXMgYWNjZXNzIHRvLiIKCglMT0dfRElSPSIkKGJhc2VuYW1lICIkKGZpbmQgIiR7RUMyUkVTQ1VFX09GRkxJTkVfU1lTVEVNX1JPT1R9Ii92YXIvdG1wL2VjMnJsIC1tYXhkZXB0aCAxIC1taW5kZXB0aCAxIC1wcmludGYgIiVUKyAlcFxcbiIgfCBzb3J0IC1yIHwgaGVhZCAtbiAxIHwgYXdrICd7cHJpbnQgJDJ9JykiKSIKICAgIEZJTEVfTkFNRT0iJChkYXRlIC0taXNvLTg2MDE9c2Vjb25kcyB8IHNlZCAicy9cXDovXy9nIikiXyIke0VDMlJFU0NVRV9TT1VSQ0VfSU5TVEFOQ0V9Ii50Z3oKCXByaW50ZiAiQ3JlYXRpbmcgdGFyYmFsbCAke0ZJTEVfTkFNRX0sIG9mIEVDMlJMIGxvZyBkaXJlY3RvcnksICR7RUMyUkVTQ1VFX09GRkxJTkVfU1lTVEVNX1JPT1R9L3Zhci90bXAvZWMycmwvJXNcXG4iICIke0xPR19ESVJ9IgoJdGFyIC1jemYgIiR7RklMRV9OQU1FfSIgLUMgIiR7RUMyUkVTQ1VFX09GRkxJTkVfU1lTVEVNX1JPT1R9Ii92YXIvdG1wL2VjMnJsICIke0xPR19ESVJ9IiB8fCBlcnJvcl90cmFwICJGYWlsZWQgdG8gY3JlYXRlIHRhcmJhbGwiCglwcmludGYgIlVwbG9hZGluZyB0YXJiYWxsIHRvIHMzOi8vJXMvJXMvJXNcXG4iICIke0VDMlJFU0NVRV9TM19CVUNLRVR9IiAiJHtFQzJSRVNDVUVfUzNfUFJFRklYfSIgIiR7RklMRV9OQU1FfSIKCWF3cyBzMyBjcCAiJHtGSUxFX05BTUV9IiBzMzovLyIke0VDMlJFU0NVRV9TM19CVUNLRVR9Ii8iJHtFQzJSRVNDVUVfUzNfUFJFRklYfSIvIiR7RklMRV9OQU1FfSIgIHx8IGVycm9yX3RyYXAgIkZhaWxlZCB0byB1cGxvYWQgdGFyYmFsbCB0byBTMyIKCXByaW50ZiAiRG9uZSFcXG4iCmVsc2UKCXByaW50ZiAiTm8gUzMgYnVja2V0IHByb3ZpZGVkLiBMb2dzIHdpbGwgbm90IGJlIGNvbGxlY3RlZC5cXG4iCmZp"
+            "IyEvYmluL3NoCiMgQ29weXJpZ2h0IDIwMjQgQW1hem9uLmNvbSwgSW5jLiBvciBpdHMgYWZmaWxpYXRlcy4gQWxsIFJpZ2h0cyBSZXNlcnZlZC4KIyBTUERYLUxpY2Vuc2UtSWRlbnRpZmllcjogTGljZW5zZVJlZi0uYW1hem9uLmNvbS4tQW16blNMLTEuMAojIExpY2Vuc2VkIHVuZGVyIHRoZSBBbWF6b24gU29mdHdhcmUgTGljZW5zZSAgaHR0cDovL2F3cy5hbWF6b24uY29tL2FzbC8KCmVycm9yX3RyYXAoKQp7CiAgICBpZiB0ZXN0IC1uICIkMSIgOyB0aGVuCiAgICAgICAgcHJpbnRmICIlc1xcbiIgIiQxIgogICAgZmkKICAgIHByaW50ZiAiJS5zPSIgJChzZXEgMSA4MCkKICAgIHByaW50ZiAiXFxuVGhlIEVDMlJlc2N1ZSBleGVjdXRpb24gZGlkIG5vdCBjb21wbGV0ZSBzdWNjZXNzZnVsbHkuXFxuIgogICAgZXhpdCAxCn0KCnByaW50ZiAiU3RhcnRpbmcgY2hyb290XFxuIgpjaHJvb3QgIiR7RUMyUkVTQ1VFX09GRkxJTkVfU1lTVEVNX1JPT1R9IiAvYmluL2Jhc2ggPDwgJ0NIUk9PVF9IRVJFJwojIS9iaW4vYmFzaAplcnJvcl90cmFwKCkKewogICAgaWYgdGVzdCAtbiAiJDEiIDsgdGhlbgogICAgICAgIHByaW50ZiAiJXNcXG4iICIkMSIKICAgIGZpCiAgICBwcmludGYgIiUucz0iICQoc2VxIDEgODApCiAgICBwcmludGYgIlxcblRoZSBFQzJSZXNjdWUgZXhlY3V0aW9uIGRpZCBub3QgY29tcGxldGUgc3VjY2Vzc2Z1bGx5LlxcbiIKICAgIGV4aXQgMQp9Ci4gL2V0Yy9wcm9maWxlCgojIENoZWNrIHRoYXQgYSBjb21wYXRpYmxlIFB5dGhvbiBpbnRlcnByZXRlciBpcyBhdmFpbGFibGUgaW4gdGhlIGNocm9vdCBlbnZpcm9ubWVudAppZiBjb21tYW5kIC12IHB5dGhvbjMgPiAvZGV2L251bGw7IHRoZW4KICAgIFBZVEhPTj1weXRob24zCmVsaWYgY29tbWFuZCAtdiBweXRob24yLjcgPiAvZGV2L251bGw7IHRoZW4KICAgIFBZVEhPTj1weXRob24yLjcKZWxzZQogICAgZXJyb3JfdHJhcCAiRmFpbGVkIHRvIGZpbmQgY29tcGF0aWJsZSBQeXRob24gZW52aXJvbm1lbnQhIgpmaQoKcHJpbnRmICJSdW5uaW5nIEVDMiBSZXNjdWUgZm9yIExpbnV4XFxuIgplYzJybCBydW4gLS1yZW1lZGlhdGUgLS1mc3RhYmZhaWx1cmVzIC0tcmVidWlsZGluaXRyZCAtLXNlbGludXhwZXJtaXNzaXZlIC0tdWRldm5ldHBlcnNpc3RlbnQgLS1ubz1kdXBsaWNhdGVmc3V1aWQsZHVwbGljYXRlcGFydHV1aWQgfHwgZXJyb3JfdHJhcApDSFJPT1RfSEVSRQoKaWYgdGVzdCAiJD8iICE9IDA7IHRoZW4KICAgIGVycm9yX3RyYXAgIkVycm9yOiBleGVjdXRpb24gZmFpbHVyZSBpbnNpZGUgY2hyb290IGVudmlyb25tZW50LiIKZmkKCmlmIHRlc3QgLW4gIiR7RUMyUkVTQ1VFX1MzX0JVQ0tFVH0iOyB0aGVuCiAgICAjIE1ha2Ugc3VyZSB0aGUgYnVja2V0IGlzIGFjY2Vzc2libGUgYmVmb3JlIHRyeWluZyB0byB1cGxvYWQKICAgIGF3cyBzM2FwaSBoZWFkLWJ1Y2tldCAtLWJ1Y2tldCAiJHtFQzJSRVNDVUVfUzNfQlVDS0VUfSIgfHwgZXJyb3JfdHJhcCAiTm8gUzMgYnVja2V0IGNhbGxlZCAke0VDMlJFU0NVRV9TM19CVUNLRVR9IGZvdW5kIGluIHRoZSBjdXJyZW50IEFXUyBhY2NvdW50IG9yIGFjY2VzcyBkZW5pZWQuIFBsZWFzZSBzcGVjaWZ5IGFuIFMzIGJ1Y2tldCB5b3Ugb3duIGFuZCB0aGF0IHRoaXMgaW5zdGFuY2UgaGFzIGFjY2VzcyB0by4iCgoJTE9HX0RJUj0iJChiYXNlbmFtZSAiJChmaW5kICIke0VDMlJFU0NVRV9PRkZMSU5FX1NZU1RFTV9ST09UfSIvdmFyL3RtcC9lYzJybCAtbWF4ZGVwdGggMSAtbWluZGVwdGggMSAtcHJpbnRmICIlVCsgJXBcXG4iIHwgc29ydCAtciB8IGhlYWQgLW4gMSB8IGF3ayAne3ByaW50ICQyfScpIikiCiAgICBGSUxFX05BTUU9IiQoZGF0ZSAtLWlzby04NjAxPXNlY29uZHMgfCBzZWQgInMvXFw6L18vZyIpIl8iJHtFQzJSRVNDVUVfU09VUkNFX0lOU1RBTkNFfSIudGd6CglwcmludGYgIkNyZWF0aW5nIHRhcmJhbGwgJHtGSUxFX05BTUV9LCBvZiBFQzJSTCBsb2cgZGlyZWN0b3J5LCAke0VDMlJFU0NVRV9PRkZMSU5FX1NZU1RFTV9ST09UfS92YXIvdG1wL2VjMnJsLyVzXFxuIiAiJHtMT0dfRElSfSIKCXRhciAtY3pmICIke0ZJTEVfTkFNRX0iIC1DICIke0VDMlJFU0NVRV9PRkZMSU5FX1NZU1RFTV9ST09UfSIvdmFyL3RtcC9lYzJybCAiJHtMT0dfRElSfSIgfHwgZXJyb3JfdHJhcCAiRmFpbGVkIHRvIGNyZWF0ZSB0YXJiYWxsIgoJcHJpbnRmICJVcGxvYWRpbmcgdGFyYmFsbCB0byBzMzovLyVzLyVzLyVzXFxuIiAiJHtFQzJSRVNDVUVfUzNfQlVDS0VUfSIgIiR7RUMyUkVTQ1VFX1MzX1BSRUZJWH0iICIke0ZJTEVfTkFNRX0iCglhd3MgczMgY3AgIiR7RklMRV9OQU1FfSIgczM6Ly8iJHtFQzJSRVNDVUVfUzNfQlVDS0VUfSIvIiR7RUMyUkVTQ1VFX1MzX1BSRUZJWH0iLyIke0ZJTEVfTkFNRX0iICB8fCBlcnJvcl90cmFwICJGYWlsZWQgdG8gdXBsb2FkIHRhcmJhbGwgdG8gUzMiCglwcmludGYgIkRvbmUhXFxuIgplbHNlCglwcmludGYgIk5vIFMzIGJ1Y2tldCBwcm92aWRlZC4gTG9ncyB3aWxsIG5vdCBiZSBjb2xsZWN0ZWQuXFxuIgpmaQ=="
           ],
           "SubnetId": [
             "{{ SubnetId }}"
@@ -179,11 +213,20 @@
           "HelperInstanceProfileName": [
             "{{ HelperInstanceProfileName }}"
           ],
+          "HelperInstanceSecurityGroupId": [
+            "{{ HelperInstanceSecurityGroupId }}"
+          ],
+          "AllowEncryptedVolume": [
+            "{{ AllowEncryptedVolume }}"
+          ],
+          "AssociatePublicIpAddress": [
+            "{{ AssociatePublicIpAddress }}"
+          ],
           "UniqueId": "{{ automation:EXECUTION_ID }}"
         },
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "getLinuxBackupAmi"
     },
     {
@@ -203,7 +246,7 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "getEC2RescueForLinuxResult"
     },
     {
@@ -223,8 +266,8 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
-      "isEnd": "true"
+      "isCritical": false,
+      "isEnd": true
     }
   ],
   "outputs": [
