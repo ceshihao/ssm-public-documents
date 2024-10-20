@@ -1,0 +1,386 @@
+{
+  "description": "The **AWSSupport-SetupK8sApiProxyForEKS** automation runbook provides a way to create an AWS Lambda function that acts as a proxy for making control plane API calls to the Amazon Elastic Kubernetes Service (EKS) cluster endpoint. It serves as a building block for other runbooks which require making control plane API calls to EKS cluster.\n\n### Key Features\n\n- **Setup Operation**: Provisions the AWS Lambda function and other resources with the required configuration to communicate with the EKS cluster endpoint.\n- **Cleanup Operation**: De-provision the resources created as part of `Setup` operation.\n\n### Usage\n\n1. Use the `aws:runAutomation` action in the caller automation to run the **AWSSupport-SetupK8sApiProxyForEKS** runbook in the `Setup` mode. This will create the infrastructure for the respective EKS cluster and return the Lambda function ARN as the output of the child automation.\n\n2. Invoke the Lambda function created in the above step with the required JSON event to perform EKS control plane API calls. You can use `aws:executeScript` action inside your caller automation.\n\n**Sample Lambda Event:**\n\n```json\n{\n    \"ApiCalls\": [\"/api/v1/pods/\", ...],\n    \"BearerToken\": \"...\"\n}\n```\n\n3. Once all the API calls have been made, use the `aws:runAutomation` action in the caller automation once again to run **AWSSupport-SetupK8sApiProxyForEKS** runbook in the `Cleanup` mode to remove the provisioned resources.\n\n### Resources\n\nThe following resources are created during `Setup` phase:\n\n1. Lambda function\n2. IAM Role (Lambda execution role)\n3. CloudWatch Log Group (Lambda Logs)\n\nLambda function and execution role are retained until `Cleanup` phase is executed by the caller. Lambda log group will be retained for 30 days or until manually deleted by the user. For more information on cost incurred, see [AWS Lambda Pricing](https://aws.amazon.com/lambda/pricing/) and [Amazon CloudWatch Pricing](https://aws.amazon.com/cloudwatch/pricing/) pages respectively.\n\n> **Note:** Please ensure to run the `Cleanup` operation after you have finished using the Lambda function to ensure there are no unused resources or unwanted charges in your account.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ClusterName": {
+      "type": "String",
+      "description": "(Required) Name of Amazon Elastic Kubernetes Service (EKS) cluster.",
+      "allowedPattern": "^[0-9A-Za-z][A-Za-z0-9\\-_]{0,99}$"
+    },
+    "Operation": {
+      "type": "String",
+      "description": "(Required) Operation to perform: 'Setup' provisions the Lambda function in the account, 'Cleanup' will de-provision resources created as part of setup phase.",
+      "allowedValues": [
+        "Setup",
+        "Cleanup"
+      ]
+    }
+  },
+  "variables": {
+    "StackName": {
+      "type": "String",
+      "default": "AWSSupport-SetupK8sApiProxyForEKS-{{ automation:EXECUTION_ID }}"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateExecution",
+      "description": "Step to check if the automation is not executed as a standalone automation and is running as a child execution for a parent automation.",
+      "action": "aws:executeScript",
+      "nextStep": "CheckForExistingStack",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "Handler": "validate_execution.handler",
+        "Runtime": "python3.11"
+      },
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": false
+    },
+    {
+      "name": "CheckForExistingStack",
+      "description": "Step to check if the AWS CloudFormation stack was already provisioned for the specified cluster name.",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnIsStackExists",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "ClusterName": "{{ ClusterName }}",
+          "Operation": "{{ Operation }}"
+        },
+        "Handler": "lookup_stack.handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "IsExists",
+          "Selector": "$.Payload.IsExists",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "SafeToDelete",
+          "Selector": "$.Payload.SafeToDelete",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "StackName",
+          "Selector": "$.Payload.StackName",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true
+    },
+    {
+      "name": "BranchOnIsStackExists",
+      "description": "Branches on whether the stack already exists or not for the given EKS cluster name.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CheckForExistingStack.IsExists }}",
+            "BooleanEquals": true,
+            "NextStep": "UpdateStackName"
+          },
+          {
+            "Variable": "{{ CheckForExistingStack.IsExists }}",
+            "BooleanEquals": false,
+            "NextStep": "BranchOnOperation"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "UpdateStackName",
+      "action": "aws:updateVariable",
+      "description": "Updates the `StackName` variable with the existing stack's name.",
+      "nextStep": "BranchOnOperation",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "inputs": {
+        "Name": "variable:StackName",
+        "Value": "{{ CheckForExistingStack.StackName }}"
+      }
+    },
+    {
+      "name": "BranchOnOperation",
+      "description": "Branches on the value of the 'Operation' parameter. For 'Setup' operation, if the stack exists then describe the existing stack, else create a new stack. For 'Cleanup' operation, we proceed to delete the stack.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ Operation }}",
+                "StringEquals": "Setup"
+              },
+              {
+                "Variable": "{{ CheckForExistingStack.IsExists }}",
+                "BooleanEquals": false
+              }
+            ],
+            "NextStep": "GetClusterNetworkConfig"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Operation }}",
+                "StringEquals": "Setup"
+              },
+              {
+                "Variable": "{{ CheckForExistingStack.IsExists }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "DescribeStackResources"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Operation }}",
+                "StringEquals": "Cleanup"
+              },
+              {
+                "Variable": "{{ CheckForExistingStack.SafeToDelete }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "PerformStackCleanup"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetClusterNetworkConfig",
+      "description": "Describe the EKS cluster to get VPC configuration for the Lambda function.",
+      "action": "aws:executeScript",
+      "nextStep": "ProvisionResources",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "ClusterName": "{{ ClusterName }}"
+        },
+        "Handler": "get_cluster_network_config.handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "Endpoint",
+          "Selector": "$.Payload.Endpoint",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Payload.VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetIds",
+          "Selector": "$.Payload.SubnetIds",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupId",
+          "Selector": "$.Payload.SecurityGroupId",
+          "Type": "String"
+        },
+        {
+          "Name": "CaData",
+          "Selector": "$.Payload.CaData",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true
+    },
+    {
+      "name": "ProvisionResources",
+      "action": "aws:createStack",
+      "description": "Creates an AWS CloudFormation stack with a Lambda function to proxy API calls to EKS cluster endpoint.",
+      "maxAttempts": 1,
+      "inputs": {
+        "Capabilities": [
+          "CAPABILITY_IAM",
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "StackName": "{{ variable:StackName }}",
+        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nDescription: CloudFormation Stack to create an AWS Lambda function.\nParameters:\n  AutomationAssumeRole:\n    Description: (Required) ARN of the role used by the automation.\n    Type: String\n  ExecutionId:\n    Description: (Required) Name of the Lambda function.\n    Type: String\n  EksClusterName:\n    Description: (Required) Name of the EKS cluster.\n    Type: String\n  EksClusterEndpoint:\n    Description: (Required) URL to the EKS cluster endpoint.\n    Type: String\n  EksCaData:\n    Description: (Required) Base64 encoded CA certificate for the EKS cluster endpoint.\n    Type: String\n  VpcId:\n    Description: (Optional) VPC ID of the EKS cluster.\n    Type: String\n    Default: ''\n  SubnetIds:\n    Description: (Optional) Comma separated list of subnet IDs.\n    Type: CommaDelimitedList\n    Default: ''\n  SecurityGroupId:\n    Description: (Optional) Security group ID of the EKS cluster.\n    Type: String\n    Default: ''\nConditions:\n  UseVpc: !Not \n    - !Equals \n      - !Ref VpcId\n      - ''\nResources:\n  LambdaFn:\n    Type: 'AWS::Lambda::Function'\n    Properties:\n      FunctionName: !Sub Automation-K8sProxy-${ExecutionId}\n      Handler: k8s_proxy.main.handler\n      Role: !GetAtt LambdaExecutionRole.Arn\n      Code:\n        ZipFile: import\n      Environment:\n        Variables:\n          CLUSTER_NAME: !Ref EksClusterName\n          CLUSTER_ENDPOINT: !Ref EksClusterEndpoint\n          CA_DATA: !Ref EksCaData\n          AUTOMATION_ROLE: !Ref AutomationAssumeRole\n      Runtime: python3.11\n      Timeout: 600\n      VpcConfig:\n        SubnetIds: !If \n          - UseVpc\n          - !Ref SubnetIds\n          - !Ref 'AWS::NoValue'\n        SecurityGroupIds:\n          - !If\n            - UseVpc\n            - !Ref SecurityGroupId\n            - !Ref 'AWS::NoValue'\n  LambdaLogGroup:\n    Type: 'AWS::Logs::LogGroup'\n    DeletionPolicy: Retain\n    UpdateReplacePolicy: Retain\n    Properties:\n      LogGroupName: !Sub /aws/lambda/${LambdaFn}\n      RetentionInDays: 30\n  LambdaExecutionRole:\n    Type: 'AWS::IAM::Role'\n    Properties:\n      RoleName: !Sub Automation-K8sProxy-Role-${ExecutionId}\n      AssumeRolePolicyDocument:\n        Version: 2012-10-17\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service:\n                - lambda.amazonaws.com\n            Action:\n              - 'sts:AssumeRole'\n      ManagedPolicyArns:\n        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole\n        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole\nOutputs:\n  LambdaFunctionArn:\n    Description: Lambda function ARN\n    Value: !GetAtt LambdaFn.Arn\n",
+        "ClientRequestToken": "{{ variable:StackName }}",
+        "TimeoutInMinutes": 30,
+        "OnFailure": "DELETE",
+        "Parameters": [
+          {
+            "ParameterKey": "AutomationAssumeRole",
+            "ParameterValue": "{{ AutomationAssumeRole }}"
+          },
+          {
+            "ParameterKey": "ExecutionId",
+            "ParameterValue": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "EksClusterName",
+            "ParameterValue": "{{ ClusterName }}"
+          },
+          {
+            "ParameterKey": "EksClusterEndpoint",
+            "ParameterValue": "{{ GetClusterNetworkConfig.Endpoint }}"
+          },
+          {
+            "ParameterKey": "EksCaData",
+            "ParameterValue": "{{ GetClusterNetworkConfig.CaData }}"
+          },
+          {
+            "ParameterKey": "VpcId",
+            "ParameterValue": "{{ GetClusterNetworkConfig.VpcId }}"
+          },
+          {
+            "ParameterKey": "SubnetIds",
+            "ParameterValue": "{{ GetClusterNetworkConfig.SubnetIds }}"
+          },
+          {
+            "ParameterKey": "SecurityGroupId",
+            "ParameterValue": "{{ GetClusterNetworkConfig.SecurityGroupId }}"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-SetupK8sApiProxyForEKS"
+          },
+          {
+            "Key": "AutomationExecutionID",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-SetupK8sApiProxyForEKS",
+            "Value": "true"
+          },
+          {
+            "Key": "TargetEKSCluster",
+            "Value": "{{ ClusterName }}"
+          },
+          {
+            "Key": "ReferenceCount",
+            "Value": "1"
+          }
+        ]
+      },
+      "nextStep": "DescribeStackResources",
+      "onFailure": "step:PerformStackCleanup",
+      "onCancel": "step:PerformStackCleanup"
+    },
+    {
+      "name": "DescribeStackResources",
+      "action": "aws:executeAwsApi",
+      "description": "Describes the AWS CloudFormation stack to get the ARN of the AWS Lambda function.",
+      "nextStep": "BranchOnIsLambdaDeploymentRequired",
+      "isCritical": true,
+      "timeoutSeconds": 180,
+      "maxAttempts": 1,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ variable:StackName }}"
+      },
+      "outputs": [
+        {
+          "Name": "LambdaFunctionArn",
+          "Selector": "$.Stacks[0].Outputs[0].OutputValue",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort",
+      "onCancel": "step:PerformStackCleanup"
+    },
+    {
+      "name": "BranchOnIsLambdaDeploymentRequired",
+      "description": "Branch on if the stack is existing or newly created. The Lambda function will require a code deployment for newly created stacks.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CheckForExistingStack.IsExists }}",
+            "BooleanEquals": false,
+            "NextStep": "DeployLambdaFunctionCode"
+          }
+        ]
+      },
+      "isEnd": true
+    },
+    {
+      "name": "DeployLambdaFunctionCode",
+      "description": "Step to deploy the Lambda function code with the deployment package present in document attachment.",
+      "action": "aws:executeScript",
+      "nextStep": "AssertLambdaAvailable",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "FunctionName": "{{ DescribeStackResources.LambdaFunctionArn }}"
+        },
+        "Attachment": "artifact.zip",
+        "Handler": "deploy_lambda_code.handler",
+        "Runtime": "python3.11"
+      },
+      "onFailure": "step:PerformStackCleanup",
+      "onCancel": "step:PerformStackCleanup"
+    },
+    {
+      "name": "AssertLambdaAvailable",
+      "description": "Verifies the Lambda code update was successful.",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "onFailure": "step:PerformStackCleanup",
+      "onCancel": "step:PerformStackCleanup",
+      "inputs": {
+        "Service": "lambda",
+        "Api": "GetFunction",
+        "FunctionName": "{{ DescribeStackResources.LambdaFunctionArn }}",
+        "PropertySelector": "$.Configuration.LastUpdateStatus",
+        "DesiredValues": [
+          "Successful"
+        ]
+      },
+      "isCritical": true,
+      "isEnd": true
+    },
+    {
+      "name": "PerformStackCleanup",
+      "description": "Deletes the AWS CloudFormation stack created for the Lambda function.",
+      "action": "aws:deleteStack",
+      "maxAttempts": 1,
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "inputs": {
+        "StackName": "{{ variable:StackName }}"
+      },
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "DescribeStackResources.LambdaFunctionArn"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "0c16581700ba98c06d9d8bc5a3b4c23f12159a40f8fab35b2b090e0b5e650bdd"
+      }
+    }
+  }
+}
