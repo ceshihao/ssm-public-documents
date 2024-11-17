@@ -1,0 +1,808 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-DiagnoseUnmanagedEC2NetworkIssues\n\n## What does this document do?\nThis runbook is used for diagnosing connectivity issues that prevent SSM Agent from reaching the Systems Manager\nservice. The runbook scans the EC2 instances in your account and identifies those which are unmanaged. Then, the\nrunbook performs a diagnostic analysis to determine potential causes for the instances being unmanaged.\n\n## Input Parameters\n\nThe runbook has two modes, `Orchestrator`, and `Worker`.\n\n### Orchestrator Mode\nOrchestrator Mode is responsible for determining which nodes are not managed by Systems Manager. This mode segments\nunmanaged nodes according to VPC and starts a child execution to diagnose potential problems at a VPC level.\n\nIt requires the following parameters:\n- **Mode**: Set to `Orchestrator`\n- **DiagnosisExecutionId**: A unique ID that separates the results from different runbook executions.\n- **AutomationAssumeRole**: The role the runbook assumes to perform a diagnosis.\n- **BucketName**: The S3 bucket that the runbook uses to store its output.\n\n### Worker Mode\nWorker Mode is responsible for performing the diagnosis of issues. It requires the following parameters:\n- **Mode**: Set to `Worker`.\n- **DiagnosisExecutionId**: A unique ID that separates the results from different runbook executions.\n- **AutomationAssumeRole**: The role that the runbook assumes to perform a diagnosis.\n- **BucketName**: The S3 bucket that the runbook uses to store its output.\n- **TargetValue**: The specified value used to make a diagnosis. For this runbook, the target values are VPC IDs.\n\n## Output Parameters\n* PublishAggregateResult.aggregate_output: The aggregated diagnosis output.\n* PublishAggregateResult.had_failure: An indication of whether or not the execution experienced a failure.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The role assumed by the runbook to perform batching and diagnosis."
+    },
+    "BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the S3 bucket used to store output."
+    },
+    "BucketOwner": {
+      "type": "String",
+      "description": "(Required) The owner of the S3 bucket used to store output.",
+      "allowedPattern": "^\\d{12}$"
+    },
+    "DiagnosisExecutionId": {
+      "type": "String",
+      "description": "(Required) A unique identifier used to separate the S3 output of different runbook executions.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "ExecutionFailurePercentageThreshold": {
+      "type": "Integer",
+      "description": "(Optional) The percentage of child executions that may fail before the parent executions fails.",
+      "allowedPattern": "^[1-9][0-9]?$|^100$",
+      "default": 100
+    },
+    "Mode": {
+      "type": "String",
+      "description": "(Optional) Defines the mode in which this runbook operates. The default is Orchestrator, which automatically\nstarts child executions in Worker mode.",
+      "allowedValues": [
+        "Orchestrator",
+        "Worker"
+      ],
+      "allowedPattern": "^(Orchestrator|Worker)$",
+      "default": "Orchestrator"
+    },
+    "RunScriptTimeout": {
+      "type": "Integer",
+      "description": "(Optional) The time limit for long-running executeScript steps. Reduce this this value if you experience\nstep failures.",
+      "allowedPattern": "^([1-5]?\\d{1,2}|600)$",
+      "default": 540
+    },
+    "TargetValue": {
+      "type": "String",
+      "description": "(Optional) A value passed to the Worker runbook, which indicates the basis for its diagnosis.",
+      "allowedPattern": "^\\[\\]$|^\\[\\\"vpc-[0-9a-f]{1,128}\\\"(, \\\"vpc-[0-9a-f]{1,128}\\\")*\\]$",
+      "default": "[]"
+    },
+    "MaxConcurrency": {
+      "type": "String",
+      "description": "(Optional) The maximum concurrency for child rate control executions.",
+      "allowedPattern": "^([1-9]|10)$",
+      "default": "5"
+    }
+  },
+  "variables": {
+    "AggregatedOutput": {
+      "type": "StringMap",
+      "description": "Used to store the aggregate of issue and finding summary between loop iterations, and identifies how many instances\nare associated with a specific subcategory of known issues.",
+      "default": {}
+    },
+    "FUNContinuation": {
+      "type": "StringMap",
+      "description": "Used to track the previous output state of FindUnmanagedNodes, so a next iteration pick ups where the\nprevious left off.",
+      "default": {
+        "InstanceNextToken": "",
+        "SuccessfulBatches": []
+      }
+    },
+    "FailedExecutions": {
+      "type": "Integer",
+      "description": "Used to store the number of failed executions that have occurred.",
+      "default": 0
+    },
+    "HadFailure": {
+      "type": "Boolean",
+      "description": "Used to determine whether the execution experienced a failure.",
+      "default": false
+    },
+    "S3PaginationNextToken": {
+      "type": "String",
+      "description": "Used for a batching loop to allow the process to continue in the next iteration.",
+      "default": ""
+    },
+    "TotalExecutions": {
+      "type": "Integer",
+      "description": "Stores the total number of executions that have been started.",
+      "default": 0
+    },
+    "ExpectedExecutions": {
+      "type": "Integer",
+      "description": "In Orchestration mode, stores the expected total number of executions.",
+      "default": 0
+    },
+    "S3EncryptionType": {
+      "type": "String",
+      "description": "S3 Server-side encryption type.",
+      "default": "AES256"
+    },
+    "S3EncryptionKey": {
+      "type": "String",
+      "description": "S3 Server-side encryption Key ARN.",
+      "default": ""
+    }
+  },
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "08f50a0ba4f51530cec9ddead86bbc5ec442fa9a6c5c1cd0264ebb38a53a90b9"
+      },
+      "size": 5797
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetS3EncryptionConfiguration",
+      "description": "## GetS3EncryptionConfiguration\nDetermines the S3 Bucket encryption type.",
+      "action": "aws:executeScript",
+      "nextStep": "UpdateS3EncryptionType",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}"
+        },
+        "Script": "from attachments.s3_utils import S3WrapperClient\n\ndef script_handler(events, context):\n    bucket_name = events['BucketName']\n    bucket_owner = events['BucketOwner']\n    s3_client = S3WrapperClient(bucket_owner)\n    encryption_type = 'AES256'  # Default to SSE-S3\n    encryption_key = 'N/A'\n\n    response = s3_client.get_bucket_encryption(Bucket=bucket_name)\n    encryption_rules = response.get('ServerSideEncryptionConfiguration', {}).get('Rules', [])\n    if encryption_rules:\n        default_encryption = encryption_rules[0].get('ApplyServerSideEncryptionByDefault', {})\n        encryption_type = default_encryption.get('SSEAlgorithm', 'AES256')\n        encryption_key = default_encryption.get('KMSMasterKeyID', 'N/A')\n\n    return {\n        'S3EncryptionType': encryption_type,\n        'S3EncryptionKey': encryption_key\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "S3EncryptionType",
+          "Type": "String",
+          "Selector": "$.Payload.S3EncryptionType"
+        },
+        {
+          "Name": "S3EncryptionKey",
+          "Type": "String",
+          "Selector": "$.Payload.S3EncryptionKey"
+        }
+      ]
+    },
+    {
+      "name": "UpdateS3EncryptionType",
+      "description": "## UpdateS3EncryptionType\nUpdates the S3 Bucket encryption type.",
+      "action": "aws:updateVariable",
+      "nextStep": "UpdateS3EncryptionKey",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:S3EncryptionType",
+        "Value": "{{ GetS3EncryptionConfiguration.S3EncryptionType }}"
+      }
+    },
+    {
+      "name": "UpdateS3EncryptionKey",
+      "description": "## UpdateS3EncryptionKey\nUpdates the S3 Bucket encryption key.",
+      "action": "aws:updateVariable",
+      "nextStep": "RunbookMode",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:S3EncryptionKey",
+        "Value": "{{ GetS3EncryptionConfiguration.S3EncryptionKey }}"
+      }
+    },
+    {
+      "name": "RunbookMode",
+      "description": "## RunbookMode\nDetermines the following steps to take based on the provided `Mode` parameter.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "FindUnmanagedNodesLoop",
+            "Variable": "{{ Mode }}",
+            "StringEquals": "Orchestrator"
+          },
+          {
+            "NextStep": "DeserializeBatch",
+            "Variable": "{{ Mode }}",
+            "StringEquals": "Worker"
+          }
+        ],
+        "Default": "FindUnmanagedNodesLoop"
+      }
+    },
+    {
+      "name": "DeserializeBatch",
+      "description": "## DeserializeBatch\nDeserializes the JSON string provided by the TargetValue parameter.",
+      "action": "aws:executeScript",
+      "nextStep": "Loop",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "Input": "{{ TargetValue }}"
+        },
+        "Script": "import json\n\ndef handler(event, context):\n    segmentation_key = event[\"Input\"]\n    try:\n        return json.loads(segmentation_key)\n    except json.decoder.JSONDecodeError:\n        if isinstance(segmentation_key, str):\n            return [segmentation_key]\n        raise ValueError(\"Invalid input target type. Accepts either a single string item or a JSON serialized array of strings\")\n"
+      },
+      "outputs": [
+        {
+          "Name": "sub_batch",
+          "Type": "StringList",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "Loop",
+      "description": "## Loop\nRuns the diagnosis on the deserialized batch.\n### Inputs\n* Iterators: A list of VPCs in which to diagnose unmanaged nodes.",
+      "action": "aws:loop",
+      "nextStep": "FailRunbookCondition",
+      "isEnd": false,
+      "inputs": {
+        "Iterators": "{{ DeserializeBatch.sub_batch }}",
+        "Steps": [
+          {
+            "name": "UpdateTotalDiagnosisRuns",
+            "description": "## UpdateTotalDiagnosisRuns\nUpdates a variable to track the total number of diagnostic runs that have occurred,\nbased on loop iteration number.",
+            "action": "aws:updateVariable",
+            "nextStep": "DiagnosisRunbook",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:TotalExecutions",
+              "Value": "{{ Loop.CurrentIteration }}"
+            }
+          },
+          {
+            "name": "DiagnosisRunbook",
+            "description": "## DiagnosisRunbook\nRuns the actual diagnosis of unmanaged nodes.",
+            "action": "aws:executeScript",
+            "nextStep": "AggregateDiagnosisSummary",
+            "isCritical": false,
+            "isEnd": false,
+            "onFailure": "step:RegisterDiagnosisFailure",
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "Attachment": "attachments.zip",
+              "InputPayload": {
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+                "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+                "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+                "VpcId": "{{ Loop.CurrentIteratorValue }}"
+              },
+              "Script": "from attachments.vpc_diagnosis import handler\n"
+            },
+            "outputs": [
+              {
+                "Name": "problem_summary",
+                "Type": "StringMap",
+                "Selector": "$.Payload"
+              }
+            ]
+          },
+          {
+            "name": "RegisterDiagnosisFailure",
+            "description": "## RegisterDiagnosisFailure\nIncrements the count of diagnosis failures.\n",
+            "action": "aws:executeScript",
+            "nextStep": "UpdateDiagnosisFailure",
+            "isEnd": false,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "InputPayload": {
+                "FailureCount": "{{ variable:FailedExecutions }}"
+              },
+              "Script": "def handler(events, context):\n    curr_failure_count = events.get(\"FailureCount\", 0)\n    return {\n        \"FailureCount\": curr_failure_count + 1\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "FailureCount",
+                "Type": "Integer",
+                "Selector": "$.Payload.FailureCount"
+              }
+            ]
+          },
+          {
+            "name": "UpdateDiagnosisFailure",
+            "description": "## UpdateDiagnosisFailure\nUpdates the FailedExecutions variable",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:FailedExecutions",
+              "Value": "{{ RegisterDiagnosisFailure.FailureCount }}"
+            }
+          },
+          {
+            "name": "AggregateDiagnosisSummary",
+            "description": "## AggregateDiagnosisSummary\nAggregates the findings summary for a diagnosis run between iterations of the loop",
+            "action": "aws:executeScript",
+            "nextStep": "UpdateDiagnosisAggregateSummary",
+            "isCritical": false,
+            "isEnd": false,
+            "onFailure": "step:RegisterDiagnosisFailure",
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "Attachment": "attachments.zip",
+              "InputPayload": {
+                "CurrentAggregatedOutput": "{{ variable:AggregatedOutput }}",
+                "DiagnosisSummary": "{{ DiagnosisRunbook.problem_summary }}"
+              },
+              "Script": "from attachments.s3_utils import merge_objects\n\n\ndef handler(events, context):\n    curr_aggregation = events.get(\"CurrentAggregatedOutput\", {})\n    diagnosis_summary = events.get(\"DiagnosisSummary\", {})\n\n    curr_aggregation = merge_objects(curr_aggregation, diagnosis_summary)\n\n    return {'AggregatedOutput': curr_aggregation}\n"
+            },
+            "outputs": [
+              {
+                "Name": "aggregated_output",
+                "Type": "StringMap",
+                "Selector": "$.Payload.AggregatedOutput"
+              }
+            ]
+          },
+          {
+            "name": "UpdateDiagnosisAggregateSummary",
+            "description": "## UpdateDiagnosisAggregateSummary\nUpdates the AggregatedOutput variable",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:AggregatedOutput",
+              "Value": "{{ AggregateDiagnosisSummary.aggregated_output }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FindUnmanagedNodesLoop",
+      "description": "## FindUnmanagedNodesLoop\nFinds the unmanaged nodes\n### Inputs\n* FindUnmanagedNodes.should_continue: Whether or not more iterations of searching for unmanaged nodes need to be\n  performed.",
+      "action": "aws:loop",
+      "nextStep": "MergeAndTransform",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Variable": "{{ FindUnmanagedNodes.should_continue }}",
+          "BooleanEquals": true
+        },
+        "Steps": [
+          {
+            "name": "FindUnmanagedNodes",
+            "description": "## FindUnmanagedNodes\nThis step identifies nodes that are not managed by Systems Manager. \n* First, it queries EC2 for running instances, then checks for the subset of those instances which are\n  known to Systems Manager. The remaining nodes are therefore unmanaged nodes.\n* This step runs in a loop until either the time limit provided by the RunScriptTimeout parameter has\n  elapsed, or if we have finished processing all instances in the account-Region.\n* It writes a file at the end of its execution which contains information relating to the unmanaged\n  instances it identified.",
+            "action": "aws:executeScript",
+            "maxAttempts": 3,
+            "nextStep": "UpdateFindUnmanagedNodesLoopState",
+            "isCritical": false,
+            "isEnd": false,
+            "onFailure": "step:RegisterFindUnmanagedNodesFailure",
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "Attachment": "attachments.zip",
+              "InputPayload": {
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+                "FUNContinuation": "{{ variable:FUNContinuation }}",
+                "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+                "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+                "Iteration": "{{ FindUnmanagedNodesLoop.CurrentIteration }}",
+                "TimeoutSeconds": "{{ RunScriptTimeout }}"
+              },
+              "Script": "import json\nimport time\nimport boto3\n\nfrom collections import defaultdict\nfrom attachments.s3_utils import S3WrapperClient, get_prefixes\nfrom attachments.utils import chunk\n\n\nclass TallyItem:\n    def __init__(self):\n        self.instances = set()\n\n    def __json__(self):\n        return {\n            \"Count\": len(self.instances),\n            \"InstanceIds\": list(self.instances)\n        }\n\n\nclass TallyEncoder(json.JSONEncoder):\n    def default(self, obj):\n        if isinstance(obj, TallyItem):\n            return obj.__json__()\n        return json.JSONEncoder.default(self, obj)\n\n\ndef get_required_instance_information(instance):\n    \"\"\"Processes an instance object retrieved via EC2 DescribeInstances, returns an object with the minimum information we need\"\"\"\n    try:\n        return {\n            \"InstanceId\": instance[\"InstanceId\"],\n            \"SubnetId\": instance[\"SubnetId\"],\n            \"VpcId\": instance[\"VpcId\"],\n            \"SecurityGroups\": \",\".join(sorted(map(lambda x: x[\"GroupId\"], instance[\"SecurityGroups\"])))\n        }\n    except KeyError:\n        raise RuntimeError(\"DescribeInstances result was malformed or in unexpected format\", instance)\n\n\ndef find_managed_instances(ssm_client, instance_ids):\n    \"\"\"Given a list of instance_ids, returns the subset of the input which are managed\"\"\"\n    managed_set = set()\n    for instance_chunk in chunk(instance_ids, 100):\n        page_iterator = ssm_client.get_paginator(\"describe_instance_information\").paginate(\n            Filters=[\n                {\"Key\": \"InstanceIds\", \"Values\": instance_chunk},\n                {\"Key\": \"PingStatus\", \"Values\": [\"Online\"]}\n            ]\n        )\n        for page in page_iterator:\n            for instance in page[\"InstanceInformationList\"]:\n                managed_set.add(instance[\"InstanceId\"])\n    return managed_set\n\n\ndef get_instance_page(ec2_client, next_token, MaxResults=1000):\n    \"\"\"Returns a dict with the instance_id as key, and the value is the minimal instance object we need for diagnosis\"\"\"\n\n    filters = [{\"Name\": \"instance-state-name\", \"Values\": [\"running\"]}]\n    kwargs = {\n        \"Filters\": filters,\n        \"MaxResults\": MaxResults\n    }\n    if next_token:\n        kwargs[\"NextToken\"] = next_token\n\n    result = ec2_client.describe_instances(**kwargs)\n\n    instances = {}\n    for reservation in result.get(\"Reservations\", []):\n        for instance in reservation.get(\"Instances\", []):\n            instances[instance[\"InstanceId\"]] = get_required_instance_information(instance)\n    return instances, result.get(\"NextToken\", None)\n\n\ndef find_unmanaged_instances(ssm_client, instances):\n    unmanaged_instances = []\n    managed_instances = find_managed_instances(ssm_client, list(instances.keys()))\n    for instance_id, instance in instances.items():\n        if instance_id not in managed_instances:\n            unmanaged_instances.append(instance)\n    return unmanaged_instances\n\n\ndef update_tally(current_tally, new_instance):\n    vpc_id = new_instance[\"VpcId\"]\n    subnet_id = new_instance[\"SubnetId\"]\n    security_groups = new_instance[\"SecurityGroups\"]\n\n    tally_item = current_tally[vpc_id][subnet_id][security_groups]\n    tally_item.instances.add(new_instance[\"InstanceId\"])\n\n\ndef save_batch_output(s3_client, s3_bucket, current_tally, iteration_count, prefix):\n    if not current_tally:\n        return False\n    object_name = f\"batch-{iteration_count}.json\"  # a retry if the step fails should override this object, ensuring we don't double count in the merge/transform step\n    s3_client.put_object(Body=json.dumps(current_tally, cls=TallyEncoder), Bucket=s3_bucket, Key=f\"{prefix}/{object_name}\")\n    return True\n\n\ndef handler(event, context):\n    start_time = time.time()\n\n    # required parameters\n    s3_bucket = event[\"BucketName\"]\n    diagnosis_execution_id = event[\"DiagnosisExecutionId\"]\n    continuation_token = event[\"FUNContinuation\"]\n    instance_next_token = continuation_token.get(\"InstanceNextToken\", None)\n    successful_batches = continuation_token.get(\"SuccessfulBatches\", [])\n    unmanaged_node_count = continuation_token.get(\"UnmanagedNodeCount\", 0)\n    iteration_count = event[\"Iteration\"]\n\n    # optional parameters\n    timeout_seconds = event.get(\"TimeoutSeconds\", 540)\n    describe_instances_page_size = event.get(\"DescribeInstancesPageSize\", 1000)\n\n    # context\n    account_id = context.get(\"global:ACCOUNT_ID\")\n    region = context.get(\"global:REGION\")\n\n    prefixes = get_prefixes(account_id, region, diagnosis_execution_id)\n    batching_prefix = prefixes[\"WORKING_BATCHES\"]\n\n    # clients\n    ec2_client = boto3.client(\"ec2\")\n    s3_client = S3WrapperClient(event[\"BucketOwner\"],event[\"S3EncryptionType\"], event[\"S3EncryptionKey\"], context.get(\"automation:EXECUTION_ID\"))\n    ssm_client = boto3.client(\"ssm\")\n\n    tally = defaultdict(lambda: defaultdict(lambda: defaultdict(TallyItem)))\n    first_run = True\n    while instance_next_token or first_run:\n        first_run = False\n\n        instances, _next_token = get_instance_page(ec2_client, instance_next_token, MaxResults=describe_instances_page_size)\n        unmanaged_instances = find_unmanaged_instances(ssm_client, instances)\n        unmanaged_node_count += len(unmanaged_instances)\n        for unmanaged_instance in unmanaged_instances:\n            update_tally(tally, unmanaged_instance)\n        instance_next_token = _next_token  # update after tallying\n\n        if time.time() - start_time > timeout_seconds:\n            break\n\n    if save_batch_output(s3_client, s3_bucket, tally, iteration_count, batching_prefix):\n        successful_batches.append(str(iteration_count))\n\n    return {\n        \"FUNContinuation\": {\n            \"InstanceNextToken\": instance_next_token,\n            \"SuccessfulBatches\": successful_batches,\n            \"UnmanagedNodeCount\": unmanaged_node_count\n        },\n        \"ShouldContinue\": bool(instance_next_token)\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "prev_state",
+                "Type": "StringMap",
+                "Selector": "$.Payload.FUNContinuation"
+              },
+              {
+                "Name": "should_continue",
+                "Type": "Boolean",
+                "Selector": "$.Payload.ShouldContinue"
+              }
+            ]
+          },
+          {
+            "name": "RegisterFindUnmanagedNodesFailure",
+            "description": "## RegisterFindUnmanagedNodesFailure\nUpdates the HadFailure variable",
+            "action": "aws:updateVariable",
+            "nextStep": "MergeAndTransform",
+            "isCritical": true,
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:HadFailure",
+              "Value": true
+            }
+          },
+          {
+            "name": "UpdateFindUnmanagedNodesLoopState",
+            "description": "## UpdateFindUnmanagedNodesLoopState\nUpdates the FUNContinuation variable",
+            "action": "aws:updateVariable",
+            "isCritical": true,
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:FUNContinuation",
+              "Value": "{{ FindUnmanagedNodes.prev_state }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MergeAndTransform",
+      "description": "## MergeAndTransform\nThis step combines the output from FindUnmanagedNodes and splits the data by VPC. It then writes a file per VPC\nwhich will later be used to diagnose issues on a vpc basis.",
+      "action": "aws:executeScript",
+      "nextStep": "UpdateExpectedExecutions",
+      "maxAttempts": 3,
+      "isEnd": false,
+      "onFailure": "step:RegisterMergeAndTransformFailure",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}",
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+          "FUNContinuation": "{{ variable:FUNContinuation }}"
+        },
+        "Script": "import json\nimport math\nfrom attachments.s3_utils import S3WrapperClient, get_prefixes, merge_objects, clear_prefix\nfrom collections import defaultdict\n\n\ndef transform(tally):\n    output = defaultdict(lambda: defaultdict(list))\n\n    for vpc_id, subnets in tally.items():\n        for subnet_id, security_groups in subnets.items():\n            output[vpc_id][subnet_id] = [{\"SecurityGroups\": group_set.split(\",\"), **tally_obj} for group_set, tally_obj in security_groups.items()]\n    return output\n\n\ndef merge_objects_with_prefix(s3_client, s3_bucket, prefix, successful_batches):\n    curr = {}\n    for successul_batch_idx in successful_batches:\n        object_name = f\"batch-{successul_batch_idx}.json\"\n        key = f\"{prefix}/{object_name}\"\n        response = s3_client.get_object(Bucket=s3_bucket, Key=key)\n        data = response[\"Body\"].read().decode(\"utf-8\")\n        curr = merge_objects(curr, json.loads(data))\n    return curr\n\n\ndef split_by_key(data):\n    for key in data.keys():\n        yield key, {\n            key: data[key]\n        }\n\n\ndef write_to_s3(s3_client, s3_bucket, key, data):\n    s3_client.put_object(Body=json.dumps(data), Bucket=s3_bucket, Key=key)\n\n\ndef calculate_page_size(item_count):\n    return min(math.ceil(item_count / 5000) * 50, 1000)\n\n\ndef handler(event, context):\n    s3_client = S3WrapperClient(event[\"BucketOwner\"],event.get(\"S3EncryptionType\"), event.get(\"S3EncryptionKey\"), context.get(\"automation:EXECUTION_ID\"))\n\n    s3_bucket = event.get(\"BucketName\")\n    diagnosis_execution_id = event.get(\"DiagnosisExecutionId\")\n    successful_batches = event.get(\"FUNContinuation\", {}).get(\"SuccessfulBatches\", [])\n\n    account_id = context.get(\"global:ACCOUNT_ID\")\n    region = context.get(\"global:REGION\")\n\n    prefixes = get_prefixes(account_id, region, diagnosis_execution_id)\n    batch_prefix = prefixes[\"WORKING_BATCHES\"]\n    output_prefix = prefixes[\"DIAGNOSIS_INPUT\"]\n\n    merged = merge_objects_with_prefix(s3_client, s3_bucket, batch_prefix, successful_batches)\n    item_count = 0\n    for vpc_id, item in split_by_key(merged):\n        obj_key = f\"{output_prefix}/{vpc_id}.json\"\n        write_to_s3(s3_client, s3_bucket, obj_key, transform(item))\n        item_count += 1\n\n    # cleanup working directory\n    clear_prefix(s3_client, s3_bucket, batch_prefix)\n    return {\n        \"PageSize\": calculate_page_size(item_count),\n        \"ResourceCount\": item_count\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "page_size",
+          "Type": "Integer",
+          "Selector": "$.Payload.PageSize"
+        },
+        {
+          "Name": "resource_count",
+          "Type": "Integer",
+          "Selector": "$.Payload.ResourceCount"
+        }
+      ]
+    },
+    {
+      "name": "UpdateExpectedExecutions",
+      "description": "## UpdateExpectedExecutions\nSets the amount of expected child executions based on the number of VPC objects written from MergeAndTransform.",
+      "action": "aws:updateVariable",
+      "nextStep": "GetDocumentName",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:ExpectedExecutions",
+        "Value": "{{ MergeAndTransform.resource_count }}"
+      }
+    },
+    {
+      "name": "GetDocumentName",
+      "description": "## GetDocumentName\nFinds the current document name in order to invoke the worker branch as a child execution.",
+      "action": "aws:executeAwsApi",
+      "nextStep": "BatchingLoop",
+      "isEnd": false,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetAutomationExecution",
+        "AutomationExecutionId": "{{ automation:EXECUTION_ID }}"
+      },
+      "outputs": [
+        {
+          "Name": "DocumentName",
+          "Type": "String",
+          "Selector": "$.AutomationExecution.DocumentName"
+        }
+      ]
+    },
+    {
+      "name": "RegisterMergeAndTransformFailure",
+      "description": "## RegisterMergeAndTransformFailure\nUpdates the HadFailure variable",
+      "action": "aws:updateVariable",
+      "nextStep": "ReportUnseenNodesAsUndiagnosed",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:HadFailure",
+        "Value": true
+      }
+    },
+    {
+      "name": "ReportUnseenNodesAsUndiagnosed",
+      "description": "## ReportUnseenNodesAsUndiagnosed\nIf the count of nodes processed in child executions does not match the total node count we tallied in\nFindUnmanagedNodes, we mark the remaining nodes as Undiagnosed. This generally happens if we see failures in\nchild executions, or failures on the MergeAndTransform step.",
+      "action": "aws:executeScript",
+      "nextStep": "UpdateUndiagnosedAggregateOutput",
+      "maxAttempts": 3,
+      "isCritical": false,
+      "isEnd": false,
+      "onFailure": "step:CleanupChildInputs",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "AggregateOutput": "{{ variable:AggregatedOutput }}",
+          "FUNContinuation": "{{ variable:FUNContinuation }}"
+        },
+        "Script": "from attachments.s3_utils import merge_objects\n\n\ndef handler(events, context):\n    aggregate_output = events.get(\"AggregateOutput\", {})\n    processed_nodes = aggregate_output.get(\"_ProcessedNodeCount\", 0)\n\n    fun_continuation = events.get(\"FUNContinuation\", {})\n    unmanaged_node_count = fun_continuation.get(\"UnmanagedNodeCount\", 0)\n\n    undiagnosed = unmanaged_node_count - processed_nodes\n    if undiagnosed > 0:\n        return merge_objects(aggregate_output, {\n            \"Undiagnosed\": undiagnosed\n        })\n    return aggregate_output\n"
+      },
+      "outputs": [
+        {
+          "Name": "aggregate_output",
+          "Type": "StringMap",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "UpdateUndiagnosedAggregateOutput",
+      "description": "## UpdateUndiagnosedAggregateOutput\nUpdates the aggregate output with the count of Undiagnosed nodes",
+      "action": "aws:updateVariable",
+      "nextStep": "CleanupChildInputs",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:AggregatedOutput",
+        "Value": "{{ ReportUnseenNodesAsUndiagnosed.aggregate_output }}"
+      }
+    },
+    {
+      "name": "CleanupChildInputs",
+      "description": "## CleanupChildInputs\nCleans up the objects created by MergeAndTransform.",
+      "action": "aws:executeScript",
+      "nextStep": "WriteSummaryToS3",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "isCritical": false,
+      "isEnd": false,
+      "onFailure": "step:WriteSummaryToS3",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}",
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}"
+        },
+        "Script": "from attachments.s3_utils import S3WrapperClient, get_prefixes, clear_prefix\n\n\ndef handler(events, context):\n    bucket_name = events[\"BucketName\"]\n    bucket_owner = events[\"BucketOwner\"]\n    diagnosis_execution_id = events[\"DiagnosisExecutionId\"]\n\n    prefixes = get_prefixes(context[\"global:ACCOUNT_ID\"], context[\"global:REGION\"], diagnosis_execution_id)\n    diagnosis_input_prefix = prefixes[\"DIAGNOSIS_INPUT\"]\n\n    s3_client = S3WrapperClient(bucket_owner)\n\n    clear_prefix(s3_client, bucket_name, diagnosis_input_prefix)"
+      }
+    },
+    {
+      "name": "BatchingLoop",
+      "description": "## BatchingLoop\nThis creates batches of VPCs to pass to diagnosis.\n### Inputs\n* S3PaginationNextToken: The continuation token of S3 pages to search through.",
+      "action": "aws:loop",
+      "nextStep": "ReportUnseenNodesAsUndiagnosed",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Not": {
+            "Variable": "{{ variable:S3PaginationNextToken }}",
+            "StringEquals": ""
+          }
+        },
+        "Steps": [
+          {
+            "name": "CreateBatch",
+            "description": "## CreateBatch\nLists the objects which were created by MergeAndTransform and forms the input for child executions based\non the result of the list.",
+            "action": "aws:executeScript",
+            "nextStep": "DidFindBatchItems",
+            "maxAttempts": 3,
+            "isEnd": false,
+            "onFailure": "step:RegisterMergeAndTransformFailure",
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "Attachment": "attachments.zip",
+              "InputPayload": {
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "ContinuationToken": "{{ variable:S3PaginationNextToken }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+                "PageSize": "{{ MergeAndTransform.page_size }}"
+              },
+              "Script": "import json\nimport math\nimport re\n\nfrom attachments.s3_utils import S3WrapperClient, get_prefixes\nfrom attachments.utils import ResourcePattern, matches_pattern\n\n\ndef sub_batch(items, TOTAL_BATCHES=50):\n    if not items:\n        return items\n    sub_batches = []\n    sub_batch_size = math.ceil(len(items) / TOTAL_BATCHES)\n    for i in range(0, len(items), sub_batch_size):\n        sub_batches.append(json.dumps(items[i:i + sub_batch_size]))\n    return sub_batches\n\n\ndef extract_batch_id(key):\n    object_name = key.split(\"/\")[-1].split(\".\")\n    return \".\".join(object_name[:-1] if len(object_name) > 1 else object_name)\n\n\ndef handler(event, context):\n    s3_client = S3WrapperClient(event[\"BucketOwner\"])\n\n    s3_bucket = event.get(\"BucketName\")\n    s3_continuation_token = event.get(\"ContinuationToken\", None)\n    account_id = context.get(\"global:ACCOUNT_ID\")\n    region = context.get(\"global:REGION\")\n    diagnosis_execution_id = event[\"DiagnosisExecutionId\"]\n\n    prefixes = get_prefixes(account_id, region, diagnosis_execution_id)\n    output_prefix = prefixes[\"DIAGNOSIS_INPUT\"]\n    max_keys = min(event.get(\"PageSize\", 50), 1000)\n\n    kwargs = {\n        \"Bucket\": s3_bucket,\n        \"Prefix\": f\"{output_prefix}/\",\n        \"Delimiter\": \"/\",\n        \"MaxKeys\": int(max_keys)\n    }\n\n    if s3_continuation_token:\n        kwargs[\"ContinuationToken\"] = s3_continuation_token\n\n    res = s3_client.list_objects_v2(**kwargs)\n\n    items = []\n    for key in res.get(\"Contents\", []):\n        resource_id = extract_batch_id(key[\"Key\"])\n        if matches_pattern(ResourcePattern.VPC, resource_id):\n            items.append(resource_id)\n        else:\n            print(f\"Found object with key '{key}' which does not follow expected format\")\n\n    sub_batches = sub_batch(items)\n    return {\n        \"Vpcs\": sub_batches,\n        \"ContinuationToken\": res.get(\"NextContinuationToken\", \"\"),\n        \"BatchSize\": len(sub_batches)\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "batch_next_token",
+                "Type": "String",
+                "Selector": "$.Payload.ContinuationToken"
+              },
+              {
+                "Name": "batch_vpcs",
+                "Type": "StringList",
+                "Selector": "$.Payload.Vpcs"
+              },
+              {
+                "Name": "batch_size",
+                "Type": "Integer",
+                "Selector": "$.Payload.BatchSize"
+              }
+            ]
+          },
+          {
+            "name": "DidFindBatchItems",
+            "description": "## DidFindBatchItems\nThis determines whether there are any VPCs to start child executions on.",
+            "action": "aws:branch",
+            "inputs": {
+              "Choices": [
+                {
+                  "NextStep": "StartChildExecutions",
+                  "Variable": "{{ CreateBatch.batch_size }}",
+                  "NumericGreater": 0
+                }
+              ],
+              "Default": "UpdateBatchingLoopState"
+            }
+          },
+          {
+            "name": "StartChildExecutions",
+            "description": "## StartChildExecutions\nStarts rate-control child executions of up to 50 children at a time, using the input passed from the\nCreateBatch step.",
+            "action": "aws:executeAutomation",
+            "nextStep": "AggregateChildExecutionOutput",
+            "timeoutSeconds": 86400,
+            "isCritical": false,
+            "isEnd": false,
+            "onFailure": "step:AggregateChildExecutionOutput",
+            "inputs": {
+              "DocumentName": "{{ GetDocumentName.DocumentName }}",
+              "DocumentVersion": "$DEFAULT",
+              "MaxConcurrency": "{{ MaxConcurrency }}",
+              "RuntimeParameters": {
+                "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+                "ExecutionFailurePercentageThreshold": "{{ ExecutionFailurePercentageThreshold }}",
+                "Mode": "Worker",
+                "RunScriptTimeout": "{{ RunScriptTimeout }}",
+                "MaxConcurrency": "{{ MaxConcurrency }}"
+              },
+              "TargetParameterName": "TargetValue",
+              "Targets": [
+                {
+                  "Key": "ParameterValues",
+                  "Values": "{{ CreateBatch.batch_vpcs }}"
+                }
+              ]
+            }
+          },
+          {
+            "name": "AggregateChildExecutionOutput",
+            "description": "## AggregateChildExecutionOutput\nRetrieves the status and output of child executions, aggregating the resulting finding summaries. Also\ntracks the number of failed executions.",
+            "action": "aws:executeScript",
+            "nextStep": "UpdateAggregateOutput",
+            "maxAttempts": 3,
+            "isCritical": false,
+            "isEnd": false,
+            "onFailure": "step:UpdateBatchingLoopState",
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "Attachment": "attachments.zip",
+              "InputPayload": {
+                "ChildExecutionId": "{{ StartChildExecutions.ExecutionId }}",
+                "CurrentAggregatedOutput": "{{ variable:AggregatedOutput }}"
+              },
+              "Script": "import boto3\nimport json\nfrom attachments.s3_utils import merge_objects\n\n\ndef handler(events, context):\n    ssm_client = boto3.client(\"ssm\")\n\n    curr_aggregation = events.get(\"CurrentAggregatedOutput\", {})\n    total_executions = events.get(\"TotalExecutions\", 0)\n    failed_executions = events.get(\"FailedExecutions\", 0)\n\n    executions = ssm_client.get_paginator(\"describe_automation_step_executions\").paginate(\n        AutomationExecutionId=events[\"ChildExecutionId\"]\n    ).build_full_result()\n\n    for execution in executions[\"StepExecutions\"]:\n        total_executions += 1\n        output = execution.get(\"Outputs\", {}).get(\"PublishAggregateResult.aggregate_output\", [])\n        success = execution.get(\"StepStatus\")\n        if success != \"Success\":\n            failed_executions += 1\n        if not output:\n            print(f\"Child execution '{execution['StepExecutionId']}' gave no output, skipping\")\n            continue\n        for item in output:\n            try:\n                child_output = json.loads(item)\n                curr_aggregation = merge_objects(curr_aggregation, child_output)\n            except json.JSONDecodeError:\n                print(f\"Warning: Child execution '{execution['StepExecutionId']}' gave invalid JSON, skipping\")\n                continue\n\n    return {\n        'AggregatedOutput': curr_aggregation,\n        'FailedExecutions': failed_executions,\n        'TotalExecutions': total_executions\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "batch_aggregated_output",
+                "Type": "StringMap",
+                "Selector": "$.Payload.AggregatedOutput"
+              },
+              {
+                "Name": "failed_executions",
+                "Type": "Integer",
+                "Selector": "$.Payload.FailedExecutions"
+              },
+              {
+                "Name": "total_executions",
+                "Type": "Integer",
+                "Selector": "$.Payload.TotalExecutions"
+              }
+            ]
+          },
+          {
+            "name": "UpdateAggregateOutput",
+            "description": "## UpdateAggregateOutput\nUpdates the aggregate findings summary output from child executions",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateFailedExecutions",
+            "maxAttempts": 3,
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:AggregatedOutput",
+              "Value": "{{ AggregateChildExecutionOutput.batch_aggregated_output }}"
+            }
+          },
+          {
+            "name": "UpdateFailedExecutions",
+            "description": "## UpdateFailedExecutions\nUpdates the count of failed child executions",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateTotalExecutions",
+            "maxAttempts": 3,
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:FailedExecutions",
+              "Value": "{{ AggregateChildExecutionOutput.failed_executions }}"
+            }
+          },
+          {
+            "name": "UpdateTotalExecutions",
+            "description": "## UpdateTotalExecutions\nUpdates the total number of child executions which have run",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateBatchingLoopState",
+            "maxAttempts": 3,
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:TotalExecutions",
+              "Value": "{{ AggregateChildExecutionOutput.total_executions }}"
+            }
+          },
+          {
+            "name": "UpdateBatchingLoopState",
+            "description": "## UpdateBatchingLoopState\nUpdates the loop state, which primarily includes an S3 list continuation token which is used on each\niteration of the loop to continue from where we left off",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:S3PaginationNextToken",
+              "Value": "{{ CreateBatch.batch_next_token }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "WriteSummaryToS3",
+      "description": "## WriteSummaryToS3\nWrites a summary of findings to S3.",
+      "action": "aws:executeScript",
+      "nextStep": "FailRunbookCondition",
+      "maxAttempts": 3,
+      "isEnd": false,
+      "onFailure": "step:FailRunbookCondition",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "AggregatedOutput": "{{ variable:AggregatedOutput }}",
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}",
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}"
+        },
+        "Script": "from attachments.s3_utils import S3WrapperClient\n\n\ndef get_object_key(diagnosis_execution_id, finding_id, account_id, region, findings_count):\n    return f\"actions/diagnosis/{diagnosis_execution_id}/summary/{finding_id}/{account_id}/{region}/{findings_count}\"\n\n\ndef handler(event, context):\n    s3_client = S3WrapperClient(event[\"BucketOwner\"], event.get(\"S3EncryptionType\"), event.get(\"S3EncryptionKey\"), context.get(\"automation:EXECUTION_ID\"))\n\n    s3_bucket = event.get(\"BucketName\")\n    diagnosis_execution_id = event.get(\"DiagnosisExecutionId\")\n    aggregate_output = event.get(\"AggregatedOutput\", {})\n\n    account_id = context.get(\"global:ACCOUNT_ID\")\n    region = context.get(\"global:REGION\")\n\n    for key, count in aggregate_output.items():\n        if count == 0:\n            continue\n\n        obj_key = get_object_key(diagnosis_execution_id, key, account_id, region, count)\n        s3_client.put_object(Body=b\"\", Bucket=s3_bucket, Key=obj_key)\n"
+      }
+    },
+    {
+      "name": "FailRunbookCondition",
+      "description": "## FailRunbookCondition\nDetermines if the execution should be marked as failed based on the amount of failed executions.",
+      "action": "aws:executeScript",
+      "nextStep": "PublishAggregateResult",
+      "maxAttempts": 1,
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "FailedExecutions": "{{ variable:FailedExecutions }}",
+          "FailurePercentageThreshold": "{{ ExecutionFailurePercentageThreshold }}",
+          "TotalExecutions": "{{ variable:TotalExecutions }}",
+          "ExpectedExecutions": "{{ variable:ExpectedExecutions }}"
+        },
+        "Script": "def script_handler(events, context):\n    failure_threshold = events.get(\"FailurePercentageThreshold\", 100)\n    total_executions = events.get(\"TotalExecutions\", 0)\n    failed_executions = events.get(\"FailedExecutions\", 0)\n    expected_executions = events.get(\"ExpectedExecutions\", 0)\n\n    if expected_executions > 0 and total_executions == 0:\n        raise RuntimeError(\"All child executions failed to start\")\n\n    if total_executions > 0 and ((failed_executions / total_executions) * 100 >= failure_threshold):\n        raise RuntimeError('Failed amount of child executions exceeds threshold')\n"
+      }
+    },
+    {
+      "name": "PublishAggregateResult",
+      "description": "## PublishAggregateResult\nMakes the results of diagnosis available to parent executions.",
+      "action": "aws:executeScript",
+      "isCritical": false,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "AggregatedOutput": "{{ variable:AggregatedOutput }}",
+          "HadFailure": "{{ variable:HadFailure }}"
+        },
+        "Script": "def script_handler(event, context):\n    return event\n"
+      },
+      "outputs": [
+        {
+          "Name": "aggregate_output",
+          "Type": "StringMap",
+          "Selector": "$.Payload.AggregatedOutput"
+        },
+        {
+          "Name": "had_failure",
+          "Type": "String",
+          "Selector": "$.Payload.HadFailure"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "PublishAggregateResult.aggregate_output",
+    "PublishAggregateResult.had_failure"
+  ]
+}

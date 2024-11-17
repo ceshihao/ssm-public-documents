@@ -1,0 +1,368 @@
+{
+  "schemaVersion": "0.3",
+  "description": "## AWS-RemediateSSMAgentVPCEndpoints\n\n## What does this runbook do?\n* If VPC endpoints required by SSM Agent don't exist, the runbook creates the VPC endpoints and associates them with\n  one subnet in each AZ.\n\nThis runbook modifies AWS resources. For resources managed by infrastructure as code (IaC) services like AWS\nCloudFormation, these modifications may cause drift. To prevent drift or recurrence, update your IaC templates\nafter running this runbook.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The role for this automation runbook to assume upon execution.\n* Mode: (Optional) The mode in which to execute the runbook. Orchestrator mode runs batching of all inputs from S3.\n  Worker mode takes a batch JSON serialized list of VPC IDs in TargetValue field to run remediation on.\n  * Default: \"Orchestrator\"\n* BucketName: (Required) The name of the S3 bucket that stores remediation input data.\n* BucketOwner: (Required) The account ID of the expected owner of the provided S3 bucket.\n* DiagnosisExecutionId: (Required) The ID of the diagnosis execution to use as input for this execution.\n* TargetValue: (Optional) A JSON serialized list of VPC IDs to remediate. This is prepopulated by Orchestrator mode.\n  * Default: \"[]\"\n* ExecutionFailurePercentageThreshold: (Optional) The threshold at which the orchestrator runbook fails if the specified\n  percentage of remediation steps fails across all child executions.\n  * Default: 100",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The role for this automation runbook to assume upon execution."
+    },
+    "Mode": {
+      "type": "String",
+      "description": "(Optional) The mode in which to execute the runbook. Orchestrator mode runs batching of all inputs from S3. Worker\nmode takes a batch JSON serialized list of VPC IDs in TargetValue field to run remediation on.",
+      "allowedValues": [
+        "Orchestrator",
+        "Worker"
+      ],
+      "default": "Orchestrator"
+    },
+    "BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the bucket that stores stores remediation input data."
+    },
+    "BucketOwner": {
+      "type": "String",
+      "description": "(Required) The account ID of the expected owner of the specified S3 bucket.",
+      "allowedPattern": "^[0-9]{12}$"
+    },
+    "DiagnosisExecutionId": {
+      "type": "String",
+      "description": "(Required) The ID of the diagnosis execution to use as input for this execution.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "TargetValue": {
+      "type": "String",
+      "description": "(Optional) A JSON serialized list of S3 object keys to read from that contains the diagnosis output. This is\nprepopulated by Orchestrator mode.",
+      "allowedPattern": "^\\[\\]$|^\\[\\\"vpc-[0-9a-f]{1,128}\\\"(, \\\"vpc-[0-9a-f]{1,128}\\\")*\\]$",
+      "default": "[]"
+    },
+    "ExecutionFailurePercentageThreshold": {
+      "type": "Integer",
+      "description": "The threshold at which the orchestrator runbook fails if the specified percentage of child steps fails across\nchild executions.",
+      "allowedPattern": "^[0-9]$|^[1-9][0-9]$|^(100)$",
+      "default": 100
+    }
+  },
+  "variables": {
+    "ContinuationToken": {
+      "type": "String",
+      "description": "The ContinuationToken to retrieve the next page of results if there are more S3 keys to fetch.",
+      "default": ""
+    },
+    "CurrentAggregatedError": {
+      "type": "StringMap",
+      "description": "A dictionary containing details of failed child execution steps.",
+      "default": {}
+    },
+    "TotalExecutions": {
+      "type": "Integer",
+      "description": "The total number of executed child steps.",
+      "default": 0
+    },
+    "FailedExecutions": {
+      "type": "Integer",
+      "description": "The number of failed child steps.",
+      "default": 0
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RunbookMode",
+      "description": "## RunbookMode\nThis determines the following steps to take based on the provided `Mode` parameter.\n### Inputs\n* Mode: The mode in which to run the runbook.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetDocumentName",
+            "Variable": "{{ Mode }}",
+            "StringEquals": "Orchestrator"
+          },
+          {
+            "NextStep": "DeserializeInput",
+            "Variable": "{{ Mode }}",
+            "StringEquals": "Worker"
+          }
+        ],
+        "Default": "GetDocumentName"
+      }
+    },
+    {
+      "name": "GetDocumentName",
+      "description": "## GetDocumentName\nFinds the name of the current runbook in order to invoke the worker branch as a child execution.\n### Inputs\n* Service: ssm\n* Api: GetAutomationExecution\n* AutomationExecutionId: The current execution ID of this automation execution.\n### Outputs\n* DocumentName: The name of the current runbook.",
+      "action": "aws:executeAwsApi",
+      "nextStep": "BatchingLoop",
+      "isEnd": false,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetAutomationExecution",
+        "AutomationExecutionId": "{{ automation:EXECUTION_ID }}"
+      },
+      "outputs": [
+        {
+          "Name": "DocumentName",
+          "Type": "String",
+          "Selector": "$.AutomationExecution.DocumentName"
+        }
+      ]
+    },
+    {
+      "name": "DeserializeInput",
+      "description": "## DeserializeInput\nDeserializes the input string of VPC IDs into a list.\n### Inputs\n* Keys: The serialized list of VPC IDs.\n### Outputs\n* Keys: The deserialized list of VPC IDs.",
+      "action": "aws:executeScript",
+      "nextStep": "RemediationLoop",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "maxAttempts": 1,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "Keys": "{{ TargetValue }}"
+        },
+        "Script": "import json\n\ndef script_handler(events, context):\n    batch = events.get('Keys')\n    return json.loads(batch)\n"
+      },
+      "outputs": [
+        {
+          "Name": "Keys",
+          "Type": "StringList",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "RemediationLoop",
+      "description": "## RemediationLoop\nThis loops over the deserialized list VPC IDs and runs the remediation script on each VPC.\n### Inputs\nIterators: The list of VPC IDs.",
+      "action": "aws:loop",
+      "nextStep": "FailRunbookCondition",
+      "isEnd": false,
+      "inputs": {
+        "Iterators": "{{ DeserializeInput.Keys }}",
+        "Steps": [
+          {
+            "name": "RemediateSSMAgentVPCEndpoints",
+            "description": "## RemediateSSMAgentVPCEndpoints\nSetup SSM Agent required VPC endpoints.\n### Inputs\n* VpcId: The EC2 VPC ID to remediate.\n* BucketName: The name of the S3 bucket that stores stores remediation input data.\n* BucketOwner: The expected owner of the S3 bucket.\n* DiagnosisExecutionId: The unique ID of the diagnostic execution that is being remediated.",
+            "action": "aws:executeScript",
+            "maxAttempts": 3,
+            "timeoutSeconds": 900,
+            "isCritical": false,
+            "isEnd": true,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "script_handler",
+              "InputPayload": {
+                "VpcId": "{{ RemediationLoop.CurrentIteratorValue }}",
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}"
+              },
+              "Script": "import boto3\nimport os\nimport time\nimport json\n\n\nVPCE_TAG = {'Key': 'SystemsManager::FindingNetworkingVPCEndpoints::VPCE', 'Value': 'VPCEndpoint'}\nVPCE_SG_TAG = {'Key': 'SystemsManager::FindingNetworkingSecurityGroups::VPCE::SG', 'Value': 'VPCEndpointSecurityGroup'}\nSG_RULE_TAG = {'Key': 'SystemsManager::FindingNetworkingSecurityGroups::SG::Rule', 'Value': 'HTTPSAccess'}\n\ns3_client = boto3.client('s3')\nec2 = boto3.resource('ec2')\nec2_client = boto3.client('ec2')\n\ndef get_inputs(events, context):\n    account_id = context.get('global:ACCOUNT_ID')\n    region = context.get('global:REGION')\n    expected_owner = events.get('BucketOwner')\n    execution_key = events.get('DiagnosisExecutionId')\n    finding_key = 'FindingNetworkingVPCEndpoints'\n    vpc_id = events.get('VpcId')\n\n    prefix = f'actions/diagnosis/{execution_key}/output/{account_id}/{region}/{finding_key}/{vpc_id}.json'\n    bucket_name = events.get('BucketName')\n    response = s3_client.get_object(Bucket=bucket_name, Key=prefix, ExpectedBucketOwner=expected_owner)\n    inputs_json = response['Body'].read().decode('utf-8')\n    return json.loads(inputs_json)\n\n\ndef script_handler(events, context):\n    vpc_id = events.get('VpcId')\n    inputs = get_inputs(events, context)\n    misconfigured_endpoints = inputs.get('MisconfiguredEndpoints', [])\n    account_id = context.get('global:ACCOUNT_ID')\n    if not misconfigured_endpoints:\n        return\n   \n    region = context.get('global:REGION')\n    required_vpc_endpoint_names = [\n        f'com.amazonaws.{region}.ssm', \n        f'com.amazonaws.{region}.ec2messages',\n        f'com.amazonaws.{region}.ssmmessages'\n    ]\n\n    security_group_id = None\n\n    for endpoint in misconfigured_endpoints: \n        service_name = endpoint.get('ServiceName')\n        subnet_ids = list(set(endpoint.get('SubnetIds', [])))\n        if service_name not in required_vpc_endpoint_names or not subnet_ids:\n            break\n\n        # Make sure the VPC DNS support is enabled.\n        enable_vpc_dns_support(vpc_id)\n\n        az_to_subnet_map = get_az_to_subnet_map(vpc_id, subnet_ids)       \n        endpoint_info = get_vpc_endpoint_info(vpc_id, service_name)\n        if endpoint_info is None:\n            if security_group_id is None:\n                security_group_id = find_or_create_security_group(vpc_id)\n            create_vpc_endpoint(account_id, service_name, vpc_id, az_to_subnet_map, security_group_id)\n    time.sleep(15)\n\n\ndef enable_vpc_dns_support(vpc_id):\n    enable_dns_support = ec2_client.describe_vpc_attribute(\n        VpcId=vpc_id, Attribute='enableDnsSupport')['EnableDnsSupport']['Value']\n    enable_dns_hostnames = ec2_client.describe_vpc_attribute(\n        VpcId=vpc_id, Attribute='enableDnsHostnames')['EnableDnsHostnames']['Value']\n\n    if not enable_dns_support:\n        ec2_client.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={'Value': True})\n    if not enable_dns_hostnames:\n        ec2_client.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={'Value': True})\n\n\ndef get_az_to_subnet_map(vpc_id, subnet_ids):\n    az_to_subnet_map = {}\n    batch_size = 20\n    subnets = []\n    for start in range(0, len(subnet_ids), batch_size):\n        end = start + batch_size\n        batch_subnet_ids = subnet_ids[start:end]\n        response = ec2_client.describe_subnets(SubnetIds=batch_subnet_ids)\n        subnets.extend(response['Subnets'])\n      \n    for subnet in subnets:\n        subnet_id = subnet['SubnetId']\n        az = subnet['AvailabilityZone']\n\n        if az in az_to_subnet_map:\n            az_to_subnet_map[az].append(subnet_id)\n        else:\n            az_to_subnet_map[az] = [subnet_id]\n    return  az_to_subnet_map\n\n\ndef get_vpc_endpoint_info(vpc_id, service_name):\n    response = ec2_client.describe_vpc_endpoints(\n        Filters = [{'Name': 'service-name', 'Values': [service_name]}, {'Name': 'vpc-id', 'Values': [vpc_id]}]\n    )\n\n    for vpc_endpoint in response['VpcEndpoints']:\n        if vpc_endpoint['PrivateDnsEnabled']:\n            return vpc_endpoint\n    return None\n\n\ndef create_vpc_endpoint(account_id, service_name, vpc_id, az_to_subnet_map, security_group_id):\n    subnet_ids = [value[0] for value in az_to_subnet_map.values()]\n\n    # Add a policy document to the endpoint that restricts actions to originating and acting on the same account as the VPC endpoint\n    policy_document = json.dumps({\n        \"Statement\": [\n            {\n                \"Effect\": \"Allow\",\n                \"Action\": \"*\",\n                \"Resource\": \"*\",\n                \"Principal\": \"*\",\n                \"Condition\": {\n                    \"StringEquals\": {\n                        \"aws:PrincipalAccount\": f\"{account_id}\"\n                    },\n                    \"StringEqualsIfExists\": {\n                        \"aws:ResourceAccount\": f\"{account_id}\"\n                    }\n                }\n            }\n        ]\n    })\n\n    # The VPC endpoints type for SSM Agents is 'Interface' \n    response = ec2_client.create_vpc_endpoint(\n        VpcId=vpc_id,\n        ServiceName=service_name,\n        VpcEndpointType='Interface',\n        SubnetIds=subnet_ids,\n        PrivateDnsEnabled=True,\n        TagSpecifications=[{'ResourceType': 'vpc-endpoint', 'Tags': [VPCE_TAG]}],\n        SecurityGroupIds=[security_group_id],\n        PolicyDocument=policy_document,\n    )\n\n\ndef find_or_create_security_group(vpc_id):\n    security_group = ec2_client.describe_security_groups(Filters=[\n        {'Name': 'vpc-id', 'Values': [vpc_id]},\n        {'Name': 'tag-key', 'Values': [VPCE_SG_TAG['Key']]},\n    ])\n    if security_group['SecurityGroups']:\n        return security_group['SecurityGroups'][0]['GroupId']\n\n    security_group = ec2_client.create_security_group(\n        VpcId=vpc_id,\n        GroupName='VPC Endpoint Allow HTTPS Traffic',\n        Description='Security group to allow inbound traffic on port 443',\n        TagSpecifications=[{\n            'ResourceType': 'security-group',\n            'Tags': [VPCE_SG_TAG],\n        }]\n    )\n    security_group_id = security_group['GroupId']\n\n    # Remove default egress rule\n    ec2_client.revoke_security_group_egress(\n        GroupId=security_group_id,\n        IpPermissions=[{'IpProtocol': '-1', 'IpRanges': [{'CidrIp': '0.0.0.0/0'}]}],\n    )\n\n    vpc = ec2.Vpc(vpc_id)\n    group_permission_parameters = {\n        'GroupId': security_group_id,\n        'IpPermissions': [\n            {'IpProtocol': 'tcp', 'FromPort': 443, 'ToPort': 443, 'IpRanges': [{'CidrIp': vpc.cidr_block}]},\n        ],\n        'TagSpecifications': [{'ResourceType': 'security-group-rule', 'Tags': [SG_RULE_TAG]}],\n    }\n    ec2_client.authorize_security_group_ingress(**group_permission_parameters)\n\n    return security_group_id\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BatchingLoop",
+      "description": "## BatchingLoop\nThis loops over the S3 bucket objects under relevant keys to start child execution remediation batches.\n### Inputs\n* ContinuationToken: The continuation token of S3 ListObjectV2 API used to find all keys.",
+      "action": "aws:loop",
+      "nextStep": "FailRunbookCondition",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Not": {
+            "Variable": "{{ variable:ContinuationToken }}",
+            "StringEquals": ""
+          }
+        },
+        "Steps": [
+          {
+            "name": "CreateBatch",
+            "description": "## CreateBatch\nCreates the batches of VPCs to remediate based on the data in the S3 bucket. Uses the continuation token\nfrom previous loop steps in order to paginate over all available keys in the ListObjectsV2 API.\n### Inputs\n* BucketName: The name of the S3 bucket that stores stores remediation input data.\n* BucketOwner: The expected owner of the S3 bucket.\n* DiagnosisExecutionId: The unique ID of the diagnosis execution that is being remediated.\n* NextToken: The continuation token used to continue finding more pages of S3 keys.\n### Outputs\n* NextToken: The next continuation token from the ListObjectsV2 API.\n* Batches: The list of JSON serialized batches to pass to child Worker executions.\n* ResultsExist: Boolean determining if there were any batches found.",
+            "action": "aws:executeScript",
+            "nextStep": "UpdateContinuationToken",
+            "isEnd": false,
+            "timeoutSeconds": 120,
+            "maxAttempts": 3,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "script_handler",
+              "InputPayload": {
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+                "NextToken": "{{ variable:ContinuationToken }}"
+              },
+              "Script": "import boto3\nimport json\nimport math\n\ns3_client = boto3.client('s3')\n\ndef vpc_id_from_s3_object(obj):\n    \"\"\"Takes just the VPC id from the S3 object key\"\"\"\n    return obj['Key'].split('/')[-1].split('.')[0]\n\ndef script_handler(events, context):\n    account_id = context.get('global:ACCOUNT_ID')\n    region = context.get('global:REGION')\n    bucket_name = events.get('BucketName')\n    expected_owner = events.get('BucketOwner')\n    execution_key = events.get('DiagnosisExecutionId')\n    next_token = events.get('NextToken')\n    finding_key = 'FindingNetworkingVPCEndpoints'\n\n    prefix = f'actions/diagnosis/{execution_key}/output/{account_id}/{region}/{finding_key}/'\n    kwargs = {\n        'Bucket': bucket_name,\n        'Prefix': prefix,\n        'Delimiter': '/',\n        'ExpectedBucketOwner': expected_owner,\n    }\n    if next_token:\n        kwargs['ContinuationToken'] = next_token\n\n    objects_result = s3_client.list_objects_v2(**kwargs)\n    keys = [vpc_id_from_s3_object(obj) for obj in objects_result.get('Contents', []) if obj['Key'].startswith(prefix + 'vpc-')]\n\n    # Find batch size if we split into 50 concurrent runs\n    sub_batch_size = max(math.ceil(len(keys) / 50), 1)\n    batches = [json.dumps(keys[i:i + sub_batch_size]) for i in range(0, len(keys), sub_batch_size)]\n\n    return {\n        'Batches': batches,\n        'NextToken': objects_result.get('NextContinuationToken', ''),\n        'ResultsExist': len(batches) > 0,\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "NextToken",
+                "Type": "String",
+                "Selector": "$.Payload.NextToken"
+              },
+              {
+                "Name": "Batches",
+                "Type": "StringList",
+                "Selector": "$.Payload.Batches"
+              },
+              {
+                "Name": "ResultsExist",
+                "Type": "Boolean",
+                "Selector": "$.Payload.ResultsExist"
+              }
+            ]
+          },
+          {
+            "name": "UpdateContinuationToken",
+            "description": "## UpdateContinuationToken\nUpdates the continuation token from the ListObjectsV2 API to allow pagination in further loops.",
+            "action": "aws:updateVariable",
+            "nextStep": "DidFindBatchItems",
+            "isEnd": false,
+            "timeoutSeconds": 60,
+            "inputs": {
+              "Name": "variable:ContinuationToken",
+              "Value": "{{ CreateBatch.NextToken }}"
+            }
+          },
+          {
+            "name": "DidFindBatchItems",
+            "description": "## DidFindBatchItems\nThis determines whether there are any VPCs to start child executions on.\n### Inputs\n* CreateBatch.ResultsExist: Whether any keys were found in this page of S3 keys.",
+            "action": "aws:branch",
+            "isEnd": true,
+            "inputs": {
+              "Choices": [
+                {
+                  "NextStep": "StartRateControlChildExecutions",
+                  "Variable": "{{ CreateBatch.ResultsExist }}",
+                  "BooleanEquals": true
+                }
+              ]
+            }
+          },
+          {
+            "name": "StartRateControlChildExecutions",
+            "description": "## StartRateControlChildExecutions\nStarts child executions in the Worker mode to remediate a batch of VPCs at a time.\n### Inputs\n* DocumentName: The name of the current runbook.\n* MaxConcurrency: The maximum number of child executions to run at once.\n* RuntimeParameters: The parameters to pass to the child Worker execution to run remediation with.",
+            "action": "aws:executeAutomation",
+            "nextStep": "RecordExecutions",
+            "timeoutSeconds": 86400,
+            "isEnd": false,
+            "onFailure": "step:RecordExecutions",
+            "isCritical": false,
+            "inputs": {
+              "DocumentName": "{{ GetDocumentName.DocumentName }}",
+              "DocumentVersion": "$DEFAULT",
+              "TargetParameterName": "TargetValue",
+              "Targets": [
+                {
+                  "Key": "ParameterValues",
+                  "Values": "{{ CreateBatch.Batches }}"
+                }
+              ],
+              "RuntimeParameters": {
+                "Mode": "Worker",
+                "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}"
+              },
+              "MaxConcurrency": "1"
+            }
+          },
+          {
+            "name": "RecordExecutions",
+            "description": "## RecordExecutions\nRecords and updates any errors that occur in child rate controlled executions.\n### Inputs\n* ExecutionId: The execution ID of the child executions.\n* CurrentAggregatedError: The previous aggregated error of child executions.\n* TotalExecutions: The total count of child executions.\n* FailedExecutions: The count of failed child executions.\n### Outputs\n* AggregatedError: An updated dictionary of failure messages from child executions.\n* FailedExecutions: The total number of failed child remediation steps.\n* TotalExecutions: The total number of child remediation steps.",
+            "action": "aws:executeScript",
+            "nextStep": "UpdateAggregatedError",
+            "isEnd": false,
+            "timeoutSeconds": 480,
+            "maxAttempts": 3,
+            "isCritical": false,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "script_handler",
+              "InputPayload": {
+                "ExecutionId": "{{ StartRateControlChildExecutions.ExecutionId }}",
+                "CurrentAggregatedError": "{{ variable:CurrentAggregatedError }}",
+                "TotalExecutions": "{{ variable:TotalExecutions }}",
+                "FailedExecutions": "{{ variable:FailedExecutions }}"
+              },
+              "Script": "import boto3\nimport json\n\nssm_client = boto3.client('ssm')\n\ndef merge_objects(curr, new):\n    if type(curr) != type(new):\n        raise ValueError('Cannot merge objects of two different types')\n\n    if isinstance(curr, dict) and isinstance(new, dict):\n        for key, new_val in new.items():\n            if key in curr:\n                curr_val = curr[key]\n                curr[key] = merge_objects(curr_val, new_val)\n            else:\n                curr[key] = new_val\n    elif isinstance(curr, list) and isinstance(new, list):\n        curr = list(set(curr + new))\n    elif isinstance(curr, int) and isinstance(new, int):\n        curr += new\n    else:\n        if curr is None:\n            curr = new\n        else:\n            raise ValueError(f'Unsupported type to merge: {type(curr)}')\n    return curr\n\ndef script_handler(events, context):\n    execution_id = events.get('ExecutionId')\n    curr_aggregation = events.get('CurrentAggregatedError', {})\n    total_executions = events.get('TotalExecutions', 0)\n    failed_executions = events.get('FailedExecutions', 0)\n\n    executions = ssm_client.describe_automation_step_executions(\n        AutomationExecutionId=execution_id\n    )\n    for execution in executions['StepExecutions']:\n        child_execution = ssm_client.describe_automation_step_executions(\n            AutomationExecutionId=execution['StepExecutionId']\n        )\n        for step in child_execution['StepExecutions']:\n            if step.get('StepName') != 'RemediateSSMAgentVPCEndpoints':\n                continue\n            total_executions += 1\n            if step.get('StepStatus') != 'Success':\n                failed_executions += 1\n                vpc_id = json.loads(step['Inputs']['InputPayload']).get('VpcId')\n                output = {'Failures': {vpc_id: step.get('FailureDetails', {})}}\n                curr_aggregation = merge_objects(curr_aggregation, output)\n    return {\n        'AggregatedError': curr_aggregation,\n        'FailedExecutions': failed_executions,\n        'TotalExecutions':  total_executions\n    }"
+            },
+            "outputs": [
+              {
+                "Name": "AggregatedError",
+                "Type": "StringMap",
+                "Selector": "$.Payload.AggregatedError"
+              },
+              {
+                "Name": "FailedExecutions",
+                "Type": "Integer",
+                "Selector": "$.Payload.FailedExecutions"
+              },
+              {
+                "Name": "TotalExecutions",
+                "Type": "Integer",
+                "Selector": "$.Payload.TotalExecutions"
+              }
+            ]
+          },
+          {
+            "name": "UpdateAggregatedError",
+            "description": "## UpdateAggregatedError\nUpdates the CurrentAggregatedError variable.",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateFailedExecutions",
+            "isEnd": false,
+            "maxAttempts": 3,
+            "inputs": {
+              "Name": "variable:CurrentAggregatedError",
+              "Value": "{{ RecordExecutions.AggregatedError }}"
+            }
+          },
+          {
+            "name": "UpdateFailedExecutions",
+            "description": "## UpdateFailedExecutions\nUpdates the FailedExecutions variable.",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateTotalExecutions",
+            "isEnd": false,
+            "maxAttempts": 3,
+            "inputs": {
+              "Name": "variable:FailedExecutions",
+              "Value": "{{ RecordExecutions.FailedExecutions }}"
+            }
+          },
+          {
+            "name": "UpdateTotalExecutions",
+            "description": "## UpdateTotalExecutions\nUpdates the TotalExecutions variable.",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "maxAttempts": 3,
+            "inputs": {
+              "Name": "variable:TotalExecutions",
+              "Value": "{{ RecordExecutions.TotalExecutions }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FailRunbookCondition",
+      "description": "## FailRunbookCondition\nFails the current execution in Orchestrator mode if the failed executions percentage is above the failure\nthreshold. Fails the current execution in Worker mode if no remediation step succeeded.\n### Inputs\n* Mode: The mode in which the runbook ran.\n* TotalExecutions: The total count of child executions.\n* FailedExecutions: The count of failed child executions.\n* FailurePercentageThreshold: The threshold at which the orchestrator runbook will fail if the specified\n  percentage of child steps fails.",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "Mode": "{{ Mode }}",
+          "TotalExecutions": "{{ variable:TotalExecutions }}",
+          "FailedExecutions": "{{ variable:FailedExecutions }}",
+          "FailurePercentageThreshold": "{{ ExecutionFailurePercentageThreshold }}"
+        },
+        "Script": "import boto3\n\nssm_client = boto3.client('ssm')\n\ndef script_handler(events, context):\n    mode = events.get('Mode')\n\n    if mode == 'Orchestrator':\n        failure_threshold = events.get('FailurePercentageThreshold', 100)\n        total_executions = events.get('TotalExecutions', 0)\n        failed_executions = events.get('FailedExecutions', 0)\n\n        if total_executions and ((failed_executions / total_executions) * 100 >= failure_threshold):\n            raise Exception('Failed amount of child executions exceeds threshold.')\n    else:\n        execution_id = context.get('automation:EXECUTION_ID')\n        execution = ssm_client.describe_automation_step_executions(AutomationExecutionId=execution_id)\n        for step in execution['StepExecutions']:\n            step_name = step.get('StepName')\n            status = step.get('StepStatus')\n            if step_name == 'RemediateSSMAgentVPCEndpoints' and status == 'Success':\n                return\n        raise Exception('All attempted VPC remediation steps in this batch have failed.')\n"
+      }
+    }
+  ]
+}

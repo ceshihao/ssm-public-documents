@@ -1,0 +1,283 @@
+{
+  "description": "### Document name - AWSQuickSetupType-ManageInstanceProfile\n\n## What does this document do?\nThis document ensures the targeted EC2 instance has an instance profile and related IAM role with a user-specified set of AWS Managed policies attached\n\n## Who should use this document?\nThis document is intended for use only by AWS Services and features, such as AWS Systems Manager. Customers should not execute or orchestrate the execution of this document on their own, as that is not supported by AWS.\n\n## Supported Versions\nThe $LATEST or $DEFAULT document version must be provided when executing this document. Using specific version numbers is not supported as this document does not retain historical versions.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the IAM role that allows Automation to perform actions on your behalf."
+    },
+    "InstanceId": {
+      "type": "String",
+      "allowedPattern": "^i-[a-z0-9]{8,17}$",
+      "description": "(Required) Id of the EC2 instance to target."
+    },
+    "UpdateExistingProfiles": {
+      "type": "String",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "default": "true",
+      "description": "(Optional) When True, will attach the provided set of AWS managed policies to any IAM roles & instance profiles already associated to the provided EC2 instance."
+    },
+    "ApplyRoleTags": {
+      "type": "String",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "default": "false",
+      "description": "(Optional) When True, Tags the IAM role associated to the instance."
+    },
+    "RoleTags": {
+      "type": "MapList",
+      "allowedPattern": "\\{([a-zA-Z0-9\" ]{1,255}:[a-zA-Z0-9\", ]{1,255})+\\}",
+      "description": "(Optional) List of key/value pair tags to apply to the IAM role associated to the provided EC2 instance. By Default the document will add a tag key \"CreatedBy\" and tag value \"QuickSetup\".",
+      "default": [
+        {
+          "Key": "CreatedBy",
+          "Value": "QuickSetup"
+        }
+      ]
+    },
+    "ManagedPoliciesToAttach": {
+      "type": "StringList",
+      "allowedPattern": "^arn:aws:iam::aws:policy/(([a-zA-Z0-9_]+)(,arn:aws:iam::aws:policy/[a-zA-Z0-9_]+)*)?$",
+      "description": "(Required) The list of AWS managed policy ARNs to attach to the IAM role associated to the provided EC2 instance."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getExistingRoleName",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "nextStep": "branchIfProfileExists",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "getInstanceProfileName",
+        "InputPayload": {
+          "InstanceId": "{{InstanceId}}"
+        },
+        "Script": "import boto3\n\ndef getInstanceProfileName(events, context):\n    ec2_client = boto3.client(\"ec2\")\n    response = ec2_client.describe_instances(InstanceIds=[events[\"InstanceId\"]])\n    if 'IamInstanceProfile' in response['Reservations'][0]['Instances'][0]:\n        return {'RoleName': response['Reservations'][0]['Instances'][0]['IamInstanceProfile']['Arn'].split('/').pop()}\n    return {'RoleName': 'NoRoleFound'}"
+      },
+      "outputs": [
+        {
+          "Name": "existingInstanceProfileRoleName",
+          "Selector": "$.Payload.RoleName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "branchIfProfileExists",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "createRoleIfNotExists",
+            "Variable": "{{getExistingRoleName.existingInstanceProfileRoleName}}",
+            "StringEquals": "NoRoleFound"
+          }
+        ],
+        "Default": "checkIfPolicyAttachAllowed"
+      }
+    },
+    {
+      "name": "checkIfPolicyAttachAllowed",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "getRoleFromInstanceProfile",
+            "Variable": "{{UpdateExistingProfiles}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "createRoleIfNotExists"
+      }
+    },
+    {
+      "name": "getRoleFromInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "nextStep": "ApplyIAMPoliciesToExistingRole",
+      "isEnd": false,
+      "inputs": {
+        "Service": "iam",
+        "Api": "GetInstanceProfile",
+        "InstanceProfileName": "{{getExistingRoleName.existingInstanceProfileRoleName}}"
+      },
+      "outputs": [
+        {
+          "Name": "existingRoleName",
+          "Selector": "$.InstanceProfile.Roles[0].RoleName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ApplyIAMPoliciesToExistingRole",
+      "description": "Apply IAM policies to Instance Profile Role",
+      "action": "aws:executeScript",
+      "nextStep": "checkIfTagsShouldBeAttachedToExistingRole",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "AWS_REGION": "{{ global:REGION }}",
+          "roleName": "{{getRoleFromInstanceProfile.existingRoleName}}",
+          "PolicyARNs": "{{ ManagedPoliciesToAttach }}"
+        },
+        "Script": "import boto3\nimport re\n\ndef script_handler(events, context):\n  region = events['AWS_REGION']\n  role_name = events['roleName']\n  policy_arns = events['PolicyARNs']\n\n  # Create an IAM client for the specified region\n  iam = boto3.client('iam', region_name=region)\n\n  # Attach policies to the role\n  for policy_arn in policy_arns:\n    try:\n      iam.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)\n      print(f\"Attached policy {policy_arn} to role {role_name}\")\n    except iam.exceptions.NoSuchEntityException as e:\n      print(f\"Policy {policy_arn} does not exist. Skipping...\")\n      raise e\n    except iam.exceptions.ClientError as e:\n      print(f\"Error attaching policy {policy_arn} to role {role_name}: {e}\")\n      raise e\n"
+      }
+    },
+    {
+      "name": "checkIfTagsShouldBeAttachedToExistingRole",
+      "action": "aws:branch",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "attachTagToExistingRole",
+            "Variable": "{{ApplyRoleTags}}",
+            "StringEquals": "true"
+          }
+        ]
+      }
+    },
+    {
+      "name": "attachTagToExistingRole",
+      "action": "aws:executeAwsApi",
+      "isEnd": true,
+      "inputs": {
+        "Service": "iam",
+        "Api": "TagRole",
+        "RoleName": "{{getRoleFromInstanceProfile.existingRoleName}}",
+        "Tags": "{{ RoleTags }}"
+      }
+    },
+    {
+      "description": "Create AmazonSSMRoleForInstancesQuickSetup Role For SSM Quick Setup",
+      "name": "createRoleIfNotExists",
+      "action": "aws:executeAwsApi",
+      "nextStep": "assertRoleForInstanceProfileExists",
+      "isEnd": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "Service": "iam",
+        "Api": "CreateRole",
+        "Path": "/",
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+        "AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}",
+        "Description": "EC2 role for SSM for Quick-Setup"
+      }
+    },
+    {
+      "name": "assertRoleForInstanceProfileExists",
+      "action": "aws:assertAwsResourceProperty",
+      "nextStep": "ApplyIAMPoliciesToRole",
+      "isEnd": false,
+      "inputs": {
+        "Service": "iam",
+        "Api": "GetRole",
+        "PropertySelector": "$.Role.RoleName",
+        "DesiredValues": [
+          "AmazonSSMRoleForInstancesQuickSetup"
+        ],
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup"
+      }
+    },
+    {
+      "name": "ApplyIAMPoliciesToRole",
+      "description": "Apply IAM policies to Instance Profile Role",
+      "action": "aws:executeScript",
+      "nextStep": "checkIfTagsShouldBeAttachedToRole",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "AWS_REGION": "{{ global:REGION }}",
+          "roleName": "AmazonSSMRoleForInstancesQuickSetup",
+          "PolicyARNs": "{{ ManagedPoliciesToAttach }}"
+        },
+        "Script": "import boto3\nimport re\n\ndef script_handler(events, context):\n  region = events['AWS_REGION']\n  role_name = events['roleName']\n  policy_arns = events['PolicyARNs']\n\n  # Create an IAM client for the specified region\n  iam = boto3.client('iam', region_name=region)\n\n  # Attach policies to the role\n  for policy_arn in policy_arns:\n    try:\n      iam.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)\n      print(f\"Attached policy {policy_arn} to role {role_name}\")\n    except iam.exceptions.NoSuchEntityException as e:\n      print(f\"Policy {policy_arn} does not exist. Skipping...\")\n      raise e\n    except iam.exceptions.ClientError as e:\n      print(f\"Error attaching policy {policy_arn} to role {role_name}: {e}\")\n      raise e\n"
+      }
+    },
+    {
+      "name": "checkIfTagsShouldBeAttachedToRole",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "attachTagToRole",
+            "Variable": "{{ApplyRoleTags}}",
+            "StringEquals": "true"
+          }
+        ],
+        "Default": "createInstanceProfileIfNotExists"
+      }
+    },
+    {
+      "name": "attachTagToRole",
+      "action": "aws:executeAwsApi",
+      "nextStep": "createInstanceProfileIfNotExists",
+      "isEnd": false,
+      "inputs": {
+        "Service": "iam",
+        "Api": "TagRole",
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+        "Tags": "{{ RoleTags }}"
+      }
+    },
+    {
+      "name": "createInstanceProfileIfNotExists",
+      "action": "aws:executeAwsApi",
+      "nextStep": "addRoleToInstanceProfile",
+      "isEnd": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceProfileName": "AmazonSSMRoleForInstancesQuickSetup",
+        "Service": "iam",
+        "Api": "CreateInstanceProfile"
+      }
+    },
+    {
+      "name": "addRoleToInstanceProfile",
+      "action": "aws:executeAwsApi",
+      "nextStep": "executeAttachIAMToInstance",
+      "isEnd": false,
+      "onFailure": "Continue",
+      "inputs": {
+        "InstanceProfileName": "AmazonSSMRoleForInstancesQuickSetup",
+        "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+        "Service": "iam",
+        "Api": "AddRoleToInstanceProfile"
+      }
+    },
+    {
+      "name": "executeAttachIAMToInstance",
+      "action": "aws:executeAutomation",
+      "maxAttempts": 10,
+      "timeoutSeconds": 60,
+      "isEnd": true,
+      "inputs": {
+        "DocumentName": "AWS-AttachIAMToInstance",
+        "RuntimeParameters": {
+          "RoleName": "AmazonSSMRoleForInstancesQuickSetup",
+          "ForceReplace": false,
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "InstanceId": "{{ InstanceId }}"
+        },
+        "Tags": [
+          {
+            "Key": "InvokedBy",
+            "Value": "AWSQuickSetupType-ManageInstanceProfile"
+          }
+        ]
+      }
+    }
+  ]
+}

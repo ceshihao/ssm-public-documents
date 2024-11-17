@@ -1,0 +1,486 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-OrchestrateUnmanagedEC2Actions\n\n## What does this document do?\nThis runbook provides a simple method of running diagnosis and remediation Automation runbooks for Systems\nManager actions in cross-account and cross-Region scenarios. It does this through the following features:\n\n* Idempotency: The runbook ensures that no other executions of this orchestration runbook are running\n  at the same time using the same secondary runbook.\n* Execution history: The runbook provides the execution history of diagnosis and remediation actions.\n* Child document execution: The runbook orchestrates the execution of the accompanying child document, \n  providing it with the needed parameters and managing the cross-account, cross-Region execution of the runbook.\n* Aggregation: When running a diagnosis, the runbook performs several aggregations:\n  * Issue/finding count aggregation from all targets;\n  * CSV output aggregation;\n  * and the generation of TargetLocation JSON files based on the Regions and accounts identified by the diagnosis.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The IAM role ARN to execute the runbook with. Required because the runbook\n  performs cross-account, cross-Region secondary executions.\n* AccountRegionMap: (Optional) A list of maps of accounts to Regions to run the secondary runbook in.\n* ExcludeAccounts: (Optional) Accounts to exclude when running the secondary runbook.\n* ActionType: (Required) The type of action the child document is taking. Valid values are 'Diagnosis' and 'Remediation'.\n* DocumentName: (Required) The name of the secondary runbook to run.\n* DocumentParameters: (Optional) The parameters to pass as input to the secondary runbook.\n* SecondaryAutomationAssumeRoleName: (Optional) The name of the IAM role to use to execute cross-account, cross-Region\n  runbooks.\n* RemediationAutomationAssumeRoleName: (Optional) The name of the IAM role to populate the target location execution\n  role. Required with the action type 'Diagnosis'.\n* OutputBucketName: (Required) The name of the S3 bucket to store the aggregated results in.\n* OutputBucketOwner: (Required) ID of the account that owns the output S3 bucket.\n* TargetLocationsUrls: (Optional) A list of JSON files in S3 to use as target locations for the secondary runbook.\n* ExportObjectName: (Optional) Defines the file name for the exported CSV file.\n* DiagnosisExecutionId: (Optional) The execution ID of the diagnostic automation execution used to identify issues to\n  be remediated. Required if ActionType is set to 'Remediation'.\n* MaxConcurrency: (Optional) The maximum number of concurrent secondary runbook executions to run at the same time.\n* MaxErrors: (Optional) The maximum number of errors to allow when executing the secondary runbook across target\n  locations. Once this is met, further targets are not started.\n* TimeoutSeconds: (Optional) The number of seconds after which long-running script executions time out.\n\n## Output Parameters\n* AggregateOutput.ExportObjectUri: The S3 URI of the exported CSV output.\n* AggregateOutput.AggregatedCount: The aggregated output of diagnostic actions.\n* AggregateOutput.TargetLocations: The aggregated target location keys that the diagnosis found issues with.\n* ExecuteChildDocument.ChildDocumentExecutionIds: The execution IDs of child automations.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The IAM role ARN to execute the document with. Required because the runbook performs cross-account,\ncross-Region secondary executions."
+    },
+    "AccountRegionMap": {
+      "type": "MapList",
+      "description": "(Optional) A list of maps of accounts to Regions in which to run the secondary runbook.",
+      "allowedPattern": "(\\{\\\"accounts\\\":\\s?\\[[a-zA-Z0-9\\-\\\", ]{1,255}\\],\\s?\\\"regions\\\":\\s?\\[[a-zA-Z0-9\\-\\\", ]{1,255}\\]\\}(,\\s?)?)+|\\[\\]",
+      "default": []
+    },
+    "ExcludeAccounts": {
+      "type": "StringList",
+      "description": "(Optional) Accounts to exclude when running the secondary runbook.",
+      "allowedPattern": "^\\[\\]$|(ou-[a-z0-9]{4,32}-[a-z0-9]{8,32})|(\\d{12})",
+      "default": []
+    },
+    "ActionType": {
+      "type": "String",
+      "description": "(Required) The type of action the child runbook is taking. Valid values are 'Diagnosis' and 'Remediation'.",
+      "allowedValues": [
+        "Diagnosis",
+        "Remediation"
+      ]
+    },
+    "DocumentName": {
+      "type": "String",
+      "description": "(Required) The name of the secondary runbook to run.",
+      "allowedPattern": "^[a-zA-Z0-9_\\-.]{3,128}$"
+    },
+    "DocumentParameters": {
+      "type": "StringMap",
+      "description": "(Optional) The parameters to pass as input to the secondary runbook.",
+      "allowedPattern": "^\\{[a-zA-Z0-9{}\\\",:_\\-\\[\\]\\/\\.#\\s]*\\}$",
+      "default": {}
+    },
+    "SecondaryAutomationAssumeRoleName": {
+      "type": "String",
+      "description": "(Optional) The name of the IAM role to use to execute cross-account, cross-Region automation runbooks.",
+      "allowedPattern": "^[\\w+=,.@-]{1,64}$",
+      "default": "AWS-SystemsManager-AutomationExecutionRole"
+    },
+    "RemediationAutomationAssumeRoleName": {
+      "type": "String",
+      "description": "(Optional) The name of the IAM role to populate the target location execution role.\nRequired with action type 'Diagnosis'",
+      "allowedPattern": "^$|^[\\w+=,.@-]{1,64}$",
+      "default": ""
+    },
+    "OutputBucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the S3 bucket to store aggregated results in."
+    },
+    "OutputBucketOwner": {
+      "type": "String",
+      "description": "(Required) ID of the account that owns the output S3 bucket.",
+      "allowedPattern": "^[0-9]{12}$"
+    },
+    "TargetLocationsUrls": {
+      "type": "StringList",
+      "description": "(Optional) A list of JSON files in S3 to use as target locations for the secondary runbook.",
+      "allowedPattern": "^\\[\\]$|^https:\\/\\/[-a-zA-Z0-9@:%._\\+~#=]{1,253}\\.s3(\\.[a-z\\d-]{9,16})?\\.amazonaws\\.com\\/[\\w\\/\\-\\.?=&%]{0,2000}$",
+      "default": []
+    },
+    "ExportObjectName": {
+      "type": "String",
+      "description": "(Optional) Defines the file name for the exported CSV file.",
+      "allowedPattern": "^[a-zA-Z0-9._:-]+\\.csv$",
+      "default": "unmanaged-ec2-diagnosis.csv"
+    },
+    "DiagnosisExecutionId": {
+      "type": "String",
+      "description": "(Optional) The execution ID of the diagnostic automation execution used to identify issues to be remediated.\nRequired if ActionType is set to 'Remediation'.",
+      "allowedPattern": "^[\\da-fA-F]{8}\\b-[\\da-fA-F]{4}\\b-[\\da-fA-F]{4}\\b-[\\da-fA-F]{4}\\b-[\\da-fA-F]{12}$|^$",
+      "default": ""
+    },
+    "MaxConcurrency": {
+      "type": "Integer",
+      "description": "(Optional) The maximum number of concurrent secondary runbook executions to run at the same time.",
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "default": 7
+    },
+    "MaxErrors": {
+      "type": "String",
+      "description": "(Optional) The maximum number of errors to allow when executing the secondary runbook across target\nlocations. Once this is met, further targets are not started.",
+      "allowedPattern": "^([1-9][0-9]*|[0]|[1-9][0-9]%|[0-9]%|100%)$",
+      "default": "99%"
+    },
+    "TimeoutSeconds": {
+      "type": "Integer",
+      "description": "(Optional) Defines the timeout for long-running script executions.",
+      "allowedPattern": "^([1-5]?\\d{1,2}|600)$",
+      "default": 540
+    }
+  },
+  "variables": {
+    "ExportAggregatorLoopState": {
+      "type": "StringMap",
+      "description": "Used during the CSV export loop to handle pagination of CSV files.",
+      "default": {}
+    },
+    "S3EncryptionType": {
+      "type": "String",
+      "description": "S3 Server-side encryption type",
+      "default": "AES256"
+    },
+    "S3EncryptionKey": {
+      "type": "String",
+      "description": "S3 Server-side encryption Key ARN",
+      "default": ""
+    }
+  },
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "2e03388f84a0a9c911f19b6117a87eccf281f9f82c4c10c02bbdd95599704462"
+      },
+      "size": 129776
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "SetupAndLogExecution",
+      "description": "## SetupAndLogExecution\nPerforms the setup of this runbook by performing an idempotency check and logging the execution.\n### Inputs\n* BucketName: The name of the S3 bucket to be used by child runbook.\n* BucketOwner: The expected owner of the S3 bucket.\n* ActionType: The action type of the child runbook.\n* DocumentName: The name of the secondary runbook to run.",
+      "action": "aws:executeScript",
+      "nextStep": "UpdateS3EncryptionType",
+      "isEnd": false,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "BucketName": "{{ OutputBucketName }}",
+          "BucketOwner": "{{ OutputBucketOwner }}",
+          "ActionType": "{{ ActionType }}",
+          "DocumentName": "{{ DocumentName }}"
+        },
+        "Script": "import sys\nfrom datetime import datetime, timezone\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom attachments.commons import S3WrapperClient\n\n\n# Execution history should be stored in reverse lexicographic order based on time of execution with version prefix to support future updates\ndef log_execution_history(s3_client, events, context):\n    automation_start_time = datetime.now()\n\n    prefix_version = 0\n    prefix_version_id = f\"{prefix_version:x}\".zfill(2)\n\n    max_time_millis = pow(2, 63) - 1\n    sort_key = f\"{max_time_millis - int(automation_start_time.timestamp() * 1000):x}\".zfill(16)\n\n    account_id = context[\"global:ACCOUNT_ID\"]\n    action_type = events[\"ActionType\"].lower()\n    region = context[\"global:REGION\"]\n    automation_id = context[\"automation:EXECUTION_ID\"]\n    executing_document = events[\"DocumentName\"]\n\n    execution_history_prefix = f\"actions/execution/{account_id}/{region}/{prefix_version_id}_{sort_key}_{automation_start_time.isoformat()}_{action_type}_{automation_id}_{executing_document}\"\n\n    s3_client.put_object(Bucket=events[\"BucketName\"], Key=f\"{execution_history_prefix}/\", Body=b\"\")\n\n\ndef check_idempotency(events, context):\n    config = Config(retries={\"max_attempts\": 10, \"mode\": \"standard\"})\n\n    sys.tracebacklimit = 0\n    ssm = boto3.client(\"ssm\", config=config)\n\n    try:\n        # Get the current execution details\n        current_execution_id = context[\"automation:EXECUTION_ID\"]\n\n        current_execution = ssm.get_automation_execution(AutomationExecutionId=current_execution_id)[\n            \"AutomationExecution\"\n        ]\n        executing_document = next(\n            iter(current_execution.get(\"Parameters\", []).get(\"DocumentName\", [])),\n            \"\",\n        )\n\n        # Parent automations do not have a Target or instance parameter set. We just return.\n        if not executing_document:\n            return\n\n        # Check for other previous/older running automations for the same current document that are in progress\n        current_execution_start_time = datetime.fromtimestamp(\n            current_execution[\"ExecutionStartTime\"].timestamp(), timezone.utc\n        )\n        document_executions = ssm.describe_automation_executions(\n            Filters=[\n                {\n                    \"Key\": \"DocumentNamePrefix\",\n                    \"Values\": [current_execution[\"DocumentName\"]],\n                },\n                {\"Key\": \"ExecutionStatus\", \"Values\": [\"InProgress\"]},\n                {\n                    \"Key\": \"StartTimeBefore\",\n                    \"Values\": [current_execution_start_time.strftime(\"%Y-%m-%dT%H:%M:%SZ\")],\n                },\n            ]\n        )[\"AutomationExecutionMetadataList\"]\n\n        # Check for other previous executions targeting the same instance ID. If any, return an error\n        for execution in document_executions:\n            execution_id = execution[\"AutomationExecutionId\"]\n            if execution_id != current_execution_id:\n                execution_details = (\n                    ssm.get_automation_execution(AutomationExecutionId=execution_id)[\"AutomationExecution\"]\n                    .get(\"Parameters\", [])\n                    .get(\"DocumentName\", [])\n                )\n                execution_executing_document = next(iter(execution_details), \"\")\n                if execution_executing_document == executing_document:\n                    raise Exception(\n                        \"There is another execution of this document already in progress for {} with id {}\".format(\n                            executing_document, execution[\"AutomationExecutionId\"]\n                        )\n                    )\n\n    except ClientError as e:\n        c = e.response[\"Error\"][\"Code\"]\n        m = e.response[\"Error\"][\"Message\"]\n        raise Exception(f\"An error occurred when checking concurrent executions: {c}:{m}\")\n\n    return\n\n\ndef script_handler(events, context):\n    bucket_name = events[\"BucketName\"]\n    bucket_owner = events[\"BucketOwner\"]\n    s3_client = S3WrapperClient(bucket_owner)\n    encryption_type = \"AES256\"\n    encryption_key = \"N/A\"\n\n    response = s3_client.get_bucket_encryption(Bucket=bucket_name)\n    encryption_rules = response.get(\"ServerSideEncryptionConfiguration\", {}).get(\"Rules\", [])\n    if encryption_rules:\n        default_encryption = encryption_rules[0].get(\"ApplyServerSideEncryptionByDefault\", {})\n        encryption_type = default_encryption.get(\"SSEAlgorithm\", \"AES256\")\n        encryption_key = default_encryption.get(\"KMSMasterKeyID\", \"N/A\")\n\n    encrypted_s3_client = S3WrapperClient(\n        bucket_owner,\n        encryption_type,\n        encryption_key,\n        context[\"automation:EXECUTION_ID\"],\n    )\n\n    log_execution_history(encrypted_s3_client, events, context)\n\n    check_idempotency(events, context)\n\n    return {\"S3EncryptionType\": encryption_type, \"S3EncryptionKey\": encryption_key}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "S3EncryptionType",
+          "Selector": "$.Payload.S3EncryptionType"
+        },
+        {
+          "Type": "String",
+          "Name": "S3EncryptionKey",
+          "Selector": "$.Payload.S3EncryptionKey"
+        }
+      ]
+    },
+    {
+      "name": "UpdateS3EncryptionType",
+      "description": "## UpdateS3EncryptionType\nUpdates the S3 Bucket encryption type.",
+      "action": "aws:updateVariable",
+      "nextStep": "UpdateS3EncryptionKey",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:S3EncryptionType",
+        "Value": "{{ SetupAndLogExecution.S3EncryptionType }}"
+      }
+    },
+    {
+      "name": "UpdateS3EncryptionKey",
+      "description": "## UpdateS3EncryptionKey\nUpdates the S3 Bucket encryption key.",
+      "action": "aws:updateVariable",
+      "nextStep": "ExecuteChildDocument",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:S3EncryptionKey",
+        "Value": "{{ SetupAndLogExecution.S3EncryptionKey }}"
+      }
+    },
+    {
+      "name": "ExecuteChildDocument",
+      "description": "## ExecuteChildDocument\nTransforms the document parameters into the shapes required by `aws:ExecuteAutomation`.\n### Inputs\n* PrimaryAutomationRole: The primary runbook automation assume role. \n* AccountToRegionMap: The list of account and Region mappings to run secondary runbook on.\n* ActionType: Indicates whether the runbook to run is for Diagnosis or Remediation.\n* DocumentName: The name of the runbook to start a child execution with.\n* DocumentParameters: Any additional document parameters to pass to secondary runbook.\n* SecondaryAutomationAssumeRole: The secondary runbook automation assume role.\n* OutputBucketName: The name of the S3 bucket to be used by a child runbook.\n* OutputBucketOwner: The expected owner of the S3 bucket.\n* TargetLocationsUrls: The S3 target location URLS to provide secondary runbook access to a S3 bucket.\n* DiagnosisExecutionId: The unique identifier needed for Remediation to find diagnosis output data.\n* MaxConcurrency: The maximum number of concurrent secondary runbook executions to run at the same time.\n* MaxErrors: The maximum number of errors to allow when executing the secondary runbook across target locations.\n* ExcludeAccounts: Accounts to exclude when running the secondary runbook\n### Outputs\n* InitialBucketPrefix: The initial part of the S3 bucket prefix.\n* ChildDocumentExecutionIds: The execution IDs of all child runbook executions.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "nextStep": "Loop",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "PrimaryAutomationRole": "{{ AutomationAssumeRole }}",
+          "AccountToRegionMap": "{{ AccountRegionMap }}",
+          "ActionType": "{{ ActionType }}",
+          "DocumentName": "{{ DocumentName }}",
+          "DocumentParameters": "{{ DocumentParameters }}",
+          "SecondaryAutomationAssumeRole": "{{ SecondaryAutomationAssumeRoleName }}",
+          "OutputBucketName": "{{ OutputBucketName }}",
+          "OutputBucketOwner": "{{ OutputBucketOwner }}",
+          "TargetLocationsUrls": "{{ TargetLocationsUrls }}",
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+          "MaxConcurrency": "{{ MaxConcurrency }}",
+          "MaxErrors": "{{ MaxErrors }}",
+          "ExcludeAccounts": "{{ ExcludeAccounts }}"
+        },
+        "Attachment": "attachments.zip",
+        "Script": "from enum import Enum\nfrom urllib.parse import urlparse\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\n\nclass TargetLocationType(Enum):\n    OBJECT = 1\n    URL = 2\n\n\ndef is_uri(uri):\n    try:\n        result = urlparse(uri)\n        return all([result.scheme, result.netloc])\n    except AttributeError:\n        return False\n\n\ndef generate_target_locations(events, context):\n    account_region_map = events.get(\"AccountToRegionMap\", [])\n    target_locations_urls = events.get(\"TargetLocationsUrls\", [])\n\n    if account_region_map:\n        target_locations = []\n\n        for entry in account_region_map:\n            if \"accounts\" not in entry or \"regions\" not in entry:\n                raise Exception(\n                    \"Invalid object in AccountToRegionMap; expected entry to include string list 'accounts' and 'regions'\"\n                )\n\n            target_location = {\n                \"Accounts\": entry[\"accounts\"],\n                \"Regions\": entry[\"regions\"],\n                \"ExecutionRoleName\": events[\"SecondaryAutomationAssumeRole\"],\n                \"TargetLocationMaxConcurrency\": str(events[\"MaxConcurrency\"]),\n                \"TargetLocationMaxErrors\": events[\"MaxErrors\"],\n                \"IncludeChildOrganizationUnits\": True,\n            }\n\n            exclude_accounts = events[\"ExcludeAccounts\"]\n            if exclude_accounts:\n                target_location[\"ExcludeAccounts\"] = exclude_accounts\n\n            target_locations.append(target_location)\n\n        return {\"type\": TargetLocationType.OBJECT, \"locations\": target_locations}\n    elif target_locations_urls:\n        if not all(is_uri(url) for url in target_locations_urls):\n            raise Exception(\"TargetLocationUrls must all be URLs\")\n\n        return {\"type\": TargetLocationType.URL, \"locations\": target_locations_urls}\n    else:\n        raise Exception(\"Either AccountRegionMap or TargetLocationUrls must be defined\")\n\n\ndef start_child_execution(ssm_client, child_parameters, events, context):\n    target_locations = generate_target_locations(events, context)\n\n    child_execution_ids = []\n\n    match target_locations[\"type\"]:\n        case TargetLocationType.OBJECT:\n            start_response = ssm_client.start_automation_execution(\n                DocumentName=events[\"DocumentName\"],\n                DocumentVersion=\"$DEFAULT\",\n                Parameters=child_parameters,\n                TargetLocations=target_locations[\"locations\"],\n            )\n            child_execution_ids.append(start_response[\"AutomationExecutionId\"])\n        case TargetLocationType.URL:\n            for target_location_url in target_locations[\"locations\"]:\n                start_response = ssm_client.start_automation_execution(\n                    DocumentName=events[\"DocumentName\"],\n                    DocumentVersion=\"$DEFAULT\",\n                    Parameters=child_parameters,\n                    TargetLocationsURL=target_location_url,\n                )\n                child_execution_ids.append(start_response[\"AutomationExecutionId\"])\n        case _:\n            raise Exception(f\"Invalid target location type found\")\n\n    return child_execution_ids\n\n\ndef execute_diagnosis(ssm_client, events, context):\n    action_type = events[\"ActionType\"].lower()\n    automation_id = context[\"automation:EXECUTION_ID\"]\n\n    root_prefix = f\"actions/{action_type}/{automation_id}\"\n\n    document_params = events[\"DocumentParameters\"]\n    document_params[\"AutomationAssumeRole\"] = [events[\"PrimaryAutomationRole\"]]\n    document_params[\"DiagnosisExecutionId\"] = [automation_id]\n    document_params[\"BucketName\"] = [events[\"OutputBucketName\"]]\n    document_params[\"BucketOwner\"] = [events[\"OutputBucketOwner\"]]\n\n    child_execution_ids = start_child_execution(\n        ssm_client, document_params, events, context\n    )\n\n    return {\n        \"InitialBucketPrefix\": root_prefix,\n        \"ChildDocumentExecutionIds\": child_execution_ids,\n    }\n\n\ndef execute_remediation(ssm_client, events, context):\n    if \"DiagnosisExecutionId\" not in events or not events[\"DiagnosisExecutionId\"]:\n        raise Exception(\n            \"DiagnosisExecutionId must be provided if ActionType is remediation\"\n        )\n\n    document_params = events[\"DocumentParameters\"]\n    document_params[\"AutomationAssumeRole\"] = [events[\"PrimaryAutomationRole\"]]\n    document_params[\"DiagnosisExecutionId\"] = [events[\"DiagnosisExecutionId\"]]\n    document_params[\"BucketName\"] = [events[\"OutputBucketName\"]]\n    document_params[\"BucketOwner\"] = [events[\"OutputBucketOwner\"]]\n\n    child_execution_ids = start_child_execution(\n        ssm_client, document_params, events, context\n    )\n\n    return {\n        \"InitialBucketPrefix\": \"\",\n        \"ChildDocumentExecutionIds\": child_execution_ids,\n    }\n\n\ndef script_handler(events, context):\n    try:\n        session = boto3.Session()\n        session._loader.search_paths.extend([\"./attachments\"])\n        config = Config(retries={\"max_attempts\": 10, \"mode\": \"standard\"})\n\n        ssm_next_client = session.client(\"ssm-next\", config=config)\n\n        match events[\"ActionType\"].lower():\n            case \"diagnosis\":\n                return execute_diagnosis(ssm_next_client, events, context)\n            case \"remediation\":\n                return execute_remediation(ssm_next_client, events, context)\n            case _:\n                raise Exception(f\"Unexpected ActionType: {events['ActionType']}\")\n    except ClientError as e:\n        c = e.response[\"Error\"][\"Code\"]\n        m = e.response[\"Error\"][\"Message\"]\n        raise Exception(\n            f\"An error occurred when when starting the secondary document: {c}:{m}\"\n        )"
+      },
+      "outputs": [
+        {
+          "Name": "InitialBucketPrefix",
+          "Type": "String",
+          "Selector": "$.Payload.InitialBucketPrefix"
+        },
+        {
+          "Name": "ChildDocumentExecutionIds",
+          "Type": "StringList",
+          "Selector": "$.Payload.ChildDocumentExecutionIds"
+        }
+      ]
+    },
+    {
+      "name": "Loop",
+      "description": "## Loop\nLoop to wait on child executions to finish.\n### Inputs\nIterators: The child document execution IDs to loop over.",
+      "action": "aws:loop",
+      "nextStep": "FailRunbookCondition",
+      "isEnd": false,
+      "inputs": {
+        "Iterators": "{{ ExecuteChildDocument.ChildDocumentExecutionIds }}",
+        "Steps": [
+          {
+            "name": "WaitOnAWSResourceProperty",
+            "description": "## WaitOnAWSResourceProperty\nWaits for the child automation to complete.\n### Inputs\n* Service: ssm\n* Api: GetAutomationExecution\n* DesiredValues: Success, TimedOut, Cancelled, Failed, CompletedWithSuccess, CompletedWithFailure, Exited\n* AutomationExecutionId: The execution ID of the child document.\n* PropertySelector: $.AutomationExecution.AutomationExecutionStatus",
+            "action": "aws:waitForAwsResourceProperty",
+            "timeoutSeconds": 86400,
+            "isEnd": true,
+            "inputs": {
+              "Service": "ssm",
+              "Api": "GetAutomationExecution",
+              "DesiredValues": [
+                "Success",
+                "TimedOut",
+                "Cancelled",
+                "Failed",
+                "CompletedWithSuccess",
+                "CompletedWithFailure",
+                "Exited"
+              ],
+              "AutomationExecutionId": "{{ Loop.CurrentIteratorValue }}",
+              "PropertySelector": "$.AutomationExecution.AutomationExecutionStatus"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FailRunbookCondition",
+      "description": "## FailRunbookCondition\nFails the current runbook execution if all child documents have failed.\n### Inputs\n* ExecutionIds: The child automation execution IDs.",
+      "action": "aws:executeScript",
+      "nextStep": "Branch",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "ExecutionIds": "{{ ExecuteChildDocument.ChildDocumentExecutionIds }}"
+        },
+        "Script": "import boto3\n\ndef script_handler(events, context):\n  ssm_client = boto3.client(\"ssm\")\n  \n  execution_ids = events.get(\"ExecutionIds\", [])\n  for id in execution_ids:\n    steps = ssm_client.get_paginator(\"describe_automation_step_executions\").paginate(\n        AutomationExecutionId=id\n    ).build_full_result().get(\"StepExecutions\", [])\n    for step in steps:\n      status = step.get(\"StepStatus\", \"\")\n      if status != 'Failed':\n        return\n  # All executions failed\n  raise Exception(\"All child documents reported failure\")"
+      }
+    },
+    {
+      "name": "Branch",
+      "description": "## Branch\nDetermines if the action type is Diagnosis in order to run additional steps.\n### Inputs\n* ActionType: The action type of the child document.",
+      "action": "aws:branch",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "StartExportUpload",
+            "Variable": "{{ ActionType }}",
+            "EqualsIgnoreCase": "diagnosis"
+          }
+        ]
+      }
+    },
+    {
+      "name": "StartExportUpload",
+      "description": "## StartExportUpload\nPrepare for uploading the aggregate CSV file.\n### Inputs\n* BucketName: The name of the S3 bucket to be used by child runbook.\n* BucketOwner: The expected owner of the S3 bucket.\n* ExportObjectName: The name of the csv export file.\n### Outputs\n* upload_id: The ID of the S3 multipart upload.\n* object_key: The export object key of S3 paths.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 45,
+      "nextStep": "ExportAggregatorLoop",
+      "isCritical": false,
+      "isEnd": false,
+      "onCancel": "step:AbortExportUpload",
+      "onFailure": "step:AbortExportUpload",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "BucketName": "{{ OutputBucketName }}",
+          "BucketOwner": "{{ OutputBucketOwner }}",
+          "ExportObjectName": "{{ ExportObjectName }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}"
+        },
+        "Script": "from attachments.commons import S3Paths, S3WrapperClient\n\n\ndef create_upload(s3_client, bucket_name, object_key):\n    response = s3_client.create_multipart_upload(\n        Bucket=bucket_name,\n        Key=object_key\n    )\n    return response[\"UploadId\"]\n\n\ndef handler(events, context):\n    bucket_name = events[\"BucketName\"]\n    bucket_owner = events[\"BucketOwner\"]\n    export_object_name = events[\"ExportObjectName\"]\n    \n    execution_id = context[\"automation:EXECUTION_ID\"]\n    \n    s3_client = S3WrapperClient(bucket_owner, events[\"S3EncryptionType\"], events[\"S3EncryptionKey\"], execution_id)\n    s3_paths = S3Paths(execution_id, context[\"global:ACCOUNT_ID\"], export_object_name)\n    \n    upload_id = create_upload(s3_client, bucket_name, s3_paths.export_key)\n    \n    return {\n        \"UploadId\": upload_id,\n        \"ExportObjectKey\": s3_paths.export_key\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "upload_id",
+          "Type": "String",
+          "Selector": "$.Payload.UploadId"
+        },
+        {
+          "Name": "object_key",
+          "Type": "String",
+          "Selector": "$.Payload.ExportObjectKey"
+        }
+      ]
+    },
+    {
+      "name": "ExportAggregatorLoop",
+      "description": "## ExportAggregatorLoop\n### Inputs\n* AggregateExportFile.continuation_token: The continuation token of",
+      "action": "aws:loop",
+      "nextStep": "CompleteExportUpload",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Not": {
+            "Variable": "{{ AggregateExportFile.continuation_token }}",
+            "StringEquals": ""
+          }
+        },
+        "Steps": [
+          {
+            "name": "AggregateExportFile",
+            "description": "## AggregateExportFile\n### Inputs\n* BucketName: The name of the S3 bucket to be used by a child runbook.\n* BucketOwner: The expected owner of the S3 bucket.\n* ExportLoopState: The continuation token of the export.\n* TimeoutSeconds: The script timeout to prevent long-running script steps.\n* UploadId: The upload ID from the StartExportUpload step.\n* ExportObjectKey: The export object key of S3 paths from the StartExportUpload step.\n### Outputs\n* continuation_object: An object containing continuation information for further steps.\n* continuation_token: The continuation key used to determine when all objects have been uploaded.",
+            "action": "aws:executeScript",
+            "nextStep": "UpdateExportAggregatorLoopState",
+            "isCritical": false,
+            "isEnd": false,
+            "onCancel": "step:CompleteExportUpload",
+            "onFailure": "step:CompleteExportUpload",
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "Attachment": "attachments.zip",
+              "InputPayload": {
+                "BucketName": "{{ OutputBucketName }}",
+                "BucketOwner": "{{ OutputBucketOwner }}",
+                "ExportLoopState": "{{ variable:ExportAggregatorLoopState }}",
+                "TimeoutSeconds": "{{ TimeoutSeconds }}",
+                "UploadId": "{{ StartExportUpload.upload_id }}",
+                "ExportObjectKey": "{{ StartExportUpload.object_key }}",
+                "AccountToRegionMap": "{{ AccountRegionMap }}",
+                "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+                "S3EncryptionKey": "{{ variable:S3EncryptionKey }}"
+              },
+              "Script": "import time\nimport json\nimport re\nfrom attachments.commons import S3Paths, S3WrapperClient, Bytes, get_is_local_execution\n\n\nclass StringListBuffer:\n    def __init__(\n        self,\n        flush_callback,\n        flush_threshold=Bytes.megabytes(50),\n        overflow_threshold=Bytes.megabytes(5)\n    ):\n        self._primary_buffer = []\n        self._primary_size = 0\n        self._primary_threshold = flush_threshold\n\n        self._overflow = []\n        self._overflow_size = 0\n        self._overflow_threshold = overflow_threshold\n\n        self._flush_callback = flush_callback\n\n    def _autoflush(func):\n        # autoflush only if overflow buffer has reached its min size / threshold\n        # the primary buffer will be set to the overflow buffer, guaranteeing that we always have enough data\n        def wrapper(self, *args, **kwargs):\n            result = func(self, *args, **kwargs)\n            if self._primary_size >= self._primary_threshold and self._overflow_size >= self._overflow_threshold:\n                self.flush()\n            return result\n        return wrapper\n\n    def extend(self, arr):\n        # no need to specify autoflush here since we autoflush on append\n        for item in arr:\n            self.append(item)\n        return self\n\n    @_autoflush\n    def append(self, item):\n        if not isinstance(item, str):\n            raise TypeError(\"Can only append strings to StringListBuffer\")\n\n        if self._primary_size < self._primary_threshold:\n            # use the primary buffer if under the flush threshold\n            self._primary_buffer.append(item)\n            self._primary_size += len(item)\n        else:\n            # otherwise use overflow\n            self._overflow.append(item)\n            self._overflow_size += len(item)\n        return self\n\n    def size(self):\n        return self._primary_size + self._overflow_size\n\n    def flush(self):\n        if self._overflow_size >= self._overflow_threshold:\n            # if the overflow buffer is at its threshold, this is likely an autoflush\n            # thus, we should only flush the primary buffer, and set the overflow buffer as the primary buffer\n            self._flush_primary_buffer()\n            self._reset_primary_buffer()\n            self._swap_buffers()  # overflow becomes primary\n        else:\n            # if we are not at the overflow threshold, this is likely a manual flush. \n            # We should put the overflow buffer into the primary buffer then call the flush callback\n            self._merge_overflow_into_primary()\n            self._flush_primary_buffer()\n            self._reset_primary_buffer()\n\n    def _flush_primary_buffer(self):\n        self._flush_callback(self._primary_buffer)\n\n    def _swap_buffers(self):\n        self._primary_buffer, self._overflow = self._overflow, self._primary_buffer\n        self._primary_size, self._overflow_size = self._overflow_size, self._primary_size\n\n    def _merge_overflow_into_primary(self):\n        self._primary_buffer.extend(self._overflow)\n        self._primary_size += self._overflow_size\n        self._reset_overflow_buffer()\n\n    def _reset_primary_buffer(self):\n        self._primary_buffer, self._primary_size = [], 0\n\n    def _reset_overflow_buffer(self):\n        self._overflow, self._overflow_size = [], 0\n\n\ndef get_page_of_keys(s3_client, bucket_name, prefix, max_keys=100, continuation_token=None):\n    kwargs = {\n        \"Bucket\": bucket_name,\n        \"Prefix\": prefix,\n        \"MaxKeys\": max_keys,\n    }\n    if continuation_token:\n        kwargs[\"ContinuationToken\"] = continuation_token\n    \n    response = s3_client.list_objects_v2(**kwargs)\n    keys = [item[\"Key\"] for item in response.get(\"Contents\", [])]\n    return keys, response.get(\"NextContinuationToken\", \"\")\n\n\ndef get_object(s3_client, bucket_name, object_key):\n    response = s3_client.get_object(\n        Bucket=bucket_name,\n        Key=object_key\n    )\n    try:\n      return json.load(response[\"Body\"])\n    except:\n      print(\"Unable to process s3://{bucket_name}/{object_key}\")\n      return {}\n\n\nclass Finding:\n    def __init__(self, obj):\n        self.name = obj[\"Name\"]\n        self.issue = obj.get(\"Issue\", \"\")\n        self.issue_name = obj.get(\"IssueName\", \"\")\n        self.kba = obj.get(\"Articles\", [\"N/A\"])\n        self.remediation = obj.get(\"Remediation\", [\"N/A\"])\n\n\ndef invert_issue_finding_map(issue_finding_map):\n    out = {}\n    for issue, issue_obj in issue_finding_map.items():\n        for finding, details in issue_obj[\"Findings\"].items():\n            details[\"Issue\"] = issue\n            details[\"IssueName\"] = issue_obj[\"Name\"]\n            out[finding] = Finding(details)\n    return out\n\n\ndef csv_headers():\n    return [\"ResourceType\", \"ResourceId\", \"RelatedResourceId\", \"Account\", \"Region\", \"Issue\", \"Finding\", \"Remediation\", \"Documentation\"]\n\n\ndef validate_resource_id(resource_id):\n    pattern = r'^[a-z-]+\\-(?:[a-f0-9]{8}|[a-f0-9]{17})$'\n    regex = re.compile(pattern, re.IGNORECASE)\n    return bool(regex.match(resource_id))\n\n\ndef json_to_csv_row(json_data, object_key, finding_issue_map):\n    try:\n        account_id, region, finding_id, filename = object_key.split('/')[4:]\n    except ValueError:\n        return []  # key not in correct/expected format\n    related_resource_id = \".\".join(filename.split('.')[:-1] if \".\" in filename else [filename])\n    finding = finding_issue_map.get(finding_id, Finding({\"Name\": finding_id}))\n\n    if not validate_resource_id(related_resource_id):\n        # ignore object that does not follow the expected format\n        return []\n\n    joined_kba = \", \".join(finding.kba)\n    joined_remediation = \", \".join(finding.remediation)\n    base_row = {\n        \"ResourceType\": \"instance\",\n        \"RelatedResourceId\": related_resource_id,\n        \"Account\": account_id,\n        \"Region\": region,\n        \"Issue\": finding.issue_name,\n        \"Finding\": finding.name,\n        \"Remediation\": f'\"{joined_remediation}\"' if len(finding.remediation) > 1 else joined_remediation,\n        \"Documentation\": f'\"{joined_kba}\"' if len(finding.kba) > 1 else joined_kba\n    }\n    headers = csv_headers()\n    rows = []\n    for instance in json_data.get(\"InstanceIds\", []):\n        if not validate_resource_id(instance):\n            continue\n        base_row[\"ResourceId\"] = instance\n        rows.append(\",\".join([\n            base_row[header] for header in headers\n        ]))\n        base_row.pop(\"ResourceId\", None)\n    return rows\n\n\ndef upload_part(s3_client, bucket_name, key, upload_id, part_number, data):\n    response = s3_client.upload_part(\n        Bucket=bucket_name,\n        Key=key,\n        PartNumber=part_number,\n        UploadId=upload_id,\n        Body=data,\n    )\n    return response[\"ETag\"]\n\n\ndef handler(events, context):\n    start_time = time.time()\n\n    bucket_name = events[\"BucketName\"]\n    bucket_owner = events[\"BucketOwner\"]\n\n    issue_findings_map_json_file_path = \"attachments/issueFindingsMap.json\"\n    \n    with open(issue_findings_map_json_file_path, \"r\") as file:\n        issue_findings_map = json.load(file)\n\n    finding_issue_map = invert_issue_finding_map(issue_findings_map)\n\n    execution_id = events.get(\"ExecutionId\")\n    if not execution_id:\n        execution_id = context[\"automation:EXECUTION_ID\"]\n    \n    account_region_map = events.get(\"AccountToRegionMap\", [])\n    s3_paths = S3Paths(execution_id, context[\"global:ACCOUNT_ID\"], is_local_execution=get_is_local_execution(context, account_region_map))\n\n    s3_client = S3WrapperClient(bucket_owner, events[\"S3EncryptionType\"], events[\"S3EncryptionKey\"], context[\"automation:EXECUTION_ID\"])\n\n    export_loop_state = events.get(\"ExportLoopState\", {})\n    parts = export_loop_state.get(\"Parts\", [])\n    continuation_token = export_loop_state.get(\"ContinuationToken\")\n    \n    upload_id = events[\"UploadId\"]\n    export_key = events[\"ExportObjectKey\"]\n\n    max_keys = events.get(\"MaxKeys\", 100)\n\n    timeout_seconds = events.get(\"TimeoutSeconds\", 540)\n\n    def buffer_flush_cb(data):\n        etag = upload_part(s3_client, bucket_name, export_key, upload_id, len(parts) + 1, \"\\n\".join(map(str, data)) + \"\\n\")\n        parts.append(etag)\n\n    primary_buffer_threshold = Bytes.megabytes(events.get(\"PrimaryBufferSize\", 100))\n    buffer = StringListBuffer(buffer_flush_cb, flush_threshold=primary_buffer_threshold)\n    if not continuation_token:\n        buffer.append(\",\".join(csv_headers()))\n\n    first_run = True\n    while continuation_token or first_run:\n        first_run = False\n\n        keys, continuation_token = get_page_of_keys(s3_client, bucket_name, s3_paths.diagnosis_output_prefix, continuation_token=continuation_token, max_keys=max_keys)\n        for key in keys:\n            content = get_object(s3_client, bucket_name, key)\n            buffer.extend(json_to_csv_row(content, key, finding_issue_map))\n\n        if time.time() - start_time >= timeout_seconds:\n            break\n    \n    if buffer.size() > 0:\n        buffer.flush()\n\n    return {\n        \"UploadId\": upload_id,\n        \"Parts\": parts,\n        \"ContinuationToken\": continuation_token\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "continuation_object",
+                "Type": "StringMap",
+                "Selector": "$.Payload"
+              },
+              {
+                "Name": "continuation_token",
+                "Type": "String",
+                "Selector": "$.Payload.ContinuationToken"
+              }
+            ]
+          },
+          {
+            "name": "UpdateExportAggregatorLoopState",
+            "description": "## UpdateExportAggregatorLoopState\nUpdates the ExportAggregatorLoopState variable.",
+            "action": "aws:updateVariable",
+            "isCritical": false,
+            "isEnd": true,
+            "onFailure": "step:CompleteExportUpload",
+            "inputs": {
+              "Name": "variable:ExportAggregatorLoopState",
+              "Value": "{{ AggregateExportFile.continuation_object }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CompleteExportUpload",
+      "description": "## CompleteExportUpload\nCompletes the multipart export upload to S3.\n### Inputs\n* ExportLoopState: The loop state of the multipart export loop.\n* BucketName: The name of the S3 bucket to be used by child runbook.\n* BucketOwner: The expected owner of the S3 bucket.\n* UploadId: The upload ID from the StartExportUpload step.\n* ExportObjectKey: The export object key of S3 paths from the StartExportUpload step.",
+      "action": "aws:executeScript",
+      "nextStep": "AggregateOutput",
+      "isCritical": false,
+      "isEnd": false,
+      "onFailure": "step:AbortExportUpload",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "ExportLoopState": "{{ variable:ExportAggregatorLoopState }}",
+          "BucketName": "{{ OutputBucketName }}",
+          "BucketOwner": "{{ OutputBucketOwner }}",
+          "UploadId": "{{ StartExportUpload.upload_id }}",
+          "ExportObjectKey": "{{ StartExportUpload.object_key }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}"
+        },
+        "Script": "from attachments.commons import S3WrapperClient\n\n\ndef complete_multipart_upload(s3_client, bucket_name, key, upload_id, parts):\n    parts = [{\"ETag\": val, \"PartNumber\": idx + 1} for idx, val in enumerate(parts)]\n    s3_client.complete_multipart_upload(\n        Bucket=bucket_name,\n        Key=key,\n        MultipartUpload={\n            'Parts': parts\n        },\n        UploadId=upload_id,\n    )\n\n\ndef handler(events, context):\n    export_loop_state = events.get(\"ExportLoopState\")\n    parts = export_loop_state.get(\"Parts\")\n\n    bucket_owner = events[\"BucketOwner\"]\n    bucket_name = events[\"BucketName\"]\n    upload_id = events[\"UploadId\"]\n    export_key = events[\"ExportObjectKey\"]\n\n    s3_client = S3WrapperClient(bucket_owner, events[\"S3EncryptionType\"], events[\"S3EncryptionKey\"], context[\"automation:EXECUTION_ID\"])\n\n    if parts:\n        complete_multipart_upload(s3_client, bucket_name, export_key, upload_id, parts)\n    else:\n        raise RuntimeError(\"No parts found for S3 MultiPart upload\")\n"
+      }
+    },
+    {
+      "name": "AggregateOutput",
+      "description": "## AggregateOutput\nAggregates the outputs of each cross-account cross-region execution of the secondary document into one output and\nsaves it to S3.\n### Inputs\n* OutputBucketName: The name of the S3 bucket to be used by child runbook.\n* OutputBucketOwner: The expected owner of the S3 bucket.\n* InitialBucketPrefix: The initial part of the S3 bucket prefix.\n* RemediationAutomationAssumeRoleName: The role name used as the target location execution role. This is used if\n  Remediation orchestration execution is started with TargetLocationUrl.\n* ExportObjectKey: The export object key of S3 paths.\n### Outputs\n* AggregatedCount: The aggregated issue counts.\n* TargetLocations: The aggregated target locations.\n* ExportObjectUri: The S3 URI of the exported object.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "OutputBucketName": "{{ OutputBucketName }}",
+          "OutputBucketOwner": "{{ OutputBucketOwner }}",
+          "InitialBucketPrefix": "{{ ExecuteChildDocument.InitialBucketPrefix }}",
+          "RemediationAutomationAssumeRoleName": "{{ RemediationAutomationAssumeRoleName }}",
+          "ExportObjectKey": "{{ StartExportUpload.object_key }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+          "AccountToRegionMap": "{{ AccountRegionMap }}"
+        },
+        "Script": "from itertools import zip_longest\nimport json\nfrom collections import defaultdict\nfrom enum import IntEnum\nfrom io import StringIO\nfrom pathlib import Path\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\nfrom attachments.commons import S3WrapperClient, get_is_local_execution, S3Paths\n\nclass KeyParts(IntEnum):\n    LENGTH = 8\n    ISSUE = 4\n    ACCOUNT = 5\n    REGION = 6\n    COUNT = 7\n\n\ndef list_files_in_s3_path(s3_client, bucket_name, path):\n    \"\"\"List all files under a specific S3 path (prefix).\"\"\"\n    files = []\n    next_token = None\n\n    while True:\n        if next_token is not None:\n            response = s3_client.list_objects_v2(\n                Bucket=bucket_name,\n                Prefix=path,\n                ContinuationToken=next_token\n            )\n        else:\n            response = s3_client.list_objects_v2(\n                Bucket=bucket_name, Prefix=path\n            )\n\n        files += [obj[\"Key\"] for obj in response.get(\"Contents\", [])]\n\n        if response[\"IsTruncated\"]:\n            next_token = response[\"NextContinuationToken\"]\n        else:\n            break\n    return files\n\ndef export_file_exists(s3_client, bucket_name, object_key):\n    try:\n        s3_client.head_object(\n            Bucket=bucket_name, Key=object_key\n        )\n        return True\n    except ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"404\":\n            return False\n        else:\n            raise e\n\ndef construct_target_locations(\n    s3_client, events, context, issue_to_regions_to_accounts\n):\n    bucket_name = events[\"OutputBucketName\"]\n    bucket_owner = events[\"OutputBucketOwner\"]\n    initial_prefix = events[\"InitialBucketPrefix\"]\n    remediation_automation_role = events[\"RemediationAutomationAssumeRoleName\"]\n    caller_account = context[\"global:ACCOUNT_ID\"]\n    caller_region = context[\"global:REGION\"]\n\n    key_paths = []\n    # API limits mean we can have max 50 accounts per target location\n    target_location_account_size = 50\n    for issue, regions_to_accounts in issue_to_regions_to_accounts.items():\n        target_locations = []\n        for region, accounts in regions_to_accounts.items():\n            # Split accounts into groups of size target_location_account_size, filling with None\n            account_groups = zip_longest(\n                *(iter(accounts),) * target_location_account_size\n            )\n            for account_group in account_groups:\n                target_locations.append(\n                    {\n                        \"Accounts\": list(filter(None, account_group)),\n                        \"Regions\": [region],\n                        \"TargetLocationMaxConcurrency\": 7,\n                        \"ExecutionRoleName\": remediation_automation_role,\n                    }\n                )\n\n        # API limits mean we can have up to 5000 target location objects in the JSON file, so split into multiple files if needed\n        target_location_max_count = 5000\n        target_location_groups = zip_longest(\n            *(iter(target_locations),) * target_location_max_count\n        )\n        for idx, target_location_group in enumerate(target_location_groups):\n            target_location_key = f\"{initial_prefix}/output/{caller_account}/{caller_region}/{issue}/targetLocations-{idx + 1}.json\"\n            key_paths.append(target_location_key)\n            s3_client.put_object(\n                Bucket=bucket_name,\n                Key=target_location_key,\n                Body=json.dumps(list(filter(None, target_location_group)))\n            )\n    return key_paths\n\ndef get_finding_codes():\n    finding_codes_file = Path(\"attachments/finding_codes.json\")\n    if finding_codes_file.is_file():\n        return json.loads(finding_codes_file.read_text(encoding=\"UTF-8\"))\n    return []\n\ndef get_summary_files(s3_client, bucket_name, s3_paths, is_local_execution):\n    if not is_local_execution:\n        return list_files_in_s3_path(\n            s3_client, bucket_name, s3_paths.finding_summary_prefix\n        )\n    finding_codes = get_finding_codes()\n    files = []\n    if not finding_codes:\n        print(\"No finding codes found\")\n        return []\n    for finding_code in finding_codes:\n        files.extend(\n            list_files_in_s3_path(\n                s3_client,\n                bucket_name,\n                s3_paths.finding_summary_prefix_finding_code_fn(finding_code)\n            )\n        )\n    return files\n\ndef aggregate_summary(s3_client, events, context):\n    bucket_name = events[\"OutputBucketName\"]\n    bucket_owner = events[\"OutputBucketOwner\"]\n    initial_prefix = events[\"InitialBucketPrefix\"]\n    account_region_map = events.get(\"AccountToRegionMap\", [])\n    is_local_execution = get_is_local_execution(context, account_region_map)\n    s3_paths = S3Paths(context[\"automation:EXECUTION_ID\"], context[\"global:ACCOUNT_ID\"], is_local_execution=is_local_execution)\n    aggregation = defaultdict(lambda: defaultdict(int))\n    issue_to_regions_to_accounts = defaultdict(lambda: defaultdict(set))\n\n    files = get_summary_files(s3_client, bucket_name, s3_paths, is_local_execution)\n    for path in files:\n        parts = path.split(\"/\")\n        if len(parts) != KeyParts.LENGTH or not parts[KeyParts.COUNT]:\n            continue\n        aggregation[parts[KeyParts.ISSUE]][\"Count\"] += int(parts[KeyParts.COUNT])\n        issue_to_regions_to_accounts[parts[KeyParts.ISSUE]][parts[KeyParts.REGION]].add(\n            parts[KeyParts.ACCOUNT]\n        )\n\n    target_location_keys = construct_target_locations(\n        s3_client,\n        events,\n        context,\n        issue_to_regions_to_accounts,\n    )\n\n    return {\"issueAggregation\": aggregation, \"targetLocations\": target_location_keys}\n\n\ndef script_handler(events, context):\n    bucket_owner=events[\"OutputBucketOwner\"]\n    try:\n        s3_client = S3WrapperClient(bucket_owner, events[\"S3EncryptionType\"], events[\"S3EncryptionKey\"], context[\"automation:EXECUTION_ID\"])\n        aggregation = aggregate_summary(s3_client, events, context)\n        export_object_uri = \"\"\n        try:\n            if export_file_exists(\n                s3_client=s3_client,\n                bucket_name=events[\"OutputBucketName\"],\n                object_key=events[\"ExportObjectKey\"],\n            ):\n                export_object_uri = f\"s3://{events['OutputBucketName']}/{events['ExportObjectKey']}\"\n        except ClientError:\n            pass\n\n        return {\n            \"AggregatedCount\": json.loads(json.dumps(aggregation[\"issueAggregation\"])),\n            \"TargetLocations\": json.dumps(aggregation[\"targetLocations\"]),\n            \"ExportObjectUri\": export_object_uri,\n        }\n    except ClientError as e:\n        c = e.response[\"Error\"][\"Code\"]\n        m = e.response[\"Error\"][\"Message\"]\n        raise Exception(f\"An error occurred when when aggregating the output: {c}:{m}\")\n"
+      },
+      "outputs": [
+        {
+          "Name": "AggregatedCount",
+          "Type": "StringMap",
+          "Selector": "$.Payload.AggregatedCount"
+        },
+        {
+          "Name": "TargetLocations",
+          "Type": "StringList",
+          "Selector": "$.Payload.TargetLocations"
+        },
+        {
+          "Name": "ExportObjectUri",
+          "Type": "String",
+          "Selector": "$.Payload.ExportObjectUri"
+        }
+      ]
+    },
+    {
+      "name": "AbortExportUpload",
+      "description": "## AbortExportUpload\nAborts the S3 multipart export if there is a failure in the export process.\n### Inputs\n* Service: s3\n* Api: AbortMultipartUpload\n* UploadId: The multipart export upload ID.\n* Bucket: The S3 bucket name the export was made to.\n* Key: The object key that exports were being made to.",
+      "action": "aws:executeAwsApi",
+      "nextStep": "AggregateOutput",
+      "isCritical": false,
+      "isEnd": false,
+      "onFailure": "step:AggregateOutput",
+      "inputs": {
+        "Service": "s3",
+        "Api": "AbortMultipartUpload",
+        "UploadId": "{{ StartExportUpload.upload_id }}",
+        "Bucket": "{{ OutputBucketName }}",
+        "Key": "{{ StartExportUpload.object_key }}"
+      }
+    }
+  ],
+  "outputs": [
+    "AggregateOutput.ExportObjectUri",
+    "AggregateOutput.AggregatedCount",
+    "AggregateOutput.TargetLocations",
+    "ExecuteChildDocument.ChildDocumentExecutionIds"
+  ]
+}
