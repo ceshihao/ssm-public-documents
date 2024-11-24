@@ -1,0 +1,101 @@
+{
+  "description": "### Runbook name - AWS-ExportNodes\n\n  ## What does this runbook do?\n  This runbook retrieves a list of nodes in Systems Manager, adds them to a CSV file, and writes the file to a specified Amazon S3 bucket. \n  The runbook retrieves the data using the ListNodes API action. The runbook also uses the ssm:executeScript Automation action, \n  which can run up to a maximum duration of 600 seconds (10 minutes). Therefore, to export all the node data, the API action is called \n  multiple times with the NextToken parameter until all data is retrieved. The intermediate data is stored in a directory in the specified \n  bucket titled '/working/'. Because the data is intermediate, an S3 Lifecycle configuration rule is added the bucket, causing objects in \n  this directory to expire within 1 day after creation. The final result is added to the S3 bucket as an output.\n\n  ## Input Parameters\n  * AutomationAssumeRole: The Amazon Resource Name (ARN) of the role to assume during the automation workflow. This parameter is required\n  * Filters: Filters for the export report request. By default, filters are empty if not provided.\n  * SyncName: The name of the  resource data sync. By default, syncName is empty if not provided.\n  * S3BucketName: The name of the  managed Amazon S3 bucket to which the nodes are exported. This  parameter is required.\n  \n  ## Output\n  * Nodes data csv: If the runbook runs successfully, the exported nodes is uploaded to the managed Amazon S3 bucket in CSV format.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the role to assume during the automation workflow."
+    },
+    "Filters": {
+      "type": "MapList",
+      "description": "(Optional) Filters for the export report request.",
+      "default": [],
+      "allowedPattern": "^\\{[\\p{L}\\p{Z}\\p{N}_.:\\/=\\+\\-@\"',\\[\\]]*\\}$"
+    },
+    "SyncName": {
+      "type": "String",
+      "description": "(Optional) The name of the resource data sync.",
+      "default": "",
+      "allowedPattern": "^[a-zA-Z0-9_-]{0,64}$"
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the managed Amazon S3 bucket to which the nodes is exported."
+    }
+  },
+  "variables": {
+    "NextToken": {
+      "type": "String",
+      "default": "",
+      "description": "NextToken to continue ExportReportStep and will initially be null"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RepeatExportReportStepUntilDone",
+      "action": "aws:loop",
+      "isEnd": true,
+      "inputs": {
+        "Steps": [
+          {
+            "name": "ExportReportStep",
+            "action": "aws:executeScript",
+            "isEnd": false,
+            "outputs": [
+              {
+                "Name": "Completed",
+                "Selector": "$.Payload.Completed",
+                "Type": "Boolean"
+              },
+              {
+                "Name": "NextToken",
+                "Selector": "$.Payload.NextToken",
+                "Type": "String"
+              },
+              {
+                "Name": "S3OutputLink",
+                "Selector": "$.Payload.S3OutputLink",
+                "Type": "String"
+              }
+            ],
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "script.script_handler",
+              "Attachment": "AWS-ExportNodes.zip",
+              "InputPayload": {
+                "Filters": "{{Filters}}",
+                "SyncName": "{{SyncName}}",
+                "S3BucketName": "{{S3BucketName}}",
+                "NextToken": "{{variable:NextToken}}"
+              }
+            },
+            "description": "### What does the step do?\n    The action for this step depends on the values of the 'Filters' parameter. \n    The step retrieves nodes based on the filters in your account and exports the data to a CSV file.\n\n### What is the output of the step?\n    * Completed: A boolean value indicating whether the export report step is completed.\n    * NextToken: The next token for pagination.\n    * S3OutputLink: The Amazon S3 link of the exported nodes.",
+            "timeoutSeconds": 600
+          },
+          {
+            "name": "UpdateVariable",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:NextToken",
+              "Value": "{{ ExportReportStep.NextToken }}"
+            }
+          }
+        ],
+        "LoopCondition": {
+          "Variable": "{{ExportReportStep.Completed}}",
+          "BooleanEquals": false
+        },
+        "MaxIterations": 100
+      }
+    }
+  ],
+  "files": {
+    "AWS-ExportNodes.zip": {
+      "checksums": {
+        "sha256": "79b2c58421ba6855751a4caf19eb43ed8bef9c03eb8d75834802c94c19f75982"
+      }
+    }
+  }
+}

@@ -1,0 +1,1091 @@
+{
+  "description": "The **AWSSupport-ContainIAMPrincipal** automation runbook is designed to contain an AWS Identity and Access Management (IAM) user, role, or Identity Center user in response to a suspected or confirmed security issue related to the target IAM principal. This runbook implements a containment process that helps isolate the target IAM principal from performing actions within your AWS environment.\nThe containment process includes:\n> * For IAM users: Disabling access keys, removing console access, and attaching a deny policy that blocks all actions if the current time is before the containment timestamp.\n> * For IAM roles: Attaching a deny policy that revokes all permissions for sessions created before the containment time.\n> * For Identity Center users: Removing permission sets, group memberships, and attaching a deny policy that blocks all actions for the specific Identity Center user ID.\n\nAdditionally, the runbook outputs recommended Service Control Policies (SCPs) for both users and roles, denying all actions for the specific IAM principal ARN. These SCPs can be manually implemented for additional security across the organization. The containment process also includes securing the backup S3 bucket with a policy that ensures only specified secure roles can access it.\nThe containment is designed to be reversible, allowing for an attempt to restore normal access when appropriate. However, **please note that restoration to the exact previous state is not guaranteed**, as changes in the account or associated IAM resources might have occurred between the time of containment and restoration.\n\n### Important:\nThis automation runbook can significantly impact the availability of your workloads. It is specifically designed to isolate an IAM principal during a security event. This isolation can disrupt any workloads, applications, or processes that depend on authentication or access using the targeted IAM principal. **Carefully consider the potential impact before executing this runbook**.\nThis runbook can be used in various scenarios, such as responding to detected unauthorized access, isolating compromised credentials, or as part of a broader incident response plan. It provides options for dry runs, secure backups of configurations, and tagging of affected resources for improved tracking and management.\n\n### Important:\n> * Ensure that the backup Amazon S3 bucket exists and is owned by the current AWS account. The Amazon S3 operations perform ownership verification and will fail if the bucket is missing or belongs to a different account.\n> * This runbook will revoke all permissions associated with the targeted IAM principal. Ensure you understand the full impact on your systems before proceeding.\n> * Always verify that the associated backup S3 bucket policy and ACLs do not grant unnecessary read or write permissions to principals that don't require access.\n> * We recommend using Amazon S3 server-side encryption, enabling S3 server access logging, and S3 Versioning for the backup bucket to enhance security and maintain an audit trail.\n> * The runbook includes a dry run option to preview the changes without applying them, allowing for impact assessment before actual containment.\n> * While the runbook applies effective containment measures, manual implementation of the recommended SCPs can provide an additional layer of security across the organization.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "PrincipalType": {
+      "type": "String",
+      "allowedValues": [
+        "IAM user",
+        "IAM role",
+        "Identity Center user"
+      ],
+      "description": "(Required) The AWS IAM principal type: `IAM user`, `IAM role`, or `Identity Center user`."
+    },
+    "PrincipalName": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9\\.\\-_\\\\!*'()/+=,@]{1,1024}$",
+      "description": "(Required) The name of the IAM principal. For Identity Center users, provide the username."
+    },
+    "Action": {
+      "type": "String",
+      "allowedValues": [
+        "Contain",
+        "Restore"
+      ],
+      "description": "(Required) Select `Contain` to isolate the target IAM principal or `Restore` to try to restore the IAM principal to its original configuration from a previous backup."
+    },
+    "DryRun": {
+      "type": "Boolean",
+      "default": true,
+      "description": "(Optional) When set to `true`, the automation will not make any changes to the target IAM principal, instead it will output on what it would have attempted to change, detailing out on each step. Default value: `true`."
+    },
+    "ActivateDisabledKeys": {
+      "type": "Boolean",
+      "default": false,
+      "description": "(Conditional) If the input parameter **Action** is set to `Restore` and the **PrincipalType** is set to `IAM user`, this option determines if this automation should try to `activate` the associated access keys if deactivated. Please note that the integrity of a compromised access key cannot be verified. AWS strongly recommends against reactivating a compromised key. Instead, it is advisable to generate new keys. Default value: `false`."
+    },
+    "BackupS3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Conditional) The Amazon S3 bucket to backup the IAM principal configuration when the **Action** is set to `Contain` or to restore the configuration from when the **Action** is `Restore`. Note that if the specified **Action** is `Contain` and the runbook is not able to access the bucket or a value is not provided, a new bucket is created in your account with the name `awssupport-containiamprincipal-<random-string>`",
+      "default": ""
+    },
+    "BackupS3KeyName": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9\\.\\-_\\\\!*'()/]{0,1024}$",
+      "default": "",
+      "description": "(Conditional) If **Action** is set to `Restore`, this specifies the Amazon S3 key the automation will use to try to restore the IAM principal configuration. The Amazon S3 key typically follows this format: `{year}/{month}/{day}/{hour}/{minute}/{automation_execution_id}.json`. The key can be obtained from the output of a previous containment automation execution."
+    },
+    "BackupS3BucketAccess": {
+      "description": "(Conditional) The ARN of the IAM users or roles that will be allowed access to the backup Amazon S3 bucket after running the containment actions. This parameter is required when Action is `Contain`. The `AutomationAssumeRole`, or in its absence the user under whose context the automation is running is automatically added to the list.",
+      "type": "StringList",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:(role|user)\\/[\\w+\\/=,.@-]+$",
+      "default": []
+    },
+    "TagIdentifier": {
+      "type": "String",
+      "allowedPattern": "^$|^[Kk][Ee][Yy]=[\\+\\-\\=\\.\\_\\:\\/@a-zA-Z0-9]{1,128},[Vv][Aa][Ll][Uu][Ee]=[\\+\\-\\=\\.\\_\\:\\/@a-zA-Z0-9]{0,128}$",
+      "default": "",
+      "description": "(Optional) Tag the IAM principal with a tag of your choice using the following format: `Key=<EXAMPLE_KEY>,Value=<EXAMPLE_VALUE>`. This option allows you to track the IAM principals that have been targeted by this runbook. Note: Tag keys and values are case-sensitive."
+    }
+  },
+  "variables": {
+    "S3Key": {
+      "type": "String",
+      "default": "{{ BackupS3KeyName }}"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateRequiredInputs",
+      "description": "Validates the required automation input parameters based on the **Action** specified.",
+      "action": "aws:executeScript",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "PrincipalType": "{{ PrincipalType }}",
+          "PrincipalName": "{{ PrincipalName }}",
+          "Action": "{{ Action }}",
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "ActivateDisabledKeys": "{{ ActivateDisabledKeys }}"
+        },
+        "Handler": "validate_required_inputs.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "nextStep": "CheckBackupS3BucketName"
+    },
+    {
+      "name": "CheckBackupS3BucketName",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "description": "Checks if the target Amazon S3 bucket potentially grants **read** or **write** public access to its objects. In case of containment workflow, a new Amazon S3 bucket is created if the `BackupS3BucketName` bucket doesn't exist.",
+      "timeoutSeconds": 300,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "Action": "{{ Action }}",
+          "Mode": "{{ DryRun }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "BackupS3BucketAccess": "{{ BackupS3BucketAccess }}"
+        },
+        "Handler": "validate_s3_bucket.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "BucketName",
+          "Selector": "$.Payload.BucketName",
+          "Type": "String"
+        },
+        {
+          "Name": "IsBucketCreated",
+          "Selector": "$.Payload.CreateBucket",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnAction"
+    },
+    {
+      "name": "BranchOnAction",
+      "description": "Branches the automation based on the value of the specified Action.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnPrincipalTypeAndDryRun",
+            "Variable": "{{ Action }}",
+            "StringEquals": "Restore"
+          }
+        ],
+        "Default": "BranchOnPrincipalTypeForContain"
+      }
+    },
+    {
+      "name": "BranchOnPrincipalTypeAndDryRun",
+      "description": "Branches the automation based on the type of IAM principal (IAM user, IAM role, or Identity Center user) and if it is running in `DryRun` mode.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ PrincipalType }}",
+                "StringEquals": "IAM role"
+              }
+            ],
+            "NextStep": "DetachInlineDenyPolicy"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ PrincipalType }}",
+                "StringEquals": "IAM user"
+              }
+            ],
+            "NextStep": "BranchOnReactivateKeys"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ PrincipalType }}",
+                "StringEquals": "Identity Center user"
+              }
+            ],
+            "NextStep": "DetachInlineDenyPolicyFromPermissionSet"
+          }
+        ],
+        "Default": "ReportRestore"
+      }
+    },
+    {
+      "name": "BranchOnPrincipalTypeForContain",
+      "description": "Branches the automation for the `Contain` action based and the IAM principal type (IAM user, IAM role, or Identity Center user) specified in the input.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetIAMUser",
+            "Variable": "{{ PrincipalType }}",
+            "EqualsIgnoreCase": "IAM user"
+          },
+          {
+            "NextStep": "GetIAMRole",
+            "Variable": "{{ PrincipalType }}",
+            "EqualsIgnoreCase": "IAM role"
+          }
+        ],
+        "Default": "GetIdentityStoreId"
+      }
+    },
+    {
+      "name": "GetIAMUser",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the creation time and username of the target IAM user.",
+      "inputs": {
+        "Service": "iam",
+        "Api": "GetUser",
+        "UserName": "{{ PrincipalName }}"
+      },
+      "isCritical": true,
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "nextStep": "GetIAMUserDetails",
+      "outputs": [
+        {
+          "Name": "UserCreationTime",
+          "Selector": "$.User.CreateDate",
+          "Type": "String"
+        },
+        {
+          "Name": "UserName",
+          "Selector": "$.User.UserName",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetIAMUserDetails",
+      "description": "Gets and stores the configuration of the target IAM user, including inline policies, managed policies, access keys, MFA devices, and login profile.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "nextStep": "UpdateS3KeyForUser",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "PrincipalName": "{{ PrincipalName }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "UserCreationTime": "{{ GetIAMUser.UserCreationTime }}"
+        },
+        "Handler": "gather_iam_user_details.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AccessKeys",
+          "Selector": "$.Payload.AccessKeys",
+          "Type": "String"
+        },
+        {
+          "Name": "MFADevices",
+          "Selector": "$.Payload.MFADevices",
+          "Type": "StringList"
+        },
+        {
+          "Name": "LoginProfile",
+          "Selector": "$.Payload.LoginProfile",
+          "Type": "String"
+        },
+        {
+          "Name": "UserCreationTime",
+          "Selector": "$.Payload.UserCreationTime",
+          "Type": "String"
+        },
+        {
+          "Name": "S3Prefix",
+          "Selector": "$.Payload.S3Prefix",
+          "Type": "String"
+        },
+        {
+          "Name": "CurrentTime",
+          "Selector": "$.Payload.AutomationExecutionTime",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "UpdateS3KeyForUser",
+      "action": "aws:updateVariable",
+      "description": "Updates the automation 'S3Key' variable from output of the step `GetIAMUserDetails`.",
+      "isCritical": false,
+      "maxAttempts": 3,
+      "timeoutSeconds": 60,
+      "onFailure": "Abort",
+      "nextStep": "BranchOnIdentityContain",
+      "inputs": {
+        "Name": "variable:S3Key",
+        "Value": "{{ GetIAMUserDetails.S3Prefix }}"
+      }
+    },
+    {
+      "name": "GetIAMRole",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the creation time, role name, and path of the target IAM role.",
+      "inputs": {
+        "Service": "iam",
+        "Api": "GetRole",
+        "RoleName": "{{ PrincipalName }}"
+      },
+      "isCritical": true,
+      "nextStep": "GetIAMRoleDetails",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "outputs": [
+        {
+          "Name": "RoleCreationTime",
+          "Selector": "$.Role.CreateDate",
+          "Type": "String"
+        },
+        {
+          "Name": "RoleName",
+          "Selector": "$.Role.RoleName",
+          "Type": "String"
+        },
+        {
+          "Name": "RolePath",
+          "Selector": "$.Role.Path",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetIAMRoleDetails",
+      "description": "Gets and stores the configuration of the target IAM role, including inline policies and managed policies attached to the role.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "nextStep": "UpdateS3KeyForRole",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "PrincipalName": "{{ PrincipalName }}",
+          "CreationTime": "{{ GetIAMRole.RoleCreationTime }}"
+        },
+        "Handler": "gather_iam_role_details.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "RoleCreationTime",
+          "Selector": "$.Payload.RoleCreationTime",
+          "Type": "String"
+        },
+        {
+          "Name": "S3Prefix",
+          "Selector": "$.Payload.S3Prefix",
+          "Type": "String"
+        },
+        {
+          "Name": "CurrentTime",
+          "Selector": "$.Payload.AutomationExecutionTime",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "UpdateS3KeyForRole",
+      "action": "aws:updateVariable",
+      "description": "Updates the automation 'S3Key' variable from output of the step `GetIAMRoleDetails`.",
+      "isCritical": false,
+      "maxAttempts": 3,
+      "timeoutSeconds": 60,
+      "onFailure": "Abort",
+      "nextStep": "BranchOnIdentityContain",
+      "inputs": {
+        "Name": "variable:S3Key",
+        "Value": "{{ GetIAMRoleDetails.S3Prefix }}"
+      }
+    },
+    {
+      "name": "GetIdentityStoreId",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the ID of the AWS IAM Identity Center instance associated with the AWS account.",
+      "inputs": {
+        "Service": "sso-admin",
+        "Api": "ListInstances"
+      },
+      "isCritical": true,
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "nextStep": "GetIDCUser",
+      "outputs": [
+        {
+          "Name": "InstanceArn",
+          "Selector": "$.Instances[0].InstanceArn",
+          "Type": "String"
+        },
+        {
+          "Name": "IdentityStoreId",
+          "Selector": "$.Instances[0].IdentityStoreId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetIDCUser",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the user ID of the target Identity Center user using the Identity Store ID.",
+      "nextStep": "GatherIDCUserDetails",
+      "inputs": {
+        "Service": "identitystore",
+        "Api": "ListUsers",
+        "IdentityStoreId": "{{ GetIdentityStoreId.IdentityStoreId }}",
+        "Filters": [
+          {
+            "AttributePath": "UserName",
+            "AttributeValue": "{{ PrincipalName }}"
+          }
+        ]
+      },
+      "isCritical": true,
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "outputs": [
+        {
+          "Name": "IDCUsersID",
+          "Selector": "$.Users[0].UserId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GatherIDCUserDetails",
+      "description": "Gets and stores the configuration of the target Identity Center user, including account assignments, associated permission sets, and inline policies.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "IDCUsersID": "{{ GetIDCUser.IDCUsersID }}",
+          "InstanceArn": "{{ GetIdentityStoreId.InstanceArn }}",
+          "IdentityStoreId": "{{ GetIdentityStoreId.IdentityStoreId }}",
+          "PrincipalName": "{{ PrincipalName }}"
+        },
+        "Handler": "gather_idc_user_details.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "S3Prefix",
+          "Selector": "$.Payload.S3Prefix",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true,
+      "nextStep": "UpdateS3KeyForIDCUser"
+    },
+    {
+      "name": "UpdateS3KeyForIDCUser",
+      "action": "aws:updateVariable",
+      "description": "Updates the automation 'S3Key' variable from output of the step `GatherIDCUserDetails`.",
+      "isCritical": false,
+      "maxAttempts": 3,
+      "timeoutSeconds": 60,
+      "onFailure": "Abort",
+      "nextStep": "BranchOnIdentityContain",
+      "inputs": {
+        "Name": "variable:S3Key",
+        "Value": "{{ GatherIDCUserDetails.S3Prefix }}"
+      }
+    },
+    {
+      "name": "BranchOnIdentityContain",
+      "description": "Branches the automation based on the value of `DryRun` and the IAM principal type for the `Contain` action.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ PrincipalType }}",
+                "StringEquals": "IAM user"
+              }
+            ],
+            "NextStep": "BranchOnDisableAccessKeys"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ PrincipalType }}",
+                "StringEquals": "IAM role"
+              }
+            ],
+            "NextStep": "AttachInlineDenyPolicyToRole"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ PrincipalType }}",
+                "StringEquals": "Identity Center user"
+              }
+            ],
+            "NextStep": "RemovePermissionSets"
+          }
+        ],
+        "Default": "ReportContain"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "BranchOnDisableAccessKeys",
+      "description": "Branches the automation based on the type of IAM principal (IAM user, IAM role, or Identity Center user) and if it is running in `DryRun` mode.",
+      "action": "aws:branch",
+      "onFailure": "step:ReportContainFailure",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnDisableConsoleAccess",
+            "Variable": "{{ GetIAMUserDetails.AccessKeys }}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "DisableAccessKeys"
+      }
+    },
+    {
+      "name": "DisableAccessKeys",
+      "description": "Disables the active IAM user access keys.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 1,
+      "onFailure": "step:ReportContainFailure",
+      "inputs": {
+        "InputPayload": {
+          "PrincipalName": "{{ PrincipalName }}",
+          "AccessKeys": "{{ GetIAMUserDetails.AccessKeys }}"
+        },
+        "Handler": "disable_access_keys.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true,
+      "nextStep": "BranchOnDisableConsoleAccess"
+    },
+    {
+      "name": "BranchOnDisableConsoleAccess",
+      "description": "Branches based on whether the IAM user has AWS Management Console access enabled or not. If a `LoginProfile` exists for a user, it means they have been granted permission to access the AWS Management Console.",
+      "action": "aws:branch",
+      "onFailure": "step:ReportContainFailure",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AttachInlineDenyPolicyToUser",
+            "Variable": "{{ GetIAMUserDetails.LoginProfile }}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "DisableConsoleAccess"
+      }
+    },
+    {
+      "name": "DisableConsoleAccess",
+      "description": "Removes the IAM user's password-based access to the AWS Management Console.",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "iam",
+        "Api": "DeleteLoginProfile",
+        "UserName": "{{ PrincipalName }}"
+      },
+      "isCritical": true,
+      "onFailure": "step:ReportContainFailure",
+      "timeoutSeconds": 60,
+      "maxAttempts": 1,
+      "nextStep": "AttachInlineDenyPolicyToUser"
+    },
+    {
+      "name": "AttachInlineDenyPolicyToUser",
+      "description": "Attaches a deny policy to the IAM user to revoke permissions for older session tokens.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 1,
+      "nextStep": "ReportContain",
+      "onFailure": "step:ReportContainFailure",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}",
+          "UserName": "{{ GetIAMUser.UserName }}",
+          "ResourceCreationTime": "{{ GetIAMUserDetails.UserCreationTime }}",
+          "CurrentTime": "{{ GetIAMUserDetails.CurrentTime }}",
+          "TagIdentifier": "{{ TagIdentifier }}"
+        },
+        "Handler": "attach_inline_deny_policy.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "AttachInlineDenyPolicyToRole",
+      "description": "Attaches a deny policy to the IAM role to revoke permissions for older session tokens.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 1,
+      "nextStep": "ReportContain",
+      "onFailure": "step:ReportContainFailure",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "RoleName": "{{ PrincipalName }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}",
+          "CurrentTime": "{{ GetIAMRoleDetails.CurrentTime }}",
+          "Action": "{{ Action }}",
+          "ResourceCreationTime": "{{ GetIAMRoleDetails.RoleCreationTime }}",
+          "TagIdentifier": "{{ TagIdentifier }}"
+        },
+        "Handler": "attach_inline_deny_policy.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "RemovePermissionSets",
+      "description": "Removes permission sets associated with the Identity Center user.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "RemoveIDCUserFromIDCGroups",
+      "onFailure": "step:ReportContainFailure",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}",
+          "IDCUsersID": "{{ GetIDCUser.IDCUsersID }}",
+          "InstanceArn": "{{ GetIdentityStoreId.InstanceArn }}"
+        },
+        "Handler": "remove_permission_sets.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "RemoveIDCUserFromIDCGroups",
+      "description": "Removes the Identity Center user from its groups.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "AttachPermissionSetsInlinePolicy",
+      "onFailure": "step:ReportContainFailure",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}",
+          "IDCUsersID": "{{ GetIDCUser.IDCUsersID }}",
+          "IdentityStoreId": "{{ GetIdentityStoreId.IdentityStoreId }}"
+        },
+        "Handler": "remove_user_from_group.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "AttachPermissionSetsInlinePolicy",
+      "description": "Attaches a deny policy to the Identity Center user to revoke older session tokens.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "onFailure": "step:ReportContainFailure",
+      "nextStep": "ReportContain",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}",
+          "TagIdentifier": "{{ TagIdentifier }}",
+          "IDCUsersID": "{{ GetIDCUser.IDCUsersID }}",
+          "InstanceArn": "{{ GetIdentityStoreId.InstanceArn }}"
+        },
+        "Handler": "attach_inline_deny_policy_to_permission_set.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "BranchOnReactivateKeys",
+      "description": "Determines whether to reactivate disabled access keys based on the `ActivateDisabledKeys` parameter.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ReActivateUserKeys",
+            "Variable": "{{ ActivateDisabledKeys }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "DetachInlineDenyPolicy"
+      }
+    },
+    {
+      "name": "ReActivateUserKeys",
+      "description": "Reactivates the IAM user keys.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "DetachInlineDenyPolicy",
+      "onFailure": "step:ReportRestoreFailure",
+      "inputs": {
+        "InputPayload": {
+          "PrincipalName": "{{ PrincipalName }}",
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}"
+        },
+        "Handler": "activate_access_keys.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "DetachInlineDenyPolicy",
+      "description": "Detaches the inline deny policy for the IAM user and role.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "ReportRestore",
+      "onFailure": "step:ReportRestoreFailure",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "TagIdentifier": "{{ TagIdentifier }}"
+        },
+        "Handler": "detach_inline_deny_policy.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "DetachInlineDenyPolicyFromPermissionSet",
+      "description": "Detaches the inline deny for the Identity Center user.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "onFailure": "step:ReportRestoreFailure",
+      "nextStep": "AddIDCUserToIDCGroup",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "TagIdentifier": "{{ TagIdentifier }}"
+        },
+        "Handler": "detach_inline_deny_policy_from_permission_set.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "AddIDCUserToIDCGroup",
+      "description": "Restores the Identity Center user group membership.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "AttachPermissionSets",
+      "onFailure": "step:ReportRestoreFailure",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}"
+        },
+        "Handler": "add_user_to_group.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "AttachPermissionSets",
+      "description": "Attaches the permission sets back to the Identity Center user.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "ReportRestore",
+      "onFailure": "step:ReportRestoreFailure",
+      "inputs": {
+        "InputPayload": {
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}"
+        },
+        "Handler": "attach_permission_set.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true
+    },
+    {
+      "name": "ReportContainFailure",
+      "description": "Outputs the information required to help contain the IAM principal in case of failure.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "DryRun": "{{ DryRun }}",
+          "Action": "{{ Action }}",
+          "PrincipalName": "{{ PrincipalName }}",
+          "PrincipalType": "{{ PrincipalType }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "ActivateDisabledKeys": "{{ ActivateDisabledKeys }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}"
+        },
+        "Handler": "report_failure.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true,
+      "isEnd": true
+    },
+    {
+      "name": "ReportContain",
+      "description": "Outputs the details of the IAM principal containment actions (for `DryRun` mode, this reflects what would have changed).",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "PrincipalName": "{{ PrincipalName }}",
+          "PrincipalType": "{{ PrincipalType }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "ActivateDisabledKeys": "{{ ActivateDisabledKeys }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}",
+          "Action": "{{ Action }}",
+          "DryRun": "{{ DryRun }}"
+        },
+        "Handler": "report_success.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true,
+      "isEnd": true
+    },
+    {
+      "name": "ReportRestoreFailure",
+      "description": "Outputs the information required to help restore the IAM principal in case of a failure.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "Action": "{{ Action }}",
+          "DryRun": "{{ DryRun }}",
+          "PrincipalName": "{{ PrincipalName }}",
+          "PrincipalType": "{{ PrincipalType }}",
+          "ActivateDisabledKeys": "{{ ActivateDisabledKeys }}",
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}"
+        },
+        "Handler": "report_failure.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true,
+      "isEnd": true
+    },
+    {
+      "name": "ReportRestore",
+      "description": "Outputs the details of the IAM principal restoration actions (for `DryRun` mode, this reflects what would have changed).",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "PrincipalName": "{{ PrincipalName }}",
+          "PrincipalType": "{{ PrincipalType }}",
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "ActivateDisabledKeys": "{{ ActivateDisabledKeys }}",
+          "Action": "{{ Action }}",
+          "DryRun": "{{ DryRun }}",
+          "BackupS3KeyName": "{{ variable:S3Key }}"
+        },
+        "Handler": "report_success.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true,
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "ReportContain.Message",
+    "ReportRestore.Message",
+    "ReportContainFailure.Message",
+    "ReportRestoreFailure.Message"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "5fac1724730090c8f9230672ad36094c2b39a7eb33e9ea301f21765298611978"
+      }
+    }
+  }
+}

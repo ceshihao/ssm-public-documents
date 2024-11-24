@@ -1,0 +1,539 @@
+{
+  "description": "The **AWSSupport-ContainS3Resource** automation runbook is designed to perform a containment of an Amazon Simple Storage Service (Amazon S3) bucket or object in response to a suspected or confirmed security issue. This runbook implements a containment process that helps isolate the target S3 resource while preserving its contents for further investigation.\nThe containment process includes:\n> * Isolating the Amazon S3 bucket or object by modifying its access policies:\n>    * For buckets: Denies all S3 actions (s3:*) for all principals except for the specified IAM principals.\n>    * For objects: Denies all actions (*) on the specific object except for the specified IAM principals.\n>    * For directory buckets (S3 Express): Denies all S3 Express actions (s3express:*) except for the specified IAM principals.\n> * Changes the public access block settings to prevent any public access to the resource.\n> * Enforcing bucket owner controls to disable ACLs and ensure proper object ownership:\n>    * Sets the bucket ownership control to `BucketOwnerEnforced`.\n>    * Disables Access Control Lists (ACLs) for the bucket and all objects within it.\n>    * Ensures the bucket owner automatically owns and has full control over every object.\nThe containment is designed to be reversible, allowing for an attempt to restore normal access when appropriate. However, **please note that restoration to the exact previous state is not guaranteed**, as changes in the account or associated S3 resources might have occurred between the time of containment and restoration.\n\n### Important:\nThis automation runbook can significantly impact the availability of your data stored in Amazon S3. It is specifically designed to isolate an S3 resource during a security event. This isolation can disrupt any applications, processes, or users that depend on access to the targeted S3 bucket or object. **Carefully consider the potential impact before executing this runbook**. This runbook can be used in various scenarios, such as responding to detected unauthorized access, isolating potentially compromised S3 resources, or as part of a broader incident response plan.\n\n### Important:\n> * Ensure that both the target and backup Amazon S3 buckets exist and are owned by the current AWS account. The Amazon S3 operations perform ownership verification and will fail if either bucket is missing or belongs to a different account.\n> * This runbook will restrict access to the target S3 bucket or object. Ensure you understand the full impact on your systems and applications before proceeding.\n> * Always verify that the associated backup S3 bucket policy and ACLs do not grant unnecessary read or write permissions to principals that don't require access.\n> * We recommend using Amazon S3 server-side encryption, enabling S3 server access logging, and S3 Versioning for both the target and backup buckets to enhance security and maintain an audit trail.\n> * While the runbook applies effective containment measures, consider implementing additional security measures as part of your overall S3 data protection strategy.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The Amazon S3 bucket name."
+    },
+    "BucketKeyName": {
+      "type": "String",
+      "description": "(Optional) The key of the Amazon S3 object you want to contain or restore workflow. Used during object level containment.",
+      "allowedPattern": "^[a-zA-Z0-9\\.\\-_\\\\!*'()/]{0,1024}$",
+      "default": ""
+    },
+    "BucketRestrictAccess": {
+      "description": "(Conditional) The ARN of the IAM users or roles that will be allowed access to the target Amazon S3 resource after running the containment actions. This parameter is **required** when Action is `Contain`. The `AutomationAssumeRole`, or in its absence the user under whose context the automation is running is automatically added to the list.",
+      "type": "StringList",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:(role|user)\\/[\\w+\\/=,.@-]+$",
+      "default": []
+    },
+    "Action": {
+      "type": "String",
+      "allowedValues": [
+        "Contain",
+        "Restore"
+      ],
+      "description": "(Required) Select `Contain` to isolate the target Amazon S3 bucket or object or `Restore` to try to restore the target resource to its original configuration from a previous backup."
+    },
+    "DryRun": {
+      "type": "Boolean",
+      "default": true,
+      "description": "(Optional) When set to `true`, the automation will not make any changes to the target resource, instead it will output on what it would have attempted to change, detailing out on each step. Default value: `true`."
+    },
+    "TagIdentifier": {
+      "type": "String",
+      "allowedPattern": "^$|^[Kk][Ee][Yy]=[\\+\\-\\=\\.\\_\\:\\/@a-zA-Z0-9]{1,128},[Vv][Aa][Ll][Uu][Ee]=[\\+\\-\\=\\.\\_\\:\\/@a-zA-Z0-9]{0,128}$",
+      "default": "",
+      "description": "(Optional) Tag the Amazon S3 bucket principal with a tag of your choice using the following format: `Key=<EXAMPLE_KEY>,Value=<EXAMPLE_VALUE>`. This option allows you to track the Amazon S3 buckets that have been targeted by this runbook. Note: Tag keys and values are case-sensitive."
+    },
+    "BackupS3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Conditional) The Amazon S3 bucket to backup the target resource configuration when the **Action** is set to `Contain` or to restore the configuration from when the **Action** is `Restore`. Note that if the specified **Action** is `Contain` and the runbook is not able to access the bucket or a value is not provided, a new bucket is created in your account with the name `awssupport-contains3resource-<random-string>`",
+      "default": ""
+    },
+    "BackupS3BucketAccess": {
+      "description": "(Conditional) The ARN of the IAM users or roles that will be allowed access to the backup Amazon S3 bucket after running the containment actions. This parameter is required when Action is `Contain`. The `AutomationAssumeRole`, or in its absence the user under whose context the automation is running is automatically added to the list.",
+      "type": "StringList",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:(role|user)\\/[\\w+\\/=,.@-]+$",
+      "default": []
+    },
+    "BackupS3KeyName": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9\\.\\-_\\\\!*'()/]{0,1024}$",
+      "default": "",
+      "description": "(Conditional) If **Action** is set to `Restore`, this specifies the Amazon S3 key the automation will use to try to restore the target resource configuration. The Amazon S3 key typically follows this format: `{year}/{month}/{day}/{hour}/{minute}/{automation_execution_id}.json`. The key can be obtained from the output of a previous containment automation execution."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateRequiredInputs",
+      "action": "aws:executeScript",
+      "description": "Validates the required automation input parameters based on the **Action** specified.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 120,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "Action": "{{ Action }}",
+          "DryRun": "{{ DryRun }}",
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "BackupS3BucketAccess": "{{ BackupS3BucketAccess }}",
+          "BucketRestrictAccess": "{{ BucketRestrictAccess }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nMAX_ATTEMPTS = 10\n\nsys.tracebacklimit = 0\n\nconfig = Config(retries={\"max_attempts\": 10, \"mode\": \"standard\"})\nssm_client = boto3.client(\"ssm\", config=config)\n\n\ndef get_executor_arn(context: dict):\n    \"\"\"Returns SSM automation executor ARN\"\"\"\n\n    execution_id = context.get(\"automation:EXECUTION_ID\")\n    if not execution_id:\n        raise ValueError(\"Missing automation:EXECUTION_ID in context\")\n\n    for attempt in range(MAX_ATTEMPTS):\n        try:\n            response = ssm_client.describe_automation_executions(\n                Filters=[{\"Key\": \"ExecutionId\", \"Values\": [execution_id]}]\n            )\n            executions = response.get(\"AutomationExecutionMetadataList\", [])\n\n            if not executions:\n                raise ValueError(f\"No execution found for ID: {execution_id}\")\n\n            executed_by = executions[0].get(\"ExecutedBy\", \"\")\n\n            if not executed_by:\n                raise ValueError(f\"ExecutedBy is empty for execution ID: {execution_id}\")\n\n            return parse_executed_by(executed_by, context)\n\n        except ClientError as e:\n            if attempt == MAX_ATTEMPTS - 1:\n                raise RuntimeError(f\"Failed to get execution details after {MAX_ATTEMPTS} attempts: {str(e)}\") from None\n            print(f\"Attempt {attempt + 1} failed: {str(e)}. Retrying...\")\n            time.sleep(10)\n\n\ndef parse_executed_by(executed_by: str, context: dict) -> str:\n    \"\"\"Parse the ExecutedBy string and return the appropriate ARN\"\"\"\n\n    session = boto3.Session()\n    partition = session.get_partition_for_region(session.region_name)\n    account_id = context.get(\"global:ACCOUNT_ID\")\n    if not account_id:\n        raise ValueError(\"Missing global:ACCOUNT_ID in context\")\n\n    parts = executed_by.split(\":\")\n\n    if parts[0] == \"arn\" and parts[2] == \"sts\":\n        # It's an assumed role, extract the role name\n        role_parts = executed_by.split(\"/\")\n        if len(role_parts) >= 2:\n            role_name = role_parts[-2]\n            return f\"arn:{partition}:iam::{account_id}:role/{role_name}\"\n        else:\n            raise ValueError(f\"Unable to parse assumed role ARN: {executed_by}\")\n    elif parts[0] == \"arn\" and parts[2] == \"iam\":\n        # It's already a full IAM ARN\n        return executed_by\n    elif executed_by == \"root\":\n        return f\"arn:{partition}:iam::{account_id}:root\"\n    if executed_by.startswith(\"user/\") or executed_by.startswith(\"role/\"):\n        # It's a short form, we need to construct the full ARN\n        return f\"arn:{partition}:iam::{account_id}:{executed_by}\"\n    else:\n        # It might be a service principal or another format\n        return executed_by\n\n\ndef script_handler(events, context):\n    \"\"\"Validates the provided inputs and raises an exception if required inputs are not provided.\n\n    Args:\n        events: The inputs parameters sent to the handler.\n        context: The context send to the handler by Systems Manager.\n\n    Returns:\n        dict: A dictionary containing the following keys:\n            - DirectoryBucket: Boolean value.\n            - AllowListedRoles: IAM roles allowed to access bucket.\n    \"\"\"\n    bucket_name = events[\"BucketName\"]\n    action = events[\"Action\"]\n    prefix_name = events[\"BackupS3KeyName\"]\n    backup_bucket = events[\"BackupS3BucketName\"]\n    backup_secure_roles = events[\"BackupS3BucketAccess\"]\n    target_secure_roles = events[\"BucketRestrictAccess\"]\n    executor_role = events[\"AutomationAssumeRole\"]\n\n    directory_bucket = False\n\n    if bucket_name == backup_bucket:\n        raise RuntimeError(\"Target Bucket and Backup bucket cannot be same.\")\n\n    if action == \"Contain\" and not target_secure_roles:\n        raise RuntimeError(\"BucketRestrictAccess need to be provided\")\n\n    elif action == \"Restore\" and not prefix_name:\n        raise RuntimeError(\"Prefix Name needs to be provided.\")\n\n    if bucket_name.endswith(\"--x-s3\"):\n        directory_bucket = True\n\n    # Get the ssm document invoker details\n    if not executor_role:\n        executor_role = get_executor_arn(context)\n\n    backup_secure_roles.append(executor_role)\n    target_secure_roles.append(executor_role)\n\n    return {\n        \"DirectoryBucket\": directory_bucket,\n        \"AllowListedRoles\": target_secure_roles,\n        \"BackupAllowListedRoles\": backup_secure_roles,\n    }\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "nextStep": "BranchOnTargetType",
+      "outputs": [
+        {
+          "Name": "isDirectoryBucket",
+          "Selector": "$.Payload.DirectoryBucket",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AllowListedRoles",
+          "Selector": "$.Payload.AllowListedRoles",
+          "Type": "StringList"
+        },
+        {
+          "Name": "BackupAllowListedRoles",
+          "Selector": "$.Payload.BackupAllowListedRoles",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnTargetType",
+      "action": "aws:branch",
+      "description": "Branches the automation based on the target Amazon S3 resource: bucket or object.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 2,
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ BucketKeyName }}",
+            "StringEquals": "",
+            "NextStep": "AssertBucketExists"
+          }
+        ],
+        "Default": "AssertObjectExists"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "AssertObjectExists",
+      "action": "aws:executeAwsApi",
+      "description": "Asserts if the target Amazon S3 object exists and it is accessible by calling the `HeadObject` API.",
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Service": "s3",
+        "Api": "HeadObject",
+        "Bucket": "{{ BucketName }}",
+        "Key": "{{ BucketKeyName }}",
+        "ExpectedBucketOwner": "{{ global:ACCOUNT_ID }}"
+      },
+      "isCritical": true,
+      "nextStep": "CheckBackupS3BucketName"
+    },
+    {
+      "name": "AssertBucketExists",
+      "action": "aws:executeAwsApi",
+      "description": "Asserts if the target Amazon S3 bucket exists and it is accessible by calling the `HeadBucket` API.",
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Service": "s3",
+        "Api": "HeadBucket",
+        "Bucket": "{{ BucketName }}",
+        "ExpectedBucketOwner": "{{ global:ACCOUNT_ID }}"
+      },
+      "isCritical": true,
+      "nextStep": "CheckBackupS3BucketName"
+    },
+    {
+      "name": "CheckBackupS3BucketName",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "Checks if the backup Amazon S3 bucket potentially grants **read** or **write** public access to its objects. In case of containment workflow, a new Amazon S3 bucket is created if the `BackupS3BucketName` bucket doesn't exist.",
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "Action": "{{ Action }}",
+          "DryRun": "{{ DryRun }}",
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "AutomationAssumeRole": "{{AutomationAssumeRole}}",
+          "BackupAllowListedRoles": "{{ ValidateRequiredInputs.BackupAllowListedRoles }}"
+        },
+        "Handler": "validate_s3_bucket.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "BucketName",
+          "Selector": "$.Payload.BucketName",
+          "Type": "String"
+        },
+        {
+          "Name": "IsBucketCreated",
+          "Selector": "$.Payload.CreateBucket",
+          "Type": "Boolean"
+        }
+      ],
+      "isCritical": true,
+      "nextStep": "BranchOnActionAndDryRun"
+    },
+    {
+      "name": "BranchOnActionAndDryRun",
+      "action": "aws:branch",
+      "description": "Branches the automation based on the value of the specified `Action` and if it is running in `DryRun` mode.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Contain"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "ContainS3ResourceDryRun"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Contain"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              }
+            ],
+            "NextStep": "BackupTargetS3ResourceMetadata"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Restore"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "RestoreS3ResourceDryRun"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Restore"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              }
+            ],
+            "NextStep": "RestoreS3Resource"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ContainS3ResourceDryRun",
+      "action": "aws:executeScript",
+      "description": "Outputs dry run details for the containment actions.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3BucketAccess": "{{ BackupS3BucketAccess }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}",
+          "Tag": "{{ TagIdentifier }}",
+          "AllowListedRoles": "{{ ValidateRequiredInputs.AllowListedRoles }}"
+        },
+        "Handler": "contain_dry_run.script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BackupTargetS3ResourceMetadata",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "Gets and stores the current configuration of the target Amazon S3 resource.",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}"
+        },
+        "Handler": "backup_target_bucket_metadata.script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "nextStep": "ContainS3Resource",
+      "outputs": [
+        {
+          "Name": "BackupMetadata",
+          "Selector": "$.Payload.BackupMetadata",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "BackupKey",
+          "Selector": "$.Payload.BackupKey",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ContainS3Resource",
+      "action": "aws:executeScript",
+      "onFailure": "step:ReportContainmentFailure",
+      "timeoutSeconds": 600,
+      "description": "Performs the containment actions on the target Amazon S3 resource.",
+      "maxAttempts": 1,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupS3BucketAccess": "{{ BackupS3BucketAccess }}",
+          "BackupMetadata": "{{ BackupTargetS3ResourceMetadata.BackupMetadata }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}",
+          "Tag": "{{ TagIdentifier }}",
+          "AllowListedRoles": "{{ ValidateRequiredInputs.AllowListedRoles }}"
+        },
+        "Handler": "contain_bucket.script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "nextStep": "ContainFinalOutput"
+    },
+    {
+      "name": "RestoreS3ResourceDryRun",
+      "action": "aws:executeScript",
+      "description": "Outputs dry run details for the restoring actions.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}",
+          "Tag": "{{ TagIdentifier }}"
+        },
+        "Handler": "restore_dry_run.script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "RestoreS3Resource",
+      "action": "aws:executeScript",
+      "onFailure": "step:ReportRestoreFailure",
+      "description": "Restores the target Amazon S3 resource configuration from the backup.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}",
+          "Tag": "{{ TagIdentifier }}"
+        },
+        "Handler": "restore_bucket.script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "nextStep": "RestoreFinalOutput"
+    },
+    {
+      "name": "ReportContainmentFailure",
+      "action": "aws:executeScript",
+      "description": "Provides instructions to restore the target Amazon S3 resource original configuration during a containment workflow failure scenario.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupMetadata": "{{ BackupTargetS3ResourceMetadata.BackupMetadata }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nfrom helpers import messages  # pyright: ignore[reportMissingImports]\n\n\ndef script_handler(events: dict, _) -> dict:\n    bucket_name = events[\"BucketName\"]\n    object_name = events[\"BucketKeyName\"]\n    backup_metadata = events[\"BackupMetadata\"]\n    directory_bucket = events[\"DirectoryBucket\"]\n\n    message = messages.build_containment_failure_message(\n        bucket_name,\n        object_name,\n        backup_metadata,\n        directory_bucket,\n    )\n\n    return {\"Message\": message}\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ReportRestoreFailure",
+      "action": "aws:executeScript",
+      "description": "Provides instructions to restore the target Amazon S3 resource original configuration during a restore workflow failure scenario.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nfrom helpers import messages, utils  # pyright: ignore[reportMissingImports]\n\n\ndef script_handler(events: dict, context: dict) -> dict:\n    bucket_name = events[\"BucketName\"]\n    object_name = events[\"BucketKeyName\"]\n    prefix_name = events[\"BackupS3KeyName\"]\n    backup_bucket = events[\"BackupS3BucketName\"]\n    directory_bucket = events[\"DirectoryBucket\"]\n    account_id = context[\"global:ACCOUNT_ID\"]\n\n    restore_metadata = utils.download_config(backup_bucket, bucket_name, prefix_name, account_id)\n\n    message = messages.build_restore_failure_message(\n        bucket_name,\n        object_name,\n        restore_metadata,\n        directory_bucket,\n    )\n\n    return {\"Message\": message}\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": true,
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ContainFinalOutput",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "Outputs the details of the containment actions.",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "BackupS3BucketName": "{{ CheckBackupS3BucketName.BucketName }}",
+          "BackupMetadata": "{{ BackupTargetS3ResourceMetadata.BackupMetadata }}",
+          "BackupKey": "{{ BackupTargetS3ResourceMetadata.BackupKey }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}",
+          "Tag": "{{ TagIdentifier }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nfrom helpers import messages, utils  # pyright: ignore[reportMissingImports]\nfrom helpers.constants import EMPTY_REPLICATION_MESSAGE  # pyright: ignore[reportMissingImports]\n\nsys.tracebacklimit = 0\n\n\ndef script_handler(events: dict, context: dict) -> str:\n    bucket_name = events[\"BucketName\"]\n    backup_bucket = events[\"BackupS3BucketName\"]\n    object_name = events[\"BucketKeyName\"]\n    backup_key = events[\"BackupKey\"]\n    backup_metadata = events[\"BackupMetadata\"]\n    directory_bucket = events[\"DirectoryBucket\"]\n    tag = events[\"Tag\"]\n    execution_id = context[\"automation:EXECUTION_ID\"]\n    account_id = context[\"global:ACCOUNT_ID\"]\n\n    replication_target_bucket = set()\n\n    current_configuration = utils.get_current_configuration(bucket_name, object_name, directory_bucket, account_id)\n\n    if not directory_bucket:\n        if current_configuration[\"ReplicationConfiguration\"] != EMPTY_REPLICATION_MESSAGE:\n            for rule in current_configuration[\"ReplicationConfiguration\"][\"Rules\"]:\n                replication_target_bucket.add(rule[\"Destination\"][\"Bucket\"])\n\n    message = messages.build_contain_final_output_message(\n        execution_id,\n        bucket_name,\n        object_name,\n        backup_bucket,\n        backup_key,\n        backup_metadata,\n        current_configuration,\n        directory_bucket,\n        replication_target_bucket,\n        tag,\n    )\n    return {\"Message\": message}\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": false,
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "RestoreFinalOutput",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "description": "Outputs the details of the restoring actions.",
+      "timeoutSeconds": 180,
+      "maxAttempts": 3,
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketKeyName": "{{ BucketKeyName }}",
+          "DirectoryBucket": "{{ ValidateRequiredInputs.isDirectoryBucket }}",
+          "Tag": "{{ TagIdentifier }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\nimport sys\n\nfrom helpers import messages, utils  # pyright: ignore[reportMissingImports]\n\nsys.tracebacklimit = 0\n\n\ndef script_handler(events: dict, context: dict) -> dict:\n    bucket_name = events[\"BucketName\"]\n    object_name = events[\"BucketKeyName\"]\n    directory_bucket = events[\"DirectoryBucket\"]\n    tag = events[\"Tag\"]\n    execution_id = context[\"automation:EXECUTION_ID\"]\n    account_id = context[\"global:ACCOUNT_ID\"]\n\n    current_configuration = utils.get_current_configuration(bucket_name, object_name, directory_bucket, account_id)\n\n    message = messages.build_restore_final_output_message(\n        execution_id, bucket_name, object_name, current_configuration, directory_bucket, tag\n    )\n\n    return {\"Message\": message}\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "isCritical": false,
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "ContainFinalOutput.Output",
+    "RestoreFinalOutput.Output",
+    "ContainS3ResourceDryRun.Output",
+    "RestoreS3ResourceDryRun.Output",
+    "ReportContainmentFailure.Output",
+    "ReportRestoreFailure.Output"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "094de6db5b760ff7c6a696abd1fb6bad7d08e15866364a125b2dda5562e4e86b"
+      }
+    }
+  }
+}

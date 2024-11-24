@@ -1,6 +1,6 @@
 {
   "schemaVersion": "0.3",
-  "description": "The AWSSupport-TroubleshootECSTaskFailedToStart runbook helps you troubleshoot why an Amazon Elastic Container Service (Amazon ECS) task in an Amazon ECS cluster failed to start. The runbook analyzes the following common issues that can prevent a task from starting:\n\n- Network connectivity to the configured container registry\n- Missing IAM permissions required by the task execution role\n- VPC endpoint connectivity\n- Security group rule configuration\n- AWS Secrets Manager secrets references\n- Logging configuration\n\n## Note:\n\nIf the analysis determines that network connectivity needs to be tested, a Lambda function and requisite IAM role are created in your account. These resources are used to simulate the network connectivity of your failed task. The automation deletes these resources when they're no longer required. However, if the automation fails to delete the resources, you must do so manually.",
+  "description": "The AWSSupport-TroubleshootECSTaskFailedToStart runbook helps you troubleshoot why an Amazon Elastic Container Service (Amazon ECS) task in an Amazon ECS cluster failed to start. You must run this runbook in the same AWS Region as your task that failed to start. The runbook analyzes the following common issues that can prevent a task from starting:\n\n- Network connectivity to the configured container registry\n- Missing IAM permissions required by the task execution role\n- VPC endpoint connectivity\n- Security group rule configuration\n- AWS Secrets Manager secrets references\n- Logging configuration\n\n## Note:\n\nIf the analysis determines that network connectivity needs to be tested, an AWS Lambda function and requisite IAM role are created in your account. These resources are used to simulate the network connectivity of your failed task. The automation deletes these resources when they're no longer required. However, if the automation fails to delete the resources, you must do so manually.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "AutomationAssumeRole": {
@@ -15,12 +15,12 @@
     },
     "TaskId": {
       "type": "String",
-      "description": "(Required) The ID of the failed task.",
+      "description": "(Required) The ID of the failed task. Use the most recently failed task.",
       "allowedPattern": "^[a-z0-9]{1,255}$"
     },
     "CloudwatchRetentionPeriod": {
       "type": "Integer",
-      "description": "(Optional) The retention period, in days, for the Lambda function logs to be stored in Amazon CloudWatch Logs. This is only necessry if the analysis determines network connectivity needs to be tested.",
+      "description": "(Optional) The retention period, in days, for the AWS Lambda function logs to be stored in Amazon CloudWatch Logs. This is only necessry if the analysis determines network connectivity needs to be tested.",
       "default": 30,
       "allowedValues": [
         1,
@@ -36,39 +36,39 @@
   },
   "mainSteps": [
     {
-      "name": "00_PreflightPermissionChecks",
-      "onFailure": "step:04_Execution_Results",
-      "onCancel": "step:04_Execution_Results",
+      "name": "PreflightPermissionChecks",
+      "onFailure": "step:ExecutionResults",
+      "onCancel": "step:ExecutionResults",
       "action": "aws:executeScript",
       "description": "Verifies that the user or role who started the automation has the required IAM permissions. If you don't have sufficient permissions to use this runbook, the missing required permissions are included in the output of the automation.",
       "timeoutSeconds": 60,
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "iam_permission_handler",
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n############################################################################\n# USAGE: iam_permission_handler will evaluate REQUIRED_PERMISSIONS\n# against the actor executing the Runbook and provides missing perms\n# if there is any.\n############################################################################\n\n\n############################################################################\n# AWS API USAGE IN FILE:\n# sts:GetCallerIdentity\n############################################################################\n\n\nimport boto3\nimport lib.iam.simulation as permission_evaluation\nfrom lib.iam.iam_const import REQUIRED_PERMISSIONS\n\nsts_client = boto3.client(\"sts\")\n\n\n# Design Consideration: iam_permission_handler is the very first step executed\n# as part of this RunBook. The iam_permission_handler should verify if the\n# user who initiated this RunBook or optionally passed SSM role has enough permission\n# to perform all required intended actions or not, specifically mutating api calls.\n# Such as CreateRole, DeleteRole, CreateFunction, DeleteFunction. There are known two\n# approaches to tackle this logic. 1) via DryRun 2) via IAM Simulation. DryRun is\n# not possible in this Runbook as not all AWS services supports DryRun especially\n# IAM actions and Lambda deletion actions. IAM Simulation provides more optimistic\n# results however with some caveats. One of the important concern when using IAM\n# Simulation is, SimulatePrincipalPolicy action requires you as an end user to pass\n# both valid user arn / role arn along with required action to simulate. Here the\n# problem is passing valid user/role arn. Identifying valid user/arn who is executing\n# SAW SSM Runbook is tricky. The problem comes with STS GetCallerIdentity where it\n# will not have direct role/user in \"Arn\" field incase of AssumeRole users/roles,\n# Federated Users/Roles, Multi Path roles etc... In all this cases we need to efficiently\n# parse STS GetCallerIdentity \"UserId\" field to understand what kind of identity\n# that has been used when this RunBook is initiated. More on IAM Pattern Identifier is\n# is documented here\n# https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html#identifiers-prefixes\n# Once UserId is extracted, we could fire GetRole, GetUser to understand if the full ARN\n# of the user/role and pass it to SimulatePrincipalPolicy for verification. In worst case\n# we may fail in UserId stage where it cannot be mapped Or trouble in mapping to any of\n# currently available User/Role in which case we have to abort the execution\n\n\ndef iam_permission_handler(events, context):\n    \"\"\"\n    The iam_permission_handler() verifies if the\n    user who initiated this RunBook or optionally passed SSM role has enough permission\n    to perform all required intended actions or not\n    \"\"\"\n    results = \"FAILED\"\n    info_codes = []\n    info_message = []\n    execution_id = context[\"automation:EXECUTION_ID\"].split(\"-\")[-1]\n\n    get_caller_identity_response = sts_client.get_caller_identity()\n    user_id = get_caller_identity_response.get(\"UserId\").split(\":\")[0]\n\n    info_codes, info_message, results = permission_evaluation.simulate_caller_policy(user_id, execution_id, REQUIRED_PERMISSIONS)\n\n    return {\n        \"results\": results,\n        \"message\": \"\".join(info_message),\n        \"info_codes\": info_codes,\n    }\n",
-        "Attachment": "attachment.zip"
+        "InputPayload": {},
+        "Handler": "iam_permission_handler.iam_permission_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
-          "Name": "Permission_check_results",
+          "Name": "PermissionCheckResults",
           "Selector": "$.Payload.results",
           "Type": "String"
         },
         {
-          "Name": "message",
+          "Name": "Message",
           "Selector": "$.Payload.message",
           "Type": "String"
         },
         {
-          "Name": "info_codes",
+          "Name": "InfoCodes",
           "Selector": "$.Payload.info_codes",
           "Type": "StringList"
         }
       ],
-      "nextStep": "ProceedOnlyIfUserHasPermission"
+      "nextStep": "BranchOnUserHasPermission"
     },
     {
-      "name": "ProceedOnlyIfUserHasPermission",
+      "name": "BranchOnUserHasPermission",
       "action": "aws:branch",
       "onFailure": "Abort",
       "description": "Branches based on whether you have permissions to all required actions for the runbook.",
@@ -76,308 +76,304 @@
         "Choices": [
           {
             "Not": {
-              "Variable": "{{ 00_PreflightPermissionChecks.Permission_check_results }}",
+              "Variable": "{{ PreflightPermissionChecks.PermissionCheckResults }}",
               "StringEquals": "FAILED"
             },
-            "NextStep": "01_NetworkToolDeployment"
+            "NextStep": "NetworkToolDeployment"
           }
         ],
-        "Default": "04_Execution_Results"
-      }
+        "Default": "ExecutionResults"
+      },
+      "nextStep": "ExecutionResults"
     },
     {
-      "name": "01_NetworkToolDeployment",
+      "name": "NetworkToolDeployment",
       "action": "aws:executeScript",
-      "description": "Creates a Lambda function in your VPC if the analysis determines network connectivity needs to be tested.",
-      "onFailure": "step:03_Deletion_Lifecycle",
-      "onCancel": "step:03_Deletion_Lifecycle",
+      "description": "Creates an AWS Lambda function in your VPC if the analysis determines network connectivity needs to be tested.",
+      "onFailure": "step:DeletionLifecycle",
+      "onCancel": "step:DeletionLifecycle",
       "timeoutSeconds": 400,
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "lambda_deployment_handler",
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\n############################################################################\n# USAGE: lambda_deployment_handler() deploys a network tool lambda function\n# in customer account with same network settings as failed task\n############################################################################\n\n\n############################################################################\n# AWS API USAGE IN FILE: NONE\n############################################################################\n\nimport boto3\nimport lib.aws_lambda.lambda_creator as lambda_creator\nimport lib.ecs.network_finder as ecs_utils\nimport logging\nfrom botocore.exceptions import ClientError\nfrom lib.aws_lambda.lambda_const import INFO_MESSAGE, ARTIFACT_NAME, FUNCTION_PREFIX, ROLE_PREFIX\nfrom lib.ecs.skip_check import skip_check\n\nlog = logging.getLogger(__name__)\n\n\necs_client = boto3.client(\"ecs\")\ncw_logs_client = boto3.client(\"logs\")\n\n\ndef deploy_lambda(task_id, cluster_name, execution_id):\n    \"\"\"\n    deploy_lambda() deploys a network tool lambda function\n    in customer account with same network settings as failed task\n    \"\"\"\n\n    deployment_result = \"FAILED\"\n    function_arn = \"\"\n    info_codes = []\n    info_message = []\n    lambda_exec_role_name = ROLE_PREFIX + execution_id\n    function_name = FUNCTION_PREFIX + execution_id\n\n    network_settings, info_codes, info_message = ecs_utils.networkconfig_finder(task_id, cluster_name)\n\n    if not bool(info_codes):\n        function_arn, info_codes, info_message = lambda_creator.create_lambda(network_settings, ARTIFACT_NAME, function_name, lambda_exec_role_name)\n        if function_arn:\n            deployment_result = \"SUCCESS\"\n            info_codes.append(\"LAMBDA_CREATOR_I010\")\n            info_message.append(INFO_MESSAGE.get(\"LAMBDA_CREATOR_I010\").format(lambda_exec_role_name))\n            info_codes.append(\"LAMBDA_CREATOR_I009\")\n            info_message.append(INFO_MESSAGE.get(\"LAMBDA_CREATOR_I009\").format(function_arn))\n\n    return function_arn, info_codes, info_message, deployment_result\n\n\ndef execution_protection(describe_task_response):\n    proceed_to_execute = False\n\n    task_launch_type = describe_task_response.get(\"tasks\")[0].get(\"launchType\", \"\")\n    task_stop_code = describe_task_response.get(\"tasks\")[0].get(\"stopCode\", \"\")\n    task_stop_reason = describe_task_response.get(\"tasks\")[0].get(\"stoppedReason\", \"\")\n\n    if (task_launch_type == \"FARGATE\" or task_launch_type == \"EC2\") and (task_stop_code == \"TaskFailedToStart\") and (not (task_stop_reason == \"\")):\n        proceed_to_execute = True\n        return proceed_to_execute\n    else:\n        proceed_to_execute = False\n        return proceed_to_execute\n\n\ndef lambda_deployment_handler(events, context):\n    \"\"\"\n    lambda_deployment_handler() deploys a network tool lambda function\n    in customer account with same network settings as failed task if the\n    incoming failure reason requires network point of presence for evaluation\n    \"\"\"\n\n    task_id = events[\"TaskId\"]\n    cluster_name = events[\"ClusterName\"]\n    execution_id = context[\"automation:EXECUTION_ID\"].split(\"-\")[-1]\n    function_arn = \"\"\n    info_codes = []\n    info_message = []\n    task_stop_reason = \"\"\n    proceed_to_execute = False\n\n    # deployment_result can be \"FAILED\" OR \"SKIPPED\" OR \"SUCCESS\"\n    # \"FAILED\" - Issue occured when network tool lambda function is mandatory to get deployed\n    # \"SKIPPED\" - As per incoming task failure reason, network tool lambda function deployment can be skipped\n    # \"SUCCESS\" - network tool lambda function required and deployed successfully\n\n    deployment_result = \"FAILED\"\n\n    try:\n        describe_task_response = ecs_client.describe_tasks(cluster=cluster_name, tasks=[task_id], include=[\"TAGS\"])\n        if bool(describe_task_response.get(\"failures\")):\n            info_codes.append(\"LAMBDA_CREATOR_I014\")\n            info_message.append(INFO_MESSAGE.get(\"LAMBDA_CREATOR_I014\").format(task_id))\n            deployment_result = \"FAILED\"\n            return {\n                \"deployment_result\": deployment_result,\n                \"network_tool_lambda_arn\": function_arn,\n                \"info_codes\": info_codes,\n                \"message\": \"\".join(info_message),\n            }\n        else:\n            task_stop_reason = describe_task_response.get(\"tasks\")[0].get(\"stoppedReason\", \"\")\n            proceed_to_execute = execution_protection(describe_task_response)\n\n    except ClientError as e:\n        info_message.append(f\"AWS API Error at describe_tasks: {e!r}\")\n        deployment_result = \"FAILED\"\n        return {\n            \"deployment_result\": deployment_result,\n            \"network_tool_lambda_arn\": function_arn,\n            \"info_codes\": info_codes,\n            \"message\": \"\".join(info_message),\n        }\n\n    if (skip_check(task_stop_reason)) and (proceed_to_execute):\n        return {\n            \"deployment_result\": \"SKIPPED\",\n            \"network_tool_lambda_arn\": function_arn,\n            \"info_codes\": info_codes,\n            \"message\": \"\".join(info_message),\n        }\n\n    elif proceed_to_execute:\n        function_arn, info_codes, info_message, deployment_result = deploy_lambda(task_id, cluster_name, execution_id)\n        return {\n            \"deployment_result\": deployment_result,\n            \"network_tool_lambda_arn\": function_arn,\n            \"info_codes\": info_codes,\n            \"message\": \"\".join(info_message),\n        }\n\n    else:\n        info_codes.append(\"info_codes\")\n        info_message.append(INFO_MESSAGE.get(\"LAMBDA_CREATOR_I011\"))\n        deployment_result = \"FAILED\"\n        return {\n            \"deployment_result\": deployment_result,\n            \"network_tool_lambda_arn\": function_arn,\n            \"info_codes\": info_codes,\n            \"message\": \"\".join(info_message),\n        }\n",
         "InputPayload": {
           "ClusterName": "{{ ClusterName }}",
           "TaskId": "{{ TaskId }}"
         },
-        "Attachment": "attachment.zip"
+        "Handler": "lambda_deployment_handler.lambda_deployment_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
-          "Name": "deployment_result",
+          "Name": "DeploymentResult",
           "Selector": "$.Payload.deployment_result",
           "Type": "String"
         },
         {
-          "Name": "network_tool_lambda_arn",
+          "Name": "NetworkToolLambdaArn",
           "Selector": "$.Payload.network_tool_lambda_arn",
           "Type": "String"
         },
         {
-          "Name": "info_codes",
+          "Name": "InfoCodes",
           "Selector": "$.Payload.info_codes",
           "Type": "StringList"
         },
         {
-          "Name": "message",
+          "Name": "Message",
           "Selector": "$.Payload.message",
           "Type": "String"
         }
       ],
-      "nextStep": "NetworkToolDeploymentStatus"
+      "nextStep": "BranchOnNetworkToolDeploymentStatus"
     },
     {
-      "name": "NetworkToolDeploymentStatus",
+      "name": "BranchOnNetworkToolDeploymentStatus",
       "action": "aws:branch",
-      "onFailure": "step:03_Deletion_Lifecycle",
-      "onCancel": "step:03_Deletion_Lifecycle",
+      "onFailure": "step:DeletionLifecycle",
+      "onCancel": "step:DeletionLifecycle",
       "description": "Branches based on the results of the previous step.",
       "inputs": {
         "Choices": [
           {
             "Or": [
               {
-                "Variable": "{{ 01_NetworkToolDeployment.deployment_result }}",
+                "Variable": "{{ NetworkToolDeployment.DeploymentResult }}",
                 "StringEquals": "SUCCESS"
               },
               {
-                "Variable": "{{ 01_NetworkToolDeployment.deployment_result }}",
+                "Variable": "{{ NetworkToolDeployment.DeploymentResult }}",
                 "StringEquals": "SKIPPED"
               }
             ],
-            "NextStep": "02_CoreFailureReasonEvaluation"
+            "NextStep": "CoreFailureReasonEvaluation"
           }
         ],
-        "Default": "03_Deletion_Lifecycle"
-      }
+        "Default": "DeletionLifecycle"
+      },
+      "nextStep": "DeletionLifecycle"
     },
     {
-      "name": "02_CoreFailureReasonEvaluation",
+      "name": "CoreFailureReasonEvaluation",
       "action": "aws:executeScript",
       "description": "Analyzes possible causes for the failure to start your task.",
-      "onFailure": "step:03_Deletion_Lifecycle",
-      "onCancel": "step:03_Deletion_Lifecycle",
+      "onFailure": "step:DeletionLifecycle",
+      "onCancel": "step:DeletionLifecycle",
       "timeoutSeconds": 600,
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "core_evaluation_handler",
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n############################################################################\n# USAGE: core_evaluation_handler is the function hanlder called by the SSM\n# Runbook step called 02_CoreFailureReasonEvaluation. The handler\n# is responsible for for invoking checks based on task failure reason message\n############################################################################\n\n\n############################################################################\n# AWS API USAGE IN FILE: NONE\n############################################################################\n\nimport re\nimport logging\nfrom lib.ecs.task import Task\nfrom lib.vpc.remote_client import NetworkClient\nfrom lib.ecs.registry_analysis import RegistryAnalysis\nfrom lib.ecs.log_config_analysis import LogAnalysis\nfrom lib.ecs.secrets_analysis import SecretAnalysis\nfrom lib.ecs.efs_analysis import EFSAnalysis\nfrom lib.ecs.generic_check import GenericChecks\n\nlog = logging.getLogger(__name__)\n\n\ndef is_pattern_in_reason_string(pattern, string) -> bool:\n    \"\"\"Check the service pattern in task group_name\"\"\"\n    if re.search(r\"\\b\" + re.escape(pattern) + r\"\\b\", string):\n        return True\n    return False\n\n\ndef core_evaluation_handler(events, context):\n    cluster_name = events[\"ClusterName\"]\n    task_id = events[\"TaskId\"]\n    function_arn = events[\"NetworkTool\"]\n    task_analysis_message = \"\"\n    task_analysis_info_codes = []\n    task_analysis_execution_logs: list[str] = []\n\n    task = Task(task_id=task_id, cluster_name=cluster_name)\n\n    # If any errors in Task state object initialization, then\n    # do not proceed for evaluation\n    if not bool(task._execution_error_logs):\n        # Perform generic checks for public ip\n        generic_checks = GenericChecks(task=task)\n        generic_check_message, generic_info_codes, generic_execution_logs = generic_checks.public_ip_check()\n        task_analysis_message += generic_check_message\n        task_analysis_info_codes += generic_info_codes\n        task_analysis_execution_logs += generic_execution_logs\n        # Perform generic check again image pull rate limits\n        generic_check_message, generic_info_codes, generic_execution_logs = generic_checks.image_pull_rate_limit_check()\n        task_analysis_message += generic_check_message\n        task_analysis_info_codes += generic_info_codes\n        task_analysis_execution_logs += generic_execution_logs\n\n        # Identifier = (ResourceInitializationError:)\n        if is_pattern_in_reason_string(\"ResourceInitializationError\", task._task_stop_reason):\n            if is_pattern_in_reason_string(\"unable to pull secrets or registry auth\", task._task_stop_reason):\n\n                network_client = NetworkClient(function_arn=function_arn)\n\n                # Perform registry checks\n                registry_checks = RegistryAnalysis(network_client=network_client, task=task)\n                registry_checks_analysis, registry_checks_info_codes, registry_execution_logs = registry_checks.registry_checks()\n                task_analysis_message += registry_checks_analysis\n                task_analysis_info_codes += registry_checks_info_codes\n                task_analysis_execution_logs += registry_execution_logs\n\n                # Perform log configuration checks\n                if bool(task.task_log_configurations):\n                    log_analysis = LogAnalysis(network_client=network_client, task=task)\n                    log_analysis_message, log_analysis_info_codes, cw_execution_logs = log_analysis.log_configuration_analysis()\n                    task_analysis_message += log_analysis_message\n                    task_analysis_info_codes += log_analysis_info_codes\n                    task_analysis_execution_logs += cw_execution_logs\n\n                # Peform secrets\n                if bool(task.task_secrets_references):\n                    secret_analysis = SecretAnalysis(network_client=network_client, task=task)\n                    secret_analysis_message, secret_analysis_info_codes, secrets_execution_logs = secret_analysis._secrets_env_references()\n                    task_analysis_message += secret_analysis_message\n                    task_analysis_info_codes += secret_analysis_info_codes\n                    task_analysis_execution_logs += secrets_execution_logs\n\n                # Perform env files\n                if bool(task.task_environment_files):\n                    secret_analysis = SecretAnalysis(network_client=network_client, task=task)\n                    env_file_analysis_message, env_file_analysis_info_codes, env_execution_logs = secret_analysis._env_files_analysis()\n                    task_analysis_message += env_file_analysis_message\n                    task_analysis_info_codes += env_file_analysis_info_codes\n                    task_analysis_execution_logs += env_execution_logs\n\n            elif is_pattern_in_reason_string(\"failed to invoke EFS utils commands to set up EFS volumes\", task._task_stop_reason):\n                # All EFS related checks\n                network_client = NetworkClient(function_arn=function_arn)\n                efs_analysis = EFSAnalysis(network_client=network_client, task=task)\n                efs_analysis_message, efs_info_codes, efs_execution_logs = efs_analysis.efs_configuration_analysis()\n                task_analysis_info_codes += efs_info_codes\n                task_analysis_message += efs_analysis_message\n                task_analysis_execution_logs += efs_execution_logs\n\n            elif is_pattern_in_reason_string(\"failed to download env files\", task._task_stop_reason):\n                # All env related checks\n                network_client = NetworkClient(function_arn=function_arn)\n                secret_analysis = SecretAnalysis(network_client=network_client, task=task)\n                env_file_analysis_message, env_file_analysis_info_codes, env_execution_logs = secret_analysis._env_files_analysis()\n                task_analysis_message += env_file_analysis_message\n                task_analysis_info_codes += env_file_analysis_info_codes\n                task_analysis_execution_logs += env_execution_logs\n\n            elif is_pattern_in_reason_string(\"failed to validate logger args\", task._task_stop_reason):\n                network_client = NetworkClient(function_arn=function_arn)\n                log_analysis = LogAnalysis(network_client=network_client, task=task)\n                log_analysis_message, log_analysis_info_codes, cw_execution_logs = log_analysis.log_configuration_analysis()\n                task_analysis_message += log_analysis_message\n                task_analysis_info_codes += log_analysis_info_codes\n                task_analysis_execution_logs += cw_execution_logs\n\n        # Identifier = (CannotPullContainerError:)\n        elif is_pattern_in_reason_string(\"CannotPullContainerError\", task._task_stop_reason):\n            network_client = NetworkClient(function_arn=function_arn)\n\n            # Perform registry checks\n            registry_checks = RegistryAnalysis(network_client=network_client, task=task)\n            registry_checks_analysis, registry_checks_info_codes, registry_execution_logs = registry_checks.registry_checks()\n            task_analysis_message += registry_checks_analysis\n            task_analysis_info_codes += registry_checks_info_codes\n            task_analysis_execution_logs += registry_execution_logs\n\n            # Peform secrets and env analysis\n            if bool(task.task_secrets_references):\n                secret_analysis = SecretAnalysis(network_client=network_client, task=task)\n                secret_analysis_message, secret_analysis_info_codes, secrets_execution_logs = secret_analysis._secrets_env_references()\n                task_analysis_message += secret_analysis_message\n                task_analysis_info_codes += secret_analysis_info_codes\n                task_analysis_execution_logs += secrets_execution_logs\n\n            # Peform secrets and env analysis\n            if bool(task.task_environment_files):\n                secret_analysis = SecretAnalysis(network_client=network_client, task=task)\n                env_file_analysis_message, env_file_analysis_info_codes, env_execution_logs = secret_analysis._env_files_analysis()\n                task_analysis_message += env_file_analysis_message\n                task_analysis_info_codes += env_file_analysis_info_codes\n                task_analysis_execution_logs += env_execution_logs\n\n        # No Identifier, then perform all checks\n        elif not task._task_stop_reason == \"\":\n            network_client = NetworkClient(function_arn=function_arn)\n\n            # Perform registry checks\n            registry_checks = RegistryAnalysis(network_client=network_client, task=task)\n            registry_checks_analysis, registry_checks_info_codes, registry_execution_logs = registry_checks.registry_checks()\n            task_analysis_message += registry_checks_analysis\n            task_analysis_info_codes += registry_checks_info_codes\n            task_analysis_execution_logs += registry_execution_logs\n\n            # Peform secrets and env analysis\n            if bool(task.task_secrets_references):\n                secret_analysis = SecretAnalysis(network_client=network_client, task=task)\n                secret_analysis_message, secret_analysis_info_codes, secrets_execution_logs = secret_analysis._secrets_env_references()\n                task_analysis_message += secret_analysis_message\n                task_analysis_info_codes += secret_analysis_info_codes\n                task_analysis_execution_logs += secrets_execution_logs\n\n            # Peform secrets and env analysis\n            if bool(task.task_environment_files):\n                secret_analysis = SecretAnalysis(network_client=network_client, task=task)\n                env_file_analysis_message, env_file_analysis_info_codes, env_execution_logs = secret_analysis._env_files_analysis()\n                task_analysis_message += env_file_analysis_message\n                task_analysis_info_codes += env_file_analysis_info_codes\n                task_analysis_execution_logs += env_execution_logs\n\n            # Perform log analysis\n            if bool(task.task_log_configurations):\n                log_analysis = LogAnalysis(network_client=network_client, task=task)\n                log_analysis_message, log_analysis_info_codes, cw_execution_logs = log_analysis.log_configuration_analysis()\n                task_analysis_message += log_analysis_message\n                task_analysis_info_codes += log_analysis_info_codes\n                task_analysis_execution_logs += cw_execution_logs\n\n    else:\n        task_analysis_message = \"Task Analysis Skipped, Please review each section of the RunBook Execution logs below\"\n        task_analysis_execution_logs = task._execution_error_logs\n\n    return {\n        \"analysis_message\": task_analysis_message,\n        \"task_analysis_info_codes\": task_analysis_info_codes,\n        \"task_analysis_execution_logs\": \"\\n\".join(task_analysis_execution_logs),\n    }\n",
         "InputPayload": {
           "ClusterName": "{{ ClusterName }}",
           "TaskId": "{{ TaskId }}",
-          "NetworkTool": "{{01_NetworkToolDeployment.network_tool_lambda_arn}}"
+          "NetworkTool": "{{ NetworkToolDeployment.NetworkToolLambdaArn }}"
         },
-        "Attachment": "attachment.zip"
+        "Handler": "core_evaluation_handler.core_evaluation_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
-          "Name": "analysis_message",
-          "Selector": "$.Payload.analysis_message",
+          "Name": "AnalysisMessage",
+          "Selector": "$.Payload.AnalysisMessage",
           "Type": "String"
         },
         {
-          "Name": "task_analysis_info_codes",
-          "Selector": "$.Payload.task_analysis_info_codes",
+          "Name": "TaskAnalysisInfoCodes",
+          "Selector": "$.Payload.TaskAnalysisInfoCodes",
           "Type": "StringList"
         },
         {
-          "Name": "task_analysis_execution_logs",
-          "Selector": "$.Payload.task_analysis_execution_logs",
+          "Name": "TaskAnalysisExecutionLogs",
+          "Selector": "$.Payload.TaskAnalysisExecutionLogs",
           "Type": "String"
         }
       ],
-      "nextStep": "03_Deletion_Lifecycle"
+      "nextStep": "DeletionLifecycle"
     },
     {
-      "name": "03_Deletion_Lifecycle",
+      "name": "DeletionLifecycle",
       "action": "aws:executeScript",
       "description": "Deletes resources created by this automation.",
-      "onFailure": "step:04_Execution_Results",
-      "onCancel": "step:04_Execution_Results",
+      "onFailure": "step:ExecutionResults",
+      "onCancel": "step:ExecutionResults",
       "timeoutSeconds": 200,
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "deletion_handler",
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n############################################################################\n# USAGE: deletion_handler will help to delete the resources that are\n# created as part of execution in previous steps. It uses same unique\n# resource naming convention used in previous steps to identify and delete\n# the resource that has been created\n############################################################################\n\n############################################################################\n# AWS API USAGE IN FILE: NONE\n############################################################################\n\nimport logging\nimport boto3\nfrom botocore.exceptions import ClientError\nimport deletion_lifecycle.resource_deletion as resource_deletion\nfrom lib.aws_lambda.lambda_const import FUNCTION_PREFIX\nfrom lib.aws_lambda.lambda_const import ROLE_PREFIX\nfrom lib.aws_lambda.lambda_const import INFO_MESSAGE\n\nlog = logging.getLogger(__name__)\ncw_logs_client = boto3.client(\"logs\")\n\n\ndef cw_retention_policy_change(group_name, retention_days):\n    retention_modified_status = False\n    info_message = \"\"\n    try:\n        cw_logs_client.put_retention_policy(logGroupName=group_name, retentionInDays=retention_days)\n        retention_modified_status = True\n\n    except cw_logs_client.exceptions.ResourceNotFoundException:\n        retention_modified_status = False\n        info_message += INFO_MESSAGE.get(\"LAMBDA_CREATOR_I015\").format(group_name)\n\n    except ClientError as e:\n        retention_modified_status = False\n        info_message += f\"AWS API Error at cw_retention_policy_change: {e!r}\\n\"\n        info_message += INFO_MESSAGE.get(\"LAMBDA_CREATOR_I013\").format(group_name)\n\n    return retention_modified_status, info_message\n\n\ndef deletion_handler(events, context):\n    \"\"\"\n    deletion_handler() will help to delete the resources that are\n    created as part of execution in previous steps. It uses same unique\n    resource naming convention used in previous steps to identify and delete\n    the resource that has been created\n    \"\"\"\n    info_message = []\n    info_codes = []\n    execution_id = context[\"automation:EXECUTION_ID\"].split(\"-\")[-1]\n    cw_retention_period = events[\"CloudwatchRetentionPeriod\"]\n    role_name = ROLE_PREFIX + execution_id\n    function_name = FUNCTION_PREFIX + execution_id\n\n    eni_deletion_flag = \"FALSE\"\n\n    # Find and store Hyperplane ENI information, if it got created as part of VPC Lambda Deployment\n    fetched_eni_list, eni_info_codes, eni_info_message = resource_deletion.find_hyperplane_eni(function_name)\n    info_codes = info_codes + eni_info_codes\n    info_message = info_message + eni_info_message\n\n    if bool(fetched_eni_list):\n        eni_deletion_flag = \"TRUE\"\n\n    # Lambda function deletion\n    delete_function_info_codes, delete_function_info_message = resource_deletion.delete_lambda_function(function_name)\n    info_codes = info_codes + delete_function_info_codes\n    info_message = info_message + delete_function_info_message\n\n    # VPC Lambda CW Retention Policy change (If present)\n    group_name = \"/aws/lambda/\" + function_name\n    retention_modified_status, cw_info_message = cw_retention_policy_change(group_name, cw_retention_period)\n    info_message.append(cw_info_message)\n    if retention_modified_status:\n        info_message.append(INFO_MESSAGE.get(\"LAMBDA_CREATOR_I012\").format(group_name, cw_retention_period))\n\n    if not (eni_deletion_flag == \"TRUE\"):\n        # Lambda execution role deletion here only if no ENI got created, else ENI Deletion handler\n        # will take care of role deletion\n        delete_role_info_codes, delete_role_info_message = resource_deletion.delete_role(role_name)\n        info_codes = info_codes + delete_role_info_codes\n        info_message = info_message + delete_role_info_message\n\n    return {\"message\": \"\".join(info_message), \"info_codes\": info_codes, \"eni_list\": fetched_eni_list, \"eni_deletion_flag\": eni_deletion_flag}\n",
         "InputPayload": {
-          "NetworkTool": "{{01_NetworkToolDeployment.network_tool_lambda_arn}}",
+          "NetworkTool": "{{ NetworkToolDeployment.NetworkToolLambdaArn }}",
           "CloudwatchRetentionPeriod": "{{ CloudwatchRetentionPeriod }}"
         },
-        "Attachment": "attachment.zip"
+        "Handler": "deletion_handler.deletion_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
-          "Name": "message",
+          "Name": "Message",
           "Selector": "$.Payload.message",
           "Type": "String"
         },
         {
-          "Name": "info_codes",
+          "Name": "InfoCodes",
           "Selector": "$.Payload.info_codes",
           "Type": "StringList"
         },
         {
-          "Name": "eni_list",
+          "Name": "EniList",
           "Selector": "$.Payload.eni_list",
           "Type": "StringList"
         },
         {
-          "Name": "eni_deletion_flag",
+          "Name": "EniDeletionFlag",
           "Selector": "$.Payload.eni_deletion_flag",
           "Type": "String"
         }
       ],
-      "nextStep": "04_Execution_Results",
-      "isCritical": "true",
-      "isEnd": "False"
+      "nextStep": "ExecutionResults",
+      "isCritical": true
     },
     {
-      "name": "04_Execution_Results",
+      "name": "ExecutionResults",
       "action": "aws:executeScript",
       "description": "Formats the output of the automation to return the results of the analysis to the console.",
       "onFailure": "Abort",
       "onCancel": "Abort",
       "timeoutSeconds": 200,
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "output_handler",
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\n############################################################################\n# USAGE: output_handler() retrieves all messages and execution logs from\n# previous steps and present it in global output section in readable format\n############################################################################\n\n\n############################################################################\n# AWS API USAGE IN FILE: NONE\n############################################################################\n\nCORE_MESSAGE = {\n    \"I010\": (\" \\nTask Failure Reason Analysis:\" \"\\n#############################\\n\" \"{0}\"),\n}\n\nEXECUTION_MESSAGE = {\n    \"I010\": (\n        \" \\nRunBook Execution logs\"\n        \"\\n######################\\n\"\n        \"\\n++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:00_PreflightPermissionChecks\"\n        \"\\n++++++++++++++++++++++++++++++\\n\"\n        \"{0}\"\n        \"\\n++++++++++++++++++++++++++\"\n        \"\\nSTEP:01_NetworkToolDeployment\"\n        \"\\n++++++++++++++++++++++++++\\n\"\n        \"{1}\"\n        \"\\n+++++++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:02_CoreFailureReasonEvaluation\"\n        \"\\n+++++++++++++++++++++++++++++++++++\\n\"\n        \"{2}\"\n        \"\\n+++++++++++++++++++++++\"\n        \"\\nSTEP:03_Deletion_Lifecycle\"\n        \"\\n+++++++++++++++++++++++\\n\"\n        \"{3}\"\n        \"\\n\\n\"\n    ),\n}\n\nENI_DELETION_MESSAGE_FORMATTER = {\n    \"I020\": (\" \\nVPC Lambda ENI Deletion Status:\" \"\\n#############################\\n\" \"{0}\\n\\n\"),\n}\n\n\ndef output_handler(events, context):\n    \"\"\" \"\"\"\n    core_message = []\n    execution_message = []\n    info_codes = []\n    permission_checks = events[\"PreflightPermissionChecks\"]\n    task_analysis = events[\"CoreFailureReasonEvaluation\"]\n    network_tool_deployment_status = events[\"NetworkToolDeployment\"]\n    task_analysis_execution_logs = events[\"task_analysis_execution_logs\"]\n    deletion_life_cycle = events[\"Deletion_Lifecycle\"]\n\n    if \"02_CoreFailureReasonEvaluation.analysis\" in task_analysis:\n        task_analysis = \"Task Analysis Skipped, Please review each section of the RunBook Execution logs\"\n\n    info_codes.append(\"I010\")\n    core_message.append(CORE_MESSAGE.get(\"I010\").format(task_analysis))\n    execution_message.append(EXECUTION_MESSAGE.get(\"I010\").format(permission_checks, network_tool_deployment_status, task_analysis_execution_logs, deletion_life_cycle))\n\n    return {\"failure_reason\": \"\".join(core_message), \"info_codes\": info_codes, \"ExecutionLogs\": \"\".join(execution_message)}\n\n\ndef eni_deletion_output_handler(events, context):\n    eni_deletion_message = []\n    info_codes = []\n    eni_deletion_buffer = events[\"ENIDeletionMessage\"]\n    network_tool_status = events[\"NetworkToolStatus\"]\n\n    if not network_tool_status == \"SUCCESS\":\n        eni_deletion_buffer = \"ENI Deletion Skipped as VPC Lambda function not deployed\"\n\n    info_codes.append(\"I020\")\n    eni_deletion_message.append(ENI_DELETION_MESSAGE_FORMATTER.get(\"I020\").format(eni_deletion_buffer))\n\n    return {\"deletion_status\": \"\".join(eni_deletion_message), \"info_codes\": info_codes}\n",
         "InputPayload": {
-          "PreflightPermissionChecks": "{{00_PreflightPermissionChecks.message}}",
-          "CoreFailureReasonEvaluation": "{{02_CoreFailureReasonEvaluation.analysis_message}}",
-          "task_analysis_execution_logs": "{{02_CoreFailureReasonEvaluation.task_analysis_execution_logs}}",
-          "NetworkToolDeployment": "{{01_NetworkToolDeployment.message}}",
-          "Deletion_Lifecycle": "{{03_Deletion_Lifecycle.message}}"
+          "PreflightPermissionChecks": "{{ PreflightPermissionChecks.Message }}",
+          "CoreFailureReasonEvaluation": "{{ CoreFailureReasonEvaluation.AnalysisMessage }}",
+          "TaskAnalysisExecutionLogs": "{{ CoreFailureReasonEvaluation.TaskAnalysisExecutionLogs }}",
+          "NetworkToolDeployment": "{{ NetworkToolDeployment.Message }}",
+          "DeletionLifecycle": "{{ DeletionLifecycle.Message }}"
         },
-        "Attachment": "attachment.zip"
+        "Handler": "output_handler.output_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
-          "Name": "01_TaskFailureReason",
-          "Selector": "$.Payload.failure_reason",
+          "Name": "TaskFailureReason",
+          "Selector": "$.Payload.FailureReason",
           "Type": "String"
         },
         {
-          "Name": "info_codes",
-          "Selector": "$.Payload.info_codes",
+          "Name": "InfoCodes",
+          "Selector": "$.Payload.InfoCodes",
           "Type": "StringList"
         },
         {
-          "Name": "02_ExecutionLogs",
+          "Name": "ExecutionLogs",
           "Selector": "$.Payload.ExecutionLogs",
           "Type": "String"
         }
       ],
-      "isCritical": "true",
-      "nextStep": "Branch_Check_For_Lambda_ENI_Deletion"
+      "isCritical": true,
+      "nextStep": "BranchOnCheckForLambdaEniDeletion"
     },
     {
-      "name": "Branch_Check_For_Lambda_ENI_Deletion",
+      "name": "BranchOnCheckForLambdaEniDeletion",
       "action": "aws:branch",
       "onFailure": "Abort",
-      "description": "Branches based on whether the Lambda function and associated resources were created and need to be deleted.",
+      "description": "Branches based on whether the AWS Lambda function and associated resources were created and need to be deleted.",
       "inputs": {
         "Choices": [
           {
             "And": [
               {
-                "Variable": "{{ 01_NetworkToolDeployment.deployment_result }}",
+                "Variable": "{{ NetworkToolDeployment.DeploymentResult }}",
                 "StringEquals": "SUCCESS"
               },
               {
-                "Variable": "{{ 03_Deletion_Lifecycle.eni_deletion_flag }}",
+                "Variable": "{{ DeletionLifecycle.EniDeletionFlag }}",
                 "StringEquals": "TRUE"
               }
             ],
-            "NextStep": "Sleep_For_HyperPlaneENI"
+            "NextStep": "SleepForHyperPlaneEni"
           }
-        ],
-        "Default": "06_ENI_Deletion_Message"
-      }
+        ]
+      },
+      "isEnd": true
     },
     {
-      "name": "Sleep_For_HyperPlaneENI",
+      "name": "SleepForHyperPlaneEni",
       "action": "aws:sleep",
-      "description": "Sleeps for 30 minutes so the elastic network interface for the Lambda function can be deleted.",
+      "description": "Sleeps for 30 minutes so the elastic network interface for the AWS Lambda function can be deleted.",
       "inputs": {
         "Duration": "PT30M"
       },
-      "nextStep": "05_Lambda_ENI_Deletion_Handler"
+      "nextStep": "LambdaEniDeletionHandler"
     },
     {
-      "name": "05_Lambda_ENI_Deletion_Handler",
+      "name": "LambdaEniDeletionHandler",
       "action": "aws:executeScript",
-      "description": "Deletes the Lambda function network interface.",
+      "description": "Deletes the AWS Lambda function network interface.",
       "onFailure": "Abort",
       "onCancel": "Abort",
       "timeoutSeconds": 600,
       "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "eni_deletion_handler",
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\n############################################################################\n# USAGE: When given with ENI list, the code performs ENI deletion operation\n# provided the ENI in available state, if not backoff retry performed till\n# to max configured timeout\n############################################################################\n\n\n############################################################################\n# AWS API USAGE IN FILE:\n# ec2:DescribeNetworkInterfaces\n# ec2:DeleteNetworkInterface\n############################################################################\nimport boto3\nimport time\nfrom eni_deletion_handler_const import ENI_DELETION\nfrom lib.aws_lambda.lambda_const import ROLE_PREFIX\nimport deletion_lifecycle.resource_deletion as resource_deletion\nfrom botocore.exceptions import ClientError\n\n\ndef eni_deletion_handler(event, context):\n    \"\"\"\n    The eni_deletion_handler() will check the status of the ENI that was utilized by the AWS Lambda\n    service to perform calls to resources within the VPC and attempt to delete it.\n    There can be the case where no action is required by the ENI Deletion Handler as the Lambda service\n    might have already deleted it.\n    \"\"\"\n    core_message = \"\"\n    info_codes = []\n    execution_logs = []\n    execution_id = context[\"automation:EXECUTION_ID\"].split(\"-\")[-1]\n    role_name = ROLE_PREFIX + execution_id\n\n    ec2_client = boto3.client(\"ec2\")\n    try:\n        eni_list: list = event[\"ENI\"]\n    except Exception:\n        eni_list: list = []\n\n    # Try to delete the lambda execution role as it was skipped in DeletionLifecycle\n    # for lambda to perform automated ENI deletion during 30 minutes of sleep time\n    delete_role_info_codes, delete_role_info_message = resource_deletion.delete_role(role_name)\n    info_codes = info_codes + delete_role_info_codes\n    core_message = core_message + \"\\n\".join(delete_role_info_message)\n\n    if eni_list:\n        is_eni_available = False\n        eni_not_found = False\n        time_counter = 0\n        while not eni_not_found and time_counter < 300 and (not is_eni_available):\n            time_counter += 20\n            try:\n                eni_status = ec2_client.describe_network_interfaces(NetworkInterfaceIds=eni_list)\n                for nw_interface in eni_status.get(\"NetworkInterfaces\"):\n                    if nw_interface.get(\"Status\") == \"available\":\n                        is_eni_available = True\n                    else:\n                        time.sleep(20)\n            except ClientError as e:\n                if e.response[\"Error\"].get(\"Code\") == \"InvalidNetworkInterfaceID.NotFound\":\n                    info_codes.append(\"ENI_DELETION_I004\")\n                    execution_logs.append(ENI_DELETION.get(\"ENI_DELETION_I004\").format(eni_list))\n                    core_message += ENI_DELETION.get(\"ENI_DELETION_I004\").format(eni_list)\n                    eni_not_found = True\n\n        if is_eni_available:\n            result_deletion_result, error_code = delete_lambda_eni(ec2_client, nw_interface.get(\"NetworkInterfaceId\"))\n            if result_deletion_result:\n                info_codes.append(\"ENI_DELETION_I004\")\n                execution_logs.append(ENI_DELETION.get(\"ENI_DELETION_I004\"))\n                core_message += ENI_DELETION.get(\"ENI_DELETION_I004\")\n            elif error_code == \"IN_USE\":\n                info_codes.append(\"ENI_DELETION_I003\")\n                core_message += ENI_DELETION.get(\"ENI_DELETION_I003\").format(eni_list)\n                execution_logs.append(ENI_DELETION.get(\"ENI_DELETION_I003\")).format(eni_list)\n    else:\n        info_codes.append(\"ENI_DELETION_I001\")\n        execution_logs.append(\"ENI Deletion Handler execution has finished succesfully.\")\n        core_message += ENI_DELETION.get(\"ENI_DELETION_I001\").format(eni_list)\n\n    return {\"message\": core_message, \"info_codes\": info_codes, \"execution_logs\": execution_logs}\n\n\ndef delete_lambda_eni(client, eni_id):\n    execution_result = False\n    error_code = \"\"\n    try:\n        client.delete_network_interface(NetworkInterfaceId=eni_id)\n        execution_result = True\n    except ClientError as e:\n        if e.response[\"Error\"].get(\"Code\") == \"InvalidNetworkInterfaceID.NotFound\":\n            execution_result = True\n        elif e.response[\"Error\"].get(\"Code\") == \"InvalidNetworkInterface.InUse\":\n            error_code = \"IN_USE\"\n        else:\n            error_code = e.response[\"Error\"].get(\"Code\")\n    return execution_result, error_code\n",
         "InputPayload": {
-          "NetworkTool": "{{01_NetworkToolDeployment.network_tool_lambda_arn}}",
-          "ENI": "{{ 03_Deletion_Lifecycle.eni_list }}"
+          "NetworkTool": "{{ NetworkToolDeployment.NetworkToolLambdaArn }}",
+          "ENI": "{{ DeletionLifecycle.EniList }}"
         },
-        "Attachment": "attachment.zip"
+        "Handler": "eni_deletion_handler.eni_deletion_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
-          "Name": "message",
+          "Name": "Message",
           "Selector": "$.Payload.message",
           "Type": "String"
         },
         {
-          "Name": "info_codes",
-          "Selector": "$.Payload.info_codes",
-          "Type": "StringList"
-        }
-      ]
-    },
-    {
-      "name": "06_ENI_Deletion_Message",
-      "action": "aws:executeScript",
-      "description": "Formats the output of the Lambda function network interface deletion step.",
-      "onFailure": "Abort",
-      "onCancel": "Abort",
-      "timeoutSeconds": 200,
-      "inputs": {
-        "Runtime": "python3.8",
-        "Handler": "eni_deletion_output_handler",
-        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\n############################################################################\n# USAGE: output_handler() retrieves all messages and execution logs from\n# previous steps and present it in global output section in readable format\n############################################################################\n\n\n############################################################################\n# AWS API USAGE IN FILE: NONE\n############################################################################\n\nCORE_MESSAGE = {\n    \"I010\": (\" \\nTask Failure Reason Analysis:\" \"\\n#############################\\n\" \"{0}\"),\n}\n\nEXECUTION_MESSAGE = {\n    \"I010\": (\n        \" \\nRunBook Execution logs\"\n        \"\\n######################\\n\"\n        \"\\n++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:00_PreflightPermissionChecks\"\n        \"\\n++++++++++++++++++++++++++++++\\n\"\n        \"{0}\"\n        \"\\n++++++++++++++++++++++++++\"\n        \"\\nSTEP:01_NetworkToolDeployment\"\n        \"\\n++++++++++++++++++++++++++\\n\"\n        \"{1}\"\n        \"\\n+++++++++++++++++++++++++++++++++++\"\n        \"\\nSTEP:02_CoreFailureReasonEvaluation\"\n        \"\\n+++++++++++++++++++++++++++++++++++\\n\"\n        \"{2}\"\n        \"\\n+++++++++++++++++++++++\"\n        \"\\nSTEP:03_Deletion_Lifecycle\"\n        \"\\n+++++++++++++++++++++++\\n\"\n        \"{3}\"\n        \"\\n\\n\"\n    ),\n}\n\nENI_DELETION_MESSAGE_FORMATTER = {\n    \"I020\": (\" \\nVPC Lambda ENI Deletion Status:\" \"\\n#############################\\n\" \"{0}\\n\\n\"),\n}\n\n\ndef output_handler(events, context):\n    \"\"\" \"\"\"\n    core_message = []\n    execution_message = []\n    info_codes = []\n    permission_checks = events[\"PreflightPermissionChecks\"]\n    task_analysis = events[\"CoreFailureReasonEvaluation\"]\n    network_tool_deployment_status = events[\"NetworkToolDeployment\"]\n    task_analysis_execution_logs = events[\"task_analysis_execution_logs\"]\n    deletion_life_cycle = events[\"Deletion_Lifecycle\"]\n\n    if \"02_CoreFailureReasonEvaluation.analysis\" in task_analysis:\n        task_analysis = \"Task Analysis Skipped, Please review each section of the RunBook Execution logs\"\n\n    info_codes.append(\"I010\")\n    core_message.append(CORE_MESSAGE.get(\"I010\").format(task_analysis))\n    execution_message.append(EXECUTION_MESSAGE.get(\"I010\").format(permission_checks, network_tool_deployment_status, task_analysis_execution_logs, deletion_life_cycle))\n\n    return {\"failure_reason\": \"\".join(core_message), \"info_codes\": info_codes, \"ExecutionLogs\": \"\".join(execution_message)}\n\n\ndef eni_deletion_output_handler(events, context):\n    eni_deletion_message = []\n    info_codes = []\n    eni_deletion_buffer = events[\"ENIDeletionMessage\"]\n    network_tool_status = events[\"NetworkToolStatus\"]\n\n    if not network_tool_status == \"SUCCESS\":\n        eni_deletion_buffer = \"ENI Deletion Skipped as VPC Lambda function not deployed\"\n\n    info_codes.append(\"I020\")\n    eni_deletion_message.append(ENI_DELETION_MESSAGE_FORMATTER.get(\"I020\").format(eni_deletion_buffer))\n\n    return {\"deletion_status\": \"\".join(eni_deletion_message), \"info_codes\": info_codes}\n",
-        "InputPayload": {
-          "ENIDeletionMessage": "{{05_Lambda_ENI_Deletion_Handler.message}}",
-          "NetworkToolStatus": "{{01_NetworkToolDeployment.deployment_result}}"
-        },
-        "Attachment": "attachment.zip"
-      },
-      "outputs": [
-        {
-          "Name": "Status",
-          "Selector": "$.Payload.deletion_status",
-          "Type": "String"
-        },
-        {
-          "Name": "info_codes",
+          "Name": "InfoCodes",
           "Selector": "$.Payload.info_codes",
           "Type": "StringList"
         }
       ],
-      "isCritical": "true",
-      "isEnd": "true"
+      "nextStep": "EniDeletionMessage"
+    },
+    {
+      "name": "EniDeletionMessage",
+      "action": "aws:executeScript",
+      "description": "Formats the output of the AWS Lambda function network interface deletion step.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "timeoutSeconds": 200,
+      "inputs": {
+        "InputPayload": {
+          "EniDeletionMessage": "{{ LambdaEniDeletionHandler.Message }}",
+          "NetworkToolStatus": "{{ NetworkToolDeployment.DeploymentResult }}"
+        },
+        "Handler": "output_handler.eni_deletion_output_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.DeletionStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "InfoCodes",
+          "Selector": "$.Payload.InfoCodes",
+          "Type": "StringList"
+        }
+      ],
+      "isCritical": true,
+      "isEnd": true
     }
   ],
+  "outputs": [
+    "ExecutionResults.TaskFailureReason",
+    "ExecutionResults.ExecutionLogs",
+    "EniDeletionMessage.Status"
+  ],
   "files": {
-    "attachment.zip": {
+    "artifact.zip": {
       "checksums": {
-        "sha256": "09af1876dfbbdd3a86f858e23dc51111a602a7959dbd99cebd58e6eaf7706399"
+        "SHA256": "900f142c601a6e0ddcbb3bf9fff696a55101a7ec9db3d1aa515fe7147b18af9e"
       }
     }
-  },
-  "outputs": [
-    "04_Execution_Results.01_TaskFailureReason",
-    "04_Execution_Results.02_ExecutionLogs",
-    "06_ENI_Deletion_Message.Status"
-  ]
+  }
 }

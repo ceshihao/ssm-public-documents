@@ -1,0 +1,660 @@
+{
+  "schemaVersion": "1.0",
+  "templateBody": {
+    "Metadata": {
+      "Version": "1.0"
+    },
+    "Parameters": {
+      "QSType": {
+        "Type": "String",
+        "AllowedValues": [
+          "DA"
+        ],
+        "Description": "(Required) Specifies whether the Quick Setup applies to the local account or an AWS organization."
+      },
+      "QSConfigurationId": {
+        "Type": "String",
+        "Description": "(Required) Unique identifier of the deployed configuration."
+      },
+      "DelegatedAccountId": {
+        "Type": "String",
+        "AllowedPattern": "^\\d{12}$",
+        "Description": "(Required) The ID of the member account in your organization you want to register as a delegated administrator."
+      },
+      "HomeRegion": {
+        "Type": "String",
+        "Description": "(Required) Name of the AWS Region to deploy global resources such as S3 buckets."
+      },
+      "S3BucketEncryptionKeyArn": {
+        "Type": "String",
+        "Description": "KMS Key ID used to encrypt the S3 bucket.",
+        "Default": "",
+        "AllowedPattern": "^$|^arn:[a-z-]+:kms:[a-z0-9-]+:\\d{12,12}:key/[a-zA-Z0-9-]+$"
+      },
+      "CreateRemediationRoles": {
+        "Type": "String",
+        "Default": "true",
+        "AllowedValues": [
+          "true",
+          "false"
+        ],
+        "Description": "(Optional) Whether to create remediation roles"
+      },
+      "QSAttachConfigurationPolicy": {
+        "Type": "String",
+        "Default": "false",
+        "AllowedValues": [
+          "true",
+          "false"
+        ],
+        "Description": "(Optional) Whether to attach Configuration permissions policy which sets boundaries of what configuration can do."
+      },
+      "QSPrincipalOrgId": {
+        "Type": "String",
+        "Default": "",
+        "Description": "AWS Organizations ID."
+      }
+    },
+    "Conditions": {
+      "S3BucketDefaultEncryption": {
+        "Fn::Equals": [
+          {
+            "Ref": "S3BucketEncryptionKeyArn"
+          },
+          ""
+        ]
+      },
+      "IsHomeRegion": {
+        "Fn::Equals": [
+          {
+            "Ref": "HomeRegion"
+          },
+          {
+            "Ref": "AWS::Region"
+          }
+        ]
+      },
+      "ShouldCreateRemediationRoles": {
+        "Fn::And": [
+          {
+            "Fn::Equals": [
+              {
+                "Ref": "CreateRemediationRoles"
+              },
+              "true"
+            ]
+          },
+          {
+            "Condition": "IsHomeRegion"
+          }
+        ]
+      }
+    },
+    "Resources": {
+      "RoleForOnboardingAutomation": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "ssm.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWSQuickSetupSSMManageResourcesExecutionPolicy"
+            }
+          ],
+          "RoleName": {
+            "Fn::Sub": "AWS-QuickSetup-SSM-ManageResources-${QSType}-${AWS::Region}"
+          }
+        }
+      },
+      "RoleForLifecycleManagement": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "lambda.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWSQuickSetupSSMLifecycleManagementExecutionPolicy"
+            }
+          ],
+          "RoleName": {
+            "Fn::Sub": "AWS-QuickSetup-SSM-LifecycleManagement-${QSType}-${AWS::Region}"
+          }
+        }
+      },
+      "SSMLifecycleOperatorLambda": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+          "Code": {
+            "ZipFile": "import boto3\nimport json\nimport urllib3\nimport os\nimport time\n\n# CONSTANTS\nSUCCESS = 'SUCCESS'\nFAILED = 'FAILED'\n# Events send in by CloudFormation\nCREATE = 'Create'\nUPDATE = 'Update'\nDELETE = 'Delete'\n\n# ENVIRONMENT VARIABLES\nregion = os.environ['REGION']\n\nSECONDS_FOR_POLLING_COMPLETION = 840 # 14 mins max.\n\n# CLIENTS\nssm_client = boto3.client('ssm', region_name= region)\nhttp = urllib3.PoolManager()\n\ndef send_response(event, context, status, message=None):\n    try:\n        stack_id = check_for_key(event, 'StackId')\n        request_id = check_for_key(event, 'RequestId')\n        logical_resource_id = check_for_key(event, 'LogicalResourceId')\n\n        body = json.dumps({\n            'Status': status,\n            'Reason': message or f'See the details in CloudWatch Log Stream: {context.log_stream_name}',\n            'StackId': stack_id,\n            'RequestId': request_id,\n            'LogicalResourceId': logical_resource_id,\n            'PhysicalResourceId': context.log_stream_name})\n\n        headers = {\n            'content-type': '',\n            'content-length': str(len(body))\n        }\n\n        print('Sending response to CloudFormation via http request...')\n        responseUrl = event['ResponseURL']\n        response = http.request(\n            'PUT', responseUrl, headers=headers, body=body, retries=5)\n        print('Status code:', response.status)\n        if str(response.status) != '200':\n            raise Exception(f'Received a failed response from Cloud Formation: {str(response.status)}')\n    except Exception as ex:\n        raise Exception(f'An Exception occurred while sending a response for Cloud Formation. {str(ex)}')\n\ndef check_for_key(hash, key):\n    if not key in hash:\n        raise Exception(f'The required key {key} is not present in {str(hash)}. Failing.')\n    else:\n        # return the value\n        return hash[key]\n\ndef reconcile(event, context):\n    request_type = event.get('RequestType')\n    resource_properties = event['ResourceProperties']\n    automation_document = resource_properties.get('AutomationDocument')\n    automation_assume_role = resource_properties.get('AutomationAssumeRole')\n\n    print('Event:', event)\n\n    try:\n        input_parameters = resource_properties['AutomationParameters']\n        input_parameters['ExecutionMode'] = [request_type]\n\n        response = ssm_client.start_automation_execution(\n            Tags=[{'Key': 'QuickSetupDocument', 'Value': 'AWSQuickSetupType-SSM'}],\n            DocumentName=automation_document,\n            Parameters=input_parameters,\n            Mode='Auto'\n        )\n        print('Lifecycle automation execution started successfully.')\n        execution_id = response['AutomationExecutionId']\n        print('Lifecycle automation execution ID:', execution_id)\n        execution_start_time = time.time()\n\n        # Wait for the execution to complete. timeout for the execution is 10 minutes\n        while time.time() - execution_start_time < SECONDS_FOR_POLLING_COMPLETION:\n            automation_execution = ssm_client.get_automation_execution(\n                AutomationExecutionId=execution_id\n            )\n            execution_status = automation_execution['AutomationExecution']['AutomationExecutionStatus']\n            print('Lifecycle automation execution status:', execution_status)\n            if execution_status in ['Success', 'Failed', 'Cancelled', 'Rejected', 'TimedOut', 'ChangeCalendarOverrideRejected', 'CompletedWithSuccess', 'CompletedWithFailure']:\n                break\n            # Check the status every 5 seconds\n            time.sleep(10)\n\n        if execution_status != 'Success' and execution_status != 'CompletedWithSuccess':\n            print('Lifecycle automation failed due to automation status:', execution_status)\n            send_response(event, context, FAILED)\n            return\n\n        print('Lifecycle automation succeeded.')\n        send_response(event, context, SUCCESS)\n    except Exception as err:\n        print(err)\n        print('Lifecycle automation failed, you can review the log for the Lambda function for details')\n        send_response(event, context, FAILED, message=str(err))\n        raise err\n"
+          },
+          "Timeout": 900,
+          "Runtime": "python3.11",
+          "Role": {
+            "Fn::GetAtt": [
+              "RoleForLifecycleManagement",
+              "Arn"
+            ]
+          },
+          "FunctionName": {
+            "Fn::Sub": "aws-quicksetup-lifecycle-${QSType}-${QSConfigurationId}"
+          },
+          "Handler": "index.reconcile",
+          "Environment": {
+            "Variables": {
+              "REGION": {
+                "Ref": "AWS::Region"
+              }
+            }
+          }
+        },
+        "DependsOn": [
+          "RoleForOnboardingAutomation"
+        ]
+      },
+      "SSMLifecycleResource": {
+        "Type": "Custom::SSMLifecycleResource",
+        "Version": "1.0",
+        "Properties": {
+          "ServiceToken": {
+            "Fn::GetAtt": [
+              "SSMLifecycleOperatorLambda",
+              "Arn"
+            ]
+          },
+          "AutomationParameters": {
+            "AutomationAssumeRole": [
+              {
+                "Fn::GetAtt": [
+                  "RoleForOnboardingAutomation",
+                  "Arn"
+                ]
+              }
+            ],
+            "GlobalResourceRegion": [
+              {
+                "Ref": "HomeRegion"
+              }
+            ],
+            "BucketName": {
+              "Fn::If": [
+                "IsHomeRegion",
+                [
+                  {
+                    "Ref": "DiagnosisBucket"
+                  }
+                ],
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            },
+            "OperationalAccountId": [
+              {
+                "Ref": "DelegatedAccountId"
+              }
+            ],
+            "QSConfigurationId": [
+              {
+                "Fn::Sub": "${QSConfigurationId}"
+              }
+            ]
+          },
+          "AutomationDocument": "AWSQuickSetupType-SSM-ManageResources"
+        },
+        "DependsOn": [
+          "SSMLifecycleOperatorLambda",
+          "RoleForOnboardingAutomation"
+        ]
+      },
+      "RoleForAutomation": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "ssm.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "RoleName": {
+            "Fn::Join": [
+              "",
+              [
+                "AWS-QuickSetup-SSM-",
+                {
+                  "Ref": "QSType"
+                },
+                "_",
+                {
+                  "Ref": "AWS::Region"
+                }
+              ]
+            ]
+          }
+        },
+        "Condition": "IsHomeRegion"
+      },
+      "DiagnosisBucket": {
+        "Type": "AWS::S3::Bucket",
+        "Properties": {
+          "BucketName": {
+            "Fn::Sub": "do-not-delete-ssm-diagnosis-${AWS::AccountId}-${HomeRegion}-${QSConfigurationId}"
+          },
+          "PublicAccessBlockConfiguration": {
+            "BlockPublicAcls": true,
+            "BlockPublicPolicy": true,
+            "IgnorePublicAcls": true,
+            "RestrictPublicBuckets": true
+          },
+          "BucketEncryption": {
+            "ServerSideEncryptionConfiguration": [
+              {
+                "ServerSideEncryptionByDefault": {
+                  "Fn::If": [
+                    "S3BucketDefaultEncryption",
+                    {
+                      "SSEAlgorithm": "AES256"
+                    },
+                    {
+                      "SSEAlgorithm": "aws:kms",
+                      "KMSMasterKeyID": {
+                        "Ref": "S3BucketEncryptionKeyArn"
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "LoggingConfiguration": {
+            "LogFilePrefix": "access-logs/"
+          },
+          "VersioningConfiguration": {
+            "Status": "Enabled"
+          },
+          "LifecycleConfiguration": {
+            "Rules": [
+              {
+                "Id": "ExpirationRule",
+                "Prefix": "actions",
+                "Status": "Enabled",
+                "ExpirationInDays": 30
+              },
+              {
+                "Id": "AbortIncompleteMultipartUploadRule",
+                "Status": "Enabled",
+                "AbortIncompleteMultipartUpload": {
+                  "DaysAfterInitiation": 1
+                }
+              }
+            ]
+          }
+        },
+        "Condition": "IsHomeRegion"
+      },
+      "DiagnosisBucketPolicy": {
+        "Type": "AWS::S3::BucketPolicy",
+        "Properties": {
+          "Bucket": {
+            "Ref": "DiagnosisBucket"
+          },
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "DenyHTTPRequests",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:*",
+                "Resource": [
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}"
+                  },
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}/*"
+                  }
+                ],
+                "Condition": {
+                  "Bool": {
+                    "aws:SecureTransport": "false"
+                  }
+                }
+              },
+              {
+                "Action": [
+                  "s3:PutObject"
+                ],
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "logging.s3.amazonaws.com"
+                },
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}/access-logs/*"
+                },
+                "Condition": {
+                  "ArnLike": {
+                    "aws:SourceArn": {
+                      "Fn::GetAtt": [
+                        "DiagnosisBucket",
+                        "Arn"
+                      ]
+                    }
+                  },
+                  "StringEquals": {
+                    "aws:SourceAccount": {
+                      "Fn::Sub": "${AWS::AccountId}"
+                    }
+                  }
+                }
+              },
+              {
+                "Sid": "DenyNonSigV4Requests",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:*",
+                "Resource": [
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}"
+                  },
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}/*"
+                  }
+                ],
+                "Condition": {
+                  "StringNotEquals": {
+                    "s3:SignatureVersion": "AWS4-HMAC-SHA256"
+                  }
+                }
+              },
+              {
+                "Sid": "AllowCrossAccountRead",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": {
+                  "Fn::Join": [
+                    "/",
+                    [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}"
+                      },
+                      "actions/*/${aws:PrincipalAccount}/*"
+                    ]
+                  ]
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "aws:PrincipalOrgID": {
+                      "Ref": "QSPrincipalOrgId"
+                    }
+                  }
+                }
+              },
+              {
+                "Sid": "AllowCrossAccountWrite",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": [
+                  "s3:PutObject",
+                  "s3:DeleteObject"
+                ],
+                "Resource": {
+                  "Fn::Join": [
+                    "/",
+                    [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}"
+                      },
+                      "actions/*/${aws:PrincipalAccount}/*"
+                    ]
+                  ]
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "aws:PrincipalOrgID": {
+                      "Ref": "QSPrincipalOrgId"
+                    }
+                  },
+                  "ArnLike": {
+                    "aws:PrincipalArn": [
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::*:role/AWS-SSM-DiagnosisExecutionRole-${AWS::AccountId}-${HomeRegion}"
+                      },
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::*:role/AWS-SSM-DiagnosisAdminRole-${AWS::AccountId}-${HomeRegion}"
+                      },
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::*:role/AWS-SSM-RemediationExecutionRole-${AWS::AccountId}-${HomeRegion}"
+                      },
+                      {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::*:role/AWS-SSM-RemediationAdminRole-${AWS::AccountId}-${HomeRegion}"
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "Sid": "AllowCrossAccountListUnderAccountOwnPrefix",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}"
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "aws:PrincipalOrgID": {
+                      "Ref": "QSPrincipalOrgId"
+                    }
+                  },
+                  "StringLike": {
+                    "s3:prefix": "*/${aws:PrincipalAccount}/*"
+                  }
+                }
+              },
+              {
+                "Sid": "AllowGetConfigurationWithinOrganization",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetEncryptionConfiguration",
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}"
+                },
+                "Condition": {
+                  "StringEquals": {
+                    "aws:PrincipalOrgID": {
+                      "Ref": "QSPrincipalOrgId"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "Condition": "IsHomeRegion"
+      },
+      "AWSSSMDiagnosisAdminRole": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": {
+            "Fn::Sub": "AWS-SSM-DiagnosisAdminRole-${AWS::AccountId}-${HomeRegion}"
+          },
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ssm.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                  "StringEquals": {
+                    "aws:SourceAccount": {
+                      "Fn::Sub": "${AWS::AccountId}"
+                    }
+                  },
+                  "ArnLike": {
+                    "aws:SourceArn": {
+                      "Fn::Sub": "arn:${AWS::Partition}:ssm:*:*:automation-execution/*"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWS-SSM-DiagnosisAutomation-AdministrationRolePolicy"
+            },
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWS-SSM-DiagnosisAutomation-OperationalAccountAdministrationRolePolicy"
+            },
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWS-SSM-Automation-DiagnosisBucketPolicy"
+            }
+          ],
+          "Path": "/"
+        },
+        "Condition": "IsHomeRegion"
+      },
+      "AWSSSMRemediationAdminRole": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": {
+            "Fn::Sub": "AWS-SSM-RemediationAdminRole-${AWS::AccountId}-${HomeRegion}"
+          },
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ssm.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                  "StringEquals": {
+                    "aws:SourceAccount": {
+                      "Fn::Sub": "${AWS::AccountId}"
+                    }
+                  },
+                  "ArnLike": {
+                    "aws:SourceArn": {
+                      "Fn::Sub": "arn:${AWS::Partition}:ssm:*:*:automation-execution/*"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWS-SSM-RemediationAutomation-AdministrationRolePolicy"
+            },
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWS-SSM-RemediationAutomation-OperationalAccountAdministrationRolePolicy"
+            },
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWS-SSM-Automation-DiagnosisBucketPolicy"
+            }
+          ],
+          "Path": "/"
+        },
+        "Condition": "ShouldCreateRemediationRoles"
+      },
+      "ManagedInstanceCrossAccountManagementRole": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": "ManagedInstance-CrossAccountManagementRole",
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ssm.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                  "StringEquals": {
+                    "aws:SourceAccount": {
+                      "Fn::Sub": "${AWS::AccountId}"
+                    }
+                  }
+                }
+              },
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "gamma.compito.aws.internal"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          },
+          "Path": "/",
+          "Policies": [
+            {
+              "PolicyName": "IAMRolePolicy",
+              "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": "sts:AssumeRole",
+                    "Resource": "arn:aws:iam::*:role/ManagedInstance-*Role*"
+                  },
+                  {
+                    "Sid": "AllowListOrganizationAccount",
+                    "Effect": "Allow",
+                    "Action": "organizations:DescribeAccount",
+                    "Resource": "*"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "Condition": "IsHomeRegion"
+      }
+    }
+  }
+}

@@ -1,0 +1,747 @@
+{
+  "description": "The **AWSSupport-ContainEC2Instance** automation runbook is designed to perform a network containment of an Amazon Elastic Compute Cloud (Amazon EC2) instance in response to a suspected or confirmed security issue. This runbook implements a containment process that helps isolate the instance from network activity while leaving it running.\nThe containment process includes:\n> * Isolating the EC2 instance from communicating with resources within your VPC or with internet resources.\n> * Modifying security group configurations to restrict inbound and outbound network traffic.\n> * Handling instances that are part of an Amazon EC2 Auto Scaling group.\n> * Optionally creating an Amazon Machine Image (AMI) backup of the instance before containment.\n> * Storing the original configuration in an Amazon Simple Storage Service (Amazon S3) for potential restoration.\n\nThe containment is designed to be reversible, allowing for an attempt to restore normal access when appropriate. However, **please note that restoration to the exact previous state is not guaranteed**, as changes in the AWS account or associated resources might have occurred between the time of containment and restoration.\n\n### Important:\nThis automation runbook can significantly impact the availability of your workloads. It is specifically designed to isolate an EC2 instance during a security event. This isolation can disrupt any workloads, applications, or processes that depend on the affected resource. **Carefully consider the potential impact before executing this runbook**. This runbook can be used in various scenarios, such as responding to detected unauthorized access, isolating potentially compromised instances, or as part of a broader incident response plan.\n\n### Important:\n> * Ensure that the backup Amazon S3 bucket exists and is owned by the current AWS account. The Amazon S3 operations perform ownership verification and will fail if the bucket is missing or belongs to a different account.\n> * This runbook will restrict network access to and from the target EC2 instance. Ensure you understand the full impact on your systems before proceeding.\n> * Always verify that the associated backup S3 bucket policy and ACLs do not grant unnecessary read or write permissions to principals that don't require access.\n> * We recommend using Amazon S3 server-side encryption, enabling S3 server access logging, and S3 Versioning for the backup bucket to enhance security and maintain an audit trail.\n> * The runbook includes a dry run option to preview the changes without applying them, allowing for impact assessment before actual containment.\n> * While the runbook helps to apply containment measures, consider implementing additional security measures as part of your overall incident response strategy.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "FinalOutput.Output",
+    "RestoreInstanceConfiguration.Output",
+    "ReportContain.Output",
+    "ReportRestore.Output",
+    "ReportContainmentFailure.Output",
+    "ReportRestoreFailure.Output"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of the Amazon EC2 Instance."
+    },
+    "Action": {
+      "type": "String",
+      "allowedValues": [
+        "Contain",
+        "Restore"
+      ],
+      "description": "(Required) Select `Contain` to isolate the EC2 instance or `Restore` to try to restore the EC2 instance configuration original configuration from a previous backup"
+    },
+    "DryRun": {
+      "type": "Boolean",
+      "default": true,
+      "allowedValues": [
+        true,
+        false
+      ],
+      "description": "(Optional) When set to `true`, the automation will not make any changes to the target EC2 instance, instead it will output on what it would have attempted to change, detailing out on each step. Default value: `true`."
+    },
+    "CreateAMIBackup": {
+      "type": "Boolean",
+      "default": true,
+      "allowedValues": [
+        true,
+        false
+      ],
+      "description": "(Optional) When set to `true`, an Amazon Machine Image (AMI) of the EC2 instance will be created before performing the containment actions."
+    },
+    "KmsKey": {
+      "type": "String",
+      "default": "alias/aws/ebs",
+      "allowedPattern": "^(((arn:(aws|aws-cn|aws-us-gov):kms:([a-z]{2}|[a-z]{2}-gov)-[a-z]+-[0-9]{1}:[0-9]{12}:key/)?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|mrk-[a-f0-9]{32}))|(arn:(aws|aws-cn|aws-us-gov):kms:([a-z]{2}|[a-z]{2}-gov)-[a-z]+-[0-9]{1}:[0-9]{12}:)?alias/.{1,})$",
+      "description": "(Optional) The ID of the Amazon KMS key that will be used to create an encrypted Amazon Machine Image (AMI) of target EC2 instance. Default is set to `alias/aws/ebs`."
+    },
+    "BackupS3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Conditional) The Amazon S3 bucket to backup the target EC2 instance configuration when the **Action** is set to `Contain` or to restore the configuration from when the **Action** is set to `Restore`. Note that if the specified **Action** is `Contain` and the runbook is not able to access the bucket or a value is not provided, a new bucket is created in your account with the name `awssupport-containec2instance-<random-string>`.",
+      "default": ""
+    },
+    "BackupS3KeyName": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9\\.\\-_\\\\!*'()/]{0,1024}$",
+      "default": "",
+      "description": "(Conditional) If **Action** is set to `Restore`, this specifies the Amazon S3 key the automation will use to try to restore the target EC2 instance configuration. The Amazon S3 key typically follows this format: `{year}/{month}/{day}/{hour}/{minute}/{automation_execution_id}.json`. The key can be obtained from the output of a previous containment automation execution."
+    },
+    "BackupS3BucketAccess": {
+      "description": "(Conditional) The ARN of the IAM users or roles that will be allowed access to the backup Amazon S3 bucket after running the containment actions. This parameter is required when Action is `Contain`. The `AutomationAssumeRole`, or in its absence the user under whose context the automation is running is automatically added to the list.",
+      "type": "StringList",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:(role|user)\\/[\\w+\\/=,.@-]+$",
+      "default": []
+    },
+    "TagIdentifier": {
+      "type": "String",
+      "allowedPattern": "^$|^[Kk][Ee][Yy]=[\\+\\-\\=\\.\\_\\:\\/@a-zA-Z0-9]{1,128},[Vv][Aa][Ll][Uu][Ee]=[\\+\\-\\=\\.\\_\\:\\/@a-zA-Z0-9]{0,128}$",
+      "default": "",
+      "description": "(Optional) A tag in the format `Key=BatchId,Value=78925` that will be added to the AWS resources created or modified by this runbook during the containment workflow. This tag can be used to identify and manage resources associated during containment process. During the restore workflow, the tag specified by this parameter will be removed from the resources. Note: Tag keys and values are case-sensitive."
+    },
+    "IngressTrafficRules": {
+      "type": "MapList",
+      "allowedPattern": "^\\{\\}$|^\\{\"Cidr\":\"[\\x00-\\x7F+]{1,128}\",\"IpProtocol\":\"[\\x00-\\x7F+]{1,128}\",\"FromPort\":\"[\\x00-\\x7F+]{1,128}\",\"ToPort\":\"[\\x00-\\x7F+]{0,255}\"\\}",
+      "default": [
+        {}
+      ],
+      "description": "(Optional) A comma separated map of security group ingress rules with Cidr, IpProtocol, FromPort and ToPort in the format [{\"Cidr\": \"1.2.3.4/32\", \"IpProtocol\": \"tcp\", \"FromPort\":\"22\", \"ToPort\":\"22\"}] to be applied to the Amazon EC2 Instance. If no rules are provided, a security group without any ingress rules will be attached to the instance, effectively isolating it from any incoming traffic."
+    },
+    "EgressTrafficRules": {
+      "type": "MapList",
+      "allowedPattern": "^\\{\\}$|^\\{\"Cidr\":\"[\\x00-\\x7F+]{1,128}\",\"IpProtocol\":\"[\\x00-\\x7F+]{1,128}\",\"FromPort\":\"[\\x00-\\x7F+]{1,128}\",\"ToPort\":\"[\\x00-\\x7F+]{0,255}\"\\}",
+      "default": [
+        {}
+      ],
+      "description": "(Optional) A comma separated map of security group egress rules with Cidr, IpProtocol, FromPort and ToPort in the format [{\"Cidr\": \"1.2.3.4/32\", \"IpProtocol\": \"tcp\", \"FromPort\":\"22\", \"ToPort\":\"22\"}] to be applied to the Amazon EC2 Instance. If no rules are provided, a security group without any egress rules will be attached to the instance, effectively preventing all outgoing traffic."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateRequiredInputs",
+      "description": "Validates the required automation input parameters based on the `Action` specified.",
+      "action": "aws:executeScript",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "Action": "{{ Action }}",
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nfrom helpers.common import CONTAIN_REQUIRED_PARAMS  # pyright: ignore[reportMissingImports]\nfrom helpers.common import RELEASE_REQUIRED_PARAMS  # pyright: ignore[reportMissingImports]\nfrom helpers.common import contain_input_validation_message  # pyright: ignore[reportMissingImports]\nfrom helpers.common import release_input_validation_message  # pyright: ignore[reportMissingImports]\n\n\ndef check_input(input_dict, valid_keys):\n    \"\"\"Validate input parameter and it's value for non-empty, for Runbook workflow to start.\"\"\"\n    errors = []\n    for key in valid_keys:\n        if key not in input_dict:\n            errors.append(f\"Invalid key: {key}\")\n        elif not input_dict[key]:  # Check if value is non-empty\n            errors.append(f\"Value for {key} cannot be empty\")\n    return errors\n\n\ndef script_handler(events, _):\n    \"\"\"Validate input parameters required for runbook.\n\n    Parameters:\n    ----------\n    Runbook input parameters\n    \"\"\"\n    input_action = events[\"Action\"]\n\n    if input_action == \"Contain\":\n        errors = check_input(events, CONTAIN_REQUIRED_PARAMS)\n        if errors:\n            raise ValueError(contain_input_validation_message(action=input_action)) from None\n    else:\n        errors = check_input(events, RELEASE_REQUIRED_PARAMS)\n        if errors:\n            raise ValueError(release_input_validation_message(action=input_action)) from None\n    return\n"
+      },
+      "nextStep": "AssertInstanceIsNotTerminated"
+    },
+    {
+      "name": "AssertInstanceIsNotTerminated",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Asserts if the target EC2 Instance is not in terminated (deleted).",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].State.Name",
+        "DesiredValues": [
+          "running",
+          "stopped",
+          "stopping",
+          "pending"
+        ]
+      },
+      "nextStep": "GetAutoScalingInstanceInfo"
+    },
+    {
+      "name": "GetAutoScalingInstanceInfo",
+      "action": "aws:executeAwsApi",
+      "description": "Gets the instance lifecycle and group name if the target instance is part of an Amazon EC2 Auto Scaling group.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "DescribeAutoScalingInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.AutoScalingInstances[0].InstanceId",
+          "Type": "String"
+        },
+        {
+          "Name": "LifecycleState",
+          "Selector": "$.AutoScalingInstances[0].LifecycleState",
+          "Type": "String"
+        },
+        {
+          "Name": "AutoScalingGroupName",
+          "Selector": "$.AutoScalingInstances[0].AutoScalingGroupName",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckBackupS3BucketName"
+    },
+    {
+      "name": "CheckBackupS3BucketName",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "description": "Checks if the target Amazon S3 bucket potentially grants **read** or **write** public access to its objects. In case of containment workflow, a new Amazon S3 bucket is created if the `BackupS3BucketName` bucket doesn't exist.",
+      "timeoutSeconds": 300,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "BackupS3BucketName": "{{ BackupS3BucketName }}",
+          "BackupS3KeyName": "{{ BackupS3KeyName }}",
+          "Action": "{{ Action }}",
+          "Mode": "{{ DryRun }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "BackupS3BucketAccess": "{{ BackupS3BucketAccess }}"
+        },
+        "Handler": "validate_s3_bucket.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "BucketName",
+          "Selector": "$.Payload.BucketName",
+          "Type": "String"
+        },
+        {
+          "Name": "IsBucketCreated",
+          "Selector": "$.Payload.CreateBucket",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnActionAndMode"
+    },
+    {
+      "name": "BranchOnActionAndMode",
+      "action": "aws:branch",
+      "description": "Branches the automation based on the input parameters `Action` and `DryRun`.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Contain"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              }
+            ],
+            "NextStep": "BranchOnAutoScalingGroupMembership"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Restore"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": false
+              }
+            ],
+            "NextStep": "RestoreInstanceConfiguration"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Contain"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "ReportContain"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ Action }}",
+                "StringEquals": "Restore"
+              },
+              {
+                "Variable": "{{ DryRun }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "ReportRestore"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BranchOnAutoScalingGroupMembership",
+      "action": "aws:branch",
+      "description": "Branches the automation based on if the target EC2 instance is part of Amazon EC2 Auto Scaling group and its lifecycle state.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ GetAutoScalingInstanceInfo.InstanceId }}",
+                "StringEquals": "{{ InstanceId }}"
+              },
+              {
+                "Variable": "{{ GetAutoScalingInstanceInfo.LifecycleState }}",
+                "StringEquals": "InService"
+              }
+            ],
+            "NextStep": "DescribeAutoScalingGroups"
+          }
+        ],
+        "Default": "BackupInstanceSecurityGroups"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "DescribeAutoScalingGroups",
+      "action": "aws:executeAwsApi",
+      "description": "Gets and stores the associated Amazon EC2 Auto Scaling group configuration.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "autoscaling",
+        "Api": "DescribeAutoScalingGroups",
+        "AutoScalingGroupNames": [
+          "{{ GetAutoScalingInstanceInfo.AutoScalingGroupName }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "AutoScalingGroupName",
+          "Selector": "$.AutoScalingGroups[0].AutoScalingGroupName",
+          "Type": "String"
+        },
+        {
+          "Name": "AutoScalingGroupMinSize",
+          "Selector": "$.AutoScalingGroups[0].MinSize",
+          "Type": "String"
+        },
+        {
+          "Name": "AutoScalingGroupMaxSize",
+          "Selector": "$.AutoScalingGroups[0].MaxSize",
+          "Type": "String"
+        },
+        {
+          "Name": "AutoScalingGroupDesiredSize",
+          "Selector": "$.AutoScalingGroups[0].DesiredCapacity",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ModifyAutoScalingGroup"
+    },
+    {
+      "name": "ModifyAutoScalingGroup",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Modifies the associated Amazon EC2 Auto Scaling group configuration for the containment actions, setting the EC2 instance to the `Standby` state and adjusting the Auto Scaling group `MinSize` capacity.",
+      "onFailure": "step:ReportContainmentFailure",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "ASGName": "{{ DescribeAutoScalingGroups.AutoScalingGroupName }}"
+        },
+        "Handler": "modify_asg.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "AutoScalingGroupName",
+          "Selector": "$.Payload.AutoScalingGroupName",
+          "Type": "String"
+        },
+        {
+          "Name": "AutoScalingGroupMinSize",
+          "Selector": "$.Payload.AutoScalingMinSize",
+          "Type": "String"
+        },
+        {
+          "Name": "AutoScalingInstanceState",
+          "Selector": "$.Payload.AutoScalingInstanceState",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BackupInstanceSecurityGroups"
+    },
+    {
+      "name": "BackupInstanceSecurityGroups",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Gets and stores the configuration of the target EC2 instance security groups.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "S3Bucket": "{{ CheckBackupS3BucketName.BucketName }}",
+          "AutoScalingGroupName": "{{ ModifyAutoScalingGroup.AutoScalingGroupName }}",
+          "AutoScalingGroupMinSize": "{{ ModifyAutoScalingGroup.AutoScalingGroupMinSize }}",
+          "AutoScalingGroupMaxSize": "{{ DescribeAutoScalingGroups.AutoScalingGroupMaxSize }}",
+          "AutoScalingGroupDesiredSize": "{{ DescribeAutoScalingGroups.AutoScalingGroupDesiredSize }}"
+        },
+        "Handler": "backup_security_groups.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroups",
+          "Selector": "$.Payload.SecurityGroups",
+          "Type": "StringList"
+        },
+        {
+          "Name": "VpcId",
+          "Selector": "$.Payload.VpcID",
+          "Type": "String"
+        },
+        {
+          "Name": "NetworkInterfaceMapping",
+          "Selector": "$.Payload.NetworkInterfaceMapping",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupDetailsS3File",
+          "Selector": "$.Payload.SecurityGroupDetailsS3File",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CreateAllAccessSecurityGroup"
+    },
+    {
+      "name": "CreateAllAccessSecurityGroup",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Creates a temporary security group allowing all ingress traffic that replaces the target EC2 instance's security groups.",
+      "onFailure": "step:ReportContainmentFailure",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "VpcId": "{{ BackupInstanceSecurityGroups.VpcId }}",
+          "NetworkInterfaceInfo": "{{ BackupInstanceSecurityGroups.NetworkInterfaceMapping }}"
+        },
+        "Handler": "create_all_access_sg.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "AllAccessSecurityGroupID",
+          "Selector": "$.Payload.AllAccessSecurityGroupID",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CreateContainmentSecurityGroup"
+    },
+    {
+      "name": "CreateContainmentSecurityGroup",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Creates a restrictive containment security group with the specified ingress and egress rules, and replaces the temporary all-access group with it.",
+      "onFailure": "step:ReportContainmentFailure",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "AllAccessSG": "{{ CreateAllAccessSecurityGroup.AllAccessSecurityGroupID }}",
+          "NetworkInterfaceInfo": "{{ BackupInstanceSecurityGroups.NetworkInterfaceMapping }}",
+          "VpcId": "{{ BackupInstanceSecurityGroups.VpcId }}",
+          "IngressTrafficRules": "{{ IngressTrafficRules }}",
+          "EgressTrafficRules": "{{ EgressTrafficRules }}"
+        },
+        "Handler": "create_containment_sg.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "ContainmentSecurityGroupID",
+          "Selector": "$.Payload.ContainmentSecurityGroup",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnCreateAMIBackup"
+    },
+    {
+      "name": "BranchOnCreateAMIBackup",
+      "action": "aws:branch",
+      "description": "Branches the automation based on the `CreateAMIBackup` input parameter.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CreateAMIBackup }}",
+            "BooleanEquals": true,
+            "NextStep": "AssertSourceInstanceRootVolumeIsEbs"
+          }
+        ],
+        "Default": "FinalOutput"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "AssertSourceInstanceRootVolumeIsEbs",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Asserts if the target EC2 instance root volume is `EBS`.",
+      "isCritical": true,
+      "onFailure": "step:FinalOutput",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].RootDeviceType",
+        "DesiredValues": [
+          "ebs"
+        ]
+      },
+      "nextStep": "CreateImage"
+    },
+    {
+      "name": "CreateImage",
+      "action": "aws:createImage",
+      "maxAttempts": 1,
+      "timeoutSeconds": 1200,
+      "isCritical": true,
+      "onFailure": "step:FinalOutput",
+      "description": "Creates an Amazon Machine Image (AMI) of the target EC2 instance.",
+      "inputs": {
+        "InstanceId": "{{ InstanceId }}",
+        "ImageName": "AWSSupport-ContainEC2Instance LocalAmi for {{ InstanceId }} at {{ global:DATE_TIME }}",
+        "NoReboot": true,
+        "ImageDescription": "AWSSupport-ContainEC2Instance localAmi for {{ InstanceId }} at {{ global:DATE_TIME }}"
+      },
+      "nextStep": "CreateEncryptedCopy"
+    },
+    {
+      "name": "CreateEncryptedCopy",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "onFailure": "Continue",
+      "timeoutSeconds": 1200,
+      "isCritical": true,
+      "description": "Creates an encrypted Amazon Machine Image (AMI) of the target EC2 instance backed by EBS volume.",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "SourceImageId": "{{ CreateImage.ImageId }}",
+          "KmsKeyId": "{{ KmsKey }}",
+          "InstanceId": "{{ InstanceId }}"
+        },
+        "Handler": "create_encrypted_ami.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "EncryptedAMI",
+          "Selector": "$.Payload.EncryptedAMI",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "FinalOutput"
+    },
+    {
+      "name": "RestoreInstanceConfiguration",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Restores the target EC2 instance configuration from the backup.",
+      "onFailure": "step:ReportRestoreFailure",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "S3Bucket": "{{ BackupS3BucketName }}",
+          "S3Path": "{{ BackupS3KeyName }}",
+          "Tag": "{{ TagIdentifier }}",
+          "ASGName": "{{ GetAutoScalingInstanceInfo.AutoScalingGroupName }}"
+        },
+        "Handler": "restore_instance.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Output",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "ReportContain",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Outputs dry run details for the containment actions.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "S3Bucket": "{{ CheckBackupS3BucketName.BucketName }}",
+          "ASGName": "{{ GetAutoScalingInstanceInfo.AutoScalingGroupName }}",
+          "Tag": "{{ TagIdentifier }}",
+          "CreateAMI": "{{ CreateAMIBackup }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nimport boto3\nfrom botocore.client import ClientError\nfrom helpers.common import build_contain_dry_run_message  # pyright: ignore[reportMissingImports]\nfrom helpers.constants import CONTAINMENT_SECURITY_GROUP  # pyright: ignore[reportMissingImports]\nfrom helpers.mutative_api_calls import TagOperation  # pyright: ignore[reportMissingImports]\n\nsys.tracebacklimit = 0\n\n\nec2 = boto3.client(\"ec2\")\nasg = boto3.client(\"autoscaling\")\n\n\ndef script_handler(events, context) -> dict:\n    \"\"\"\n    Outputs a templated format of containment activity that will be performed.\n\n    Args:\n        events (dict): The inputs parameters sent to the handler.\n        context (dict): The context send to the handler by Systems Manager.\n\n    Returns:\n        dict: Returns formated output\n    \"\"\"\n\n    execution_id = context[\"automation:EXECUTION_ID\"]\n    instance_id = events[\"InstanceId\"]\n    s3_bucket = events[\"S3Bucket\"]\n    add_tag = events[\"Tag\"]\n    asg_name = events[\"ASGName\"]\n    create_ami = events[\"CreateAMI\"]\n\n    sg_groups = set()\n\n    tag_obj = TagOperation(add_tag)\n\n    if asg_name.startswith(\"{\"):\n        asg_name = None\n\n    response = ec2.describe_instances(InstanceIds=[instance_id])[\"Reservations\"][0][\"Instances\"][0]\n    for interface in response.get(\"NetworkInterfaces\"):\n        sg_ids = [_ele[\"GroupId\"] for _ele in interface.get(\"Groups\")]\n        sg_groups.update(sg_ids)\n\n    # Create security group: dry-run\n    try:\n        group_name = CONTAINMENT_SECURITY_GROUP.format(execution_id.split(\"-\")[0])\n        ec2.create_security_group(\n            Description=\"All access security group to convert tracking connections to untracked connections\",\n            GroupName=group_name,\n            DryRun=True,\n        )\n    except ClientError as e:\n        if e.response[\"Error\"][\"Code\"] == \"DryRunOperation\":\n            print(\"Dry-run. Create security group\")\n        else:\n            raise RuntimeError(f\"Failed to a create security group in dry-run mode: {str(e)}\") from None\n\n    # Create AMI: dry-run\n    if create_ami:\n        if response.get(\"RootDeviceType\") != \"ebs\":\n            raise RuntimeError(\n                \"Failed to create an Amazon Machine Image (AMI) in dry-run mode: Instance root volume is not EBS.\"\n            )\n        try:\n            ec2.create_image(\n                Name=f\"AWSSupport-ContainEC2Instance-{execution_id[-12:]}\", InstanceId=instance_id, DryRun=True\n            )\n        except ClientError as e:\n            if e.response[\"Error\"][\"Code\"] == \"DryRunOperation\":\n                print(\"Dry-run. Create Image\")\n            else:\n                raise RuntimeError(\n                    f\"Failed to create an Amazon Machine Image (AMI) in dry-run mode: {str(e)}\"\n                ) from None\n\n    # Add EC2 tag: dry-run\n    ec2_tag_count = tag_obj.get_ec2_resource_tag_count(instance_id)\n    if ec2_tag_count >= 50:\n        print(\"Tag can't be added as the threshold limit 50 tags per EC2 resource reached.\")\n    else:\n        tag_obj.add_ec2_resource_tag(instance_id, dry_run=True)\n\n    def asg_message():\n        asg_res = asg.describe_auto_scaling_instances(InstanceIds=[instance_id])[\"AutoScalingInstances\"]\n        life_cycle_state = None\n\n        if asg_res:\n            life_cycle_state = asg_res[0][\"LifecycleState\"]\n            res = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])\n            min_size = res.get(\"AutoScalingGroups\")[0][\"MinSize\"]\n\n            if asg_name and life_cycle_state == \"InService\":\n                message = f\"The instance is part of the Auto Scaling group: {asg_name}. The instance lifecycle state will be changed to the Standby state. \"\n                if min_size > 1:\n                    message += f\"Updates the Auto Scaling group minimum capacity to {min_size - 1}\"\n                return message\n        return \"\"\n\n    def ami_message():\n        return \"Backup AMI will be created for the EC2 instance\" if create_ami else \"\"\n\n    def s3_bucket_message():\n        if s3_bucket.endswith(execution_id[-12:]):\n            return f\"An S3 bucket will be created with the name: {s3_bucket}\"\n        return \"\"\n\n    def tag_instance_message():\n        if add_tag and ec2_tag_count < 50:\n            return f\"Adds the tag: {add_tag} to EC2 instance\"\n        elif add_tag and ec2_tag_count >= 50:\n            return \"Tag can't be added as the threshold limit 50 tags per EC2 resource reached.\"\n        else:\n            return \"\"\n\n    def tag_asg_message():\n        if add_tag and asg_name and tag_obj.get_asg_tag_count(asg_name) < 50:\n            return f\"Adds the tag: {add_tag} to the Auto Scaling group\"\n        elif add_tag and asg_name and tag_obj.get_asg_tag_count(asg_name) >= 50:\n            return \"Tag can't be added as the threshold limit 50 tags per Auto Scaling group reached.\"\n        return \"\"\n\n    def tag_containtment_sg_message():\n        if add_tag:\n            return f\"Adds the tag: {add_tag} to the containment security group\"\n        return \"\"\n\n    def tag_ami_message():\n        if add_tag and create_ami:\n            return f\"Adds the tag: {add_tag} to the backup AMI\"\n        return \"\"\n\n    template_values = {\n        \"instance_id\": instance_id,\n        \"sg_groups_str\": \", \".join(sg_groups),\n        \"s3_bucket\": s3_bucket,\n        \"s3_bucket_message\": s3_bucket_message(),\n        \"asg_message\": asg_message(),\n        \"ami_message\": ami_message(),\n        \"tag_instance_message\": tag_instance_message(),\n        \"tag_asg_message\": tag_asg_message(),\n        \"tag_containtment_sg_message\": tag_containtment_sg_message(),\n        \"tag_ami_message\": tag_ami_message(),\n    }\n\n    message = build_contain_dry_run_message(**template_values)\n\n    return {\"Output\": message}\n"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Output",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "ReportRestore",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Outputs dry run details for the restoring actions.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "S3Bucket": "{{ BackupS3BucketName }}",
+          "S3Path": "{{ BackupS3KeyName }}",
+          "Tag": "{{ TagIdentifier }}",
+          "ASGName": "{{ GetAutoScalingInstanceInfo.AutoScalingGroupName }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport base64\nimport hashlib\nimport json\nimport sys\nfrom typing import Set\n\nimport boto3\nfrom botocore.client import ClientError\nfrom helpers.common import build_report_release_dry_run_message  # pyright: ignore[reportMissingImports]\nfrom helpers.constants import AUTOSCALING_GROUP_INTEGRITY_KEY  # pyright: ignore[reportMissingImports]\nfrom helpers.constants import INSTANCE_RESOURCE_INTEGRITY_KEY  # pyright: ignore[reportMissingImports]\nfrom helpers.constants import S3_BACKUP_INTEGRITY_KEY  # pyright: ignore[reportMissingImports]\nfrom helpers.constants import S3_OBJECT_CHECKSUM_ALGORITHM  # pyright: ignore[reportMissingImports]\nfrom helpers.mutative_api_calls import TagOperation  # pyright: ignore[reportMissingImports]\n\nsys.tracebacklimit = 0\n\nec2 = boto3.client(\"ec2\")\nasg = boto3.client(\"autoscaling\")\ns3 = boto3.client(\"s3\")\n\n\ndef get_instance_security_group(instance) -> dict:\n    sg_groups: Set[list] = set()\n    network_interface_ids = []\n\n    response = ec2.describe_instances(InstanceIds=[instance])[\"Reservations\"][0][\"Instances\"][0]\n    for interface in response.get(\"NetworkInterfaces\"):\n        network_interface_ids.append(interface.get(\"NetworkInterfaceId\"))\n        sg_ids = [_ele[\"GroupId\"] for _ele in interface.get(\"Groups\")]\n        sg_groups.update(sg_ids)\n\n    return {\"SecurityGroups\": sg_groups, \"NetworkInterfaceIds\": network_interface_ids}\n\n\ndef script_handler(events, context) -> dict:\n    \"\"\"\n    Outputs a templated format of restore activity that will be performed.\n\n    Args:\n        events (dict): The inputs parameters sent to the handler.\n        context (dict): The context send to the handler by Systems Manager.\n\n    Returns:\n        dict: Returns formated output\n    \"\"\"\n\n    instance_id = events[\"InstanceId\"]\n    bucket = events[\"S3Bucket\"]\n    file_name = events[\"S3Path\"]\n    remove_tag = events[\"Tag\"]\n    asg_name = events[\"ASGName\"]\n    account_id = context[\"global:ACCOUNT_ID\"]\n\n    instance_network_interface_ids = []\n    interfaces_from_backup = []\n    security_groups_from_backup = []\n\n    if asg_name.startswith(\"{\"):\n        asg_name = None\n    if remove_tag.startswith(\"{\"):\n        remove_tag = None\n\n    tag_obj = TagOperation(remove_tag)\n\n    json_object = s3.get_object(Bucket=bucket, Key=file_name, ExpectedBucketOwner=account_id)\n    encoded_content = json_object[\"Body\"].read()\n    sha256_hash = json_object[\"Metadata\"][S3_BACKUP_INTEGRITY_KEY]\n    resource_check = json_object[\"Metadata\"][INSTANCE_RESOURCE_INTEGRITY_KEY]\n    asg_check = json_object[\"Metadata\"].get(AUTOSCALING_GROUP_INTEGRITY_KEY, None)\n\n    hasher = hashlib.new(S3_OBJECT_CHECKSUM_ALGORITHM)\n    hasher.update(encoded_content)\n    downloaded_sha256_hash = base64.b64encode(hasher.digest()).decode(\"utf-8\")\n\n    # Verify backup file authenticity by comparing content hash and metadata hash value\n    if sha256_hash != downloaded_sha256_hash:\n        raise RuntimeError(\n            \"The provided backup downloaded from S3 had an encoding mismatch of 256, which could lead to data corruption. Please provide backup file with the correct encoding.\"\n        )\n\n    if resource_check != instance_id:\n        raise RuntimeError(f\"Configuration trying to update doesn't belong to requested EC2 Instance: {instance_id}.\")\n\n    if asg_name and asg_check != asg_name:\n        raise RuntimeError(f\"Configuration trying to update doesn't belong to requested ASG: {asg_name}.\")\n\n    json_data = json.loads(encoded_content.decode(\"utf-8\"))\n    mapping_details = json_data.get(\"NetworkInterfaceMapping\")\n    if not mapping_details:\n        raise RuntimeError(\n            \"Backup configuration file doesn't have details regarding network interface mapping and security groups associated with them. It's possible the file is incorrect or corrupted.\"\n        )\n\n    for interface, security_group in mapping_details.items():\n        interfaces_from_backup.append(interface)\n        security_groups_from_backup.append(security_group)\n\n    if any(isinstance(item, list) for item in security_groups_from_backup):\n        security_groups_from_backup = sum(security_groups_from_backup, [])\n\n    response_dict = get_instance_security_group(instance_id)\n    instance_network_interface_ids = response_dict.get(\"NetworkInterfaceIds\", [])\n    containment_sg_groups = response_dict.get(\"SecurityGroups\", set([]))\n\n    # Make sure instance has same network interfaces during containment and restore workflow.\n    if set(interfaces_from_backup) != set(instance_network_interface_ids):\n        raise RuntimeError(\n            \"There is a mismatch in EC2 instance network interfaces from the point of Contain to Restore. Not making changes to instance security groups\"\n        )\n\n    # Replace containment security groups with initial security groups: dry-run\n    for key, value in mapping_details.items():\n        try:\n            ec2.modify_network_interface_attribute(NetworkInterfaceId=key, Groups=value, DryRun=True)\n        except ClientError as e:\n            if e.response[\"Error\"][\"Code\"] == \"DryRunOperation\":\n                print(\"Dry-run. Modify EC2 instance security groups\")\n            else:\n                raise e\n\n    # Delete containment security group: dry-run\n    for sg_id in list(containment_sg_groups):\n        try:\n            ec2.delete_security_group(GroupId=sg_id, DryRun=True)\n        except ClientError as e:\n            if e.response[\"Error\"][\"Code\"] == \"DryRunOperation\":\n                print(\"Dry-run. Delete security group\")\n            else:\n                raise e\n\n    # Delete EC2 tag: dry-run\n    tag_obj.remove_ec2_resource_tag(instance_id, dry_run=True)\n\n    def get_asg_message():\n        asg_response = asg.describe_auto_scaling_instances(InstanceIds=[instance_id])[\"AutoScalingInstances\"]\n        if asg_response and asg_response[0][\"LifecycleState\"] == \"Standby\":\n            asg_details = json_data.get(\"AutoscalingGroupConfig\")\n            min_size = int(asg_details[\"asg_min_size\"])\n            max_size = int(asg_details[\"asg_max_size\"])\n            desired_capacity = int(asg_details[\"asg_desired_size\"])\n            return f\"Modifies AutoScaling group '{asg_name}' to previous configuration, minimum capacity to {min_size}, maximum capacity to {max_size}, desired capacity to {desired_capacity} and changes instance lifecyle to InService.\"\n        else:\n            return \"\"\n\n    asg_message = get_asg_message()\n\n    remove_tag_instance = \"Removes the tag: {} from EC2 instance and S3 object\".format(remove_tag) if remove_tag else \"\"\n    remove_tag_asg = (\n        \"Removes the tag: {} from Auto Scaling group\".format(remove_tag)\n        if asg_name and remove_tag and asg_message\n        else \"\"\n    )\n\n    template_values = {\n        \"instance_id\": instance_id,\n        \"file_name\": file_name,\n        \"security_groups_from_backup\": security_groups_from_backup,\n        \"asg_message\": asg_message,\n        \"bucket\": bucket,\n        \"containment_sg_groups\": containment_sg_groups,\n        \"remove_tag_instance\": remove_tag_instance,\n        \"remove_tag_asg\": remove_tag_asg,\n    }\n\n    message = build_report_release_dry_run_message(**template_values)\n\n    return {\"Output\": message}\n"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Output",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "ReportRestoreFailure",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Provides instructions to restore the target EC2 instance original configuration during a restore workflow failure scenario.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "S3Bucket": "{{ BackupS3BucketName }}",
+          "S3Path": "{{ BackupS3KeyName }}",
+          "Tag": "{{ TagIdentifier }}",
+          "ASGName": "{{ GetAutoScalingInstanceInfo.AutoScalingGroupName }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nfrom helpers.common import build_release_failure_message  # pyright: ignore[reportMissingImports]\n\nsys.tracebacklimit = 0\n\n\ndef script_handler(events, _) -> dict:\n    \"\"\"\n    Outputs a templated format of Instance initial state configuration to restore to during restore workflow failure.\n\n    Args:\n        events (dict): The inputs parameters sent to the handler.\n\n    Returns:\n        dict: Returns next steps\n    \"\"\"\n    instance_id = events[\"InstanceId\"]\n    bucket = events[\"S3Bucket\"]\n    object_path = events[\"S3Path\"]\n    tag = events[\"Tag\"]\n    asg_name = events[\"ASGName\"]\n\n    if asg_name.startswith(\"{\"):\n        asg_name = None\n\n    remove_tag = (\n        \"Remove the tag : {} added to Auto Scaling group, EC2 instance and s3 object'\".format(tag) if tag else \"\"\n    )\n    asg_info = (\n        \"The EC2 instance is part of Auto Scaling group: {}. Make sure EC2 instance is in the InService state. You can bring the EC2 instance to the InService state by making the AWS api call: https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_ExitStandby.html\"\n        if asg_name\n        else \"The EC2 instance is not part of Auto Scaling group\"\n    )\n\n    message = build_release_failure_message(\n        bucket=bucket,\n        object_path=object_path,\n        asg_info=asg_info,\n        remove_tag=remove_tag,\n        instance_id=instance_id,\n    )\n\n    return {\"Output\": message}\n"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Output",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "ReportContainmentFailure",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Provides instructions to restore the target EC2 instance original configuration during a containment workflow failure scenario.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "NetworkInterfaceInfo": "{{ BackupInstanceSecurityGroups.NetworkInterfaceMapping }}",
+          "AutoScalingGroup": "{{ DescribeAutoScalingGroups.AutoScalingGroupName }}",
+          "ASGMinSize": "{{ DescribeAutoScalingGroups.AutoScalingGroupMinSize }}",
+          "ASGInstanceState": "{{ GetAutoScalingInstanceInfo.LifecycleState }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport json\n\nfrom helpers.common import CONTAINMENT_FAILURE_ASG_SECTION  # pyright: ignore[reportMissingImports]\nfrom helpers.common import CONTAINMENT_FAILURE_NETWORK_INTERFACE_SECTION  # pyright: ignore[reportMissingImports]\nfrom helpers.common import build_containment_failure_message  # pyright: ignore[reportMissingImports]\n\n\ndef script_handler(events, _) -> dict:\n    \"\"\"\n    Outputs a templated format of Instance initial state to restore, during containment workflow failure.\n\n    Args:\n        events (dict): The inputs parameters sent to the handler.\n\n    Returns:\n        dict: Returns markdown response\n    \"\"\"\n    instance = events[\"InstanceId\"]\n    network_interface_mapping = events[\"NetworkInterfaceInfo\"]\n    asg_name = events[\"AutoScalingGroup\"]\n    asg_min_size = events[\"ASGMinSize\"]\n    asg_instance_state = events[\"ASGInstanceState\"]\n\n    # If variable value is not passed, script gets literal variable name.\n    if asg_name.startswith(\"{\"):\n        asg_name = None\n\n    if network_interface_mapping.startswith(\"{{\"):\n        network_interface_mapping = None\n    else:\n        network_interface_mapping = json.loads(network_interface_mapping)\n\n    asg_section = (\n        CONTAINMENT_FAILURE_ASG_SECTION.format(\n            asg_name=asg_name, asg_min_size=asg_min_size, asg_instance_state=asg_instance_state\n        )\n        if asg_name\n        else \"The EC2 instance is not part of the Auto Scaling group.\"\n    )\n\n    network_interface_section = (\n        CONTAINMENT_FAILURE_NETWORK_INTERFACE_SECTION.format(network_interface_mapping=network_interface_mapping)\n        if network_interface_mapping\n        else \"The workflow didn't make changes to the EC2 instance security groups.\"\n    )\n\n    message = build_containment_failure_message(\n        instance=instance, asg_section=asg_section, network_interface_section=network_interface_section\n    )\n\n    return {\"Output\": message}\n"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Output",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "FinalOutput",
+      "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "description": "Outputs the details of the containment actions.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "InstanceSGs": "{{ BackupInstanceSecurityGroups.SecurityGroups }}",
+          "S3Bucket": "{{ CheckBackupS3BucketName.BucketName }}",
+          "S3file": "{{ BackupInstanceSecurityGroups.SecurityGroupDetailsS3File }}",
+          "AllAccessSG": "{{ CreateAllAccessSecurityGroup.AllAccessSecurityGroupID }}",
+          "ContainmentSG": "{{ CreateContainmentSecurityGroup.ContainmentSecurityGroupID }}",
+          "EncryptedAMI": "{{ CreateEncryptedCopy.EncryptedAMI }}",
+          "Tag": "{{ TagIdentifier }}",
+          "UnEncryptedAMI": "{{ CreateImage.ImageId }}",
+          "ASGName": "{{ ModifyAutoScalingGroup.AutoScalingGroupName }}",
+          "ASGMinSize": "{{ ModifyAutoScalingGroup.AutoScalingGroupMinSize }}",
+          "ASGInstanceState": "{{ ModifyAutoScalingGroup.AutoScalingInstanceState }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nfrom helpers.common import build_contain_message  # pyright: ignore[reportMissingImports]\nfrom helpers.mutative_api_calls import TagOperation  # pyright: ignore[reportMissingImports]\n\nsys.tracebacklimit = 0\n\n\ndef script_handler(events, context) -> dict:\n    \"\"\"\n    Outputs a templated format of both initial and final state of resources after successful containment activity.\n\n    Args:\n        events (dict): The inputs parameters sent to the handler.\n        context (dict): The context send to the handler by Systems Manager.\n\n    Returns:\n        dict: Returns formated output\n    \"\"\"\n    execution_id = context[\"automation:EXECUTION_ID\"]\n    instance_id = events[\"InstanceId\"]\n    original_sgs = events[\"InstanceSGs\"]\n    bucket = events[\"S3Bucket\"]\n    s3_object = events[\"S3file\"]\n    all_access_sg = events[\"AllAccessSG\"]\n    containment_sg = events[\"ContainmentSG\"]\n    un_encrypted_ami_id = events[\"UnEncryptedAMI\"]\n    encrypted_ami_id = events[\"EncryptedAMI\"]\n    add_tag = events[\"Tag\"]\n    asg_name = events[\"ASGName\"]\n    asg_min_size = events[\"ASGMinSize\"]\n    asg_instance_state = events[\"ASGInstanceState\"]\n\n    ami_tag_count = 0\n    sg_tag_count = 0\n    ec2_tag_count = 0\n    asg_tag_count = 0\n\n    if asg_name.startswith(\"{\"):\n        asg_name = None\n    if encrypted_ami_id.startswith(\"{\"):\n        encrypted_ami_id = None\n    if add_tag.startswith(\"{\"):\n        add_tag = None\n    if un_encrypted_ami_id.startswith(\"{\"):\n        un_encrypted_ami_id = None\n\n    if add_tag:\n        tag_obj = TagOperation(add_tag)\n\n        # Add tags to containment security group\n        sg_tag_count = tag_obj.get_ec2_resource_tag_count(containment_sg)\n        if sg_tag_count >= 50:\n            print(\"Tag can't be added as the threshold limit 50 tags per security group is reached.\")\n        else:\n            tag_obj.add_ec2_resource_tag(containment_sg)\n\n        # Add tag to EC2 Instance\n        ec2_tag_count = tag_obj.get_ec2_resource_tag_count(instance_id)\n        if ec2_tag_count >= 50:\n            print(\"Tag can't be added as the threshold limit 50 tags per EC2 instance is reached.\")\n        else:\n            tag_obj.add_ec2_resource_tag(instance_id)\n\n        # Add tag to AMI ID\n        if un_encrypted_ami_id:\n            ami_tag_count = tag_obj.get_ec2_resource_tag_count(un_encrypted_ami_id)\n            if ami_tag_count >= 50:\n                print(\"Tag can't be added as the threshold limit 50 tags per AMI is reached.\")\n            else:\n                tag_obj.add_ec2_resource_tag(un_encrypted_ami_id)\n\n        if encrypted_ami_id:\n            ami_tag_count = tag_obj.get_ec2_resource_tag_count(encrypted_ami_id)\n            if ami_tag_count >= 50:\n                print(\"Tag can't be added as the threshold limit 50 tags per AMI is reached.\")\n            else:\n                tag_obj.add_ec2_resource_tag(encrypted_ami_id)\n\n        if asg_name:\n            # Add tag to Autoscaling group\n            asg_tag_count = tag_obj.get_asg_tag_count(asg_name)\n            if asg_tag_count >= 50:\n                print(\"Tag can't be added as the threshold limit 50 tags per AutoScaling group reached.\")\n            else:\n                tag_obj.add_asg_tag(asg_name)\n\n    def asg_name_expr():\n        return (\n            f\"Instance is part of Auto Scaling Group: {asg_name}\"\n            if asg_name\n            else \"Instance is not part of Auto Scaling Group\"\n        )\n\n    def asg_details_expr(asg_tag_count):\n        if asg_name:\n            message = (\n                f\"AutoScaling Group '{asg_name}' minimum capacity: {asg_min_size}{chr(10)}\"\n                f\"AutoScaling Group instance state: {asg_instance_state}{chr(10)}\"\n            )\n            if asg_tag_count < 50:\n                message += f\"Added tag {add_tag} to AutoScaling Group. \"\n            else:\n                message += \"Tag can't be added as the threshold limit 50 tags per AutoScaling Group is reached. \"\n\n            return message\n        else:\n            return \"Instance is not part of Auto Scaling Group. \"\n\n    def ami_expr(ami_tag_count):\n        message = \"\"\n        if un_encrypted_ami_id:\n            message = f\"Amazon Machine Image(AMI) created: {un_encrypted_ami_id}. \"\n            if add_tag:\n                if ami_tag_count < 50:\n                    message += f\"Added tag {add_tag} to AMI.\"\n                else:\n                    message += \"Tag can't be added as the threshold limit 50 tags per AMI is reached.\"\n        return message\n\n    def encrypted_ami_expr(ami_tag_count):\n        message = \"\"\n        if encrypted_ami_id:\n            message = f\"Encrypted Amazon Machine Image(AMI) created: {encrypted_ami_id}. \"\n            if add_tag:\n                if ami_tag_count < 50:\n                    message += f\"Added tag {add_tag} to AMI.\"\n                else:\n                    message += \"Tag can't be added as the threshold limit 50 tags per AMI is reached.\"\n        return message\n\n    def containment_sg_expr(sg_tag_count):\n        message = f\"Created containment security group ID: {containment_sg} and associated with Instance. \"\n        if add_tag:\n            if sg_tag_count < 50:\n                message += f\"Added tag {add_tag} to Security Group.\"\n            else:\n                message += \"Tag can't be added as the threshold limit 50 tags per security group is reached.\"\n\n        return message\n\n    def bucket_object_expr():\n        if asg_name:\n            message = f\"Uploaded security group and autoscaling group configuration to S3 location: {s3_object}. \"\n        else:\n            message = f\"Uploaded security group configuration to S3 location: {s3_object}. \"\n        if add_tag:\n            message += f\"Added tag {add_tag} to this file.\"\n\n        return message\n\n    def ec2_instance_expr(ec2_tag_count):\n        message = \"\"\n        if add_tag:\n            if ec2_tag_count < 50:\n                message += f\"Added tag {add_tag} to the EC2 instance.\"\n            else:\n                message += \"Tag can't be added as the threshold limit 50 tags per EC2 instance is reached.\"\n\n        return message\n\n    template_values = {\n        \"execution_id\": execution_id,\n        \"instance_id\": instance_id,\n        \"ec2_instance_expr\": ec2_instance_expr(ec2_tag_count),\n        \"original_sgs\": \", \".join(original_sgs),\n        \"bucket\": bucket,\n        \"asg_name_expr\": asg_name_expr(),\n        \"all_access_sg\": all_access_sg,\n        \"containment_sg_expr\": containment_sg_expr(sg_tag_count),\n        \"bucket_object_expr\": bucket_object_expr(),\n        \"asg_details_expr\": asg_details_expr(asg_tag_count),\n        \"ami_expr\": ami_expr(ami_tag_count),\n        \"encrypted_ami_expr\": encrypted_ami_expr(ami_tag_count),\n    }\n\n    message = build_contain_message(**template_values)\n\n    return {\"Output\": message}\n"
+      },
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.Output",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    }
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "da75f47fc390d6abc6a3ebe44d8bf73b3147c3f207f0e94636a9752b50a87fdb"
+      }
+    }
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document name - AWSQuickSetupType-SSM-ManageResources\n\n## What does this document do?\nManages resources needed by the integrated Systems Manager Console\n\n## Who should use this document?\nThis document is intended for use only by AWS Services and features, such as AWS Systems Manager. Customers should not execute or orchestrate the execution of this document on their own, as that is not supported by AWS.\n\n## Supported Versions\nThe $LATEST or $DEFAULT document version must be provided when executing this document. Using specific version numbers is not supported as this document does not retain historical versions.\n\n## Input Parameters\n* AutomationAssumeRole: The ARN of the role that allows Systems Manager Account Discovery Automation to perform actions on your behalf.\n* ExecutionMode: Type of incoming request: Create, Update or Delete.\n\n## Output Paramaters\nNone",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the role that allows Systems Manager Automation to perform actions on your behalf."
+    },
+    "ExecutionMode": {
+      "type": "String",
+      "description": "(Required) Type of incoming request: Create, Update or Delete.",
+      "allowedValues": [
+        "Create",
+        "Update",
+        "Delete"
+      ]
+    },
+    "GlobalResourceRegion": {
+      "type": "String",
+      "description": "(Required) The name of the region that handle cleanup.",
+      "allowedValues": [
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2",
+        "ap-south-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-west-3",
+        "eu-central-1",
+        "eu-north-1",
+        "sa-east-1",
+        "ca-central-1"
+      ]
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Optional) S3 bucket name to empty before deletion",
+      "default": "",
+      "allowedPattern": "^$|[a-zA-Z0-9\\\\\\-\\.:\\/]+"
+    },
+    "OperationalAccountId": {
+      "type": "String",
+      "description": "(Optional) Account Id that was designed as operational account",
+      "default": "",
+      "allowedPattern": "^$|[a-zA-Z0-9\\\\\\-\\.:\\/]+"
+    },
+    "QSConfigurationId": {
+      "type": "String",
+      "description": "(Required) Id of a configuration Systems Manager Automation belongs to.",
+      "allowedPattern": "^$|[a-zA-Z0-9\\\\\\-\\.:\\/]+"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RunScript",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "reconcile",
+        "InputPayload": {
+          "ExecutionMode": "{{ExecutionMode}}",
+          "GlobalResourceRegion": "{{GlobalResourceRegion}}",
+          "CurrentRegion": "{{ global:REGION }}",
+          "AccountId": "{{ global:ACCOUNT_ID }}",
+          "BucketName": "{{ BucketName }}",
+          "OperationalAccountId": "{{ OperationalAccountId }}",
+          "QSConfigurationId": "{{QSConfigurationId}}"
+        },
+        "Script": "import boto3\nimport json\nimport time\nimport random\nfrom botocore.exceptions import ClientError\nfrom functools import partial, wraps\n\nTRUST_POLICY = {\n    \"Version\": \"2012-10-17\",\n    \"Statement\": [\n        {\n            \"Effect\": \"Allow\",\n            \"Principal\": {\n                \"Service\": \"ssm.amazonaws.com\"\n            },\n            \"Action\": \"sts:AssumeRole\"\n        }\n    ]\n}\n\nCREATE = 'Create'\nUPDATE = 'Update'\nDELETE = 'Delete'\n\nROLES_WITH_MANAGED_POLICIES = {\n    'AWS-QuickSetup-SSM-EnableExplorer': 'arn:aws:iam::aws:policy/AWSSystemsManagerEnableExplorerExecutionPolicy',\n    'AWS-QuickSetup-SSM-EnableDHMC': 'arn:aws:iam::aws:policy/AWSQuickSetupEnableDHMCExecutionPolicy',\n    'AWS-QuickSetup-SSM-ManageInstanceProfile': 'arn:aws:iam::aws:policy/AWSQuickSetupManagedInstanceProfileExecutionPolicy',\n    'AWS-QuickSetup-SSM-EnableAREX': 'arn:aws:iam::aws:policy/AWSQuickSetupEnableAREXExecutionPolicy',\n}\n\ndef reconcile(event, context):\n    mode = event['ExecutionMode']\n    # for OperationalAccount we don't create/update any resources\n    if mode != DELETE and event['AccountId'] == event['OperationalAccountId']:\n        return\n\n    if mode == DELETE:\n        delete_roles(event)\n        if event['BucketName']:\n            empty_bucket(event['BucketName'], event['CurrentRegion'])\n    else:\n        get_or_create_roles(event)\n\ndef empty_bucket(bucket_name, region):\n    try:\n        s3_resource = boto3.resource(\"s3\", region_name=region)\n        bucket = s3_resource.Bucket(bucket_name)\n        bucket.object_versions.all().delete()\n        time.sleep(2)\n    except:\n        pass\n\ndef get_or_create_roles(event):\n    iam_client = boto3.client(\"iam\")\n\n    for role, policy in ROLES_WITH_MANAGED_POLICIES.items():\n        get_or_create_role(iam_client, f\"{role}-{event['QSConfigurationId']}\", policy)\n        # To have less chance of throttling\n        time.sleep(1)\n\n\ndef get_or_create_role(iam_client, role, policy):\n    print(f\"Getting role {role} with policy {policy}\")\n    roleResponse = None\n    policyResponse = None\n    try:\n        roleResponse = get_role(iam_client, role)\n        # TODO: Adjust once policies are managed\n        policyName = policy.split(\"/\")[-1]\n        policyResponse = get_role_policy(iam_client, role, policyName)\n        return\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'NoSuchEntity':\n            print(f\"Role: {role} or policy: {policy} was not found, creating\")\n            try:\n                if roleResponse is None:\n                    try:\n                        create_role(iam_client, role, json.dumps(TRUST_POLICY))\n                    except ClientError as e:\n                        if e.response['Error']['Code'] == 'EntityAlreadyExists':\n                            print(f\"Role: {role} has been created by something else\")\n                        else:\n                            raise\n\n                attach_role_policy(iam_client, role, policy)\n            except:\n                print(f\"Unable to create role: {role} with policy: {policy}\")\n                raise\n        else:\n            raise\n\n\ndef delete_roles(event):\n    if event['GlobalResourceRegion'] != event['CurrentRegion']:\n        return\n    iam_client = boto3.client(\"iam\")\n    for role, policy in ROLES_WITH_MANAGED_POLICIES.items():\n        detach_policy_and_delete_role(iam_client, f\"{role}-{event['QSConfigurationId']}\", policy, event['AccountId'])\n        # To have less chance of throttling\n        time.sleep(1)\n\ndef detach_policy_and_delete_role(iam_client, role, policy, accountId):\n    print(f\"Deleting role {role}\")\n    try:\n        detach_role_policy(iam_client, role, policy)\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'NoSuchEntity':\n            print(f\"Policy {policy} is not attached to role {role}\")\n        else:\n            raise\n\n    try:\n        delete_role(iam_client, role)\n    except ClientError as e:\n        if e.response['Error']['Code'] == 'NoSuchEntity':\n            print(f\"Role {role} does not exist\")\n        else:\n            raise\n\n\ndef back_off_retry(retryable_api_call=None, api_name=''):\n\n    if retryable_api_call is None:\n        return partial(back_off_retry, api_name=api_name)\n\n    @wraps(retryable_api_call)\n    def retry(*args, **kwargs):\n        max_retry_times = 5\n        current_retry = 0\n        # Adding jitter to avoid high volume of API call simultaneously\n        jitter = random.random()\n        time.sleep(jitter)\n        retry_interval_time = 0\n        exception = None\n        while current_retry < max_retry_times:\n            try:\n                return retryable_api_call(*args, **kwargs)\n            except ClientError as e:\n                if e.response['Error']['Code'] not in ['InternalFailure', 'ServiceUnavailable']:\n                    raise\n                exception = e\n                retry_interval_time = calculate_sleep_interval(current_retry)\n            finally:\n                current_retry = current_retry + 1\n                time.sleep(retry_interval_time)\n        raise Exception(\n            'The following Exception persists after reaching maximum retry limit: %s' % (exception))\n    return retry\n\ndef calculate_sleep_interval(current_retry):\n    return 2 ** current_retry + random.random()\n\n\n@back_off_retry(api_name='GetRole')\ndef get_role(iam_client, role_name):\n    return iam_client.get_role(RoleName=role_name)\n\n@back_off_retry(api_name='GetRolePolicy')\ndef get_role_policy(iam_client, role_name, policy_name):\n    return iam_client.get_role_policy(RoleName=role_name, PolicyName=policy_name)\n\n@back_off_retry(api_name='CreateRole')\ndef create_role(iam_client, role_name, assume_policy):\n    return iam_client.create_role(RoleName=role_name, AssumeRolePolicyDocument=assume_policy, Tags=[{'Key': 'QuickSetupDocument', 'Value': 'AWSQuickSetupType-SSM'}])\n\n@back_off_retry(api_name='AttachRolePolicy')\ndef attach_role_policy(iam_client, role_name, policy_arn):\n    return iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)\n\n@back_off_retry(api_name='DetachRolePolicy')\ndef detach_role_policy(iam_client, role_name, policy_arn):\n    return iam_client.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn)\n\n@back_off_retry(api_name='DeleteRole')\ndef delete_role(iam_client, role_name):\n    return iam_client.delete_role(RoleName=role_name)\n"
+      }
+    }
+  ]
+}
