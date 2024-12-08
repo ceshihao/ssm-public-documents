@@ -1,0 +1,882 @@
+{
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "description": "SSM Automation document to automate rehost migration of source servers using MGN Connector",
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "sha256": "b4490170941ec7db12962cb00eaea7b8ce0ded4b27571155fc868d7ab22bf22b"
+      }
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:branch",
+      "description": "Branch based on the MGN Rehost automation action type",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "InstallMGNAgentsInputValidation",
+            "StringEquals": "install-agents-using-connector",
+            "Variable": "{{ ActionType }}"
+          },
+          {
+            "NextStep": "LaunchTestInstancesInputValidation",
+            "StringEquals": "launch-test-instances",
+            "Variable": "{{ ActionType }}"
+          },
+          {
+            "NextStep": "MarkReadyForCutoverInputValidation",
+            "StringEquals": "mark-ready-for-cutover",
+            "Variable": "{{ ActionType }}"
+          },
+          {
+            "NextStep": "LaunchCutoverInstancesInputValidation",
+            "StringEquals": "launch-cutover-instances",
+            "Variable": "{{ ActionType }}"
+          },
+          {
+            "NextStep": "FinalizeCutoverInputValidation",
+            "StringEquals": "finalize-cutover",
+            "Variable": "{{ ActionType }}"
+          },
+          {
+            "NextStep": "MarkAsArchivedInputValidation",
+            "StringEquals": "mark-archived",
+            "Variable": "{{ ActionType }}"
+          },
+          {
+            "NextStep": "TerminateTargetInstancesValidation",
+            "StringEquals": "terminate-target-instances",
+            "Variable": "{{ ActionType }}"
+          }
+        ]
+      },
+      "name": "BranchOnActionType"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Validate input parameters for install-agents-using-connector action",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_connector_install_agents.validate_input",
+        "InputPayload": {
+          "additionalRequiredParameters": [
+            "connectorARN",
+            "credentialsSecretARN"
+          ],
+          "allowedLifecycleStates": [
+            "DISCOVERED",
+            "PENDING_INSTALLATION"
+          ],
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "connectorARN": "{{ ConnectorARN }}",
+          "credentialsSecretARN": "{{ CredentialsSecretARN }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "InstallMGNAgentsInputValidation",
+      "nextStep": "InstallMGNAgentsBranchOnSourceServersCount",
+      "outputs": [
+        {
+          "Name": "sourceServersInfo",
+          "Selector": "$.Payload.sourceServersInfo",
+          "Type": "StringList"
+        },
+        {
+          "Name": "sourceServersCount",
+          "Selector": "$.Payload.sourceServersCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "action": "aws:branch",
+      "description": "Branch based on source servers count to verify if action should proceed",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "VerifyIAMRolesRequiredForMGNConnectorExists",
+            "NumericGreater": 0,
+            "Variable": "{{ InstallMGNAgentsInputValidation.sourceServersCount }}"
+          }
+        ],
+        "Default": "EndExecution"
+      },
+      "name": "InstallMGNAgentsBranchOnSourceServersCount"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step verifies IAM roles required for MGN Connector based agent installation exists in account",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_connector_install_agents.verify_connector_roles_exist",
+        "InputPayload": {
+          "accountId": "{{ global:ACCOUNT_ID }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "VerifyIAMRolesRequiredForMGNConnectorExists",
+      "nextStep": "RegisterSourceServersWithConnector"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step registers source servers and their credential with MGN Connector",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_connector_install_agents.register_servers_handler",
+        "InputPayload": {
+          "connectorARN": "{{ ConnectorARN }}",
+          "credentialsSecretARN": "{{ CredentialsSecretARN }}",
+          "sourceServersInfo": "{{ InstallMGNAgentsInputValidation.sourceServersInfo }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "RegisterSourceServersWithConnector",
+      "nextStep": "RunPrerequisitesVerification"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step runs command for verification of prerequisites on source servers for agent installation",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_connector_install_agents.run_prerequisites_check",
+        "InputPayload": {
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "connectorARN": "{{ ConnectorARN }}",
+          "credentialsSecretARN": "{{ CredentialsSecretARN }}",
+          "sourceServersInfo": "{{ InstallMGNAgentsInputValidation.sourceServersInfo }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "RunPrerequisitesVerification",
+      "nextStep": "PollForPrerequisitesVerificationCompletion",
+      "outputs": [
+        {
+          "Name": "serverIdToSSMCommandIdDict",
+          "Selector": "$.Payload.serverIdToSSMCommandIdDict",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "action": "aws:loop",
+      "description": "This step polls for completion of prerequisites verification on source servers for about 1 hour",
+      "inputs": {
+        "LoopCondition": {
+          "BooleanEquals": true,
+          "Variable": "{{ VerifyPrerequisiteCheckStatus.shouldRetry }}"
+        },
+        "MaxIterations": 60,
+        "Steps": [
+          {
+            "action": "aws:executeScript",
+            "description": "Determine if SourceServers Prerequisite check reached a terminal state and verify result",
+            "inputs": {
+              "Attachment": "attachment.zip",
+              "Handler": "mgn_connector_install_agents.poll_command_status",
+              "InputPayload": {
+                "currentIteration": "{{ PollForPrerequisitesVerificationCompletion.CurrentIteration }}",
+                "maxIterations": 60,
+                "serverIdToSSMCommandIdDict": "{{ RunPrerequisitesVerification.serverIdToSSMCommandIdDict }}"
+              },
+              "Runtime": "python3.9"
+            },
+            "isEnd": false,
+            "name": "VerifyPrerequisiteCheckStatus",
+            "nextStep": "SleepForOneMinuteInVerifyPrerequisitesPollingLoop",
+            "outputs": [
+              {
+                "Name": "shouldRetry",
+                "Selector": "$.Payload.shouldRetry",
+                "Type": "Boolean"
+              }
+            ]
+          },
+          {
+            "action": "aws:sleep",
+            "inputs": {
+              "Duration": "PT1M"
+            },
+            "isEnd": true,
+            "name": "SleepForOneMinuteInVerifyPrerequisitesPollingLoop"
+          }
+        ]
+      },
+      "isEnd": false,
+      "name": "PollForPrerequisitesVerificationCompletion",
+      "nextStep": "RunAgentInstallation"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step runs replication agents installation command on source servers using MGN Connector",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_connector_install_agents.run_agent_installation",
+        "InputPayload": {
+          "accountId": "{{ global:ACCOUNT_ID }}",
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "connectorARN": "{{ ConnectorARN }}",
+          "credentialsSecretARN": "{{ CredentialsSecretARN }}",
+          "sourceServersInfo": "{{ InstallMGNAgentsInputValidation.sourceServersInfo }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "RunAgentInstallation",
+      "nextStep": "PollForAgentInstallationCompletion",
+      "outputs": [
+        {
+          "Name": "serverIdToSSMCommandIdDict",
+          "Selector": "$.Payload.serverIdToSSMCommandIdDict",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "action": "aws:loop",
+      "description": "This step polls for completion of agent installation on source servers",
+      "inputs": {
+        "LoopCondition": {
+          "BooleanEquals": true,
+          "Variable": "{{ VerifyAgentInstallationStatus.shouldRetry }}"
+        },
+        "MaxIterations": 60,
+        "Steps": [
+          {
+            "action": "aws:executeScript",
+            "description": "Determine if agent installation command run reached a terminal state and verify result",
+            "inputs": {
+              "Attachment": "attachment.zip",
+              "Handler": "mgn_connector_install_agents.poll_command_status",
+              "InputPayload": {
+                "currentIteration": "{{ PollForAgentInstallationCompletion.CurrentIteration }}",
+                "maxIterations": 60,
+                "serverIdToSSMCommandIdDict": "{{ RunAgentInstallation.serverIdToSSMCommandIdDict }}"
+              },
+              "Runtime": "python3.9"
+            },
+            "isEnd": false,
+            "name": "VerifyAgentInstallationStatus",
+            "nextStep": "SleepForOneMinuteInAgentInstallationPollingLoop",
+            "outputs": [
+              {
+                "Name": "shouldRetry",
+                "Selector": "$.Payload.shouldRetry",
+                "Type": "Boolean"
+              }
+            ]
+          },
+          {
+            "action": "aws:sleep",
+            "inputs": {
+              "Duration": "PT1M"
+            },
+            "isEnd": true,
+            "name": "SleepForOneMinuteInAgentInstallationPollingLoop"
+          }
+        ]
+      },
+      "isEnd": true,
+      "name": "PollForAgentInstallationCompletion"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Validate input parameters for launch-test-instances action",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_validator.validate_and_get_in_scope_resources",
+        "InputPayload": {
+          "allowedLifecycleStates": [
+            "READY_FOR_TEST"
+          ],
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "LaunchTestInstancesInputValidation",
+      "nextStep": "LaunchTestInstancesBranchOnSourceServersCount",
+      "outputs": [
+        {
+          "Name": "sourceServerIds",
+          "Selector": "$.Payload.sourceServerIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "sourceServersCount",
+          "Selector": "$.Payload.sourceServersCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "action": "aws:branch",
+      "description": "Branch based on source servers count to verify if action should proceed",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "StartTest",
+            "NumericGreater": 0,
+            "Variable": "{{ LaunchTestInstancesInputValidation.sourceServersCount }}"
+          }
+        ],
+        "Default": "EndExecution"
+      },
+      "name": "LaunchTestInstancesBranchOnSourceServersCount"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step starts the job to launch test instances for servers in-scope",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "instance_actions.start_test_job",
+        "InputPayload": {
+          "sourceServerIds": "{{ LaunchTestInstancesInputValidation.sourceServerIds }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "StartTest",
+      "nextStep": "PollForStartTestCompletion",
+      "outputs": [
+        {
+          "Name": "jobId",
+          "Selector": "$.Payload.jobId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "action": "aws:loop",
+      "description": "This step waits for the StartTest job to launch test instances",
+      "inputs": {
+        "LoopCondition": {
+          "BooleanEquals": true,
+          "Variable": "{{ VerifyStartTestStatus.shouldRetry }}"
+        },
+        "MaxIterations": 60,
+        "Steps": [
+          {
+            "action": "aws:executeScript",
+            "description": "Verifies if test instances are launched successfully",
+            "inputs": {
+              "Attachment": "attachment.zip",
+              "Handler": "instance_actions.verify_instance_status",
+              "InputPayload": {
+                "accountId": "{{ global:ACCOUNT_ID }}",
+                "currentIteration": "{{ PollForStartTestCompletion.CurrentIteration }}",
+                "jobId": "{{ StartTest.jobId }}",
+                "jobInitiatedBy": "START_TEST",
+                "maxIterations": 60
+              },
+              "Runtime": "python3.9"
+            },
+            "isEnd": false,
+            "name": "VerifyStartTestStatus",
+            "nextStep": "SleepFor1MinInVerifyStartTestStatusLoop",
+            "outputs": [
+              {
+                "Name": "shouldRetry",
+                "Selector": "$.Payload.shouldRetry",
+                "Type": "Boolean"
+              }
+            ]
+          },
+          {
+            "action": "aws:sleep",
+            "inputs": {
+              "Duration": "PT1M"
+            },
+            "isEnd": true,
+            "name": "SleepFor1MinInVerifyStartTestStatusLoop"
+          }
+        ]
+      },
+      "isEnd": true,
+      "name": "PollForStartTestCompletion"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Validate input parameters for launch-cutover-instances step",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_validator.validate_and_get_in_scope_resources",
+        "InputPayload": {
+          "allowedLifecycleStates": [
+            "READY_FOR_CUTOVER"
+          ],
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "LaunchCutoverInstancesInputValidation",
+      "nextStep": "LaunchCutoverInstancesBranchOnSourceServersCount",
+      "outputs": [
+        {
+          "Name": "sourceServerIds",
+          "Selector": "$.Payload.sourceServerIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "sourceServersCount",
+          "Selector": "$.Payload.sourceServersCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "action": "aws:branch",
+      "description": "Branch based on source servers count to verify if action should proceed",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "StartCutover",
+            "NumericGreater": 0,
+            "Variable": "{{ LaunchCutoverInstancesInputValidation.sourceServersCount }}"
+          }
+        ],
+        "Default": "EndExecution"
+      },
+      "name": "LaunchCutoverInstancesBranchOnSourceServersCount"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step starts the job to launch cutover instances for servers in-scope",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "instance_actions.start_cutover_job",
+        "InputPayload": {
+          "sourceServerIds": "{{ LaunchCutoverInstancesInputValidation.sourceServerIds }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "StartCutover",
+      "nextStep": "PollForStartCutoverCompletion",
+      "outputs": [
+        {
+          "Name": "jobId",
+          "Selector": "$.Payload.jobId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "action": "aws:loop",
+      "description": "This step waits for the StartCutover job to launch cut over instances",
+      "inputs": {
+        "LoopCondition": {
+          "BooleanEquals": true,
+          "Variable": "{{ VerifyStartCutoverStatus.shouldRetry }}"
+        },
+        "MaxIterations": 60,
+        "Steps": [
+          {
+            "action": "aws:executeScript",
+            "description": "Verifies if cutover instances are launched successfully",
+            "inputs": {
+              "Attachment": "attachment.zip",
+              "Handler": "instance_actions.verify_instance_status",
+              "InputPayload": {
+                "accountId": "{{ global:ACCOUNT_ID }}",
+                "currentIteration": "{{ PollForStartCutoverCompletion.CurrentIteration }}",
+                "jobId": "{{ StartCutover.jobId }}",
+                "jobInitiatedBy": "START_CUTOVER",
+                "maxIterations": 60
+              },
+              "Runtime": "python3.9"
+            },
+            "isEnd": false,
+            "name": "VerifyStartCutoverStatus",
+            "nextStep": "SleepFor1MinInVerifyStartCutoverStatusLoop",
+            "outputs": [
+              {
+                "Name": "shouldRetry",
+                "Selector": "$.Payload.shouldRetry",
+                "Type": "Boolean"
+              }
+            ]
+          },
+          {
+            "action": "aws:sleep",
+            "inputs": {
+              "Duration": "PT1M"
+            },
+            "isEnd": true,
+            "name": "SleepFor1MinInVerifyStartCutoverStatusLoop"
+          }
+        ]
+      },
+      "isEnd": true,
+      "name": "PollForStartCutoverCompletion"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Validate input parameters for mark-ready-for-cutover action",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_validator.validate_and_get_in_scope_resources",
+        "InputPayload": {
+          "allowedLifecycleStates": [
+            "TESTING",
+            "CUTTING_OVER"
+          ],
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "MarkReadyForCutoverInputValidation",
+      "nextStep": "MarkReadyForCutoverBranchOnSourceServersCount",
+      "outputs": [
+        {
+          "Name": "sourceServerIds",
+          "Selector": "$.Payload.sourceServerIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "sourceServersCount",
+          "Selector": "$.Payload.sourceServersCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "action": "aws:branch",
+      "description": "Branch based on source servers count to verify if action should proceed",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "MarkReadyForCutover",
+            "NumericGreater": 0,
+            "Variable": "{{ MarkReadyForCutoverInputValidation.sourceServersCount }}"
+          }
+        ],
+        "Default": "EndExecution"
+      },
+      "name": "MarkReadyForCutoverBranchOnSourceServersCount"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step changes the lifecycle state for all of the specified source servers to READY_FOR_CUTOVER",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mark_ready_for_cutover.change_state",
+        "InputPayload": {
+          "sourceServerIds": "{{ MarkReadyForCutoverInputValidation.sourceServerIds }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": true,
+      "name": "MarkReadyForCutover"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Validate input parameters for finalize-cutover action",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_validator.validate_and_get_in_scope_resources",
+        "InputPayload": {
+          "allowedLifecycleStates": [
+            "CUTTING_OVER"
+          ],
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "FinalizeCutoverInputValidation",
+      "nextStep": "FinalizeCutoverBranchOnSourceServersCount",
+      "outputs": [
+        {
+          "Name": "sourceServerIds",
+          "Selector": "$.Payload.sourceServerIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "sourceServersCount",
+          "Selector": "$.Payload.sourceServersCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "action": "aws:branch",
+      "description": "Branch based on source servers count to verify if action should proceed",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "FinalizeCutover",
+            "NumericGreater": 0,
+            "Variable": "{{ FinalizeCutoverInputValidation.sourceServersCount }}"
+          }
+        ],
+        "Default": "EndExecution"
+      },
+      "name": "FinalizeCutoverBranchOnSourceServersCount"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "This step finalizes the cutover for all specified source servers",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "finalize_cutover.finalize",
+        "InputPayload": {
+          "sourceServerIds": "{{ FinalizeCutoverInputValidation.sourceServerIds }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": true,
+      "name": "FinalizeCutover"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Validate input parameters for mark-as-archived action",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_validator.validate_and_get_in_scope_resources",
+        "InputPayload": {
+          "allowedLifecycleStates": [
+            "CUTOVER",
+            "DISCONNECTED"
+          ],
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "MarkAsArchivedInputValidation",
+      "nextStep": "MarkAsArchivedBranchOnSourceServersCount",
+      "outputs": [
+        {
+          "Name": "sourceServerIds",
+          "Selector": "$.Payload.sourceServerIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "sourceServersCount",
+          "Selector": "$.Payload.sourceServersCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "action": "aws:branch",
+      "description": "Branch based on source servers count to verify if action should proceed",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "MarkAsArchived",
+            "NumericGreater": 0,
+            "Variable": "{{ MarkAsArchivedInputValidation.sourceServersCount }}"
+          }
+        ],
+        "Default": "EndExecution"
+      },
+      "name": "MarkAsArchivedBranchOnSourceServersCount"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Archives source servers by setting the SourceServer.isArchived property to true for specified SourceServers by ID.",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mark_as_archived.archive",
+        "InputPayload": {
+          "sourceServerIds": "{{ MarkAsArchivedInputValidation.sourceServerIds }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": true,
+      "name": "MarkAsArchived"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Validate input parameters for terminate-target-instances action",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "mgn_validator.validate_and_get_in_scope_resources",
+        "InputPayload": {
+          "allowedLifecycleStates": [
+            "NOT_READY",
+            "READY_FOR_TEST",
+            "READY_FOR_CUTOVER",
+            "DISCONNECTED",
+            "DISCOVERED",
+            "PENDING_INSTALLATION"
+          ],
+          "applicationARNs": "{{ ApplicationARNs }}",
+          "waveARN": "{{ WaveARN }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "TerminateTargetInstancesValidation",
+      "nextStep": "TerminateTargetInstancesBranchOnSourceServersCount",
+      "outputs": [
+        {
+          "Name": "sourceServerIds",
+          "Selector": "$.Payload.sourceServerIds",
+          "Type": "StringList"
+        },
+        {
+          "Name": "sourceServersCount",
+          "Selector": "$.Payload.sourceServersCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "action": "aws:branch",
+      "description": "Branch based on source servers count to verify if action should proceed",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "TerminateTargetInstances",
+            "NumericGreater": 0,
+            "Variable": "{{ TerminateTargetInstancesValidation.sourceServersCount }}"
+          }
+        ],
+        "Default": "EndExecution"
+      },
+      "name": "TerminateTargetInstancesBranchOnSourceServersCount"
+    },
+    {
+      "action": "aws:executeScript",
+      "description": "Starts a job that terminates specific launched EC2 Test and Cutover instances.",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "instance_actions.terminate_target_instances",
+        "InputPayload": {
+          "sourceServerIds": "{{ TerminateTargetInstancesValidation.sourceServerIds }}"
+        },
+        "Runtime": "python3.9"
+      },
+      "isEnd": false,
+      "name": "TerminateTargetInstances",
+      "nextStep": "PollForTerminateTargetInstancesCompletion",
+      "outputs": [
+        {
+          "Name": "jobId",
+          "Selector": "$.Payload.jobId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "action": "aws:loop",
+      "description": "This step waits for the TerminateTargetInstances job to terminate all instances",
+      "inputs": {
+        "LoopCondition": {
+          "BooleanEquals": true,
+          "Variable": "{{ VerifyTerminateTargetInstancesStatus.shouldRetry }}"
+        },
+        "MaxIterations": 60,
+        "Steps": [
+          {
+            "action": "aws:executeScript",
+            "description": "Verifies if instances are terminated successfully",
+            "inputs": {
+              "Attachment": "attachment.zip",
+              "Handler": "instance_actions.verify_instance_status",
+              "InputPayload": {
+                "accountId": "{{ global:ACCOUNT_ID }}",
+                "currentIteration": "{{ PollForTerminateTargetInstancesCompletion.CurrentIteration }}",
+                "jobId": "{{ TerminateTargetInstances.jobId }}",
+                "jobInitiatedBy": "TERMINATE_TARGET_INSTANCES",
+                "maxIterations": 60
+              },
+              "Runtime": "python3.9"
+            },
+            "isEnd": false,
+            "name": "VerifyTerminateTargetInstancesStatus",
+            "nextStep": "SleepFor1MinInVerifyTerminateTargetInstancesStatusLoop",
+            "outputs": [
+              {
+                "Name": "shouldRetry",
+                "Selector": "$.Payload.shouldRetry",
+                "Type": "Boolean"
+              }
+            ]
+          },
+          {
+            "action": "aws:sleep",
+            "inputs": {
+              "Duration": "PT1M"
+            },
+            "isEnd": true,
+            "name": "SleepFor1MinInVerifyTerminateTargetInstancesStatusLoop"
+          }
+        ]
+      },
+      "isEnd": true,
+      "name": "PollForTerminateTargetInstancesCompletion"
+    },
+    {
+      "action": "aws:executeScript",
+      "inputs": {
+        "Attachment": "attachment.zip",
+        "Handler": "end_execution.end_execution",
+        "Runtime": "python3.9"
+      },
+      "isEnd": true,
+      "name": "EndExecution"
+    }
+  ],
+  "parameters": {
+    "ActionType": {
+      "allowedValues": [
+        "install-agents-using-connector",
+        "launch-test-instances",
+        "mark-ready-for-cutover",
+        "launch-cutover-instances",
+        "finalize-cutover",
+        "mark-archived",
+        "terminate-target-instances"
+      ],
+      "description": "The type of MGN Rehost automation action to perform",
+      "type": "String"
+    },
+    "ApplicationARNs": {
+      "allowedPattern": "^$|^arn:([a-z\\-]+[a-z]*):mgn:([a-z-0-9]*):([0-9]{12}):application/app-[a-zA-Z0-9/_+=.@-]+$|^(arn:([a-z\\-]+[a-z]*):mgn:([a-z-0-9]*):([0-9]{12}):application/app-[a-zA-Z0-9/_+=.@-]+,)*arn:([a-z\\-]+[a-z]*):mgn:([a-z-0-9]*):([0-9]{12}):application/app-[a-zA-Z0-9/_+=.@-]+$",
+      "default": [],
+      "description": "(Optional) List of MGN Application ARNs to be rehosted",
+      "type": "StringList"
+    },
+    "AutomationAssumeRole": {
+      "allowedPattern": "^arn:([a-z\\-]+[a-z]*):iam::[0-9]{12}:[a-z\\-]*/[a-zA-Z0-9/_+=.@-]+$",
+      "description": "The Amazon Resource Name (ARN) of the role that allows AWS Systems Manager Automation to perform the actions on your behalf.",
+      "type": "String"
+    },
+    "ConnectorARN": {
+      "allowedPattern": "^$|^arn:([a-z\\-]+[a-z]*):mgn:([a-z-0-9]*):([0-9]{12}):connector/connector-[a-zA-Z0-9/_+=.@-]+$",
+      "default": "",
+      "description": "(Only required for the \"install-agents-using-connector\" ActionType) MGN Connector ARN to be used for MGN rehost",
+      "type": "String"
+    },
+    "CredentialsSecretARN": {
+      "allowedPattern": "^$|^arn:([a-z\\-]+[a-z]*):secretsmanager:([a-z-0-9]*):([0-9]{12}):secret:[a-zA-Z0-9/_+=.@-]+$",
+      "default": "",
+      "description": "(Only required for the \"install-agents-using-connector\" ActionType) Secret ARN containing the credentials for the source servers in-scope for rehost",
+      "type": "String"
+    },
+    "WaveARN": {
+      "allowedPattern": "^arn:([a-z\\-]+[a-z]*):mgn:([a-z-0-9]*):([0-9]{12}):wave/wave-[a-zA-Z0-9/_+=.@-]+$",
+      "description": "MGN Wave ARN to be rehosted",
+      "type": "String"
+    }
+  },
+  "schemaVersion": "0.3"
+}
