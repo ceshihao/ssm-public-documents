@@ -1,56 +1,63 @@
 {
-  "description": "This runbook helps identifying working snapshot (if any) of an EC2 instance and restore the EC2 instance with this identified snapshot.",
+  "description": "The **AWSSupport-RestoreEC2InstanceFromSnapshot** runbook assists you in restoring an Amazon Elastic Compute Cloud (Amazon EC2) instance from a functional Amazon Elastic Block Store (Amazon EBS) snapshot.\n\nThis runbook allows you to specify an Amazon EBS snapshot for restoration or identify a working snapshot of the target instance's root volume. By default, the runbook will create a new Amazon EC2 instance with the restored root volume. However, you have the option to perform an in-place restore of the original instance by setting the `InplaceSwap` parameter to `true`.\n\n### Important Considerations\n- The runbook will incur costs for creating new Amazon EBS volumes and snapshots within your AWS account. Refer to the [Amazon EBS pricing](https://aws.amazon.com/ebs/pricing/) for associated costs. Unused volumes and snapshots will be removed at the end of automation execution.\n- The automation will temporarily tag the target instance with `SSMExecutionStatusOn` during execution, and this tag will be removed upon successful completion.\n- During automation execution, a new Amazon EC2 instance will be created in your account. If you opt for in-place restore, this instance will be terminated at the end of successful automation execution.\n- If you do not opt for an in-place restore, the resulting Amazon EC2 instance will have IMDSv2 enforced. Consult the [EC2 documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-IMDS-existing-instances.html#modify-restore-IMDSv1) if you need to restore the use of IMDSv1. \n- If you choose in-place restore, the automation will create a root volume replacement task to replace the volume. You must specify the snapshot that belong to the same lineage as the current root volume or let the automation to identify the snapshot. Consult [EC2 documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/replace-root.html) for more details.\n\n### Unsupported Scenarios\nIn-place restore operation is not supported for Amazon EC2 instances managed by AWS Auto Scaling.",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
-    "launchCloneInstance.InstanceIds",
-    "ListSnapshotByDate.finalSnapshots",
-    "ListSnapshotByDate.remainingSnapshotToBeCheckedInSameDateRange",
-    "findWorkingSnapshot.workingSnapshot",
-    "InstanceRecovery.result"
+    "LaunchCloneInstance.InstanceId",
+    "GenerateRecoveryStatus.Message",
+    "CleanupResources.Message"
   ],
   "parameters": {
     "InstanceId": {
-      "type": "String",
-      "description": "The Instance Id of the EC2 Instance you need to restore from Snapshot.",
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The instance ID of the Amazon EC2 instance you need to restore from snapshot.",
       "allowedPattern": "^i-[a-z0-9]{8,17}$"
     },
     "SnapshotId": {
       "type": "String",
-      "description": "(Optional) If you already have a snapshot Id you want to restore from, you can enter it here.",
+      "description": "(Optional) The ID of the Amazon EBS snapshot you want to restore the EC2 instance from.",
       "default": "",
       "allowedPattern": "^$|^snap-[a-z0-9]{8,17}$"
     },
     "InplaceSwap": {
       "type": "Boolean",
-      "description": "(Optional) If you wish to replace new volume in your exisiting instance or launch a new instance."
+      "description": "(Optional) If set to true, automation will replace the existing root volume of your EC2 instance with a new EBS volume created from the snapshot.",
+      "allowedValues": [
+        true,
+        false
+      ],
+      "default": false
     },
     "StartDate": {
       "type": "String",
-      "description": "(Optional) The Start date for which we need to look for snapshot.",
+      "description": "(Optional) The earliest date in YYYY-MM-DD format from which the automation should consider snapshots, with the default value being 7 days prior to the current date.",
       "default": "",
-      "allowedPattern": "^$|^(19|20)\\d\\d[- /.](0[1-9]|1[012])[- /.](0[1-9]|[12][0-9]|3[01])$"
+      "allowedPattern": "^$|^(19|20)\\d\\d-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$"
     },
     "EndDate": {
       "type": "String",
-      "description": "(Optional) The end date for which we need to look for snapshot.",
+      "description": "(Optional) The latest date in YYYY-MM-DD format up to which the automation should consider snapshots, with the default value being the current date. This date must be later than the specified 'StartDate'.",
       "default": "",
-      "allowedPattern": "^$|^(19|20)\\d\\d[- /.](0[1-9]|1[012])[- /.](0[1-9]|[12][0-9]|3[01])$"
+      "allowedPattern": "^$|^(19|20)\\d\\d-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$"
     },
-    "LookForInstancetStatusCheck": {
-      "description": " (Optional) To look for first instance status check failed in given time range in order to filter out snapshots more efficiently.  Default is set to ‘True’.",
+    "LookForInstanceStatusCheck": {
+      "description": "(Optional) If the value for this parameter is set to true, the automation checks first for the instance status check failures within the given time range and adjusts the end time to a time before the failure, in order to filter out Amazon EBS snapshots more efficiently.",
       "type": "Boolean",
+      "allowedValues": [
+        true,
+        false
+      ],
       "default": true
     },
     "TotalSnapshotsToLook": {
       "type": "String",
-      "description": "(Optional) Determines how many snapshots automation will look in a single execution.",
+      "description": "(Optional) Specify the number of snapshots, up to a maximum of five, that the automation will attempt to restore from.",
       "default": "",
-      "allowedPattern": "^$|^[1-2]$"
+      "allowedPattern": "^$|^[1-5]$"
     },
-    "skipSnapshotsBy": {
+    "SkipSnapshotsBy": {
       "type": "String",
-      "description": "(Optional) Number of snapshots to be skipped while looking. For example if there are 100 snapshots available in an input time range and 'skipSnapshotsBy' value is set to 2 then every third snapshot will be taken into consideration for execution.",
+      "description": "(Optional) The interval at which snapshots are skipped when searching for snapshots to restore your instance. For example, if there are 100 snapshots available, and you specify a value of 2 for this parameter, then every third snapshot is considered for recovery.",
       "default": "0",
       "allowedPattern": "^$|^[0-4]$"
     },
@@ -60,97 +67,28 @@
       "default": ""
     }
   },
+  "variables": {
+    "WorkingSnapshot": {
+      "type": "String",
+      "description": "The ID of the snapshot to be used for EC2 instance recovery."
+    },
+    "FailureHandling": {
+      "type": "Boolean",
+      "default": false,
+      "description": "Indicates any failures in the automation."
+    }
+  },
   "mainSteps": [
     {
-      "name": "describeInstance",
-      "action": "aws:executeAwsApi",
-      "outputs": [
-        {
-          "Name": "InstanceType",
-          "Selector": "$.Reservations[0].Instances[0].InstanceType",
-          "Type": "String"
-        },
-        {
-          "Name": "AvailabilityZone",
-          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
-          "Type": "String"
-        },
-        {
-          "Name": "RootVolId",
-          "Selector": "$.Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId",
-          "Type": "String"
-        },
-        {
-          "Name": "SecurityGroupIds",
-          "Selector": "$.Reservations[0].Instances[0].SecurityGroups..GroupId",
-          "Type": "StringList"
-        },
-        {
-          "Name": "KeyName",
-          "Selector": "$.Reservations[0].Instances[0].KeyName",
-          "Type": "String"
-        },
-        {
-          "Name": "SubnetId",
-          "Selector": "$.Reservations[0].Instances[0].NetworkInterfaces[0].SubnetId",
-          "Type": "String"
-        },
-        {
-          "Name": "rootDeviceName",
-          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
-          "Type": "String"
-        },
-        {
-          "Name": "Platform",
-          "Selector": "$.Reservations[0].Instances[0].Platform",
-          "Type": "String"
-        }
-      ],
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeInstances",
-        "InstanceIds": [
-          "{{ InstanceId }}"
-        ]
-      },
-      "description": "describe the instance."
-    },
-    {
-      "name": "checkInstanceisNotTerminated",
+      "description": "Verifies that another automation isn't already running that targets this instance.",
+      "name": "CheckForConcurrentExecution",
       "action": "aws:assertAwsResourceProperty",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeInstances",
-        "PropertySelector": "$.Reservations[0].Instances[0].State.Name",
-        "DesiredValues": [
-          "running",
-          "stopped"
-        ],
-        "InstanceIds": [
-          "{{ InstanceId }}"
-        ]
-      },
-      "description": "checks if the instance is available or not"
-    },
-    {
-      "name": "assertRootVolumeIsEbs",
-      "action": "aws:assertAwsResourceProperty",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeInstances",
-        "DesiredValues": [
-          "ebs"
-        ],
-        "PropertySelector": "$.Reservations[0].Instances[0].RootDeviceType",
-        "InstanceIds": [
-          "{{ InstanceId }}"
-        ]
-      },
-      "description": "check root vol is ebs"
-    },
-    {
-      "name": "checkForConcurrentExecution",
-      "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "nextStep": "ValidateTargetInstance",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeTags",
@@ -162,7 +100,7 @@
           {
             "Name": "resource-id",
             "Values": [
-              "{{ InstanceId}}"
+              "{{ InstanceId }}"
             ]
           },
           {
@@ -172,13 +110,107 @@
             ]
           }
         ]
-      },
-      "description": "This will check if any other SSM documentation is running simultaneously at this moment."
+      }
     },
     {
-      "name": "AddTagsOnOriginalInstance",
+      "description": "Verifies the target Amazon EC2 instance and collects relevant information about it.",
+      "name": "ValidateTargetInstance",
+      "action": "aws:executeScript",
+      "maxAttempts": 2,
+      "nextStep": "DescribeRootVolume",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "InplaceSwap": "{{ InplaceSwap }}"
+        },
+        "Handler": "validate_target.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Payload.InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "AvailabilityZone",
+          "Selector": "$.Payload.Placement.AvailabilityZone",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Payload.SecurityGroups..GroupId",
+          "Type": "StringList"
+        },
+        {
+          "Name": "KeyName",
+          "Selector": "Payload.KeyName",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Payload.SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "RootDeviceName",
+          "Selector": "$.Payload.RootDeviceName",
+          "Type": "String"
+        },
+        {
+          "Type": "String",
+          "Name": "RootVolumeId",
+          "Selector": "$.Payload.RootVolumeId"
+        },
+        {
+          "Type": "String",
+          "Name": "InstanceState",
+          "Selector": "$.Payload.State"
+        }
+      ]
+    },
+    {
+      "description": "Gathers the details of the EC2 instance's root volume.",
+      "name": "DescribeRootVolume",
       "action": "aws:executeAwsApi",
-      "description": "This step adds tag on input instance which indicates that this instance is currently being used by SSM.",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "nextStep": "TagTargetInstance",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeVolumes",
+        "VolumeIds": [
+          "{{ ValidateTargetInstance.RootVolumeId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "VolumeType",
+          "Selector": "$.Volumes[0].VolumeType"
+        },
+        {
+          "Type": "Integer",
+          "Name": "VolumeIops",
+          "Selector": "$.Volumes[0].Iops"
+        }
+      ]
+    },
+    {
+      "description": "Tags the target EC2 instance to avoid concurrent automation executions.",
+      "name": "TagTargetInstance",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "timeoutSeconds": 120,
+      "nextStep": "FindUsableSnapshots",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
       "inputs": {
         "Service": "ec2",
         "Api": "CreateTags",
@@ -194,51 +226,66 @@
       }
     },
     {
-      "name": "createImageWithNoReboot",
-      "action": "aws:executeAwsApi",
+      "description": "Finds restorable snapshots for the EC2 instance's root volume.",
+      "name": "FindUsableSnapshots",
+      "action": "aws:executeScript",
+      "nextStep": "CreateImageWithNoReboot",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
-        "Service": "ec2",
-        "Api": "CreateImage",
+        "InputPayload": {
+          "SnapshotToBeUsed": "{{ SnapshotId }}",
+          "SourceInstance": "{{ InstanceId }}",
+          "SourceRootVolume": "{{ ValidateTargetInstance.RootVolumeId }}",
+          "StartDate": "{{ StartDate }}",
+          "EndDate": "{{ EndDate }}",
+          "CheckInstanceStatus": "{{ LookForInstanceStatusCheck }}",
+          "TotalSnapshotsToLook": "{{ TotalSnapshotsToLook }}",
+          "SkipSnapshotsBy": "{{ SkipSnapshotsBy }}"
+        },
+        "Handler": "find_usable_snapshots.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringList",
+          "Name": "SnapshotsToBeChecked",
+          "Selector": "$.Payload.SnapshotsToBeChecked"
+        },
+        {
+          "Type": "StringList",
+          "Name": "RemainingSnapshots",
+          "Selector": "$.Payload.RemainingSnapshots"
+        }
+      ]
+    },
+    {
+      "description": "Creates an Amazon Machine Image (AMI) from the target instance without rebooting it.",
+      "name": "CreateImageWithNoReboot",
+      "action": "aws:createImage",
+      "nextStep": "waitForInstanceImage",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
+      "inputs": {
         "InstanceId": "{{ InstanceId }}",
-        "Name": "AWSSupport_RestoreInstanceFromSnapshot-{{ automation:EXECUTION_ID }}"
-      },
-      "outputs": [
-        {
-          "Name": "ImageId",
-          "Selector": "$.ImageId",
-          "Type": "String"
-        }
-      ],
-      "onCancel": "step:CleanResources"
+        "ImageName": "AWSSupport-RestoreEC2InstanceFromSnapshot_{{ automation:EXECUTION_ID }}",
+        "ImageDescription": "Image created from {{ InstanceId }} by AWSSupport-RestoreEC2InstanceFromSnapshot automation",
+        "NoReboot": true
+      }
     },
     {
-      "name": "describeOriginalInstanceImage",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeImages",
-        "Filters": [
-          {
-            "Name": "name",
-            "Values": [
-              "AWSSupport_RestoreInstanceFromSnapshot-{{ automation:EXECUTION_ID }}"
-            ]
-          }
-        ]
-      },
-      "outputs": [
-        {
-          "Name": "ImageId",
-          "Selector": "$.Images[0].ImageId",
-          "Type": "String"
-        }
-      ],
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "waitTillOriginalInstanceImageImageReady",
+      "description": "Waits for the Amazon Machine Image (AMI) to complete creation and reach the 'available' state.",
+      "name": "waitForInstanceImage",
       "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 1,
+      "timeoutSeconds": 3600,
+      "nextStep": "LaunchCloneInstance",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeImages",
@@ -247,426 +294,572 @@
         ],
         "PropertySelector": "$.Images[0].State",
         "ImageIds": [
-          "{{ describeOriginalInstanceImage.ImageId }}"
+          "{{ CreateImageWithNoReboot.ImageId }}"
         ]
-      },
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
+      }
     },
     {
-      "name": "launchCloneInstance",
+      "description": "Launches a new Amazon EC2 instance from the created AMI.",
+      "name": "LaunchCloneInstance",
       "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "WaitForCloneInstance",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "launchCloneInstance",
-        "Script": "import json\nimport boto3\ndef launchCloneInstance(events, context):\n  \n    client = boto3.client(\n        'ec2'\n    )\n    instanceId = ''\n    InstanceIds = []\n    try:\n        runInstance = client.run_instances(\n                    ImageId=events['ImageId'],\n                    InstanceType=events['InstanceType'],\n                    KeyName=events['KeyName'],\n                    MaxCount=1,\n                    MinCount=1,\n                    SecurityGroupIds=\n                      events['SecurityGroupIds']\n                    ,\n                    SubnetId=events['SubnetId'],\n                    TagSpecifications=[\n                        {\n                            'ResourceType': 'instance',\n                            'Tags': [\n                                {\n                                    'Key': 'Name',\n                                    'Value': 'AWSSupport-RestoreFromSnapshot'\n                                },\n                            ]\n                        },\n                    ]\n        )\n        instanceId = runInstance['Instances'][0]['InstanceId']\n        if instanceId:\n            client.get_waiter('instance_running').wait(\n                        InstanceIds=[\n                                instanceId\n                                ],\n                    \n                        WaiterConfig={\n                            'Delay':30,\n                            'MaxAttempts':30\n                            }\n                            )\n            instanceStatus = client.describe_instances(\n                                        InstanceIds=[\n                                            instanceId\n                                                    ]\n                                    )\n            if instanceStatus['Reservations'][0]['Instances'][0]['State']['Name']=='running':\n                print(\"Instance is running\")\n                InstanceIds.append(instanceId)\n\n            \n\n    except Exception as e:\n                print('***Failed to launch the instance')\n                print(type(e), ':', e) \n    \n    return {'InstanceIds':InstanceIds, 'InstanceId':InstanceIds[0]}\n",
         "InputPayload": {
-          "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
-          "InstanceType": "{{ describeInstance.InstanceType }}",
-          "SubnetId": "{{ describeInstance.SubnetId }}",
-          "KeyName": "{{ describeInstance.KeyName }}",
-          "SecurityGroupIds": "{{ describeInstance.SecurityGroupIds }}",
-          "AutomationId": "{{ automation:EXECUTION_ID }}"
-        }
+          "SourceInstance": "{{ InstanceId }}",
+          "ImageId": "{{ CreateImageWithNoReboot.ImageId }}",
+          "InstanceType": "{{ ValidateTargetInstance.InstanceType }}",
+          "SubnetId": "{{ ValidateTargetInstance.SubnetId }}",
+          "KeyName": "{{ ValidateTargetInstance.KeyName }}",
+          "SecurityGroupIds": "{{ ValidateTargetInstance.SecurityGroupIds }}"
+        },
+        "Handler": "launch_clone_instance.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
       },
-      "maxAttempts": 3,
-      "nextStep": "waitTillInstanceIsReady",
-      "timeoutSeconds": 7200,
       "outputs": [
         {
-          "Selector": "$.Payload.InstanceIds",
-          "Type": "StringList",
-          "Name": "InstanceIds"
-        },
-        {
           "Name": "InstanceId",
-          "Selector": "$.Payload.InstanceId",
-          "Type": "String"
+          "Type": "String",
+          "Selector": "$.Payload.InstanceId"
         }
-      ],
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
+      ]
     },
     {
-      "name": "waitTillInstanceIsReady",
-      "action": "aws:assertAwsResourceProperty",
+      "description": "Waits for the cloned EC2 instance to be in running state before proceeding.",
+      "name": "WaitForCloneInstance",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 2,
+      "timeoutSeconds": 300,
+      "nextStep": "SnapshotValidationLoop",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstances",
         "InstanceIds": [
-          "{{ launchCloneInstance.InstanceIds }}"
+          "{{ LaunchCloneInstance.InstanceId }}"
         ],
         "PropertySelector": "$.Reservations[0].Instances[0].State.Name",
         "DesiredValues": [
-          "running",
-          "stopped"
+          "running"
         ]
-      },
-      "maxAttempts": 3,
-      "timeoutSeconds": 600,
-      "onFailure": "step:CleanResources",
-      "nextStep": "getCloneInstance",
-      "onCancel": "step:CleanResources"
+      }
     },
     {
-      "name": "getCloneInstance",
-      "action": "aws:executeAwsApi",
+      "description": "Tests the snapshots until working snapshot is identified.",
+      "name": "SnapshotValidationLoop",
+      "action": "aws:loop",
+      "nextStep": "FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeInstances",
-        "InstanceIds": [
-          "{{launchCloneInstance.InstanceIds}}"
+        "Iterators": "{{ FindUsableSnapshots.SnapshotsToBeChecked }}",
+        "IteratorDataType": "String",
+        "MaxIterations": 10,
+        "Steps": [
+          {
+            "description": "Gathers details of the cloned EC2 instance.",
+            "name": "DescribeCloneInstance",
+            "action": "aws:executeAwsApi",
+            "maxAttempts": 2,
+            "timeoutSeconds": 120,
+            "nextStep": "CreateNewRootVolumeFromSnapshot",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "DescribeInstances",
+              "InstanceIds": [
+                "{{LaunchCloneInstance.InstanceId}}"
+              ]
+            },
+            "outputs": [
+              {
+                "Name": "AvailabilityZone",
+                "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
+                "Type": "String"
+              },
+              {
+                "Name": "RootVolumeId",
+                "Selector": "$.Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId",
+                "Type": "String"
+              },
+              {
+                "Name": "RootDeviceName",
+                "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
+                "Type": "String"
+              }
+            ]
+          },
+          {
+            "description": "Creates a new Amazon EBS volume from the specified snapshot.",
+            "name": "CreateNewRootVolumeFromSnapshot",
+            "action": "aws:executeScript",
+            "nextStep": "StopCloneInstance",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "InputPayload": {
+                "SnapshotId": "{{ SnapshotValidationLoop.CurrentIteratorValue }}",
+                "AvailabilityZone": "{{ DescribeCloneInstance.AvailabilityZone }}",
+                "VolumeType": "{{ DescribeRootVolume.VolumeType }}",
+                "Iops": "{{ DescribeRootVolume.VolumeIops }}"
+              },
+              "Handler": "create_ebs_volume.script_handler",
+              "Runtime": "python3.11",
+              "Attachment": "attachment.zip"
+            },
+            "outputs": [
+              {
+                "Name": "RootVolumeId",
+                "Selector": "$.Payload.VolumeId",
+                "Type": "String"
+              }
+            ]
+          },
+          {
+            "description": "Stops the cloned EC2 instance.",
+            "name": "StopCloneInstance",
+            "action": "aws:changeInstanceState",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "nextStep": "WaitForVolumeAvailability",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "InstanceIds": [
+                "{{ LaunchCloneInstance.InstanceId }}"
+              ],
+              "DesiredState": "stopped"
+            }
+          },
+          {
+            "description": "Waits for the EBS volume to complete creation and reach the 'available' state.",
+            "name": "WaitForVolumeAvailability",
+            "action": "aws:waitForAwsResourceProperty",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "nextStep": "DetachRootVolume",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "DescribeVolumes",
+              "PropertySelector": "$.Volumes[0].State",
+              "DesiredValues": [
+                "available"
+              ],
+              "VolumeIds": [
+                "{{ CreateNewRootVolumeFromSnapshot.RootVolumeId }}"
+              ]
+            }
+          },
+          {
+            "description": "Detaches the EBS root volume from the cloned EC2 instance.",
+            "name": "DetachRootVolume",
+            "action": "aws:executeAwsApi",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "nextStep": "WaitForRootVolumeToBeDetached",
+            "isCritical": false,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:WaitForRootVolumeToBeDetached",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "DetachVolume",
+              "VolumeId": "{{ DescribeCloneInstance.RootVolumeId }}"
+            }
+          },
+          {
+            "description": "Waits for the EBS root volume to be detached from the cloned EC2 instance.",
+            "name": "WaitForRootVolumeToBeDetached",
+            "action": "aws:waitForAwsResourceProperty",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "nextStep": "AttachNewRootVolume",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "DescribeVolumes",
+              "PropertySelector": "$.Volumes[0].State",
+              "DesiredValues": [
+                "available"
+              ],
+              "VolumeIds": [
+                "{{ DescribeCloneInstance.RootVolumeId }}"
+              ]
+            }
+          },
+          {
+            "description": "Attaches the new root volume to the cloned EC2 instance.",
+            "name": "AttachNewRootVolume",
+            "action": "aws:executeAwsApi",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "nextStep": "WaitForNewRootVolumeToBeAttached",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "AttachVolume",
+              "InstanceId": "{{ LaunchCloneInstance.InstanceId }}",
+              "VolumeId": "{{ CreateNewRootVolumeFromSnapshot.RootVolumeId }}",
+              "Device": "{{ DescribeCloneInstance.RootDeviceName }}"
+            }
+          },
+          {
+            "description": "Waits for the new root volume to be attached to the cloned EC2 instance.",
+            "name": "WaitForNewRootVolumeToBeAttached",
+            "action": "aws:waitForAwsResourceProperty",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "nextStep": "StartCloneInstance",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "DescribeVolumes",
+              "PropertySelector": "$.Volumes[0].Attachments[0].State",
+              "DesiredValues": [
+                "attached"
+              ],
+              "VolumeIds": [
+                "{{ CreateNewRootVolumeFromSnapshot.RootVolumeId }}"
+              ]
+            }
+          },
+          {
+            "description": "Starts the cloned EC2 instance and waits up to 20 minutes for the instance status checks to pass.",
+            "name": "StartCloneInstance",
+            "action": "aws:changeInstanceState",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "nextStep": "DescribeInstanceStatus",
+            "isCritical": false,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:DescribeInstanceStatus",
+            "inputs": {
+              "InstanceIds": [
+                "{{ LaunchCloneInstance.InstanceId }}"
+              ],
+              "DesiredState": "running"
+            }
+          },
+          {
+            "description": "Describes the instance status check with restored volume.",
+            "name": "DescribeInstanceStatus",
+            "action": "aws:executeAwsApi",
+            "maxAttempts": 3,
+            "timeoutSeconds": 120,
+            "nextStep": "BranchOnInstanceStatus",
+            "isCritical": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "DescribeInstanceStatus",
+              "InstanceIds": [
+                "{{ LaunchCloneInstance.InstanceId }}"
+              ]
+            },
+            "outputs": [
+              {
+                "Type": "String",
+                "Name": "InstanceStatus",
+                "Selector": "$.InstanceStatuses[0].InstanceStatus.Status"
+              }
+            ]
+          },
+          {
+            "description": "Branches automation based on the instance status check status.",
+            "name": "BranchOnInstanceStatus",
+            "action": "aws:branch",
+            "inputs": {
+              "Choices": [
+                {
+                  "NextStep": "UpdateWorkingSnapshot",
+                  "Variable": "{{ DescribeInstanceStatus.InstanceStatus }}",
+                  "StringEquals": "ok"
+                }
+              ],
+              "Default": "TagSnapshotAsCorrupted"
+            }
+          },
+          {
+            "description": "Tags the snapshot as corrupted if the instance fails status check.",
+            "name": "TagSnapshotAsCorrupted",
+            "action": "aws:executeAwsApi",
+            "isEnd": true,
+            "onCancel": "step:FailureHandling",
+            "onFailure": "step:FailureHandling",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "CreateTags",
+              "Resources": [
+                "{{ SnapshotValidationLoop.CurrentIteratorValue }}"
+              ],
+              "Tags": [
+                {
+                  "Key": "corrupted",
+                  "Value": "Yes"
+                }
+              ]
+            }
+          }
         ]
-      },
-      "outputs": [
-        {
-          "Name": "InstanceId",
-          "Selector": "$.Reservations[0].Instances[0].InstanceId",
-          "Type": "String"
-        },
-        {
-          "Name": "availabilityZone",
-          "Selector": "$.Reservations[0].Instances[0].Placement.AvailabilityZone",
-          "Type": "String"
-        },
-        {
-          "Name": "RootVolId",
-          "Selector": "$.Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId",
-          "Type": "String"
-        },
-        {
-          "Name": "rootDeviceName",
-          "Selector": "$.Reservations[0].Instances[0].RootDeviceName",
-          "Type": "String"
-        }
-      ],
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
+      }
     },
     {
-      "name": "checkIfSnapshotIdProvided",
+      "description": "Updates the value of WorkingSnapshot variable.",
+      "name": "UpdateWorkingSnapshot",
+      "action": "aws:updateVariable",
+      "nextStep": "BranchOnInplaceSwap",
+      "isCritical": false,
+      "onFailure": "step:BranchOnInplaceSwap",
+      "inputs": {
+        "Name": "variable:WorkingSnapshot",
+        "Value": "{{ SnapshotValidationLoop.CurrentIteratorValue }}"
+      }
+    },
+    {
+      "description": "Branches automation based on InplaceSwap parameter.",
+      "name": "BranchOnInplaceSwap",
       "action": "aws:branch",
+      "isEnd": false,
       "inputs": {
         "Choices": [
           {
-            "NextStep": "ListSnapshotByDate",
-            "Variable": "{{SnapshotId}}",
-            "StringEquals": ""
+            "NextStep": "CreateVolumeReplacementTask",
+            "And": [
+              {
+                "Variable": "{{ InplaceSwap }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ ValidateTargetInstance.InstanceState }}",
+                "StringEquals": "running"
+              }
+            ]
           },
           {
-            "NextStep": "createNewRootVolumeFromSnapshot",
-            "Variable": "{{SnapshotId}}",
-            "StartsWith": "snap-"
+            "NextStep": "StartTargetForInplaceSwap",
+            "And": [
+              {
+                "Variable": "{{ InplaceSwap }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ ValidateTargetInstance.InstanceState }}",
+                "StringEquals": "stopped"
+              }
+            ]
           }
-        ]
-      },
-      "description": "Check if we have to restore from a custom Snapshot-ID",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "ListSnapshotByDate",
-      "action": "aws:executeScript",
-      "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "ListSnapshotByDate",
-        "Script": "import boto3\nimport json\nimport datetime\nfrom datetime import datetime\ndef ListSnapshotByDate(events, context):\n                  volId= events[\"VolumeId\"]\n                  objList = [ ]\n                  startDate = events[\"StartDate\"]\n                  endDate = events[\"EndDate\"]\n                  startDate += \"T00:00:00+00:00\"\n                  endDate += \"T23:59:00+00:00\" \n                  skipSnapshotsBy = events[\"skipSnapshotsBy\"]\n                  startDateDatetimeObj = datetime.strptime(startDate, '%Y/%m/%dT%H:%M:%S%z')\n                  endDateDatetimeObj =  datetime.strptime(endDate, '%Y/%m/%dT%H:%M:%S%z')\n                  checkInstanceStatus = events[\"CheckInstanceStatus\"]\n                  totalSnapshotsToLookFor = events[\"TotalSnapshotsToLook\"]\n                  if totalSnapshotsToLookFor == '':\n                     totalSnapshotsToLookFor= 10000\n                  else: \n                    totalSnapshotsToLookFor = int(totalSnapshotsToLookFor)\n                  client = boto3.client('ec2')\n                  cwClient = boto3.client('cloudwatch')\n                  response = client.describe_snapshots(\n                            Filters=[\n                                {\n                                    'Name': 'volume-id',\n                                    'Values': [\n                                        volId,\n                                    ]\n                                },\n                                {\n                                    'Name': 'status',\n                                    'Values': [\n                                        'completed',\n                                    ]\n                                }\n                            ]\n                          )\n                  for snap in response['Snapshots']:\n                            obj = {'SnapID':snap['SnapshotId'], 'Date':snap['StartTime']}\n                            objList.append(obj)\n                  objList = sorted(objList, key=lambda k: k['Date'], reverse=True)\n\n                  nonCorruptedSnapshots = []\n                  for snap in objList:\n                    snapshotId = (snap['SnapID'])\n                    checkSnapStatus = client.describe_tags(\n                                        Filters=[\n                                            {\n                                                'Name': 'resource-id',\n                                                'Values': [\n                                                    snapshotId,\n                                                ]\n                                            },\n                                            {\n                                                'Name': 'key',\n                                                'Values': [\n                                                    'corrupted',\n                                                ]\n                                            }\n                                    ]\n                                    \n                                )\n                    if checkSnapStatus['Tags']:\n                        if checkSnapStatus['Tags'][0]['Value']=='yes':\n                                continue\n                        else:\n                            nonCorruptedSnapshots.append(snap)\n                    else:\n                        nonCorruptedSnapshots.append(snap)\n                  \n                  objList = nonCorruptedSnapshots\n                  \n                  if checkInstanceStatus:\n                            inputJson = [\n                                          {\n                                              \"Id\": \"e1\",\n                                              \"Expression\": \"IF(m1>0, m1)\",\n                                              \"Label\": \"Expression1\"\n                                          },\n                                          {\n                                              \"Id\": \"m1\",\n                                              \"MetricStat\": {\n                                                  \"Metric\": {\n                                                      \"Namespace\": \"AWS/EC2\",\n                                                      \"MetricName\": \"StatusCheckFailed\",\n                                                      \"Dimensions\": [\n                                                          {\n                                                              \"Name\": \"InstanceId\",\n                                                              \"Value\": events[\"InstanceId\"]\n                                                          }\n                                                      ]\n                                                  },\n                                                  \"Period\": 3600,\n                                                  \"Stat\": \"Average\",\n                                                  \"Unit\": \"Count\"\n                                              },\n                                              \"ReturnData\": False\n                                          }\n                                          \n                                      ]\n                            instanceCheckFail = cwClient.get_metric_data(\n                                              MetricDataQueries=inputJson,\n                                              StartTime=startDateDatetimeObj,\n                                              EndTime=endDateDatetimeObj,\n                                              ScanBy='TimestampAscending'\n                                          )\n\n                            statusFailTime = instanceCheckFail['MetricDataResults'][0]['Timestamps']\n                            if statusFailTime:\n                              endDateDatetimeObj = min(endDateDatetimeObj, statusFailTime[0])\n\n\n\n\n                  testSnapshotIds = [] # This contains list of snapshots which will be tested.\n                  leftOutSnapshotIds = [] # This contains list of snapshots which will be not be tested in further steps this time\n                  finalSnapshotIds = [] # This contains all snapshots which are relevent\n                  \n                  if skipSnapshotsBy > '0':\n                      skipSnapshotsBy = int(skipSnapshotsBy) +1\n                      objList = objList[::skipSnapshotsBy]\n\n                  \n                  for snap in objList:\n                      snapDate =  (snap['Date'])\n                      if snapDate >= startDateDatetimeObj and snapDate <= endDateDatetimeObj:\n                        finalSnapshotIds.append(snap['SnapID'])\n                  \n                  if events['Platform'] == 'windows':\n                      totalSnapshotsToLookFor = min(totalSnapshotsToLookFor, 2)\n                      testSnapshotIds = finalSnapshotIds[0:totalSnapshotsToLookFor]\n                      leftOutSnapshotIds = finalSnapshotIds[totalSnapshotsToLookFor:]\n                  else:\n                      totalSnapshotsToLookFor = min(totalSnapshotsToLookFor, 2) # min snapshots for linux is also 2 at this stage because instance status check takes around 5 min and 12 min is hard cord limit for ssm run script, so more than 2 can't be tested for any platform. \n                      testSnapshotIds = finalSnapshotIds[0:totalSnapshotsToLookFor]\n                      leftOutSnapshotIds = finalSnapshotIds[totalSnapshotsToLookFor:]\n                  \n                  return {'finalSnapshots': testSnapshotIds, 'leftOutSnapshotIds': leftOutSnapshotIds}\n",
-        "InputPayload": {
-          "VolumeId": "{{ describeInstance.RootVolId}}",
-          "StartDate": "{{StartDate}}",
-          "EndDate": "{{EndDate}}",
-          "Platform": "{{describeInstance.Platform}}",
-          "CheckInstanceStatus": "{{LookForInstancetStatusCheck}}",
-          "TotalSnapshotsToLook": "{{TotalSnapshotsToLook}}",
-          "InstanceId": "{{ InstanceId }}",
-          "skipSnapshotsBy": "{{ skipSnapshotsBy }}"
-        }
-      },
-      "description": "This will give the list of snapshots which were created later or on same date given by user",
-      "nextStep": "findWorkingSnapshot",
-      "outputs": [
-        {
-          "Name": "finalSnapshots",
-          "Selector": "$.Payload.finalSnapshots",
-          "Type": "StringList"
-        },
-        {
-          "Name": "remainingSnapshotToBeCheckedInSameDateRange",
-          "Selector": "$.Payload.leftOutSnapshotIds",
-          "Type": "StringList"
-        }
-      ],
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "createNewRootVolumeFromSnapshot",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "CreateVolume",
-        "AvailabilityZone": "{{getCloneInstance.availabilityZone }}",
-        "SnapshotId": "{{SnapshotId}}"
-      },
-      "outputs": [
-        {
-          "Name": "newRootVolumeId",
-          "Selector": "$.VolumeId",
-          "Type": "String"
-        }
-      ],
-      "nextStep": "stopInstance",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "stopInstance",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "StopInstances",
-        "InstanceIds": [
-          "{{ launchCloneInstance.InstanceIds }}"
-        ]
-      },
-      "nextStep": "verifyVolumeAvailability",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "verifyVolumeAvailability",
-      "action": "aws:waitForAwsResourceProperty",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeVolumes",
-        "PropertySelector": "$.Volumes[0].State",
-        "DesiredValues": [
-          "available"
         ],
-        "VolumeIds": [
-          "{{ createNewRootVolumeFromSnapshot.newRootVolumeId }}"
-        ]
-      },
-      "nextStep": "verifyInstanceStopped",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources",
-      "maxAttempts": 3
+        "Default": "GenerateRecoveryStatus"
+      }
     },
     {
-      "name": "verifyInstanceStopped",
-      "action": "aws:waitForAwsResourceProperty",
-      "inputs": {
-        "Service": "ec2",
-        "DesiredValues": [
-          "stopped"
-        ],
-        "Api": "DescribeInstances",
-        "PropertySelector": "$.Reservations[0].Instances[0].State.Name",
-        "InstanceIds": [
-          "{{ launchCloneInstance.InstanceIds }}"
-        ]
-      },
-      "nextStep": "detachRootVolume",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "detachRootVolume",
+      "description": "Starts the original instance for root volume replacement.",
+      "name": "StartTargetForInplaceSwap",
       "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DetachVolume",
-        "VolumeId": "{{ getCloneInstance.RootVolId}}"
-      },
-      "nextStep": "verifyRootVolumeDetached",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources",
-      "maxAttempts": 3,
-      "timeoutSeconds": 3
-    },
-    {
-      "name": "verifyRootVolumeDetached",
-      "action": "aws:waitForAwsResourceProperty",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeVolumes",
-        "PropertySelector": "$.Volumes[0].State",
-        "DesiredValues": [
-          "available"
-        ],
-        "VolumeIds": [
-          "{{getCloneInstance.RootVolId}}"
-        ]
-      },
-      "timeoutSeconds": 30,
-      "nextStep": "attachNewRootVolume",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources",
-      "maxAttempts": 3
-    },
-    {
-      "name": "attachNewRootVolume",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "AttachVolume",
-        "Device": "{{ getCloneInstance.rootDeviceName }}",
-        "VolumeId": "{{ createNewRootVolumeFromSnapshot.newRootVolumeId }}",
-        "InstanceId": "{{ launchCloneInstance.InstanceId }}"
-      },
-      "nextStep": "verifyNewRootVolumeAttached",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "verifyNewRootVolumeAttached",
-      "action": "aws:waitForAwsResourceProperty",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeVolumes",
-        "PropertySelector": "$.Volumes[0].Attachments[0].State",
-        "DesiredValues": [
-          "attached"
-        ],
-        "VolumeIds": [
-          "{{ createNewRootVolumeFromSnapshot.newRootVolumeId }}"
-        ]
-      },
-      "timeoutSeconds": 30,
-      "nextStep": "startInstance",
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources",
-      "maxAttempts": 3
-    },
-    {
-      "name": "startInstance",
-      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
+      "timeoutSeconds": 300,
+      "nextStep": "WaitForTargetInstanceRunning",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
         "Service": "ec2",
         "Api": "StartInstances",
         "InstanceIds": [
-          "{{ launchCloneInstance.InstanceIds }}"
+          "{{ InstanceId }}"
         ]
-      },
-      "outputs": [
-        {
-          "Name": "InstanceState",
-          "Selector": "$.StartingInstances[0].CurrentState.Name",
-          "Type": "String"
-        }
-      ],
-      "nextStep": "InstanceStatusCheck",
-      "timeoutSeconds": 180,
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
+      }
     },
     {
-      "name": "InstanceStatusCheck",
+      "description": "Waits for the original instance to be in running state before proceeding.",
+      "name": "WaitForTargetInstanceRunning",
       "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 2,
+      "timeoutSeconds": 300,
+      "nextStep": "CreateVolumeReplacementTask",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
-        "PropertySelector": "$.Reservations[0].Instances[0].State.Name",
         "Service": "ec2",
         "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.Reservations[0].Instances[0].State.Name",
         "DesiredValues": [
           "running"
-        ],
-        "InstanceIds": "{{launchCloneInstance.InstanceIds}}"
-      },
-      "nextStep": "InstanceHealthCheck",
-      "maxAttempts": 3,
+        ]
+      }
+    },
+    {
+      "description": "Creates root volume replacement task for original instance.",
+      "name": "CreateVolumeReplacementTask",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 2,
       "timeoutSeconds": 300,
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "InstanceHealthCheck",
-      "action": "aws:waitForAwsResourceProperty",
+      "nextStep": "WaitForVolumeReplacement",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
       "inputs": {
-        "Api": "DescribeInstanceStatus",
-        "PropertySelector": "$.InstanceStatuses[0].InstanceStatus.Details[0].Status",
-        "DesiredValues": [
-          "passed"
-        ],
         "Service": "ec2",
-        "InstanceIds": "{{launchCloneInstance.InstanceIds}}"
-      },
-      "description": "Check if both System status checks and Instance status checks gets passed.",
-      "onFailure": "step:CleanResources",
-      "timeoutSeconds": 420,
-      "nextStep": "InstanceRecovery",
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "findWorkingSnapshot",
-      "action": "aws:executeScript",
-      "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "findWorkingSnapshot",
-        "Script": "import json\nimport boto3\nimport time\nimport botocore\nimport botocore.exceptions\nimport sys\ndef findWorkingSnapshot(event, context):\n    client = boto3.client(\n        'ec2'\n    )\n    snapshots= event['Snapshots']\n    workingSnapFound = False\n    workingSnap =''\n    for snap in snapshots:\n        checkSnapStatus = client.describe_tags(\n                Filters=[\n                    {\n                        'Name': 'resource-id',\n                        'Values': [\n                            snap,\n                        ]\n                    },\n                    {\n                        'Name': 'key',\n                        'Values': [\n                            'corrupted',\n                        ]\n                    }\n                ]\n                \n            )\n        \n        if checkSnapStatus['Tags']:\n            if checkSnapStatus['Tags'][0]['Value']=='yes':\n                continue\n            elif checkSnapStatus['Tags'][0]['Value']=='no':\n                workingSnapFound = True\n                workingSnap = snap\n                break\n        \n        volumeId = ''\n        \n        try:\n            response = client.create_volume(\n                AvailabilityZone=event['AvailabilityZone'],\n                SnapshotId=snap)\n            \n            if response['ResponseMetadata']['HTTPStatusCode']== 200:\n                volumeId= response['VolumeId']\n                print('***volume:', volumeId)\n            \n            client.get_waiter('volume_available').wait(\n                VolumeIds=[volumeId],\n                WaiterConfig={\n                    'Delay': 10,\n                    'MaxAttempts': 12\n                \n                }\n            )\n            print('***Success!! volume:', volumeId, 'created...')\n            \n            \n                \n                    \n        except Exception as e:\n                print('***Failed to create the volume...')\n                print(type(e), ':', e)\n                continue\n            \n        \n        if volumeId:\n            try:\n                stopInstance = client.stop_instances(\n                    InstanceIds=[\n                            event['InstanceId'][0]\n                                ]\n                )\n                \n                if stopInstance['ResponseMetadata']['HTTPStatusCode']== 200:\n                        client.get_waiter('instance_stopped').wait(\n                        InstanceIds=[\n                            event['InstanceId'][0]\n                                ],\n                    \n                        WaiterConfig={\n                            'Delay': 10,\n                            'MaxAttempts': 40\n                            }\n                    )\n                        print (\"Instance is stopped\")\n                \n        \n            except Exception as e:\n                print('***Failed to stop the instance...')\n                print(type(e), ':', e)\n                continue\n        \n        try:\n            \n            describeInstance = client.describe_instances(\n                                InstanceIds=[\n                                    event['InstanceId'][0],\n                                ]\n                                )\n            rootVolId = describeInstance['Reservations'][0]['Instances'][0]['BlockDeviceMappings'][0]['Ebs']['VolumeId']\n\n            deviceName = describeInstance['Reservations'][0]['Instances'][0]['BlockDeviceMappings'][0]['DeviceName']\n\n            \n            if deviceName == event['DeviceId'] and rootVolId.startswith(\"vol\"):\n                    response = client.detach_volume(\n                                VolumeId= rootVolId )\n                    if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n                        print( \"***Success**\" + \"detaching root volume\")\n                        client.get_waiter('volume_available').wait(\n                                VolumeIds=[\n                                    rootVolId\n                                        ],\n                                \n                                WaiterConfig={\n                                    'Delay': 10,\n                                    'MaxAttempts':12\n                                    }\n                            )\n                        \n                        VolumeStatus = client.describe_volumes(\n                                            VolumeIds=[rootVolId]\n                        )\n                        \n                        if VolumeStatus['Volumes'][0]['State'] == 'available':\n                            print (\"Volume detached\")\n                        else:\n                            print (\"Volume Not Detached\")\n                \n                \n        except Exception as e:\n                print('***Failed to detached the volume')\n                print(type(e), ':', e)\n                continue\n        \n        \n        try:\n            response = client.attach_volume(\n                        Device=event['DeviceId'],\n                        InstanceId=\n                            event['InstanceId'][0]\n                                ,\n                        VolumeId=volumeId\n                        )\n            \n            if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n                \n                print( \"***Success***\" + \"attaching root volume\")\n                client.get_waiter('volume_in_use').wait(\n                        VolumeIds=[\n                                volumeId\n                                ],\n                        \n                        WaiterConfig={\n                            'Delay': 10,\n                            'MaxAttempts':20\n                            }\n                    )\n                VolumeStatus = client.describe_volumes(\n                                    VolumeIds=[volumeId]\n                )\n                if VolumeStatus['Volumes'][0]['Attachments'][0]['State'] == 'attached':\n                    print (\"Volume is attached\")\n                \n        \n                \n        except Exception as e:\n                print('***Failed to attach the volume')\n                print(type(e), ':', e)\n                continue    \n                \n        try:\n            response = client.start_instances(\n                    InstanceIds=[event['InstanceId'][0]]\n                        )\n            \n            if response['ResponseMetadata']['HTTPStatusCode']== 200:\n                        client.get_waiter('instance_running').wait(\n                        InstanceIds=[\n                            event['InstanceId'][0]\n                                ],\n                    \n                        WaiterConfig={\n                            'Delay': 10,\n                            'MaxAttempts':30\n                            }\n                            )\n                        \n                        client.get_waiter('instance_status_ok').wait(\n                            InstanceIds=[\n                            event['InstanceId'][0]\n                                ],\n                    \n                        WaiterConfig={\n                            'Delay': 10,\n                            'MaxAttempts':26\n                            }\n                            \n                            )\n                        instanceStatus = client.describe_instance_status(\n                                        InstanceIds=[\n                                            event['InstanceId'][0]\n                                                    ]\n                                    )\n                        \n                        \n                        if instanceStatus['InstanceStatuses'][0]['InstanceStatus']['Status']=='ok' and instanceStatus['InstanceStatuses'][0]['SystemStatus']['Status']=='ok':\n                                print (\"Instance Passed\")\n                                workingSnap = snap\n                                workingSnapFound = True\n                                client.create_tags(\n    \n                                        Resources=[\n                                            snap,\n                                        ],\n                                        Tags=[\n                                            {\n                                                'Key': 'corrupted',\n                                                'Value': 'no'\n                                            },\n                                        ]\n                                    )\n                                break\n                                \n                        else:\n                            client.create_tags(\n    \n                                        Resources=[\n                                            snap,\n                                        ],\n                                        Tags=[\n                                            {\n                                                'Key': 'corrupted',\n                                                'Value': 'yes'\n                                            },\n                                        ]\n                                    )\n                            continue\n                                \n                        \n        except botocore.exceptions.WaiterError  as waiterr:\n            print(\"***Failed to reach out to the instance. Status check is getting timed out\")\n            workingSnap = \"No working instance found, getting instance check timed out, please check is separately or look for further snapshots\"\n            print(type(waiterr), ':', waiterr)\n            client.create_tags(\n    \n                                        Resources=[\n                                            snap,\n                                        ],\n                                        Tags=[\n                                            {\n                                                'Key': 'corrupted',\n                                                'Value': 'yes'\n                                            },\n                                        ]\n                                    )                \n        except Exception as e:\n                print('***Failed to Start the Instance')\n                print(type(e), ':', e)\n                client.create_tags(\n    \n                                        Resources=[\n                                            snap,\n                                        ],\n                                        Tags=[\n                                            {\n                                                'Key': 'corrupted',\n                                                'Value': 'yes'\n                                            },\n                                        ]\n                                    )\n                continue         \n        \n            \n            \n            \n        \n          \n        \n    return {'workingSnap':workingSnap}\n",
-        "InputPayload": {
-          "Snapshots": "{{ListSnapshotByDate.finalSnapshots}}",
-          "DeviceId": "{{getCloneInstance.rootDeviceName}}",
-          "VolumeId": "{{getCloneInstance.RootVolId}}",
-          "InstanceId": "{{launchCloneInstance.InstanceIds}}",
-          "AvailabilityZone": "{{describeInstance.AvailabilityZone}}"
-        }
+        "Api": "CreateReplaceRootVolumeTask",
+        "ClientToken": "{{ automation:EXECUTION_ID }}",
+        "InstanceId": "{{ InstanceId }}",
+        "SnapshotId": "{{ SnapshotValidationLoop.CurrentIteratorValue }}"
       },
       "outputs": [
         {
-          "Name": "workingSnapshot",
-          "Selector": "$.Payload.workingSnap",
+          "Name": "ReplaceRootVolumeTaskId",
+          "Selector": "$.ReplaceRootVolumeTask.ReplaceRootVolumeTaskId",
           "Type": "String"
         }
-      ],
-      "nextStep": "InstanceRecovery",
-      "timeoutSeconds": 1200,
-      "onFailure": "step:CleanResources",
-      "onCancel": "step:CleanResources"
+      ]
     },
     {
-      "name": "InstanceRecovery",
+      "description": "Waits for the EBS volume replacement task to be completed.",
+      "name": "WaitForVolumeReplacement",
+      "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 2,
+      "timeoutSeconds": 300,
+      "nextStep": "AssertTargetInstanceStatus",
+      "isCritical": true,
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeReplaceRootVolumeTasks",
+        "ReplaceRootVolumeTaskIds": [
+          "{{ CreateVolumeReplacementTask.ReplaceRootVolumeTaskId }}"
+        ],
+        "PropertySelector": "$.ReplaceRootVolumeTasks[0].TaskState",
+        "DesiredValues": [
+          "succeeded"
+        ]
+      }
+    },
+    {
+      "description": "Asserts the original EC2 instance status check passing.",
+      "name": "AssertTargetInstanceStatus",
+      "action": "aws:assertAwsResourceProperty",
+      "maxAttempts": 3,
+      "timeoutSeconds": 60,
+      "nextStep": "GenerateRecoveryStatus",
+      "onCancel": "step:FailureHandling",
+      "onFailure": "step:FailureHandling",
+      "isCritical": true,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstanceStatus",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "PropertySelector": "$.InstanceStatuses[0].InstanceStatus.Status",
+        "DesiredValues": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "description": "Updates the value of failure handling variable.",
+      "name": "FailureHandling",
+      "action": "aws:updateVariable",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "GenerateRecoveryStatus",
+      "isCritical": true,
+      "onFailure": "step:GenerateRecoveryStatus",
+      "inputs": {
+        "Name": "variable:FailureHandling",
+        "Value": true
+      }
+    },
+    {
+      "description": "Generates instance recovery status report.",
+      "name": "GenerateRecoveryStatus",
       "action": "aws:executeScript",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "nextStep": "CleanupResources",
+      "onFailure": "step:CleanupResources",
+      "onCancel": "step:CleanupResources",
+      "isCritical": true,
       "inputs": {
         "Runtime": "python3.11",
-        "Handler": "InstanceRecovery",
-        "Script": "import json\nimport boto3\nimport sys\nimport botocore\nimport botocore.exceptions\n\ndef InstanceRecovery(event, context):\n  client = boto3.client(\n        'ec2'\n    )\n  inplaceSwap = event['InplaceSwap']\n  snapshotId = event['SnapShotId']\n  workingSnapshot = event['WorkingSnapshot']\n  result = ''\n  \n  if inplaceSwap == True:\n            \n        if snapshotId =='':\n\n                if workingSnapshot:\n                    volumeId = ''\n            \n                    try:\n                        response = client.create_volume(\n                            AvailabilityZone=event['AvailabilityZone'],\n                            SnapshotId=workingSnapshot)\n                        \n                        if response['ResponseMetadata']['HTTPStatusCode']== 200:\n                            volumeId= response['VolumeId']\n                            print('***volume:', volumeId)\n                        \n                        client.get_waiter('volume_available').wait(\n                            VolumeIds=[volumeId],\n                            WaiterConfig={\n                                'Delay': 10,\n                                'MaxAttempts': 12\n                            \n                            }\n                        )\n                        print('***Success!! volume:', volumeId, 'created...')\n                        \n                        \n                            \n                                \n                    except Exception as e:\n                            print('***Failed to create the volume...')\n                            print(type(e), ':', e)\n                        \n                    \n                    if volumeId:\n                        try:\n                            stopInstance = client.stop_instances(\n                                InstanceIds=[\n                                        event['InstanceId']\n                                            ]\n                            )\n                            \n                            if stopInstance['ResponseMetadata']['HTTPStatusCode']== 200:\n                                    client.get_waiter('instance_stopped').wait(\n                                    InstanceIds=[\n                                        event['InstanceId']\n                                            ],\n                                \n                                    WaiterConfig={\n                                        'Delay': 10,\n                                        'MaxAttempts': 40\n                                        }\n                                )\n                                    print (\"Instance is stopped\")\n                            \n                    \n                        except Exception as e:\n                            print('***Failed to stop the instance...')\n                            print(type(e), ':', e)\n                    \n                    try:\n                        response = client.detach_volume(\n                                    VolumeId= event['VolumeId'] )\n                        if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n                            print( \"**Success**\" + \"detaching root volume\")\n                            client.get_waiter('volume_available').wait(\n                                    VolumeIds=[\n                                        event['VolumeId']\n                                            ],\n                                    \n                                    WaiterConfig={\n                                        'Delay': 10,\n                                        'MaxAttempts':12\n                                        }\n                                )\n                            \n                            volumeStatus = client.describe_volumes(\n                                                VolumeIds=[event['VolumeId']]\n                            )\n                            \n                            if volumeStatus['Volumes'][0]['State'] == 'available':\n                                print (\"Volume detached\")\n                            else:\n                                print (\"Volume Not Detached\")\n                            \n                            \n                    except Exception as e:\n                            print('***Failed to detached the volume')\n                            print(type(e), ':', e)\n                            \n                    \n                    \n                    try:\n                        response = client.attach_volume(\n                                    Device=event['DeviceId'],\n                                    InstanceId=\n                                        event['InstanceId']\n                                            ,\n                                    VolumeId=volumeId\n                                    )\n                        \n                        if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n                            \n                            print( \"***\" + \"ataching root volume\")\n                            client.get_waiter('volume_in_use').wait(\n                                    VolumeIds=[\n                                            volumeId\n                                            ],\n                                    \n                                    WaiterConfig={\n                                        'Delay': 10,\n                                        'MaxAttempts':12\n                                        }\n                                )\n                            volumeStatus = client.describe_volumes(\n                                                VolumeIds=[volumeId]\n                            )\n                            if volumeStatus['Volumes'][0]['Attachments'][0]['State'] == 'attached':\n                                print (\"Volume is attached\")\n                            \n                    \n                            \n                    except Exception as e:\n                            print('***Failed to attach the volume')\n                            print(type(e), ':', e)\n                          \n                            \n                    try:\n                        response = client.start_instances(\n                                InstanceIds=[event['InstanceId']]\n                                    )\n                        \n                        if response['ResponseMetadata']['HTTPStatusCode']== 200:\n                                    client.get_waiter('instance_running').wait(\n                                    InstanceIds=[\n                                        event['InstanceId']\n                                            ],\n                                \n                                    WaiterConfig={\n                                        'Delay': 10,\n                                        'MaxAttempts':30\n                                        }\n                                        )\n                                    \n                                    client.get_waiter('instance_status_ok').wait(\n                                            InstanceIds=[\n                                                event['InstanceId']\n                                                    ],\n                                        \n                                            WaiterConfig={\n                                                'Delay': 10,\n                                                'MaxAttempts':40\n                                                }\n                                                )\n                                    instanceStatus = client.describe_instance_status(\n                                                    InstanceIds=[\n                                                        event['InstanceId']\n                                                                ]\n                                                )\n                                    \n                                    \n                                    if instanceStatus['InstanceStatuses'][0]['InstanceStatus']['Status']=='ok' and instanceStatus['InstanceStatuses'][0]['SystemStatus']['Status']=='ok':\n                                            print (\"Instance Passed\")\n                                            result += \"Instance status Passed and inplace swap is done\"\n                                            \n                                            \n                                    else:\n                                        print (\"Instance status failed\")\n                                        result += \"Instance status failed\"\n                                            \n                                    \n                    except botocore.exceptions.WaiterError  as waiterr:\n                            print(\"***Failed to reach out to the instance. Status check is getting timed out\")\n                            print(type(waiterr), ':', waiterr)  \n                            result += \"Instance status check Timed out\"            \n                    except Exception as e:\n                            print('***Failed to Start the Instance')\n                            print(type(e), ':', e)\n                            result += \"Instance status failed\"      \n            \n                         \n                else:\n                         print (\"No working snapshot is available\")\n                         result += \"No working snapshot is available\"\n                 \n                \n            \n        else:\n                \n                        volumeId = ''\n        \n                        try:\n                            response = client.create_volume(\n                                AvailabilityZone=event['AvailabilityZone'],\n                                SnapshotId=snapshotId)\n                            \n                            if response['ResponseMetadata']['HTTPStatusCode']== 200:\n                                volumeId= response['VolumeId']\n                                print('***volume:', volumeId)\n                            \n                            client.get_waiter('volume_available').wait(\n                                VolumeIds=[volumeId],\n                                WaiterConfig={\n                                    'Delay': 10,\n                                    'MaxAttempts': 12\n                                \n                                }\n                            )\n                            print('***Success!! volume:', volumeId, 'created...')\n                            \n                            \n                                \n                                    \n                        except Exception as e:\n                                print('***Failed to create the volume...')\n                                print(type(e), ':', e)\n                                \n                            \n                        \n                        if volumeId:\n                            try:\n                                stopInstance = client.stop_instances(\n                                    InstanceIds=[\n                                            event['InstanceId']\n                                                ]\n                                )\n                                \n                                if stopInstance['ResponseMetadata']['HTTPStatusCode']== 200:\n                                        client.get_waiter('instance_stopped').wait(\n                                        InstanceIds=[\n                                            event['InstanceId']\n                                                ],\n                                    \n                                        WaiterConfig={\n                                            'Delay': 10,\n                                            'MaxAttempts': 30\n                                            }\n                                    )\n                                        print (\"Instance is stopped\")\n                                \n                        \n                            except Exception as e:\n                                print('***Failed to stop the instance...')\n                                print(type(e), ':', e)\n                            \n                        \n                        try:\n                            response = client.detach_volume(\n                                        VolumeId= event['VolumeId'] )\n                            if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n                                print( \"***\" + \"detaching root volume\")\n                                client.get_waiter('volume_available').wait(\n                                        VolumeIds=[\n                                            event['VolumeId']\n                                                ],\n                                        \n                                        WaiterConfig={\n                                            'Delay': 10,\n                                            'MaxAttempts':12\n                                            }\n                                    )\n                                \n                                volumeStatus = client.describe_volumes(\n                                                    VolumeIds=[event['VolumeId']]\n                                )\n                                \n                                if volumeStatus['Volumes'][0]['State'] == 'available':\n                                    print (\"Volume detached\")\n                                else:\n                                    print (\"Volume Not Detached\")\n                                \n                                \n                        except Exception as e:\n                                print('***Failed to detached the volume')\n                                print(type(e), ':', e)\n                                \n                        \n                        \n                        try:\n                            response = client.attach_volume(\n                                        Device=event['DeviceId'],\n                                        InstanceId=\n                                            event['InstanceId']\n                                                ,\n                                        VolumeId=volumeId\n                                        )\n                            \n                            if response['ResponseMetadata']['HTTPStatusCode'] == 200:\n                                \n                                print( \"**\" + \"ataching root volume\")\n                                client.get_waiter('volume_in_use').wait(\n                                        VolumeIds=[\n                                                volumeId\n                                                ],\n                                        \n                                        WaiterConfig={\n                                            'Delay': 10,\n                                            'MaxAttempts':6\n                                            }\n                                    )\n                                volumeStatus = client.describe_volumes(\n                                                    VolumeIds=[volumeId]\n                                )\n                                if volumeStatus['Volumes'][0]['Attachments'][0]['State'] == 'attached':\n                                    print (\"Volume is attached\")\n                                \n                        \n                                \n                        except Exception as e:\n                                print('***Failed to attach the volume')\n                                print(type(e), ':', e)\n                                   \n                                \n                        try:\n                            response = client.start_instances(\n                                    InstanceIds=[event['InstanceId']]\n                                        )\n                            \n                            if response['ResponseMetadata']['HTTPStatusCode']== 200:\n                                        client.get_waiter('instance_running').wait(\n                                        InstanceIds=[\n                                            event['InstanceId']\n                                                ],\n                                    \n                                        WaiterConfig={\n                                            'Delay': 10,\n                                            'MaxAttempts':30\n                                            }\n                                            )\n                                        print (\"Instance is running\")\n                                        client.get_waiter('instance_status_ok').wait(\n                                        InstanceIds=[\n                                            event['InstanceId']\n                                                ],\n                                    \n                                        WaiterConfig={\n                                            'Delay': 10,\n                                            'MaxAttempts':40\n                                            }\n                                            )\n                                        instanceStatus = client.describe_instance_status(\n                                                        InstanceIds=[\n                                                            event['InstanceId']\n                                                                    ]\n                                                    )\n                                        \n                                        \n                                        if instanceStatus['InstanceStatuses'][0]['InstanceStatus']['Status']=='ok' and instanceStatus['InstanceStatuses'][0]['SystemStatus']['Status']=='ok':\n                                                print (\"Instance Passed and inplace swap is done\")\n                                                result += \"Instance Passed and inplace swap is done\"\n                                                \n                                                \n                                        else:\n                                            print (\"Instance status failed\")\n                                            result += \"Instance status failed\"\n                                                \n                                        \n                        except botocore.exceptions.WaiterError  as waiterr:\n                            print(\"***Failed to reach out to the instance. Status check is getting timed out\")\n                            print(type(waiterr), ':', waiterr)\n                            result += \"Instance status check Timed out\"               \n                        except Exception as e:\n                                print('***Failed to Start the Instance')\n                                print(type(e), ':', e)\n                                result += \"Instance status failed\"\n        \n        try:\n            response = client.terminate_instances(\n                            InstanceIds=[\n                                event['CloneInstanceId'][0]])\n        except Exception as terminateFailed:\n                print('***Instance Termination failed')\n                print(type(terminateFailed), ':', terminateFailed)\n\n         \n  else:\n                if snapshotId:\n                    print (\"working Instance\", event['CloneInstanceId'][0])\n                    result += \"working Instance\" + event['CloneInstanceId'][0]\n                    \n                else:\n                    if workingSnapshot:\n                        print (\"working Instance\", event['CloneInstanceId'][0])\n                        result += \"working Instance\" + event['CloneInstanceId'][0]\n                    else:\n                        print (\"Instance recovery cannot happen as it does not have working snapshot\")\n                        result += \"Instance recovery cannot happen as it does not have working snapshot\"\n                \n    \n        \n  return {'result':result}\n",
+        "Handler": "recovery_status.script_handler",
         "InputPayload": {
-          "InplaceSwap": "{{InplaceSwap}}",
-          "SnapShotId": "{{SnapshotId}}",
-          "CloneInstanceId": "{{launchCloneInstance.InstanceIds}}",
-          "DeviceId": "{{getCloneInstance.rootDeviceName}}",
-          "AvailabilityZone": "{{describeInstance.AvailabilityZone}}",
-          "VolumeId": "{{describeInstance.RootVolId}}",
+          "WorkingSnapshot": "{{ variable:WorkingSnapshot }}",
+          "CloneInstanceId": "{{ LaunchCloneInstance.InstanceId }}",
+          "OriginalInstanceId": "{{ InstanceId }}",
+          "InplaceSwap": "{{ InplaceSwap }}",
+          "FailureHandling": "{{ variable:FailureHandling }}"
+        },
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "description": "Deletes resources created by the automation.",
+      "name": "CleanupResources",
+      "action": "aws:executeScript",
+      "maxAttempts": 2,
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
           "InstanceId": "{{ InstanceId }}",
-          "WorkingSnapshot": "{{ findWorkingSnapshot.workingSnapshot}}"
-        }
+          "ImageId": "{{ CreateImageWithNoReboot.ImageId }}",
+          "CloneInstanceId": "{{ LaunchCloneInstance.InstanceId }}",
+          "TagValue": "AWSSupport-RestoreEC2InstanceFromSnapshot_{{ automation:EXECUTION_ID }}",
+          "InplaceSwap": "{{ InplaceSwap }}",
+          "FailureHandling": "{{ variable:FailureHandling }}"
+        },
+        "Handler": "cleanup.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
       },
-      "onFailure": "step:CleanResources",
       "outputs": [
         {
-          "Name": "result",
-          "Selector": "$.Payload.result",
-          "Type": "String"
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload"
         }
-      ],
-      "onCancel": "step:CleanResources"
-    },
-    {
-      "name": "CleanResources",
-      "action": "aws:executeScript",
-      "description": "This will clean all the additional resources which were created by SSM document during execution.",
-      "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "CleanResources",
-        "Script": "import json\nimport boto3\ndef CleanResources(events, context):\n  \n  client = boto3.client(\n        'ec2'\n    )\n  \n  try:\n    client.delete_tags(\n    Resources = [\n        events['InstanceId']\n    ],\n    Tags = [\n        {\n            'Key': 'SSMExecutionStatusOn',\n            'Value': 'Yes'\n        }\n    ]\n  )\n    if events['ImageId'].startswith(\"ami\"):\n      checkImageStatus =  client.describe_images(\n        Filters=[\n            {\n                'Name': 'name',\n                'Values': [\n                    events['TagValue']\n                ]\n            }\n        ],\n        ImageIds=[\n            events['ImageId']\n        ]\n    )\n      if checkImageStatus['Images'] !='':\n                try:\n                  response = client.deregister_image(\n                             ImageId=events['ImageId']\n                             )\n\n                except Exception as e:\n                  print('***Failed to deregister the image.')\n                  print(type(e), ':', e)\n\n  except Exception as e:\n                print('***Failed to delete the tags')\n                print(type(e), ':', e)\n  \n  if events['CloneInstanceId'][0].startswith(\"i-\"):\n    if events['CloneInstanceId'][0] and events['InplaceSwap'] :\n          try:\n            client.terminate_instances(\n                                InstanceIds=[\n                                    events['CloneInstanceId'][0]])\n          except Exception as e:\n                  print('***Failed to terminate the instance.')\n                  print(type(e), ':', e)\n  return 0\n",
-        "InputPayload": {
-          "InstanceId": "{{InstanceId }}",
-          "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
-          "CloneInstanceId": "{{launchCloneInstance.InstanceIds }}",
-          "TagValue": "AWSSupport_RestoreInstanceFromSnapshot-{{ automation:EXECUTION_ID }}",
-          "InplaceSwap": "{{InplaceSwap}}"
-        }
+      ]
+    }
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "6835194badc51d9cca54d8a7e141bae62c50c73ba49e12ad9088adc81abd52c6"
       }
     }
-  ]
+  }
 }

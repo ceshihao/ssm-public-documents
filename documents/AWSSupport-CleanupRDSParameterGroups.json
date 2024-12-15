@@ -1,0 +1,349 @@
+{
+  "description": "The **AWSSupport-CleanupRDSParameterGroups** automation runbook removes unattached, non-default Amazon Relational Database Service (RDS) Option Groups, Parameter Groups, and Cluster Parameter Groups. Before deleting any resources, the automation includes a manual approval step to receive user confirmation. The resource deletion is controlled by the following parameters:\n\n- `DeleteInstanceParameterGroups` (Optional): Set this flag to `true` to delete unattached Parameter Groups. The default value is `false`.\n- `DeleteClusterParameterGroups` (Optional): Set this flag to `true` to delete unattached Cluster Parameter Groups. The default value is `false`.\n- `DeleteOptionGroups` (Optional): Set this flag to `true` to delete unattached Option Groups. The default value is `false`.\n\nIf you want to review the resources that would be deleted before proceeding, run the execution with these parameters set to `false`. This will provide a list of resources that are applicable for deletion if the parameters were set to `true`.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "DeleteInstanceParameterGroups": {
+      "type": "Boolean",
+      "description": "(Optional) Flag used to determine if all unattached Amazon RDS Instance Parameter Groups should be deleted or not. Default value is `false`.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "DeleteClusterParameterGroups": {
+      "type": "Boolean",
+      "description": "(Optional) Flag used to determine if all unattached Amazon RDS Cluster Parameter Groups should be deleted or not. Default value is `false`.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "DeleteOptionGroups": {
+      "type": "Boolean",
+      "description": "(Optional) Flag used to determine if all unattached Amazon RDS Option Groups should be deleted or not. Default value is `false`.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "Approvers": {
+      "type": "StringList",
+      "description": "(Required) The list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of the following formats: user name, user ARN, IAM role ARN, or IAM assume role ARN.",
+      "allowedPattern": "^[a-z0-9A-Z+=,.@_-]{1,64}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-[a-z]):iam::[0-9]{12,14}:(role/|user/|assumed-role/)[a-z0-9A-Z+=,.@_-]{1,64}(/[a-z0-9A-Z+=,.@_-]{1,64})?$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ListRDSResources",
+      "action": "aws:executeScript",
+      "nextStep": "ListInstanceParameterGroups",
+      "description": "List Amazon RDS instances, clusters, and snapshots in order to determine the instance parameter groups, cluster parameter groups, and option groups that are currently being used.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "DeleteInstanceParameterGroups": "{{ DeleteInstanceParameterGroups }}",
+          "DeleteClusterParameterGroups": "{{ DeleteClusterParameterGroups }}",
+          "DeleteOptionGroups": "{{ DeleteOptionGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to list parameter groups and option groups associated with RDS instances, RDS clusters, and RDS snapshots.\n\"\"\"\n\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\nrds = boto3.client(\"rds\")\n\n\ndef script_handler(event: dict, _):\n    \"\"\"\n    Main function that retrieves and processes RDS resources.\n\n    Args:\n        event (dict): Dictionary with the following parameters:\n            DeleteInstanceParameterGroups (bool): Indicates whether to list instance parameter groups.\n            DeleteClusterParameterGroups (bool): Indicates whether to list cluster parameter groups.\n            DeleteOptionGroups (bool): Indicates whether to list option groups.\n        _: unused context object\n\n    Returns:\n        dict: Dictionary with the following keys:\n            attached_instance_parameter_groups (str): Comma-separated string of associated instance parameter groups.\n            attached_cluster_parameter_groups (str): Comma-separated string of associated cluster parameter groups.\n            attached_option_groups (str): Comma-separated string of associated option groups.\n    \"\"\"\n\n    delete_instance_parameter_groups = event.get(\"DeleteInstanceParameterGroups\", False)\n    delete_cluster_parameter_groups = event.get(\"DeleteClusterParameterGroups\", False)\n    delete_option_groups = event.get(\"DeleteOptionGroups\", False)\n\n    attached_instance_parameter_groups = []\n    attached_cluster_parameter_groups = []\n    attached_option_groups = []\n\n    if delete_instance_parameter_groups or (not delete_cluster_parameter_groups and not delete_option_groups):\n        paginator = rds.get_paginator(\"describe_db_instances\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            instances = page.get(\"DBInstances\", [])\n            for instance in instances:\n                if instance.get(\"DBParameterGroups\"):\n                    parameter_group_name = instance[\"DBParameterGroups\"][0][\"DBParameterGroupName\"]\n                    if not parameter_group_name.startswith(\"default.\"):\n                        attached_instance_parameter_groups.append(parameter_group_name)\n\n    if delete_cluster_parameter_groups or (not delete_instance_parameter_groups and not delete_option_groups):\n        paginator = rds.get_paginator(\"describe_db_clusters\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            clusters = page.get(\"DBClusters\", [])\n            for cluster in clusters:\n                if cluster.get(\"DBClusterParameterGroup\"):\n                    parameter_group_name = cluster[\"DBClusterParameterGroup\"]\n                    if not parameter_group_name.startswith(\"default.\"):\n                        attached_cluster_parameter_groups.append(parameter_group_name)\n\n    if delete_option_groups or (not delete_instance_parameter_groups and not delete_cluster_parameter_groups):\n        paginator = rds.get_paginator(\"describe_db_instances\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            instances = page.get(\"DBInstances\", [])\n            for instance in instances:\n                if instance.get(\"OptionGroupMemberships\"):\n                    for option_group in instance[\"OptionGroupMemberships\"]:\n                        option_group_name = option_group[\"OptionGroupName\"]\n                        if not option_group_name.startswith(\"default.\"):\n                            attached_option_groups.append(option_group_name)\n\n        paginator = rds.get_paginator(\"describe_db_clusters\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            clusters = page.get(\"DBClusters\", [])\n            for cluster in clusters:\n                if cluster.get(\"AssociatedRoles\"):\n                    for role in cluster[\"AssociatedRoles\"]:\n                        if role.get(\"FeatureName\") == \"OPT_IN_REQUIRED\" and role.get(\"OptionGroupName\"):\n                            option_group_name = role[\"OptionGroupName\"]\n                            if not option_group_name.startswith(\"default.\"):\n                                attached_option_groups.append(option_group_name)\n\n        paginator = rds.get_paginator(\"describe_db_snapshots\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            snapshots = page.get(\"DBSnapshots\", [])\n            for snapshot in snapshots:\n                if snapshot.get(\"OptionGroupMemberships\"):\n                    for option_group in snapshot[\"OptionGroupMemberships\"]:\n                        option_group_name = option_group[\"OptionGroupName\"]\n                        if not option_group_name.startswith(\"default.\"):\n                            attached_option_groups.append(option_group_name)\n\n    if not attached_instance_parameter_groups and (\n        delete_instance_parameter_groups or (not delete_cluster_parameter_groups and not delete_option_groups)\n    ):\n        attached_instance_parameter_groups.append(\"No attached instance parameter groups\")\n    if not attached_cluster_parameter_groups and (\n        delete_cluster_parameter_groups or (not delete_instance_parameter_groups and not delete_option_groups)\n    ):\n        attached_cluster_parameter_groups.append(\"No attached cluster parameter groups\")\n    if not attached_option_groups and (\n        delete_option_groups or (not delete_instance_parameter_groups and not delete_cluster_parameter_groups)\n    ):\n        attached_option_groups.append(\"No attached option groups\")\n\n    comma_separated_instance_parameter_groups = \", \".join(attached_instance_parameter_groups)\n    comma_separated_cluster_parameter_groups = \", \".join(attached_cluster_parameter_groups)\n    comma_separated_option_groups = \", \".join(attached_option_groups)\n\n    return {\n        \"attached_instance_parameter_groups\": comma_separated_instance_parameter_groups,\n        \"attached_cluster_parameter_groups\": comma_separated_cluster_parameter_groups,\n        \"attached_option_groups\": comma_separated_option_groups,\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "AttachedInstanceParameterGroups",
+          "Selector": "$.Payload.attached_instance_parameter_groups",
+          "Type": "String"
+        },
+        {
+          "Name": "AttachedClusterParameterGroups",
+          "Selector": "$.Payload.attached_cluster_parameter_groups",
+          "Type": "String"
+        },
+        {
+          "Name": "AttachedOptionGroups",
+          "Selector": "$.Payload.attached_option_groups",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ListInstanceParameterGroups",
+      "action": "aws:executeScript",
+      "nextStep": "ListClusterParameterGroups",
+      "description": "Lists all applicable Amazon RDS Instance Parameter Groups (not associated with any RDS instance) for deletion. Non-default instance parameter groups are not considered applicable for deletion.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "AttachedInstanceParameterGroups": "{{ ListRDSResources.AttachedInstanceParameterGroups }}",
+          "DeleteInstanceParameterGroups": "{{ DeleteInstanceParameterGroups }}",
+          "DeleteClusterParameterGroups": "{{ DeleteClusterParameterGroups }}",
+          "DeleteOptionGroups": "{{ DeleteOptionGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to list Amazon RDS DB Instance Parameter Groups (not associated with any RDS instance).\n\"\"\"\n\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\nrds = boto3.client(\"rds\")\n\n\ndef script_handler(event: dict, _):\n    \"\"\"\n    Main function that lists RDS DB Instance Parameter Groups.\n\n    Args:\n        event (dict): Dictionary with the following parameters:\n            AttachedInstanceParameterGroups (str): Comma-separated string of attached instance parameter group names.\n            DeleteInstanceParameterGroups (bool): Indicates whether to list instance parameter groups.\n            DeleteClusterParameterGroups (bool): Indicates whether to list cluster parameter groups.\n            DeleteOptionGroups (bool): Indicates whether to list option groups.\n        _: unused context object\n\n    Returns:\n        dict: Dictionary with the following key:\n            listed_instance_parameter_groups (str): Comma-separated string of listed instance parameter group names or\n            \"Not applicable\".\n    \"\"\"\n\n    delete_instance_parameter_groups = event.get(\"DeleteInstanceParameterGroups\", False)\n    delete_cluster_parameter_groups = event.get(\"DeleteClusterParameterGroups\", False)\n    delete_option_groups = event.get(\"DeleteOptionGroups\", False)\n\n    if delete_instance_parameter_groups or (not delete_cluster_parameter_groups and not delete_option_groups):\n        attached_instance_parameter_groups = [\n            group.strip()\n            for group in event.get(\"AttachedInstanceParameterGroups\", \"\").split(\",\")\n            if group.strip() != \"No attached instance parameter groups\"\n        ]\n\n        listed_instance_parameter_groups = []\n\n        paginator = rds.get_paginator(\"describe_db_parameter_groups\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            parameter_groups = page.get(\"DBParameterGroups\", [])\n            for parameter_group in parameter_groups:\n                parameter_group_name = parameter_group[\"DBParameterGroupName\"]\n                if (\n                    parameter_group_name not in attached_instance_parameter_groups\n                    and not parameter_group_name.startswith(\"default.\")\n                ):\n                    listed_instance_parameter_groups.append(parameter_group_name)\n\n        comma_separated_groups = \", \".join(listed_instance_parameter_groups)\n\n        return {\"listed_instance_parameter_groups\": comma_separated_groups}\n    else:\n        return {\"listed_instance_parameter_groups\": \"Not applicable\"}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "ListedInstanceParameterGroups",
+          "Selector": "$.Payload.listed_instance_parameter_groups"
+        }
+      ]
+    },
+    {
+      "name": "ListClusterParameterGroups",
+      "action": "aws:executeScript",
+      "nextStep": "ListOptionGroups",
+      "description": "Lists all applicable Amazon RDS Cluster Parameter Groups (not associated with any RDS Cluster) for deletion. Non-default cluster parameter groups are not considered applicable for deletion.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "AttachedClusterParameterGroups": "{{ ListRDSResources.AttachedClusterParameterGroups }}",
+          "DeleteInstanceParameterGroups": "{{ DeleteInstanceParameterGroups }}",
+          "DeleteClusterParameterGroups": "{{ DeleteClusterParameterGroups }}",
+          "DeleteOptionGroups": "{{ DeleteOptionGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to list Amazon RDS DB Cluster Parameter Groups (not associated with any RDS Cluster).\n\"\"\"\n\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\nrds = boto3.client(\"rds\")\n\n\ndef script_handler(event: dict, context: dict):\n    \"\"\"\n    Main function that lists RDS DB Cluster Parameter Groups.\n\n    Args:\n        event (dict): Dictionary with the following parameters:\n            AttachedClusterParameterGroups (str): Comma-separated string of attached cluster parameter group names.\n            DeleteInstanceParameterGroups (bool): Indicates whether to list instance parameter groups.\n            DeleteClusterParameterGroups (bool): Indicates whether to list cluster parameter groups.\n            DeleteOptionGroups (bool): Indicates whether to list option groups.\n        context (dict): AWS Lambda execution context (not used in this script).\n\n    Returns:\n        dict: Dictionary with the following key:\n            listed_cluster_parameter_groups (str): Comma-separated string of listed cluster parameter group names or\n            \"Not applicable\".\n    \"\"\"\n\n    delete_instance_parameter_groups = event.get(\"DeleteInstanceParameterGroups\", False)\n    delete_cluster_parameter_groups = event.get(\"DeleteClusterParameterGroups\", False)\n    delete_option_groups = event.get(\"DeleteOptionGroups\", False)\n\n    if delete_cluster_parameter_groups or (not delete_instance_parameter_groups and not delete_option_groups):\n        attached_cluster_parameter_groups = [\n            group.strip()\n            for group in event.get(\"AttachedClusterParameterGroups\", \"\").split(\",\")\n            if group.strip() != \"No attached cluster parameter groups\"\n        ]\n\n        listed_cluster_parameter_groups = []\n\n        paginator = rds.get_paginator(\"describe_db_cluster_parameter_groups\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            parameter_groups = page.get(\"DBClusterParameterGroups\", [])\n            for parameter_group in parameter_groups:\n                parameter_group_name = parameter_group[\"DBClusterParameterGroupName\"]\n                if (\n                    parameter_group_name not in attached_cluster_parameter_groups\n                    and not parameter_group_name.startswith(\"default.\")\n                ):\n                    listed_cluster_parameter_groups.append(parameter_group_name)\n        comma_separated_groups = \", \".join(listed_cluster_parameter_groups)\n\n        return {\"listed_cluster_parameter_groups\": comma_separated_groups}\n    else:\n        return {\"listed_cluster_parameter_groups\": \"Not applicable\"}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "ListedClusterParameterGroups",
+          "Selector": "$.Payload.listed_cluster_parameter_groups"
+        }
+      ]
+    },
+    {
+      "name": "ListOptionGroups",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnAutomationParameters",
+      "description": "Lists all applicable Amazon RDS Option Groups (not associated with any RDS resources) for deletion. Non-default option groups are not considered applicable for deletion.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "AttachedOptionGroups": "{{ ListRDSResources.AttachedOptionGroups }}",
+          "DeleteInstanceParameterGroups": "{{ DeleteInstanceParameterGroups }}",
+          "DeleteClusterParameterGroups": "{{ DeleteClusterParameterGroups }}",
+          "DeleteOptionGroups": "{{ DeleteOptionGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to list Amazon RDS Option Groups (not associated with any RDS resources).\n\"\"\"\n\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\nrds = boto3.client(\"rds\")\n\n\ndef script_handler(event: dict, _):\n    \"\"\"\n    Main function that lists RDS Option Groups.\n\n    Args:\n        event (dict): Dictionary with the following parameters:\n            AttachedOptionGroups (str): Comma-separated string of attached option group names.\n            DeleteInstanceParameterGroups (bool): Indicates whether to list instance parameter groups.\n            DeleteClusterParameterGroups (bool): Indicates whether to list cluster parameter groups.\n            DeleteOptionGroups (bool): Indicates whether to list option groups.\n        _: unused context object\n\n    Returns:\n        dict: Dictionary with the following key:\n            listed_option_groups (str): Comma-separated string of listed option group names or \"Not applicable\".\n    \"\"\"\n\n    delete_instance_parameter_groups = event.get(\"DeleteInstanceParameterGroups\", False)\n    delete_cluster_parameter_groups = event.get(\"DeleteClusterParameterGroups\", False)\n    delete_option_groups = event.get(\"DeleteOptionGroups\", False)\n\n    if delete_option_groups or (not delete_instance_parameter_groups and not delete_cluster_parameter_groups):\n        attached_option_groups = [\n            group.strip()\n            for group in event.get(\"AttachedOptionGroups\", \"\").split(\",\")\n            if group.strip() != \"No attached option groups\"\n        ]\n\n        listed_option_groups = []\n\n        paginator = rds.get_paginator(\"describe_option_groups\")\n        page_iterator = paginator.paginate()\n        for page in page_iterator:\n            option_groups = page.get(\"OptionGroupsList\", [])\n            for option_group in option_groups:\n                option_group_name = option_group[\"OptionGroupName\"]\n                if option_group_name not in attached_option_groups and not option_group_name.startswith(\"default:\"):\n                    listed_option_groups.append(option_group_name)\n\n        comma_separated_groups = \", \".join(listed_option_groups)\n\n        return {\"listed_option_groups\": comma_separated_groups}\n    else:\n        return {\"listed_option_groups\": \"Not applicable\"}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "ListedOptionGroups",
+          "Selector": "$.Payload.listed_option_groups"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnAutomationParameters",
+      "action": "aws:branch",
+      "description": "Branches the execution based on the values of the `DeleteInstanceParameterGroups`, `DeleteClusterParameterGroups`, and `DeleteOptionGroups` parameters. If the automation is performing an execution to list resources applicable for deletion, it proceeds to the `GenerateReport` step. If the automation is performing an execution to delete resources, it proceeds to the `GenerateApprovalMessage` step.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "And": [
+              {
+                "Variable": "{{ DeleteInstanceParameterGroups }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ DeleteClusterParameterGroups }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ DeleteOptionGroups }}",
+                "BooleanEquals": false
+              }
+            ]
+          }
+        ],
+        "Default": "GenerateApprovalMessage"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "GenerateApprovalMessage",
+      "action": "aws:executeScript",
+      "nextStep": "ApproveDeletion",
+      "description": "Generates a confirmation message and a report detailing the Amazon RDS resources that will be deleted. The user will be presented with this information before the deletion process proceeds, allowing them to review and approve the action.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ListedInstanceParameterGroups": "{{ ListInstanceParameterGroups.ListedInstanceParameterGroups }}",
+          "ListedClusterParameterGroups": "{{ ListClusterParameterGroups.ListedClusterParameterGroups }}",
+          "ListedOptionGroups": "{{ ListOptionGroups.ListedOptionGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to generate an approval message and a formatted report for manual approval before deleting Amazon RDS resources.\n\"\"\"\n\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\n\nINSTANCE_PARAMETER_GROUPS_TITLE = \"Amazon RDS DB Instance Parameter Groups\"\nCLUSTER_PARAMETER_GROUPS_TITLE = \"Amazon RDS DB Cluster Parameter Groups\"\nOPTION_GROUPS_TITLE = \"Amazon RDS Option Groups\"\n\nEMOJI_CHECK = \"✅\"\nEMOJI_WARNING = \"⚠️\"\n\nSTEP_NAME = \"GenerateApprovalMessage\"\n\nssm_client = boto3.client(\"ssm\")\n\n\ndef script_handler(event: dict, context: dict):\n    \"\"\"\n    Generates an approval message and a formatted report for manual approval before deleting Amazon RDS resources.\n\n    Args:\n        event (dict): Dictionary with the following keys:\n            ListedInstanceParameterGroups (str): Comma-separated string of listed instance parameter group names or\n            \"Not applicable\".\n            ListedClusterParameterGroups (str): Comma-separated string of listed cluster parameter group names or\n            \"Not applicable\".\n            ListedOptionGroups (str): Comma-separated string of listed option group names or \"Not applicable\".\n        context (dict): AWS Lambda execution context containing the automation execution ID and region.\n\n    Returns:\n        dict: Dictionary with the following keys:\n            approval_message (str): The approval message to be displayed to the user.\n            formatted_report (str): The formatted report with the list of resources to be deleted.\n    \"\"\"\n\n    listed_instance_parameter_groups = event.get(\"ListedInstanceParameterGroups\", \"\")\n    listed_cluster_parameter_groups = event.get(\"ListedClusterParameterGroups\", \"\")\n    listed_option_groups = event.get(\"ListedOptionGroups\", \"\")\n\n    resources_to_delete = []\n    instance_parameter_groups_count = 0\n    cluster_parameter_groups_count = 0\n    option_groups_count = 0\n\n    if listed_instance_parameter_groups != \"Not applicable\":\n        instance_parameter_groups = listed_instance_parameter_groups.split(\",\")\n        instance_parameter_groups_count = len(instance_parameter_groups)\n        resources_to_delete.append(\n            f\"{INSTANCE_PARAMETER_GROUPS_TITLE} ({instance_parameter_groups_count}): \"\n            f\"{','.join(instance_parameter_groups)}\"\n        )\n\n    if listed_cluster_parameter_groups != \"Not applicable\":\n        cluster_parameter_groups = listed_cluster_parameter_groups.split(\",\")\n        cluster_parameter_groups_count = len(cluster_parameter_groups)\n        resources_to_delete.append(\n            f\"{CLUSTER_PARAMETER_GROUPS_TITLE} ({cluster_parameter_groups_count}): {','.join(cluster_parameter_groups)}\"\n        )\n\n    if listed_option_groups != \"Not applicable\":\n        option_groups = listed_option_groups.split(\",\")\n        option_groups_count = len(option_groups)\n        resources_to_delete.append(f\"{OPTION_GROUPS_TITLE} ({option_groups_count}): {','.join(option_groups)}\")\n\n    if not resources_to_delete:\n        approval_message = f\"{EMOJI_CHECK} No applicable Amazon RDS resources found for deletion.\"\n        formatted_report = approval_message\n    else:\n        formatted_report = (\n            f\"{EMOJI_WARNING} The following Amazon RDS resources will be permanently deleted if approved:\\n\\n\"\n        )\n\n        for resource in resources_to_delete:\n            title, groups = resource.split(\": \")\n            formatted_report += f\"{title}:\\n\"\n            for group in groups.split(\",\"):\n                formatted_report += f\"- {group.strip()}\\n\"\n            formatted_report += \"\\n\"\n\n        automation_execution_id = context.get(\"automation:EXECUTION_ID\")\n        region = context.get(\"global:REGION\")\n\n        step_execution_response = ssm_client.describe_automation_step_executions(\n            AutomationExecutionId=automation_execution_id, Filters=[{\"Key\": \"StepName\", \"Values\": [STEP_NAME]}]\n        )\n        step_execution_id = step_execution_response[\"StepExecutions\"][0][\"StepExecutionId\"]\n\n        url_domain_mapping = {\"aws\": \"aws.amazon.com\", \"aws-cn\": \"amazonaws.cn\", \"aws-us-gov\": \"amazonaws-us-gov.com\"}\n        partition = context.get(\"global:AWS_PARTITION\", \"aws\")\n\n        report_output_link = (\n            f\"https://console.{url_domain_mapping[partition]}/systems-manager/automation/execution/\"\n            f\"{automation_execution_id}/step/7/{step_execution_id}?region={region}\"\n        )\n\n        approval_message_parts = []\n        if instance_parameter_groups_count > 0:\n            approval_message_parts.append(f\"{instance_parameter_groups_count} Instance Parameter Groups\")\n        if cluster_parameter_groups_count > 0:\n            approval_message_parts.append(f\"{cluster_parameter_groups_count} Cluster Parameter Groups\")\n        if option_groups_count > 0:\n            approval_message_parts.append(f\"{option_groups_count} Option Groups\")\n\n        if approval_message_parts:\n            approval_message = (\n                f\"{EMOJI_WARNING} The following Amazon RDS resources will be permanently deleted if \"\n                f\"approved: {', '.join(approval_message_parts)}. Please review the detailed list in \"\n                f\"the 'FormattedReport' output: {report_output_link}\"\n            )\n        else:\n            approval_message = f\"{EMOJI_CHECK} No applicable Amazon RDS resources found for deletion.\"\n\n    return {\"approval_message\": approval_message, \"formatted_report\": formatted_report}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "ApprovalMessage",
+          "Selector": "$.Payload.approval_message"
+        },
+        {
+          "Type": "String",
+          "Name": "FormattedReport",
+          "Selector": "$.Payload.formatted_report"
+        }
+      ]
+    },
+    {
+      "name": "ApproveDeletion",
+      "action": "aws:approve",
+      "description": "Waits for the approval of the designated AWS IAM principals to proceed with the next steps of the automation. The approval notification contains the list of Amazon RDS resources to be deleted. To proceed with the deletion, the notification must be approved.",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Message": "{{GenerateApprovalMessage.ApprovalMessage}}",
+        "Approvers": [
+          "{{ Approvers }}"
+        ]
+      },
+      "nextStep": "DeleteInstanceParameterGroups"
+    },
+    {
+      "name": "DeleteInstanceParameterGroups",
+      "action": "aws:executeScript",
+      "nextStep": "DeleteClusterParameterGroups",
+      "description": "Deletes all applicable Amazon RDS Instance Parameter Groups that are not associated with any RDS instance or designated as default parameter groups. The deletion is performed only if the user approves the action during the manual approval step and the `DeleteInstanceParameterGroups` parameter is set to `true`.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ListedInstanceParameterGroups": "{{ ListInstanceParameterGroups.ListedInstanceParameterGroups }}",
+          "DeleteInstanceParameterGroups": "{{ DeleteInstanceParameterGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to delete Amazon RDS DB Instance Parameter Groups (not associated with any RDS Instance).\n\"\"\"\n\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\nrds = boto3.client(\"rds\")\n\n\ndef script_handler(event: dict, _):\n    \"\"\"\n    Main function that deletes RDS DB Instance Parameter Groups.\n\n    Args:\n        event (dict): Dictionary with the following parameters:\n            ListedInstanceParameterGroups (str): Comma-separated string of listed instance parameter group names.\n            DeleteInstanceParameterGroups (bool): Indicates whether to delete instance parameter groups.\n        _: unused context object\n\n    Returns:\n        dict: Dictionary with the following key:\n            deleted_instance_parameter_groups (str): Comma-separated string of deleted instance parameter group names\n            or \"Not applicable\".\n    \"\"\"\n\n    delete_instance_parameter_groups = event.get(\"DeleteInstanceParameterGroups\", False)\n\n    if delete_instance_parameter_groups:\n        listed_instance_parameter_groups = [\n            group.strip() for group in event.get(\"ListedInstanceParameterGroups\", \"\").split(\",\")\n        ]\n\n        deleted_instance_parameter_groups = []\n\n        for parameter_group_name in listed_instance_parameter_groups:\n            try:\n                rds.delete_db_parameter_group(DBParameterGroupName=parameter_group_name)\n                deleted_instance_parameter_groups.append(parameter_group_name)\n            except ClientError as e:\n                if e.response[\"ResponseMetadata\"][\"HTTPStatusCode\"] == 400:\n                    continue\n\n        comma_separated_groups = \", \".join(deleted_instance_parameter_groups)\n\n        return {\"deleted_instance_parameter_groups\": comma_separated_groups}\n    else:\n        return {\"deleted_instance_parameter_groups\": \"Not applicable\"}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "DeletedInstanceParameterGroups",
+          "Selector": "$.Payload.deleted_instance_parameter_groups"
+        }
+      ]
+    },
+    {
+      "name": "DeleteClusterParameterGroups",
+      "action": "aws:executeScript",
+      "nextStep": "DeleteOptionGroups",
+      "description": "Deletes all applicable Amazon RDS Cluster Parameter Groups that are not associated with any RDS cluster or designated as default parameter groups. The deletion is performed only if the user approves the action during the manual approval step and the `DeleteClusterParameterGroups` parameter is set to `true`.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ListedClusterParameterGroups": "{{ ListClusterParameterGroups.ListedClusterParameterGroups }}",
+          "DeleteClusterParameterGroups": "{{ DeleteClusterParameterGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to delete Amazon RDS DB Cluster Parameter Groups (not associated with any RDS Cluster).\n\"\"\"\n\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\nrds = boto3.client(\"rds\")\n\n\ndef script_handler(event: dict, _):\n    \"\"\"\n    Main function that deletes RDS DB Cluster Parameter Groups.\n\n    Args:\n        event (dict): Dictionary with the following parameters:\n            ListedClusterParameterGroups (str): Comma-separated string of listed cluster parameter group names.\n            DeleteClusterParameterGroups (bool): Indicates whether to delete cluster parameter groups.\n        _: unused context object\n\n    Returns:\n        dict: Dictionary with the following key:\n            deleted_cluster_parameter_groups (str): Comma-separated string of deleted cluster parameter group names or\n            \"Not applicable\".\n    \"\"\"\n\n    delete_cluster_parameter_groups = event.get(\"DeleteClusterParameterGroups\", False)\n\n    if delete_cluster_parameter_groups:\n        listed_cluster_parameter_groups = [\n            group.strip() for group in event.get(\"ListedClusterParameterGroups\", \"\").split(\",\")\n        ]\n\n        deleted_cluster_parameter_groups = []\n\n        for parameter_group_name in listed_cluster_parameter_groups:\n            try:\n                rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName=parameter_group_name)\n                deleted_cluster_parameter_groups.append(parameter_group_name)\n            except ClientError as e:\n                if e.response[\"ResponseMetadata\"][\"HTTPStatusCode\"] == 400:\n                    continue\n\n        comma_separated_groups = \", \".join(deleted_cluster_parameter_groups)\n\n        return {\"deleted_cluster_parameter_groups\": comma_separated_groups}\n    else:\n        return {\"deleted_cluster_parameter_groups\": \"Not applicable\"}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "DeletedClusterParameterGroups",
+          "Selector": "$.Payload.deleted_cluster_parameter_groups"
+        }
+      ]
+    },
+    {
+      "name": "DeleteOptionGroups",
+      "action": "aws:executeScript",
+      "nextStep": "GenerateReport",
+      "description": "Deletes all applicable Amazon RDS Option Groups that are not associated with any RDS resources or designated as default option groups. The deletion is performed only if the user approves the action during the manual approval step and the `DeleteOptionGroups` parameter is set to `true`.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ListedOptionGroups": "{{ ListOptionGroups.ListedOptionGroups }}",
+          "DeleteOptionGroups": "{{ DeleteOptionGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to delete Amazon RDS Option Groups (not associated with any RDS resources).\n\"\"\"\n\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\nrds = boto3.client(\"rds\")\n\n\ndef script_handler(event: dict, _):\n    \"\"\"\n    Main function that deletes RDS Option Groups.\n\n    Args:\n        event (dict): Dictionary with the following parameters:\n            ListedOptionGroups (str): Comma-separated string of listed option group names.\n            DeleteOptionGroups (bool): Indicates whether to delete option groups.\n        _: unused context object\n\n    Returns:\n        dict: Dictionary with the following key:\n            deleted_option_groups (str): Comma-separated string of deleted option group names or \"Not applicable\".\n    \"\"\"\n\n    delete_option_groups = event.get(\"DeleteOptionGroups\", False)\n\n    if delete_option_groups:\n        listed_option_groups = [group.strip() for group in event.get(\"ListedOptionGroups\", \"\").split(\",\")]\n\n        deleted_option_groups = []\n\n        for option_group_name in listed_option_groups:\n            try:\n                rds.delete_option_group(OptionGroupName=option_group_name)\n                deleted_option_groups.append(option_group_name)\n            except ClientError as e:\n                if e.response[\"ResponseMetadata\"][\"HTTPStatusCode\"] == 400:\n                    continue\n\n        comma_separated_groups = \", \".join(deleted_option_groups)\n\n        return {\"deleted_option_groups\": comma_separated_groups}\n    else:\n        return {\"deleted_option_groups\": \"Not applicable\"}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "DeletedOptionGroups",
+          "Selector": "$.Payload.deleted_option_groups"
+        }
+      ]
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "It generates a report with the IDs of the Amazon RDS resources that were removed for each type. If all parameters were passed as false, it generates a report with the resources that are applicable for deletion.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "ListedInstanceParameterGroups": "{{ ListInstanceParameterGroups.ListedInstanceParameterGroups }}",
+          "ListedClusterParameterGroups": "{{ ListClusterParameterGroups.ListedClusterParameterGroups }}",
+          "ListedOptionGroups": "{{ ListOptionGroups.ListedOptionGroups }}",
+          "DeletedInstanceParameterGroups": "{{ DeleteInstanceParameterGroups.DeletedInstanceParameterGroups }}",
+          "DeletedClusterParameterGroups": "{{ DeleteClusterParameterGroups.DeletedClusterParameterGroups }}",
+          "DeletedOptionGroups": "{{ DeleteOptionGroups.DeletedOptionGroups }}",
+          "DeleteInstanceParameterGroups": "{{ DeleteInstanceParameterGroups }}",
+          "DeleteClusterParameterGroups": "{{ DeleteClusterParameterGroups }}",
+          "DeleteOptionGroups": "{{ DeleteOptionGroups }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\"\"\"\nScript to generate a formatted report with the IDs of the Amazon RDS resources that were removed or listed.\n\"\"\"\n\nimport sys\n\nsys.tracebacklimit = 0\n\nEMOJIS = {\n    \"CHECK\": \"✅\",\n    \"INFO\": \"ℹ️\",\n    \"RED_CIRCLE\": \"🔴\",\n    \"BOOKS\": \"📖\",\n    \"MEGAPHONE\": \"📢\",\n}\n\n\ndef script_handler(event: dict, _):\n    \"\"\"\n    Main function that generates a formatted report with the IDs of the Amazon RDS resources that were removed or\n    listed.\n\n    Args:\n        event (dict): Dictionary containing parameters related to the listed and deleted RDS resources.\n        _: unused context object\n\n    Returns:\n        dict: Dictionary with the following key:\n            automation_report (str): A formatted report with the IDs of the removed or listed resources.\n    \"\"\"\n\n    listed_instance_parameter_groups = event.get(\"ListedInstanceParameterGroups\", \"\")\n    listed_cluster_parameter_groups = event.get(\"ListedClusterParameterGroups\", \"\")\n    listed_option_groups = event.get(\"ListedOptionGroups\", \"\")\n    deleted_instance_parameter_groups = event.get(\"DeletedInstanceParameterGroups\", \"\")\n    deleted_cluster_parameter_groups = event.get(\"DeletedClusterParameterGroups\", \"\")\n    deleted_option_groups = event.get(\"DeletedOptionGroups\", \"\")\n    delete_instance_parameter_groups = event.get(\"DeleteInstanceParameterGroups\", False)\n    delete_cluster_parameter_groups = event.get(\"DeleteClusterParameterGroups\", False)\n    delete_option_groups = event.get(\"DeleteOptionGroups\", False)\n\n    report_lines = []\n\n    if delete_instance_parameter_groups:\n        if deleted_instance_parameter_groups != \"Not applicable\":\n            report_lines.append(f\"{EMOJIS['RED_CIRCLE']} The following DB Instance Parameter Groups were deleted:\")\n            for group in deleted_instance_parameter_groups.split(\",\"):\n                report_lines.append(f\"- {group.strip()}\")\n        else:\n            report_lines.append(f\"{EMOJIS['CHECK']} No DB Instance Parameter Groups found to be deleted.\")\n        report_lines.append(\"\")\n    elif listed_instance_parameter_groups != \"Not applicable\":\n        report_lines.append(f\"{EMOJIS['INFO']} The following DB Instance Parameter Groups are applicable for deletion:\")\n        for group in listed_instance_parameter_groups.split(\",\"):\n            report_lines.append(f\"- {group.strip()}\")\n        report_lines.append(\n            \"To delete the DB Instance Parameter Groups listed above, run the automation again with the parameter \"\n            \"'DeleteInstanceParameterGroups' set to 'true'.\"\n        )\n        report_lines.append(\"\")\n\n    if delete_cluster_parameter_groups:\n        if deleted_cluster_parameter_groups != \"Not applicable\":\n            report_lines.append(f\"{EMOJIS['RED_CIRCLE']} The following Cluster Parameter Groups were deleted:\")\n            for group in deleted_cluster_parameter_groups.split(\",\"):\n                report_lines.append(f\"- {group.strip()}\")\n        else:\n            report_lines.append(f\"{EMOJIS['CHECK']} No Cluster Parameter Groups found to be deleted.\")\n        report_lines.append(\"\")\n    elif listed_cluster_parameter_groups != \"Not applicable\":\n        report_lines.append(f\"{EMOJIS['INFO']} The following Cluster Parameter Groups are applicable for deletion:\")\n        for group in listed_cluster_parameter_groups.split(\",\"):\n            report_lines.append(f\"- {group.strip()}\")\n        report_lines.append(\n            \"To delete the Cluster Parameter Groups listed above, run the automation again with the parameter \"\n            \"'DeleteClusterParameterGroups' set to 'true'.\"\n        )\n        report_lines.append(\"\")\n\n    if delete_option_groups:\n        if deleted_option_groups != \"Not applicable\":\n            report_lines.append(f\"{EMOJIS['RED_CIRCLE']} The following Option Groups were deleted:\")\n            for group in deleted_option_groups.split(\",\"):\n                report_lines.append(f\"- {group.strip()}\")\n        else:\n            report_lines.append(f\"{EMOJIS['CHECK']} No Option Groups found to be deleted.\")\n        report_lines.append(\"\")\n    elif listed_option_groups != \"Not applicable\":\n        report_lines.append(f\"{EMOJIS['INFO']} The following Option Groups are applicable for deletion:\")\n        for group in listed_option_groups.split(\",\"):\n            report_lines.append(f\"- {group.strip()}\")\n        report_lines.append(\n            \"To delete the Option Groups listed above, run the automation again with the parameter \"\n            \"'DeleteOptionGroups' set to 'true'.\"\n        )\n        report_lines.append(\"\")\n\n    if not report_lines:\n        report_lines.append(f\"{EMOJIS['MEGAPHONE']} No applicable resources found for deletion or listing.\")\n\n    automation_report = \"\\n\".join(report_lines)\n\n    return {\"automation_report\": automation_report}\n"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "AutomationReport",
+          "Selector": "$.Payload.automation_report"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateReport.AutomationReport"
+  ]
+}
