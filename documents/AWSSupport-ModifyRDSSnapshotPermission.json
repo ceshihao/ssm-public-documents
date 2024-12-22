@@ -1,65 +1,59 @@
 {
-  "description": "# AWSSupport-ModifyRDSSnapshotPermission\n---\nThe AWSSupport-ModifyRDSSnapshotPermission document will allow to automatically modify permissions of multiple RDS snapshots from Public to Private or share RDS snapshots with other accounts. Snapshots encrypted with your default KMS key cannot be shared with other accounts automatically. For more information about modifying snapshot permissions, see Sharing a DB snapshot in the RDS Public Document.\n\nFor more information, you can refer to the [public documentation (https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ShareSnapshot.html) for this runbook.\n---\n",
+  "description": "The **AWSSupport-ModifyRDSSnapshotPermission** runbook helps you modify permissions for multiple Amazon Relational Database Service (Amazon RDS) snapshots. Using this runbook, you can make snapshots `Public` or `Private` and share them with other AWS accounts. Snapshots encrypted with a default KMS key can't be shared with other accounts using this runbook.",
   "schemaVersion": "0.3",
-  "assumeRole": "{{AutomationAssumeRole}}",
-  "outputs": [
-    "ValidateSnapshots.EncryptedSnapshots",
-    "SharewithOtherAccounts.Result",
-    "MakePrivate.Result",
-    "MakePrivate.Commands"
-  ],
+  "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "SnapshotIdentifiers": {
       "type": "StringList",
-      "description": "Enter list of DB snapshot Identifiers",
-      "allowedPattern": "^$|^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$|^rds:[A-Za-z0-9]+(-[A-Za-z0-9]+)*$"
+      "description": "(Required) The names of the Amazon RDS snapshots whose permission you want to modify.",
+      "allowedPattern": "^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$|^rds:[A-Za-z0-9]+(-[A-Za-z0-9]+)*$"
     },
     "Private": {
       "type": "String",
+      "description": "(Required) Flag to indicate if the snapshot should be private or shared to AWS accounts. Please select `No`, if you want to share snapshot with specific account IDs and you are providing input in `AccountIds` parameter section.",
       "allowedValues": [
         "Yes",
         "No"
-      ],
-      "description": "Allowed Values: \"Yes\" or \"No\". Please select  no, if you want to share snapshot with specific account ids and you are providing input of AccountIds in \"AccountIds\" parameter section."
+      ]
     },
     "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
-      "default": "",
-      "allowedPattern": "^arn:aws(-cn|-us-gov)?:iam::\\d{12}:role\\/[\\w+=,.@_\\/-]+|^$"
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
     },
     "AccountIds": {
       "type": "StringList",
-      "description": "AccountIds to Share Snapshot. This is only applicable if you select \"No\" in \"Private\" parameter. Please keep this \"None\" if you have selected \"Yes\" in private parameters",
+      "description": "(Optional) The IDs of the accounts you want to share snapshots with. This parameter is required if you enter `No` for the value of the Private parameter.",
       "default": [
         "None"
       ],
-      "allowedPattern": "^[0-9]{12}(,[0-9]{12})*$|(^None$)"
+      "allowedPattern": "^[0-9]{12}$|^None$"
     },
     "AccountPermissionOperation": {
       "type": "String",
-      "description": "Enter \"Add\" or \"Remove\"",
-      "default": "None",
+      "description": "(Optional) Operation flag to `Add` or `Remove` permissions to the snapshot.",
+      "default": "Remove",
       "allowedValues": [
         "Add",
-        "Remove",
-        "None"
+        "Remove"
       ]
     }
   },
   "mainSteps": [
     {
       "name": "ValidateSnapshots",
+      "description": "Verifies the IDs of the snapshots provided in the `SnapshotIdentifiers` parameter. After verifying the IDs, the script checks for encrypted snapshots and outputs a list if any are found.",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "script_handler",
-        "Script": "import boto3\nimport botocore\ndef script_handler(events, context):\n    client = boto3.client('rds')\n    SnapshotIds = events['Snapshot_Id']\n    Result = {}\n    message = \"Please follow document 'https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ShareSnapshot.html#USER_ShareSnapshot.Encrypted.KeyPolicy' to share KMS key with destination account. The following snapshot(s) are encrypted:  \"\n    for snaps in SnapshotIds:\n        try:\n            response = client.describe_db_snapshots(DBSnapshotIdentifier=snaps)\n            if response[\"DBSnapshots\"][0]['Encrypted'] == True:\n                message = message + (snaps) +  \", \"\n            #print(response)\n        except botocore.exceptions.ClientError as error:\n            Result[snaps] = 'Validation Failed - ' + str(error)\n            raise error\n    message= message[:-2]\n    return{'EncryptedSnaps':message, 'Result':Result}\n",
         "InputPayload": {
-          "Snapshot_Id": "{{SnapshotIdentifiers}}",
-          "Account_Id": "{{AccountIds}}"
-        }
+          "SnapshotIds": "{{ SnapshotIdentifiers }}"
+        },
+        "Handler": "validate_snapshots.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
+      "nextStep": "BranchOnIsPrivate",
+      "onFailure": "Abort",
       "outputs": [
         {
           "Name": "EncryptedSnapshots",
@@ -69,71 +63,88 @@
       ]
     },
     {
-      "name": "Branch",
+      "name": "BranchOnIsPrivate",
+      "description": "Branches the automation based on the value you enter for the `Private` parameter.",
       "action": "aws:branch",
+      "isEnd": true,
       "inputs": {
         "Choices": [
           {
-            "NextStep": "SharewithOtherAccounts",
-            "Variable": "{{Private}}",
+            "NextStep": "ShareWithOtherAccounts",
+            "Variable": "{{ Private }}",
             "StringEquals": "No"
           },
           {
             "NextStep": "MakePrivate",
-            "Variable": "{{Private}}",
+            "Variable": "{{ Private }}",
             "StringEquals": "Yes"
           }
         ]
-      },
-      "description": ""
+      }
     },
     {
-      "name": "SharewithOtherAccounts",
+      "name": "ShareWithOtherAccounts",
+      "description": "Modifies permissions of the snapshots specified to share it with the accounts specified.",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "script_handler",
-        "Script": "import boto3\nimport botocore\ndef script_handler(events, context):\n    client = boto3.client('rds')\n    SnapshotIds= events['Snapshot_Id']\n    permissions = events['AccountOperation']\n    Accountids= events['Account_Id']\n    Result = {}\n    for snaps in SnapshotIds:\n        if Accountids != ['None']:\n            if permissions == 'Add':\n                try:\n                    response = client.modify_db_snapshot_attribute(\n                        DBSnapshotIdentifier=snaps,\n                        AttributeName='restore',\n                        ValuesToAdd=Accountids\n                    )\n                    if (response['ResponseMetadata']['HTTPStatusCode']==200):\n                                Result[snaps] = 'Snapshot is shared successfully with AccountIds'\n                except botocore.exceptions.ClientError as error:\n                    Result[snaps] = 'Failed - ' + str(error)\n            else:\n                try:\n                    response = client.modify_db_snapshot_attribute(\n                        DBSnapshotIdentifier=snaps,\n                        AttributeName='restore',\n                        ValuesToRemove=Accountids\n                    )\n                    if (response['ResponseMetadata']['HTTPStatusCode']==200):\n                                Result[snaps] = 'Snapshot sharing removed for provided AccountIds'\n                except botocore.exceptions.ClientError as error:\n                    Result[snaps] = 'Failed - ' + str(error)\n        else:\n            Result[snaps] = 'No Account Ids provided, Changing Snapshot permissions to Private'\n        return {'Result':Result}\n",
         "InputPayload": {
-          "Snapshot_Id": "{{SnapshotIdentifiers}}",
-          "Account_Id": "{{AccountIds}}",
-          "AccountOperation": "{{AccountPermissionOperation}}"
-        }
+          "SnapshotIds": "{{ SnapshotIdentifiers }}",
+          "AccountIds": "{{ AccountIds }}",
+          "AccountPermissionOperation": "{{ AccountPermissionOperation }}"
+        },
+        "Handler": "share_with_other_accounts.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
           "Name": "Result",
           "Selector": "$.Payload.Result",
-          "Type": "StringMap"
+          "Type": "String"
         }
       ],
+      "onFailure": "Abort",
       "isEnd": true
     },
     {
       "name": "MakePrivate",
+      "description": "Modifies permissions of the snapshots to change them from `Public` to `Private`.",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "script_handler",
-        "Script": "import boto3\nimport botocore\n\n\ndef script_handler(events, context):\n    client = boto3.client(\"rds\")\n    SnapshotIds = events[\"Snapshot_Id\"]\n    permissions = events[\"PrivatePerm\"]\n    ModifiedPermission = {\"Yes\": \"Remove\"}\n    Result = {}\n    Commands = {}\n    for snaps in SnapshotIds:\n        try:\n            response = client.modify_db_snapshot_attribute(\n                DBSnapshotIdentifier=snaps,\n                AttributeName=\"restore\",\n                ValuesToRemove=[\n                    \"all\",\n                ],\n            )\n            if response[\"ResponseMetadata\"][\"HTTPStatusCode\"] == 200:\n                Result[snaps] = \"Snapshot is Successfully changed to Private\"\n                command = (\n                    '\"aws rds modify-db-snapshot-attribute --db-snapshot-identifier '\n                    + snaps\n                    + ' --attribute-name restore --values-to-add all\"'\n                )\n                Commands[snaps] = (\n                    \"You can use AWSCli command \"\n                    + command\n                    + \" to make snapshot Public again\"\n                )\n        except botocore.exceptions.ClientError as error:\n            Result[snaps] = \"Failed - \" + str(error)\n    return {\"Result\": Result, \"Commands\": Commands}\n",
         "InputPayload": {
-          "Snapshot_Id": "{{SnapshotIdentifiers}}",
-          "PrivatePerm": "{{Private}}"
-        }
+          "SnapshotIds": "{{ SnapshotIdentifiers }}"
+        },
+        "Handler": "make_private.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
       },
       "outputs": [
         {
           "Name": "Result",
           "Selector": "$.Payload.Result",
-          "Type": "StringMap"
+          "Type": "String"
         },
         {
           "Name": "Commands",
           "Selector": "$.Payload.Commands",
-          "Type": "StringMap"
+          "Type": "String"
         }
       ],
+      "onFailure": "Abort",
       "isEnd": true
     }
-  ]
+  ],
+  "outputs": [
+    "ValidateSnapshots.EncryptedSnapshots",
+    "ShareWithOtherAccounts.Result",
+    "MakePrivate.Result",
+    "MakePrivate.Commands"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "4939ec8d054b183269107ae1b6c7a858f784840c0026bd99e25980c377c05330"
+      }
+    }
+  }
 }
