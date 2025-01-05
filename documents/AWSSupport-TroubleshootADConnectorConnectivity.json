@@ -1,5 +1,5 @@
 {
-  "description": "The **AWSSupport-TroubleshootADConnectorConnectivity** runbook verifies the following prerequisites for an AD Connector:\n\n1. Checks if the required traffic is allowed by the security group and network access control list (ACL) rules associated with your AD Connector.\n1. Checks if the AWS Systems Manager, AWS Security Token Service, and Amazon CloudWatch interface VPC endpoints exist in the same virtual private cloud (VPC) as the AD Connector.\n\nWhen the prerequisite checks complete successfully, the runbook launches two Amazon Elastic Compute Cloud (Amazon EC2) Linux t2.micro instances in the same subnets as your AD Connector. Network connectivity tests are then performed using the ```netcat``` and ```nslookup``` utilities.\n\n## Important:\n\nUsing this runbook might incur extra charges to your AWS account for the Amazon EC2 instances, Amazon Elastic Block Store volumes and Amazon Machine Image (AMI) created during the automation. For more information, see [Amazon Elastic Compute Cloud Pricing](https://aws.amazon.com/ec2/pricing/) and [Amazon Elastic Block Store Pricing](https://aws.amazon.com/ebs/pricing/).\nIf the ```aws:deletestack``` step fails, go to the AWS CloudFormation console to manually delete the stack. The stack name created by this runbook begins with ```AWSSupport-TroubleshootADConnectorConnectivity```. For information about deleting AWS CloudFormation stacks, see [Deleting a stack](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html) in the AWS CloudFormation User Guide. ",
+  "description": "The **AWSSupport-TroubleshootADConnectorConnectivity** runbook verifies the following prerequisites for an AD Connector:\n\n1. Checks if the required traffic is allowed by the security group and network access control list (ACL) rules associated with your AD Connector.\n1. Checks if the AWS Systems Manager, AWS Security Token Service, and Amazon CloudWatch interface VPC endpoints exist in the same virtual private cloud (VPC) as the AD Connector.\n\nWhen the prerequisite checks complete successfully, the runbook launches two Amazon Elastic Compute Cloud (Amazon EC2) Linux t2.micro instances in the same subnets as your AD Connector. Network connectivity tests are then performed using the ```netcat``` and ```nslookup``` utilities.\n\n## Important:\n\n- Using this runbook might incur extra charges to your AWS account for the Amazon EC2 instances, Amazon Elastic Block Store volumes and Amazon Machine Image (AMI) created during the automation. For more information, see [Amazon Elastic Compute Cloud Pricing](https://aws.amazon.com/ec2/pricing/) and [Amazon Elastic Block Store Pricing](https://aws.amazon.com/ebs/pricing/).\n- If the ```aws:deletestack``` step fails, go to the AWS CloudFormation console to manually delete the stack. The stack name created by this runbook begins with ```AWSSupport-TroubleshootADConnectorConnectivity```. For information about deleting AWS CloudFormation stacks, see [Deleting a stack](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html) in the AWS CloudFormation User Guide. ",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
@@ -18,8 +18,8 @@
     },
     "Ec2InstanceProfile": {
       "type": "String",
-      "description": "(Required) The name of the instance profile you want to assign to the instances that are launched to perform connectivity tests. The instance profile you specify must have the AmazonSSMManagedInstanceCore policy or equivalent permissions attached.",
-      "allowedPattern": "[\\w+=,.@-]+",
+      "description": "(Required) The name of the instance profile to be assigned to EC2 instances launched to perform connectivity tests. Specified instance profile must have the AmazonSSMManagedInstanceCore policy or equivalent permissions attached.",
+      "allowedPattern": "^[\\w+=,.@-]{1,128}",
       "maxChars": 128
     },
     "AutomationAssumeRole": {
@@ -36,6 +36,7 @@
       "onFailure": "Abort",
       "maxAttempts": 3,
       "timeoutSeconds": 120,
+      "nextStep": "getDirectoryInfo",
       "inputs": {
         "Service": "ds",
         "Api": "DescribeDirectories",
@@ -47,12 +48,12 @@
           "ADConnector"
         ]
       },
-      "isCritical": "true"
+      "isCritical": true
     },
     {
       "name": "getDirectoryInfo",
       "action": "aws:executeAwsApi",
-      "description": "Gathers information about the AD Connector: DnsIpAddrs, VpcId, SecurityGroupId, SubnetIds, ConnectIps, and Name.",
+      "description": "Gathers name and network information about the AD Connector",
       "onFailure": "Abort",
       "maxAttempts": 3,
       "timeoutSeconds": 120,
@@ -85,6 +86,16 @@
           "Type": "StringList"
         },
         {
+          "Name": "directorySubnet1",
+          "Selector": "$.DirectoryDescriptions[0].ConnectSettings.SubnetIds[0]",
+          "Type": "String"
+        },
+        {
+          "Name": "directorySubnet2",
+          "Selector": "$.DirectoryDescriptions[0].ConnectSettings.SubnetIds[1]",
+          "Type": "String"
+        },
+        {
           "Name": "directoryDnsIpAddrs",
           "Selector": "$.DirectoryDescriptions[0].ConnectSettings.ConnectIps",
           "Type": "StringList"
@@ -100,7 +111,7 @@
     {
       "name": "getDirectorySubnetCidrs",
       "action": "aws:executeAwsApi",
-      "description": "Gathers information about the subnets that are associated with the AD Connector.",
+      "description": "Gathers CIDRs associated with the subnets that are attached to AD Connector.",
       "onFailure": "Abort",
       "maxAttempts": 3,
       "timeoutSeconds": 120,
@@ -123,7 +134,7 @@
     {
       "name": "getDirectorySecurityGroup",
       "action": "aws:executeAwsApi",
-      "description": "Gathers information about the security groups that are associated with the AD Connector.",
+      "description": "Gathers the list of the security groups that are associated with the AD Connector.",
       "onFailure": "Abort",
       "maxAttempts": 3,
       "timeoutSeconds": 120,
@@ -146,7 +157,7 @@
     {
       "name": "getDirectoryAcl",
       "action": "aws:executeAwsApi",
-      "description": "Gathers information about the  network ACL rules that are associated with the AD Connector.",
+      "description": "Gathers the list of network ACLs that are associated with the AD Connector.",
       "onFailure": "Abort",
       "maxAttempts": 3,
       "timeoutSeconds": 120,
@@ -172,25 +183,28 @@
     {
       "name": "evalDirectorySecurityGroup",
       "action": "aws:executeScript",
-      "description": "Evalutes the AD Connector security group rules to verify that the required outbound traffic is allowed.",
-      "maxAttempts": 3,
-      "timeoutSeconds": 45,
+      "description": "Evaluates the AD Connector security group rules to verify that the required outbound traffic is allowed.",
       "onFailure": "Continue",
       "inputs": {
         "Runtime": "python3.11",
-        "Handler": "evalDirectorySecurityGroup",
+        "Handler": "eval_directory_security_group",
         "InputPayload": {
           "remoteCidrs": "{{ getDirectoryInfo.onPremDnsIpAddrs }}",
           "directorySecurityGroups": "{{ getDirectorySecurityGroup.directorySecurityGroups }}",
           "requiredTraffic": "{\"outbound\":{\"-1\":[[0,65535]]}}"
         },
-        "Script": "def evalDirectorySecurityGroup(events,context):\n    import json \n    \n    directorySecurityGroups = events['directorySecurityGroups']\n    inputCidrs = events['remoteCidrs']\n    remoteCidrs = []\n    finalOutput = []\n    for inputCidr in inputCidrs:\n        remoteCidr = inputCidr.replace(inputCidr, inputCidr + \"/32\")\n        remoteCidrs.append(remoteCidr)\n    requiredTraffic = json.loads(events['requiredTraffic'])\n#    print('RequiredTraffic',requiredTraffic)\n    \n    err = False\n    sourceCidr = {'network-cidrs':remoteCidrs,'security-groups':[]} \n    err = eval_security_groups_traffic(directorySecurityGroups, sourceCidr, requiredTraffic)\n    \n    if err:\n        finalOutput.append({ 'Error': 'Required traffic is not allowed in Security Groups. See ExecutionLog for Step 6. Please refer to the following article for more information regarding AD connector Prerequisites https://docs.aws.amazon.com/directoryservice/latest/admin-guide/prereq_connector.html' })\n        return finalOutput\n    else:\n        finalOutput.append({ 'Success': 'Required traffic is allowed in Security Groups' })\n        return finalOutput\n\ndef eval_security_groups_traffic(sgs, sourceCidr, traffic):\n    from ipaddress import ip_network\n    try:\n        err = False\n        for sg in sgs:\n            for protocol, ranges in traffic.get('outbound',[]).items():\n                for range in ranges:\n                    allowed = False\n                    for r in sg.get('IpPermissionsEgress', []):\n                        if r['IpProtocol'] in (protocol,'-1'): \n                            if (not 'FromPort' in r and not 'ToPort' in r) or (r['FromPort'] <= range[0] and r['ToPort'] >= range[1]): # \"Rule allows port %s\" % r['fromPort']\n                                for user_id_group_pair in r.get('UserIdGroupPairs',[]):\n                                    for group_id in sourceCidr.get('security-groups', []):\n                                        if user_id_group_pair['GroupId'] == group_id:\n                                            allowed = True\n                                            break\n                                for ip_range in r['IpRanges']:\n                                    for network_cidr in sourceCidr.get('network-cidrs', []):\n                                        if (ip_network(ip_range['CidrIp'], strict=False).overlaps(ip_network(network_cidr, strict=False))):\n                                            allowed = True\n                                            break\n                    if (not allowed):\n                        print('No outbound Security Group rule in', sg['GroupId'],'allows connectivity for',protocol.replace(\"-1\", \"all\").upper(),'in range:',range)\n                        err = True\n        return err\n\n    except Exception as e:\n        print('Failed to evaluate Security Groups.', str(e))\n        return True\n"
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport json\n\n\ndef eval_directory_security_group(events, _):\n    \"\"\"\n    Evaluates the security group of the directory and returns the result of the evaluation.\n    Args:\n        events(dict): Input event from the automation step.\n            - remoteCidrs(list): List of remote CIDRs.\n            - directorySecurityGroups(list): List of security groups of the directory.\n            - requiredTraffic(dict): Required traffic for the directory.\n\n    Returns:\n        dict: Dictionary containing the result of the evaluation.\n            - output(str): Result of the evaluation.\n            - dnsIps(str): Comma separated list of DNS IPs.\n    \"\"\"\n\n    error = False\n    directory_security_groups = events[\"directorySecurityGroups\"]\n    dns_ips_list = events[\"remoteCidrs\"]\n    dns_ips_str = \" \".join(dns_ips_list)\n\n    remote_cidrs = [f\"{dns_ip}/32\" for dns_ip in dns_ips_list]\n    required_traffic = json.loads(events[\"requiredTraffic\"])\n\n    source_cidr = {\"network-cidrs\": remote_cidrs, \"security-groups\": []}\n    error = eval_security_groups_traffic(directory_security_groups, source_cidr, required_traffic)\n\n    if error:\n        final_output = \"Error : Required traffic is not allowed in Security Groups. See ExecutionLog for Step 6. Please refer to the following article for more information regarding AD connector Prerequisites https://docs.aws.amazon.com/directoryservice/latest/admin-guide/prereq_connector.html\"\n        return {\"output\": final_output, \"dnsIps\": dns_ips_str}\n    else:\n        final_output = \"Success : Required traffic is allowed in Security Groups\"\n        return {\"output\": final_output, \"dnsIps\": dns_ips_str}\n\n\ndef eval_security_groups_traffic(directory_security_groups, source_cidr, required_traffic):\n    \"\"\"\n    Evaluates the security groups of the directory and returns the result of the evaluation.\n    Args:\n        directory_security_groups(list): List of security groups of the directory.\n        source_cidr(dict): Source CIDR.\n        required_traffic(dict): Required traffic for the directory.\n\n    Returns:\n        bool: True if the evaluation is successful, False otherwise.\n    \"\"\"\n    from ipaddress import ip_network\n\n    try:\n        error = False\n        for sg in directory_security_groups:\n            protocol, port_ranges = list(required_traffic.get(\"outbound\", {}).items())[0]\n            for port_range in port_ranges:\n                allowed = False\n                for r in sg.get(\"IpPermissionsEgress\", []):\n                    if r[\"IpProtocol\"] in (protocol, \"-1\"):\n                        if (\"FromPort\" not in r and \"ToPort\" not in r) or (\n                            r[\"FromPort\"] <= port_range[0] and r[\"ToPort\"] >= port_range[1]\n                        ):\n                            for user_id_group_pair in r.get(\"UserIdGroupPairs\", []):\n                                for group_id in source_cidr.get(\"security-groups\", []):\n                                    if user_id_group_pair[\"GroupId\"] == group_id:\n                                        allowed = True\n                                        break\n                            for ip_range in r[\"IpRanges\"]:\n                                for network_cidr in source_cidr.get(\"network-cidrs\", []):\n                                    if ip_network(ip_range[\"CidrIp\"], strict=False).overlaps(\n                                        ip_network(network_cidr, strict=False)\n                                    ):\n                                        allowed = True\n                                        break\n                if not allowed:\n                    print(\n                        \"No outbound Security Group rule in\",\n                        sg[\"GroupId\"],\n                        \"allows connectivity for\",\n                        protocol.replace(\"-1\", \"all\").upper(),\n                        \"in range:\",\n                        port_range,\n                    )\n                    error = True\n\n    except Exception as e:\n        print(\"Failed to evaluate Security Groups.\", str(e))\n        error = True\n\n    return error\n"
       },
       "outputs": [
         {
           "Name": "output",
-          "Selector": "$.Payload",
-          "Type": "MapList"
+          "Selector": "$.Payload.output",
+          "Type": "String"
+        },
+        {
+          "Name": "dnsIps",
+          "Selector": "$.Payload.dnsIps",
+          "Type": "String"
         },
         {
           "Name": "error",
@@ -203,25 +217,23 @@
     {
       "name": "evalAclEntries",
       "action": "aws:executeScript",
-      "description": "Evalutes the AD Connector network ACL rules to verify that the required outbound and inbound network traffic is allowed.",
-      "maxAttempts": 3,
-      "timeoutSeconds": 45,
+      "description": "Evaluates the AD Connector network ACL rules to verify that the required outbound and inbound network traffic is allowed.",
       "onFailure": "Continue",
       "inputs": {
         "Runtime": "python3.11",
-        "Handler": "evalAclEntries",
+        "Handler": "eval_acl_entries",
         "InputPayload": {
           "remoteCidrs": "{{ getDirectoryInfo.onPremDnsIpAddrs }}",
           "directoryAcl": "{{ getDirectoryAcl.directoryAcls }}",
-          "requiredTraffic": "{\"inbound\":{\"tcp\":[[53,53],[88,88],[389,389],[1024,65535]],\"udp\":[[53,53],[88,88],[389,389]],\"icmp\":[[-1,-1]]},\"outbound\":{\"-1\":[[0,65535]]}}"
+          "requiredTraffic": "{\"inbound\":{\"tcp\":[[53,53],[88,88],[389,389],[1024,65535]],\"udp\":[[53,53],[88,88],[389,389]]},\"outbound\":{\"-1\":[[0,65535]]}}"
         },
-        "Script": "def evalAclEntries(events,context):\n    from ipaddress import ip_network\n    import json\n    err = False\n    directoryNetworkAcls = events['directoryAcl']\n    inputCidrs = events['remoteCidrs']\n    remoteCidrs = []\n    finalOutput = []\n    for inputCidr in inputCidrs:\n        remoteCidr = inputCidr.replace(inputCidr, inputCidr + \"/32\")\n        remoteCidrs.append(remoteCidr)\n    requiredTraffic = json.loads(events['requiredTraffic'])\n    \n    sourceCidr = {'network-cidrs':remoteCidrs,'security-groups':[]} \n    allowRules = eval_acl_rules(directoryNetworkAcls, sourceCidr, requiredTraffic)\n    err = check_allowed(allowRules, requiredTraffic)\n\n    if err:\n        finalOutput.append({ 'Error': 'Required traffic is not allowed in Network ACLs. See ExecutionLog for Step 7. Please refer to the following article for more information regarding AD connector Prerequisites https://docs.aws.amazon.com/directoryservice/latest/admin-guide/prereq_connector.html' })\n        return finalOutput\n    else:\n        finalOutput.append({ 'Success': 'Required traffic is allowed in Network ACLs' })\n        return finalOutput\n\ndef print_allowed(allowRules):\n    for nacl_id, nacl in allowRules.items():\n        print('NetworkAclId', nacl_id, 'Inbound:', list(nacl[0].items()), ' <> Outbound:', list(nacl[1].items()))\n\ndef eval_acl_rules(rules, sourceCidr, traffic): \n    from collections import defaultdict\n    from ipaddress import ip_network\n\n    in_allow = defaultdict(list)\n    out_allow = defaultdict(list)\n    allowRules = defaultdict(list)\n    \n    try:\n        for nacl in rules:\n                for r in sorted(nacl['Entries'], key=lambda k: k['RuleNumber'], reverse=True):\n                        for network_cidr in sourceCidr.get('network-cidrs', []):\n                            protocol = get_std_protocol(r['Protocol'])\n                            if (ip_network(r['CidrBlock'], strict=False).overlaps(ip_network(network_cidr, strict=False))):\n                                if not 'PortRange' in r:\n                                    f=0\n                                    t=65535\n                                else:\n                                    f=r['PortRange']['From']\n                                    t=r['PortRange']['To']\n\n                                if not r['Egress']:\n                                    if r['RuleAction'] == 'allow':\n                                        in_allow[protocol] = range_add([f,t],in_allow[protocol])\n                                    else:\n                                        in_allow[protocol] = range_diff([f,t],in_allow[protocol])\n                                else:\n                                    if r['RuleAction'] == 'allow':\n\n                                        out_allow[protocol] = range_add([f,t],out_allow[protocol])\n                                    else:\n                                        out_allow[protocol] = range_diff([f,t],out_allow[protocol])\n                \n                allowRules[nacl['NetworkAclId']].append(in_allow.copy())#[0]\n                allowRules[nacl['NetworkAclId']].append(out_allow.copy())#[1]\n                in_allow.clear()\n                out_allow.clear()\n\n        return allowRules\n    \n    except Exception as e:\n        print('Failed to evaluate Network ACLs.', str(e))\n        return allowRules\n\ndef get_std_protocol(acl_protocol):\n    # defined at https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml\n    customprotocol = {\"-1\":\"-1\",\"hopopt\":\"0\",\"icmp\":\"1\",\"igmp\":\"2\",\"ggp\":\"3\",\"ipv4\":\"4\",\"st\":\"5\",\"tcp\":\"6\",\"cbt\":\"7\",\"egp\":\"8\",\"igp\":\"9\",\"bbn-rcc-mon\":\"10\",\"nvp-ii\":\"11\",\"pup\":\"12\",\"argus\":\"13\",\"emcon\":\"14\",\"xnet\":\"15\",\"chaos\":\"16\",\"udp\":\"17\",\"mux\":\"18\",\"dcn-meas\":\"19\",\"hmp\":\"20\",\"prm\":\"21\",\"xns-idp\":\"22\",\"trunk-1\":\"23\",\"trunk-2\":\"24\",\"leaf-1\":\"25\",\"leaf-2\":\"26\",\"rdp\":\"27\",\"irtp\":\"28\",\"iso-tp4\":\"29\",\"netblt\":\"30\",\"mfe-nsp\":\"31\",\"merit-inp\":\"32\",\"dccp\":\"33\",\"3pc\":\"34\",\"idpr\":\"35\",\"xtp\":\"36\",\"ddp\":\"37\",\"idpr-cmtp\":\"38\",\"tp++\":\"39\",\"il\":\"40\",\"ipv6\":\"41\",\"sdrp\":\"42\",\"ipv6-route\":\"43\",\"ipv6-frag\":\"44\",\"idrp\":\"45\",\"rsvp\":\"46\",\"gre\":\"47\",\"dsr\":\"48\",\"bna\":\"49\",\"esp\":\"50\",\"ah\":\"51\",\"i-nlsp\":\"52\",\"swipe\":\"53\",\"narp\":\"54\",\"mobile\":\"55\",\"tlsp\":\"56\",\"ipv6-icmp\":\"58\",\"ipv6-nonxt\":\"59\",\"ipv6-opts\":\"60\",\"61\":\"61\",\"cftp\":\"62\",\"63\":\"63\",\"sat-expak\":\"64\",\"kryptolan\":\"65\",\"rvd\":\"66\",\"ippc\":\"67\",\"68\":\"68\",\"sat-mon\":\"69\",\"visa\":\"70\",\"ipcv\":\"71\",\"cpnx\":\"72\",\"cphb\":\"73\",\"wsn\":\"74\",\"pvp\":\"75\",\"br-sat-mon\":\"76\",\"sun-nd\":\"77\",\"wb-mon\":\"78\",\"wb-expak\":\"79\",\"iso-ip\":\"80\",\"vmtp\":\"81\",\"secure-vmtp\":\"82\",\"vines\":\"83\",\"ttp\":\"84\",\"nsfnet-igp\":\"85\",\"dgp\":\"86\",\"tcf\":\"87\",\"eigrp\":\"88\",\"ospfigp\":\"89\",\"sprite-rpc\":\"90\",\"larp\":\"91\",\"mtp\":\"92\",\"ax.25\":\"93\",\"ipip\":\"94\",\"micp\":\"95\",\"scc-sp\":\"96\",\"etherip\":\"97\",\"encap\":\"98\",\"99\":\"99\",\"gmtp\":\"100\",\"ifmp\":\"101\",\"pnni\":\"102\",\"pim\":\"103\",\"aris\":\"104\",\"scps\":\"105\",\"qnx\":\"106\",\"a/n\":\"107\",\"ipcomp\":\"108\",\"snp\":\"109\",\"compaq-peer\":\"110\",\"ipx-in-ip\":\"111\",\"vrrp\":\"112\",\"pgm\":\"113\",\"114\":\"114\",\"l2tp\":\"115\",\"dd\":\"116\",\"iatp\":\"117\",\"stp\":\"118\",\"srp\":\"119\",\"uti\":\"120\",\"smp\":\"121\",\"sm\":\"122\",\"ptp\":\"123\",\"isis-over-ipv4\":\"124\",\"fire\":\"125\",\"crtp\":\"126\",\"crudp\":\"127\",\"sscopmce\":\"128\",\"iplt\":\"129\",\"sps\":\"130\",\"pipe\":\"131\",\"sctp\":\"132\",\"fc\":\"133\",\"rsvp-e2e-ignore\":\"134\",\"mobility-header\":\"135\",\"udplite\":\"136\",\"mpls-in-ip\":\"137\",\"manet\":\"138\",\"hip\":\"139\",\"shim6\":\"140\",\"wesp\":\"141\",\"rohc\":\"142\",\"253\":\"253\",\"254\":\"254\"}\n    inv_map = {v: k for k, v in customprotocol.items()}\n    return inv_map.get(acl_protocol)\n\ndef range_add(new,interv):\n    interv.append(new)\n    interv = [x for x in interv if x != [] and len(x) == 2 and all(isinstance(val, int) for val in x)]\n    interv.sort()\n    res=[]\n    while(len(interv)>0):\n        if len(interv)==1:\n            res.append(interv[0])\n            interv.pop(0)\n            continue\n        if interv[0][1]>=interv[1][0]:\n            tmp=[interv[0][0],max(interv[0][1],interv[1][1])]\n            interv[0]=tmp\n            interv.pop(1)\n            continue\n        res.append(interv[0])\n        interv.pop(0)\n    return res\n\ndef range_diff(new,interv):\n    interv = range_add([],interv)\n    if len(new)==0:\n        new = [0,0]\n    interv = [x for x in interv if x != [] and len(x) == 2 and all(isinstance(val, int) for val in x)]\n    interv.sort()\n    res=[]\n    for t in interv:\n        s1, e1 = t\n        s2, e2 = new\n        s = sorted((s1, s2, e1, e2))\n        if s[0] == s1 and s[0] != s[1]:\n            v = s[1] if e1 < s2 else s[1]-1 \n            res.append([s[0],v])\n        if s[3] == e1 and s[2] != s[3]:\n            v = s[2] if e2 < s1 else s[2]+1\n            res.append([v,s[3]])\n    if len(res)==0:\n        res = [[0,0]]\n    return res\n\ndef check_allowed(allowRules, traffic):\n    err = False\n    for nacl_id, nacl in allowRules.items():\n        for protocol, ranges in traffic.get('inbound',[]).items():\n            for range in ranges:\n                allowed = False\n                for r in nacl[0].get('-1', []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n                for r in nacl[0].get(protocol, []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n            if (not allowed):\n                print('Error: No inbound ACL rule in',nacl_id,'allows connectivity for',protocol.replace(\"-1\", \"all\").upper(),'in range:',range)\n                err = True\n            else:\n                break\n\n        for protocol, ranges in traffic.get('outbound',[]).items():\n            for range in ranges:\n                allowed = False\n                for r in nacl[1].get('-1', []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n                for r in nacl[1].get(protocol, []):\n                    if r[0] <= range[0] and r[1] >= range[1]:\n                        allowed = True\n                        break\n            if (not allowed):\n                print('Error: No outbound ACL rule in',nacl_id,'allows connectivity for',protocol.replace(\"-1\", \"all\").upper(),'in range:',range)\n                err = True\n            else:\n                break\n            \n    return err\n"
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport json\nimport sys\nfrom bisect import insort\nfrom collections import defaultdict\nfrom ipaddress import ip_network\nfrom typing import Any, Dict, List\n\nsys.tracebacklimit = 0\n\n\ndef eval_acl_entries(event: Dict[str, Any], _) -> List[Dict[str, str]]:\n    \"\"\"\n    Evaluates the network ACL entries of the directory and returns the result of the evaluation.\n    Args:\n        event(dict): Input event from the automation step.\n            - directoryAcl(list): List of network ACLs of the directory.\n            - remoteCidrs(list): List of remote CIDRs.\n            - requiredTraffic(dict): Required traffic for the directory.\n\n    Returns:\n        list: List of dictionaries containing the result of the evaluation.\n            - output(str): Result of the evaluation.\n    \"\"\"\n    err = False\n    final_output = []\n\n    directory_network_acls = event[\"directoryAcl\"]\n    remote_cidrs = [f\"{cidr}/32\" for cidr in event[\"remoteCidrs\"]]\n    required_traffic = json.loads(event[\"requiredTraffic\"])\n\n    if not all([directory_network_acls, remote_cidrs, remote_cidrs]):\n        raise ValueError(\"Missing required input.\")\n\n    source_cidr = {\"network-cidrs\": remote_cidrs, \"security-groups\": []}\n    allow_rules = eval_acl_rules(directory_network_acls, source_cidr)\n    err = check_allowed(allow_rules, required_traffic)\n\n    if err:\n        final_output = \"\"\"\n                Error :\n                Required traffic is not allowed in Network ACLs.\n                See ExecutionLog for Step 7.\n                Refer to AD connector Prerequisites:\n                https://docs.aws.amazon.com/directoryservice/latest/admin-guide/prereq_connector.html\"\n                \"\"\"\n    else:\n        final_output = \"Success : Required traffic is allowed in Network ACLs\"\n    return final_output\n\n\ndef eval_acl_rules(\n    network_acls: List[Dict[str, Any]], source_cidr_config: Dict[str, List[str]]\n) -> Dict[str, List[Dict[str, List]]]:\n    \"\"\"\n    Evaluates the network ACL entries of the directory and returns the result of the evaluation.\n    Args:\n        network_acls(list): List of network ACLs of the directory.\n        source_cidr_config(dict): Configuration of the source CIDRs.\n\n    Returns:\n        dict: Dictionary containing the result of the evaluation.\n            - acl_rules_summary(dict): Dictionary containing the summary of the ACL rules.\n                - inbound_allowed_rules(dict): Dictionary containing the inbound allowed rules.\n                - outbound_allowed_rules(dict): Dictionary containing the outbound allowed rules.\n    \"\"\"\n    inbound_allowed_rules = defaultdict(list)\n    outbound_allowed_rules = defaultdict(list)\n    acl_rules_summary = defaultdict(list)\n\n    # Pre-convert source CIDRs to ip_network objects\n    source_cidrs = [ip_network(cidr, strict=False) for cidr in source_cidr_config.get(\"network-cidrs\", [])]\n\n    try:\n        for acl in network_acls:\n            # Pre-convert ACL's CidrBlock entries to ip_network objects\n            entries = [\n                (ip_network(entry[\"CidrBlock\"], strict=False), entry)\n                for entry in sorted(acl[\"Entries\"], key=lambda entry: entry[\"RuleNumber\"], reverse=True)\n            ]\n            for cidr_obj, entry in entries:\n                protocol = get_std_protocol(entry[\"Protocol\"])\n\n                # Check overlap with pre-converted source CIDRs\n                for source_cidr in source_cidrs:\n                    if cidr_obj.overlaps(source_cidr):\n                        from_port, to_port = get_port_range(entry)\n\n                        # Determine whether to apply the rule to inbound or outbound traffic\n                        if not entry[\"Egress\"]:\n                            apply_rule_action(\n                                inbound_allowed_rules, protocol, [from_port, to_port], entry[\"RuleAction\"]\n                            )\n                        else:\n                            apply_rule_action(\n                                outbound_allowed_rules, protocol, [from_port, to_port], entry[\"RuleAction\"]\n                            )\n            # Save current ACL configurations and clear rules for the next ACL\n\n            acl_rules_summary[acl[\"NetworkAclId\"]] = [inbound_allowed_rules, outbound_allowed_rules]\n\n    except Exception as e:\n        raise RuntimeError(\"Failed to evaluate Network ACLs:\", str(e)) from None\n    return acl_rules_summary\n\n    # defined at https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml\n\n\nCUSTOM_PROTOCOL = {\n    \"-1\": \"-1\",\n    \"hopopt\": \"0\",\n    \"icmp\": \"1\",\n    \"igmp\": \"2\",\n    \"ggp\": \"3\",\n    \"ipv4\": \"4\",\n    \"st\": \"5\",\n    \"tcp\": \"6\",\n    \"cbt\": \"7\",\n    \"egp\": \"8\",\n    \"igp\": \"9\",\n    \"bbn-rcc-mon\": \"10\",\n    \"nvp-ii\": \"11\",\n    \"pup\": \"12\",\n    \"argus\": \"13\",\n    \"emcon\": \"14\",\n    \"xnet\": \"15\",\n    \"chaos\": \"16\",\n    \"udp\": \"17\",\n    \"mux\": \"18\",\n    \"dcn-meas\": \"19\",\n    \"hmp\": \"20\",\n    \"prm\": \"21\",\n    \"xns-idp\": \"22\",\n    \"trunk-1\": \"23\",\n    \"trunk-2\": \"24\",\n    \"leaf-1\": \"25\",\n    \"leaf-2\": \"26\",\n    \"rdp\": \"27\",\n    \"irtp\": \"28\",\n    \"iso-tp4\": \"29\",\n    \"netblt\": \"30\",\n    \"mfe-nsp\": \"31\",\n    \"merit-inp\": \"32\",\n    \"dccp\": \"33\",\n    \"3pc\": \"34\",\n    \"idpr\": \"35\",\n    \"xtp\": \"36\",\n    \"ddp\": \"37\",\n    \"idpr-cmtp\": \"38\",\n    \"tp++\": \"39\",\n    \"il\": \"40\",\n    \"ipv6\": \"41\",\n    \"sdrp\": \"42\",\n    \"ipv6-route\": \"43\",\n    \"ipv6-frag\": \"44\",\n    \"idrp\": \"45\",\n    \"rsvp\": \"46\",\n    \"gre\": \"47\",\n    \"dsr\": \"48\",\n    \"bna\": \"49\",\n    \"esp\": \"50\",\n    \"ah\": \"51\",\n    \"i-nlsp\": \"52\",\n    \"swipe\": \"53\",\n    \"narp\": \"54\",\n    \"mobile\": \"55\",\n    \"tlsp\": \"56\",\n    \"ipv6-icmp\": \"58\",\n    \"ipv6-nonxt\": \"59\",\n    \"ipv6-opts\": \"60\",\n    \"61\": \"61\",\n    \"cftp\": \"62\",\n    \"63\": \"63\",\n    \"sat-expak\": \"64\",\n    \"kryptolan\": \"65\",\n    \"rvd\": \"66\",\n    \"ippc\": \"67\",\n    \"68\": \"68\",\n    \"sat-mon\": \"69\",\n    \"visa\": \"70\",\n    \"ipcv\": \"71\",\n    \"cpnx\": \"72\",\n    \"cphb\": \"73\",\n    \"wsn\": \"74\",\n    \"pvp\": \"75\",\n    \"br-sat-mon\": \"76\",\n    \"sun-nd\": \"77\",\n    \"wb-mon\": \"78\",\n    \"wb-expak\": \"79\",\n    \"iso-ip\": \"80\",\n    \"vmtp\": \"81\",\n    \"secure-vmtp\": \"82\",\n    \"vines\": \"83\",\n    \"ttp\": \"84\",\n    \"nsfnet-igp\": \"85\",\n    \"dgp\": \"86\",\n    \"tcf\": \"87\",\n    \"eigrp\": \"88\",\n    \"ospfigp\": \"89\",\n    \"sprite-rpc\": \"90\",\n    \"larp\": \"91\",\n    \"mtp\": \"92\",\n    \"ax.25\": \"93\",\n    \"ipip\": \"94\",\n    \"micp\": \"95\",\n    \"scc-sp\": \"96\",\n    \"etherip\": \"97\",\n    \"encap\": \"98\",\n    \"99\": \"99\",\n    \"gmtp\": \"100\",\n    \"ifmp\": \"101\",\n    \"pnni\": \"102\",\n    \"pim\": \"103\",\n    \"aris\": \"104\",\n    \"scps\": \"105\",\n    \"qnx\": \"106\",\n    \"a/n\": \"107\",\n    \"ipcomp\": \"108\",\n    \"snp\": \"109\",\n    \"compaq-peer\": \"110\",\n    \"ipx-in-ip\": \"111\",\n    \"vrrp\": \"112\",\n    \"pgm\": \"113\",\n    \"114\": \"114\",\n    \"l2tp\": \"115\",\n    \"dd\": \"116\",\n    \"iatp\": \"117\",\n    \"stp\": \"118\",\n    \"srp\": \"119\",\n    \"uti\": \"120\",\n    \"smp\": \"121\",\n    \"sm\": \"122\",\n    \"ptp\": \"123\",\n    \"isis-over-ipv4\": \"124\",\n    \"fire\": \"125\",\n    \"crtp\": \"126\",\n    \"crudp\": \"127\",\n    \"sscopmce\": \"128\",\n    \"iplt\": \"129\",\n    \"sps\": \"130\",\n    \"pipe\": \"131\",\n    \"sctp\": \"132\",\n    \"fc\": \"133\",\n    \"rsvp-e2e-ignore\": \"134\",\n    \"mobility-header\": \"135\",\n    \"udplite\": \"136\",\n    \"mpls-in-ip\": \"137\",\n    \"manet\": \"138\",\n    \"hip\": \"139\",\n    \"shim6\": \"140\",\n    \"wesp\": \"141\",\n    \"rohc\": \"142\",\n    \"253\": \"253\",\n    \"254\": \"254\",\n}\nINV_MAP = {v: k for k, v in CUSTOM_PROTOCOL.items()}\n\n\ndef get_std_protocol(acl_protocol: str) -> str:\n    \"\"\"Converts the protocol number to the standard protocol name.\"\"\"\n    return INV_MAP.get(acl_protocol)\n\n\ndef get_port_range(rule: Dict[str, Any]) -> (int, int):\n    \"\"\"Returns the port range of the rule.\"\"\"\n    if \"PortRange\" not in rule:\n        return 0, 65535\n    return rule[\"PortRange\"][\"From\"], rule[\"PortRange\"][\"To\"]\n\n\ndef apply_rule_action(acl_dict: Dict[str, List], protocol: str, port_range: List[int], action: str) -> None:\n    \"\"\"Applies the rule action to the ACL dictionary.\"\"\"\n    if action == \"allow\":\n        acl_dict[protocol] = range_add(port_range, acl_dict[protocol])\n    else:\n        acl_dict[protocol] = range_diff(port_range, acl_dict[protocol])\n\n\ndef range_add(new: List[int], intervals: List[List[int]]) -> List[List[int]]:\n    \"\"\"Adds the new range to the intervals.\"\"\"\n\n    insort(intervals, new)\n    res = []\n    for start, end in intervals:\n        if not res or res[-1][1] < start:\n            res.append([start, end])\n        else:\n            res[-1][1] = max(res[-1][1], end)\n    return res\n\n\ndef range_diff(new: List[int], intervals: List[List[int]]) -> List[List[int]]:\n    \"\"\"Subtracts the new range from the intervals.\"\"\"\n\n    # If intervals contain only [[0, 0]], treat it as a default value that should not be overridden to an empty list\n    if intervals == [[0, 0]]:\n        intervals = []\n\n    result = []\n    for start, end in intervals:\n        # Check if new range does not overlap with current interval\n        if new[0] > end or new[1] < start:\n            result.append([start, end])\n        else:\n            # If there's an overlap, adjust the ranges accordingly\n            if new[0] > start:\n                result.append([start, new[0] - 1])\n            if new[1] < end:\n                result.append([new[1] + 1, end])\n\n    # If result is empty and intervals was originally [[0, 0]], preserve [[0, 0]]\n    return result if result else [[0, 0]]\n\n\ndef check_allowed(\n    allow_rules: Dict[str, List[Dict[str, List[List[int]]]]], traffic: Dict[str, Dict[str, List[List[int]]]]\n) -> bool:\n    \"\"\"Checks if the traffic is allowed by the ACLs.\"\"\"\n    err = False\n    for nacl_id, acl in allow_rules.items():\n        if not check_traffic_direction(acl[0], traffic.get(\"inbound\", {}), \"inbound\", nacl_id):\n            err = True\n        if not check_traffic_direction(acl[1], traffic.get(\"outbound\", {}), \"outbound\", nacl_id):\n            err = True\n    return err\n\n\ndef check_traffic_direction(\n    acl: Dict[str, List[List[int]]], traffic: Dict[str, List[List[int]]], direction: str, nacl_id: str\n) -> bool:\n    \"\"\"Checks if the traffic is allowed by the ACL for a given direction(outbound/inbound).\"\"\"\n\n    for protocol, ranges in traffic.items():\n        for range_needed in ranges:\n            if not is_range_allowed(acl, protocol, range_needed):\n                print(\n                    f\"Error: No {direction} ACL rule in {nacl_id} allows {protocol.replace('-1', 'all').upper()} in range: {range_needed}\"\n                )\n                return False\n    return True\n\n\ndef is_range_allowed(acl: Dict[str, List[List[int]]], protocol: str, range_needed: List[int]) -> bool:\n    \"\"\"Checks if the range is allowed by the ACL.\"\"\"\n    allowed_ranges = acl.get(protocol, []) + acl.get(\"-1\", [])\n    return any(start <= range_needed[0] and end >= range_needed[1] for start, end in allowed_ranges)\n"
       },
       "outputs": [
         {
           "Name": "output",
           "Selector": "$.Payload",
-          "Type": "MapList"
+          "Type": "String"
         },
         {
           "Name": "error",
@@ -235,88 +247,53 @@
       "name": "checkVPCEndpoints",
       "action": "aws:executeScript",
       "description": "Checks if the AWS Systems Manager, AWS Security Token Service and Amazon CloudWatch interface VPC endpoints exist in the same VPC as the AD Connector.",
-      "maxAttempts": 3,
-      "timeoutSeconds": 45,
       "onFailure": "Continue",
       "inputs": {
         "Runtime": "python3.11",
-        "Handler": "checkVPCEndpoints",
+        "Handler": "check_vpc_endpoints",
         "InputPayload": {
           "directoryVPC": "{{ getDirectoryInfo.directoryVpcId }}"
         },
-        "Script": "def checkVPCEndpoints(events,context):\n    import boto3\n    from botocore.exceptions import ClientError,ParamValidationError\n\n    client = boto3.client('ec2')\n\n    # Getting current region\n    current_session = boto3.session.Session()\n    current_region = current_session.region_name\n\n    # Setting Variables for VPC endpoints\n    ssmUrl = 'com.amazonaws.' + current_region + '.ssm'\n    stsUrl = 'com.amazonaws.' + current_region + '.sts'\n    cwUrl = 'com.amazonaws.' + current_region + '.monitoring'\n    vpcId = events['directoryVPC']\n\n\n    try:\n        # Checking SSM Enpoint\n        ssmResponse = client.describe_vpc_endpoints(Filters=[{'Name':'service-name','Values':[ssmUrl]},{'Name': 'vpc-id','Values': [vpcId]}])\n        if ssmResponse['VpcEndpoints']:\n            ssmOutput = { 'Error': 'VPC endpoint for AWS Systems Manager found for the same VPC as of the directory. Please remove the endpoint to fix the directory impairment. VPC Endpoint ID: ' + ssmResponse['VpcEndpoints'][0]['VpcEndpointId']}\n        else:\n            ssmOutput= { 'Success': 'VPC endpoint for AWS Systems Manager not found for the same VPC as of the directory. No Action Required.'}\n        \n        # Checking STS Endpoint\n        stsResponse = client.describe_vpc_endpoints(Filters=[{'Name':'service-name','Values':[stsUrl]},{'Name': 'vpc-id','Values': [vpcId]}])\n        if stsResponse['VpcEndpoints']:\n            stsOutput = { 'Error': 'VPC endpoint for AWS Security Token Service (AWS STS) found for the same VPC as of the directory. Please remove the endpoint to fix the directory impairment. VPC Endpoint ID: ' + stsResponse['VpcEndpoints'][0]['VpcEndpointId']}\n        else:\n            stsOutput = { 'Success': 'VPC endpoint for AWS Security Token Service (AWS STS) not found for the same VPC as of the directory. No Action Required.'}\n\n        # Checking CloudWatch Endpoint\n        cwResponse = client.describe_vpc_endpoints(Filters=[{'Name':'service-name','Values':[cwUrl]},{'Name': 'vpc-id','Values': [vpcId]}])\n        if cwResponse['VpcEndpoints']:\n            cwOutput = { 'Error': 'VPC endpoint for Amazon CloudWatch found for the same VPC as of the directory. Please remove the endpoint to fix the directory impairment. VPC Endpoint ID: ' + cwResponse['VpcEndpoints'][0]['VpcEndpointId']}\n        else:\n            cwOutput = { 'Success': 'VPC endpoint for Amazon CloudWatch not found for the same VPC as of the directory. No Action Required.'}\n        \n        return ssmOutput,stsOutput,cwOutput\n\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n"
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport json\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\n\ndef check_vpc_endpoints(events, context):\n    \"\"\"\n    Checks if the directory has connectivity to the Amazon Virtual Private Cloud(VPC) endpoints.\n    Args:\n        events(dict): Input event from the automation step.\n            - directoryVPC(str): ID of the VPC, AD Connector directory is created in.\n        context(dict): Lambda context object.\n\n    Returns:\n        str: JSON string containing the results of the check.\n    \"\"\"\n\n    results = {}\n    # Getting current region\n    current_region = context.get(\"global:REGION\")\n\n    # Setting Variables for VPC endpoints\n    services_to_check = {\n        \"ssm\": \"AWS Systems Manager\",\n        \"sts\": \"AWS Security Token Service (AWS STS)\",\n        \"cloudwatch\": \"Amazon CloudWatch\",\n    }\n    vpc_id = events[\"directoryVPC\"]\n\n    try:\n        ec2_client = boto3.client(\"ec2\", region_name=current_region)\n\n        for service_name, service_display_name in services_to_check.items():\n            # Check if a VPC endpoint exists for this service\n            vpc_endpoints = ec2_client.describe_vpc_endpoints(\n                Filters=[\n                    # {\"Name\": \"service-name\", \"Values\": [service_name]},\n                    {\"Name\": \"vpc-id\", \"Values\": [vpc_id]}\n                ]\n            ).get(\"VpcEndpoints\", [])\n\n            if vpc_endpoints:\n                results[service_name] = {\n                    \"Error\": f\"VPC endpoint for {service_display_name} found for the same VPC as of the directory. \"\n                    f\"Please remove the endpoint to fix the directory impairment. \"\n                    f\"VPC Endpoint ID: {vpc_endpoints[0]['VpcEndpointId']}\"\n                }\n            else:\n                results[service_name] = {\n                    \"Success\": f\"VPC endpoint for {service_display_name} not found for the same VPC as of the directory. \"\n                    f\"No Action Required.\"\n                }\n\n    except ClientError as e:\n        raise RuntimeError(f\"[ERROR] {e}\") from None\n\n    return json.dumps(results)\n"
       },
       "outputs": [
         {
           "Name": "output",
           "Selector": "$.Payload",
-          "Type": "MapList"
-        }
-      ],
-      "nextStep": "compilePrerequistesTestsOutput"
-    },
-    {
-      "name": "compilePrerequistesTestsOutput",
-      "action": "aws:executeScript",
-      "description": "Compiles the outputs of the checks performed in the previous steps.",
-      "maxAttempts": 3,
-      "timeoutSeconds": 45,
-      "onFailure": "Abort",
-      "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "compilePrerequistesTestsOutput",
-        "InputPayload": {
-          "securityGroupOutput": "{{ evalDirectorySecurityGroup.output }}",
-          "aclOutput": "{{ evalAclEntries.output }}",
-          "vpceOutput": "{{ checkVPCEndpoints.output }}",
-          "Subnets": [
-            "{{ getDirectoryInfo.directorySubnets }}"
-          ],
-          "DNS": [
-            "{{ getDirectoryInfo.onPremDnsIpAddrs }}"
-          ]
-        },
-        "Script": "def compilePrerequistesTestsOutput(events,context):\n    import json\n    \n    # Setting Variables for VPC endpoints\n    directorySecurityGroup = events['securityGroupOutput']\n    directoryAclOutput = events['aclOutput']\n    directoryEndpoint = events['vpceOutput']\n\n    # Convert Outputs to string\n    subnetList = events['Subnets']\n    dnsIps = events['DNS']\n    joinIps = ' '.join(dnsIps)\n    newIps = '\"' + joinIps + '\"'\n    newdirectorySecurityGroup = json.dumps(directorySecurityGroup)\n    newDirectoryAcloutput = json.dumps(directoryAclOutput)\n    newdirectoryEndpoint = json.dumps(directoryEndpoint)\n    finalOutPut = newdirectorySecurityGroup + newDirectoryAcloutput + newdirectoryEndpoint\n    return {'finalOutPut': finalOutPut, 'finalIps':newIps, 'subnet1': subnetList[0], 'subnet2': subnetList[1]}\n"
-      },
-      "outputs": [
-        {
-          "Name": "output",
-          "Selector": "$.Payload.finalOutPut",
-          "Type": "String"
-        },
-        {
-          "Name": "firstSubnet",
-          "Selector": "$.Payload.subnet1",
-          "Type": "String"
-        },
-        {
-          "Name": "secondSubnet",
-          "Selector": "$.Payload.subnet2",
-          "Type": "String"
-        },
-        {
-          "Name": "dnsServerIps",
-          "Selector": "$.Payload.finalIps",
           "Type": "String"
         }
       ],
-      "nextStep": "checkPrerequisites"
+      "nextStep": "branchOnCheckPrerequisites"
     },
     {
-      "name": "checkPrerequisites",
+      "name": "branchOnCheckPrerequisites",
       "action": "aws:branch",
       "description": "Branches the automation depending on the output of previous steps. The automation stops here if the required outbound and inbound rules are missing for the security groups and network ACLs.",
-      "maxAttempts": 3,
-      "timeoutSeconds": 120,
       "isEnd": true,
       "inputs": {
         "Choices": [
           {
             "NextStep": "createHelperEC2InstancesStack",
-            "Not": {
-              "Variable": "{{compilePrerequistesTestsOutput.output}}",
-              "Contains": "Error"
-            }
+            "And": [
+              {
+                "Not": {
+                  "Variable": "{{ evalDirectorySecurityGroup.output }}",
+                  "Contains": "Error"
+                }
+              },
+              {
+                "Not": {
+                  "Variable": "{{ evalAclEntries.output }}",
+                  "Contains": "Error"
+                }
+              },
+              {
+                "Not": {
+                  "Variable": "{{ checkVPCEndpoints.output }}",
+                  "Contains": "Error"
+                }
+              }
+            ]
           }
         ]
       }
@@ -326,7 +303,7 @@
       "action": "aws:createStack",
       "description": "Creates an AWS CloudFormation stack to launch Amazon EC2 instances to perform connectivity tests.",
       "maxAttempts": 1,
-      "timeoutSeconds": 500,
+      "timeoutSeconds": 600,
       "onFailure": "step:deleteStack",
       "inputs": {
         "Capabilities": [
@@ -334,8 +311,20 @@
           "CAPABILITY_NAMED_IAM"
         ],
         "StackName": "AWSSupport-TroubleshootADConnectorConnectivity-{{ automation:EXECUTION_ID }}",
-        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nDescription: 'This step create a CloudFormation template to launch resources required to collect logs. CloudFormation template created 2 Helper Instances: 1 in each subnet of AD connector.'\nParameters:\n  LINUXAMI:\n    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>\n    Default: \"/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2\"\n  InstanceProfile:\n    Type: String\n    Default: \"{{ Ec2InstanceProfile }}\"\nResources:\n  HelperEC2Instance1:\n    Type: AWS::EC2::Instance\n    Properties:\n      IamInstanceProfile:\n        Ref: InstanceProfile\n      ImageId:\n        Ref: LINUXAMI\n      InstanceType: t3.micro\n      SecurityGroupIds:\n      - \"{{ getDirectoryInfo.directorySecurityGroupId }}\"\n      SubnetId: \"{{ compilePrerequistesTestsOutput.firstSubnet }}\"\n      Tags:\n      - Key: Name\n        Value: awssupport-{{ automation:EXECUTION_ID }}-ec2\n  HelperEC2Instance2:\n    Type: AWS::EC2::Instance\n    Properties:\n      IamInstanceProfile:\n        Ref: InstanceProfile\n      ImageId:\n        Ref: LINUXAMI\n      InstanceType: t3.micro\n      SecurityGroupIds:\n      - \"{{ getDirectoryInfo.directorySecurityGroupId }}\"\n      SubnetId: \"{{ compilePrerequistesTestsOutput.secondSubnet }}\"\n      Tags:\n      - Key: Name\n        Value: awssupport-{{ automation:EXECUTION_ID }}-ec2\nOutputs:\n  firstInstance:\n    Value:\n      Ref: HelperEC2Instance1\n  secondInstance:\n    Value:\n      Ref: HelperEC2Instance2\n",
-        "TimeoutInMinutes": 15
+        "ClientRequestToken": "AWSSupport-TroubleshootADConnectorConnectivity-{{ automation:EXECUTION_ID }}",
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nDescription: 'This step create a CloudFormation template to launch resources required to collect logs. CloudFormation template created 2 Helper Instances: 1 in each subnet of AD connector.'\nParameters:\n  LINUXAMI:\n    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>\n    Default: \"/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2\"\n  InstanceProfile:\n    Type: String\n    Default: \"{{ Ec2InstanceProfile }}\"\nResources:\n  HelperEC2Instance1:\n    Type: AWS::EC2::Instance\n    Properties:\n      IamInstanceProfile:\n        Ref: InstanceProfile\n      ImageId:\n        Ref: LINUXAMI\n      InstanceType: t3.micro\n      SecurityGroupIds:\n      - \"{{ getDirectoryInfo.directorySecurityGroupId }}\"\n      SubnetId: \"{{ getDirectoryInfo.directorySubnet1 }}\"\n      Tags:\n      - Key: Name\n        Value: awssupport-{{ automation:EXECUTION_ID }}-ec2\n  HelperEC2Instance2:\n    Type: AWS::EC2::Instance\n    Properties:\n      IamInstanceProfile:\n        Ref: InstanceProfile\n      ImageId:\n        Ref: LINUXAMI\n      InstanceType: t3.micro\n      SecurityGroupIds:\n      - \"{{ getDirectoryInfo.directorySecurityGroupId }}\"\n      SubnetId: \"{{ getDirectoryInfo.directorySubnet2 }}\"\n      Tags:\n      - Key: Name\n        Value: awssupport-{{ automation:EXECUTION_ID }}-ec2\nOutputs:\n  firstInstance:\n    Value:\n      Ref: HelperEC2Instance1\n  secondInstance:\n    Value:\n      Ref: HelperEC2Instance2",
+        "OnFailure": "DELETE",
+        "TimeoutInMinutes": 15,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootADConnectorConnectivity-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-TroubleshootADConnectorConnectivity-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
       },
       "outputs": [
         {
@@ -379,7 +368,7 @@
       "onFailure": "step:stopEc2HelperInstances",
       "maxAttempts": 3,
       "timeoutSeconds": 120,
-      "isCritical": "true",
+      "isCritical": true,
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -405,7 +394,7 @@
       "onFailure": "step:stopEc2HelperInstances",
       "maxAttempts": 3,
       "timeoutSeconds": 120,
-      "isCritical": "true",
+      "isCritical": true,
       "inputs": {
         "Service": "ssm",
         "Api": "DescribeInstanceInformation",
@@ -439,33 +428,97 @@
         "TimeoutSeconds": "180",
         "Parameters": {
           "commands": [
-            "dnsIp={{ compilePrerequistesTestsOutput.dnsServerIps }}",
-            "sleep 5",
-            "sudo yum install nc -y -q 2>/dev/null",
-            "echo '********************************************************************\\nRunning Connectivity Test from subnet: {{ compilePrerequistesTestsOutput.firstSubnet }}\\n********************************************************************'",
-            "echo '\\n''===================================================='",
-            "echo '1) Performing name resolution and srv records test:\\n===================================================='",
-            "for ipAddress in $dnsIp",
+            "#!/bin/bash",
+            "",
+            "# Capture the DNS IP addresses and other required info from the environment",
+            "dnsIps=\"{{ evalDirectorySecurityGroup.dnsIps }}\"",
+            "IFS=' ' read -r -a dnsIpArray <<< \"$dnsIps\"",
+            "",
+            "directoryName=\"{{ getDirectoryInfo.directoryName }}\"",
+            "token=$(curl -sS -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\") 2> /dev/null",
+            "",
+            "# Get MAC address",
+            "mac=$(curl -sS -H \"X-aws-ec2-metadata-token: $token\" -s http://169.254.169.254/latest/meta-data/mac) 2>/dev/null",
+            "",
+            "# Use MAC address to get subnet ID",
+            "subnet=$(curl -sS -H \"X-aws-ec2-metadata-token: $token\" -s http://169.254.169.254/latest/meta-data/network/interfaces/macs/$mac/subnet-id) 2>/dev/null",
+            "",
+            "# Install netcat if not already installed",
+            "if ! command -v nc &> /dev/null; then",
+            "  sudo yum install nc -y -q 2>/dev/null",
+            "fi",
+            "",
+            "echo \"************************\"",
+            "echo \"Running Connectivity Test from subnet: $subnet\"",
+            "echo \"************************\"",
+            "echo -e \"\\n====================================================\"",
+            "echo \"1) Performing name resolution and SRV records test:\"",
+            "echo \"====================================================\"",
+            "",
+            "# Function to check DNS name and SRV record resolution",
+            "check_dns_resolution() {",
+            "  local ip=\"$1\"",
+            "  ",
+            "  if nslookup \"$directoryName\" \"$ip\" &>/dev/null; then",
+            "    echo \"Checking domain $directoryName name resolution against DNS server $ip: PASSED\"",
+            "  else",
+            "    echo \"Checking domain $directoryName name resolution against DNS server $ip: FAILED\"",
+            "  fi",
+            "  ",
+            "  if nslookup -type=srv \"_ldap._tcp.$directoryName\" \"$ip\" &>/dev/null; then",
+            "    echo \"Checking domain $directoryName LDAP SRV records resolution against DNS server $ip: PASSED\"",
+            "  else",
+            "    echo \"Checking domain $directoryName LDAP SRV records resolution against DNS server $ip: FAILED\"",
+            "  fi",
+            "  ",
+            "  if nslookup -type=srv \"_kerberos._tcp.$directoryName\" \"$ip\" &>/dev/null; then",
+            "    echo \"Checking domain $directoryName Kerberos SRV records resolution against DNS server $ip: PASSED\"",
+            "  else",
+            "    echo \"Checking domain $directoryName Kerberos SRV records resolution against DNS server $ip: FAILED\"",
+            "  fi",
+            "}",
+            "",
+            "# Perform DNS checks for each IP in the list",
+            "for ipAddress in \"${dnsIpArray[@]}\"; ",
             "do",
-            "if nslookup {{ getDirectoryInfo.directoryName }} $ipAddress &>/dev/null; then echo 'Checking domain {{ getDirectoryInfo.directoryName }} name resolution against DNS server '$ipAddress': PASSED'; else echo 'Checking domain {{ getDirectoryInfo.directoryName }} name resolution against DNS server '$ipAddress': FAILED'; fi",
-            "if nslookup -type=srv _ldap._tcp.{{ getDirectoryInfo.directoryName }} $ipAddress &>/dev/null; then echo 'Checking domain {{ getDirectoryInfo.directoryName }} LDAP SRV records resolution against DNS server '$ipAddress': PASSED'; else echo 'Checking domain {{ getDirectoryInfo.directoryName }} LDAP SRV records resolution against DNS server '$ipAddress': FAILED'; fi",
-            "if nslookup -type=srv _kerberos._tcp.{{ getDirectoryInfo.directoryName }} $ipAddress &>/dev/null; then echo 'Checking domain {{ getDirectoryInfo.directoryName }} Kerberos SRV records resolution against DNS server '$ipAddress': PASSED'; else echo 'Checking domain {{ getDirectoryInfo.directoryName }} Kerberos SRV records resolution against DNS server '$ipAddress': FAILED\\n'; fi",
+            "  check_dns_resolution \"$ipAddress\"",
             "done",
-            "stepNumber='2'",
-            "for ipAddress in $dnsIp",
-            "do",
-            "echo '\\n''================================================'",
-            "echo ''$stepNumber') Testing required TCP ports on '$ipAddress':\\n================================================'",
-            "if nc -vzw1 $ipAddress 389 2>/dev/null; then echo 'Checking TCP port 389: PASSED'; else echo 'Checking TCP port 389: FAILED'; fi",
-            "if nc -vzw1 $ipAddress 88 2>/dev/null; then echo 'Checking TCP port 88: PASSED'; else echo 'Checking TCP port 88: FAILED'; fi",
-            "if nc -vzw1 $ipAddress 53 2>/dev/null; then echo 'Checking TCP port 53: PASSED'; else echo 'Checking TCP port 53: FAILED'; fi",
-            "((stepNumber=stepNumber+1))",
-            "echo '\\n''================================================'",
-            "echo ''$stepNumber') Testing required UDP ports on '$ipAddress':\\n================================================'",
-            "if nc -vzw1 -u $ipAddress 389 2>/dev/null; then echo 'Checking UDP port 389: PASSED'; else echo 'Checking UDP port 389: FAILED'; fi",
-            "if nc -vzw1 -u $ipAddress 88 2>/dev/null; then echo 'Checking UDP port 88: PASSED'; else echo 'Checking UDP port 88: FAILED'; fi",
-            "if nc -vzw1 -u $ipAddress 53 2>/dev/null; then echo 'Checking UDP port 53: PASSED'; else echo 'Checking UDP port 53: FAILED'; fi",
-            "((stepNumber=stepNumber+1))",
+            "",
+            "# Function to test specific TCP and UDP ports",
+            "test_port_connectivity() {",
+            "  local ip=\"$1\"",
+            "  local port=\"$2\"",
+            "  local protocol=\"$3\"",
+            "  local label=\"$4\"",
+            "",
+            "  if nc -vz\"$protocol\"w1 \"$ip\" \"$port\" &>/dev/null; then",
+            "    echo \"Checking $label port $port: PASSED\"",
+            "  else",
+            "    echo \"Checking $label port $port: FAILED\"",
+            "  fi",
+            "}",
+            "",
+            "# TCP and UDP port lists",
+            "tcp_ports=(389 88 53)",
+            "udp_ports=(389 88 53)",
+            "",
+            "# Test TCP and UDP ports on each DNS IP address",
+            "for ipAddress in $dnsIps; do",
+            "  echo -e \"\\n================================================\"",
+            "  echo \"2) Testing required TCP ports on $ipAddress:\"",
+            "  echo \"================================================\"",
+            "",
+            "  for port in \"${tcp_ports[@]}\"; do",
+            "    test_port_connectivity \"$ipAddress\" \"$port\" \"\" \"TCP\"",
+            "  done",
+            "  ",
+            "  echo -e \"\\n================================================\"",
+            "  echo \"3) Testing required UDP ports on $ipAddress:\"",
+            "  echo \"================================================\"",
+            "  ",
+            "  for port in \"${udp_ports[@]}\"; do",
+            "    test_port_connectivity \"$ipAddress\" \"$port\" \"u\" \"UDP\"",
+            "  done",
             "done"
           ]
         }
@@ -498,33 +551,97 @@
         "TimeoutSeconds": "180",
         "Parameters": {
           "commands": [
-            "dnsIp={{ compilePrerequistesTestsOutput.dnsServerIps }}",
-            "sleep 5",
-            "sudo yum install nc -y -q 2>/dev/null",
-            "echo '********************************************************************\\nRunning Connectivity Test from subnet: {{ compilePrerequistesTestsOutput.secondSubnet }}\\n********************************************************************'",
-            "echo '\\n''===================================================='",
-            "echo '1) Performing name resolution and srv records test:\\n===================================================='",
-            "for ipAddress in $dnsIp",
+            "#!/bin/bash",
+            "",
+            "# Capture the DNS IP addresses and other required info from the environment",
+            "dnsIps=\"{{ evalDirectorySecurityGroup.dnsIps }}\"",
+            "IFS=' ' read -r -a dnsIpArray <<< \"$dnsIps\"",
+            "",
+            "directoryName=\"{{ getDirectoryInfo.directoryName }}\"",
+            "token=$(curl -sS -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\") 2> /dev/null",
+            "",
+            "# Get MAC address",
+            "mac=$(curl -sS -H \"X-aws-ec2-metadata-token: $token\" -s http://169.254.169.254/latest/meta-data/mac) 2>/dev/null",
+            "",
+            "# Use MAC address to get subnet ID",
+            "subnet=$(curl -sS -H \"X-aws-ec2-metadata-token: $token\" -s http://169.254.169.254/latest/meta-data/network/interfaces/macs/$mac/subnet-id) 2>/dev/null",
+            "",
+            "# Install netcat if not already installed",
+            "if ! command -v nc &> /dev/null; then",
+            "  sudo yum install nc -y -q 2>/dev/null",
+            "fi",
+            "",
+            "echo \"************************\"",
+            "echo \"Running Connectivity Test from subnet: $subnet\"",
+            "echo \"************************\"",
+            "echo -e \"\\n====================================================\"",
+            "echo \"1) Performing name resolution and SRV records test:\"",
+            "echo \"====================================================\"",
+            "",
+            "# Function to check DNS name and SRV record resolution",
+            "check_dns_resolution() {",
+            "  local ip=\"$1\"",
+            "  ",
+            "  if nslookup \"$directoryName\" \"$ip\" &>/dev/null; then",
+            "    echo \"Checking domain $directoryName name resolution against DNS server $ip: PASSED\"",
+            "  else",
+            "    echo \"Checking domain $directoryName name resolution against DNS server $ip: FAILED\"",
+            "  fi",
+            "  ",
+            "  if nslookup -type=srv \"_ldap._tcp.$directoryName\" \"$ip\" &>/dev/null; then",
+            "    echo \"Checking domain $directoryName LDAP SRV records resolution against DNS server $ip: PASSED\"",
+            "  else",
+            "    echo \"Checking domain $directoryName LDAP SRV records resolution against DNS server $ip: FAILED\"",
+            "  fi",
+            "  ",
+            "  if nslookup -type=srv \"_kerberos._tcp.$directoryName\" \"$ip\" &>/dev/null; then",
+            "    echo \"Checking domain $directoryName Kerberos SRV records resolution against DNS server $ip: PASSED\"",
+            "  else",
+            "    echo \"Checking domain $directoryName Kerberos SRV records resolution against DNS server $ip: FAILED\"",
+            "  fi",
+            "}",
+            "",
+            "# Perform DNS checks for each IP in the list",
+            "for ipAddress in \"${dnsIpArray[@]}\"; ",
             "do",
-            "if nslookup {{ getDirectoryInfo.directoryName }} $ipAddress &>/dev/null; then echo 'Checking domain {{ getDirectoryInfo.directoryName }} name resolution against DNS server '$ipAddress': PASSED'; else echo 'Checking domain {{ getDirectoryInfo.directoryName }} name resolution against DNS server '$ipAddress': FAILED'; fi",
-            "if nslookup -type=srv _ldap._tcp.{{ getDirectoryInfo.directoryName }} $ipAddress &>/dev/null; then echo 'Checking domain {{ getDirectoryInfo.directoryName }} LDAP SRV records resolution against DNS server '$ipAddress': PASSED'; else echo 'Checking domain {{ getDirectoryInfo.directoryName }} LDAP SRV records resolution against DNS server '$ipAddress': FAILED'; fi",
-            "if nslookup -type=srv _kerberos._tcp.{{ getDirectoryInfo.directoryName }} $ipAddress &>/dev/null; then echo 'Checking domain {{ getDirectoryInfo.directoryName }} Kerberos SRV records resolution against DNS server '$ipAddress': PASSED'; else echo 'Checking domain {{ getDirectoryInfo.directoryName }} Kerberos SRV records resolution against DNS server '$ipAddress': FAILED\\n'; fi",
+            "  check_dns_resolution \"$ipAddress\"",
             "done",
-            "stepNumber='2'",
-            "for ipAddress in $dnsIp",
-            "do",
-            "echo '\\n''================================================'",
-            "echo ''$stepNumber') Testing required TCP ports on '$ipAddress':\\n================================================'",
-            "if nc -vzw1 $ipAddress 389 2>/dev/null; then echo 'Checking TCP port 389: PASSED'; else echo 'Checking TCP port 389: FAILED'; fi",
-            "if nc -vzw1 $ipAddress 88 2>/dev/null; then echo 'Checking TCP port 88: PASSED'; else echo 'Checking TCP port 88: FAILED'; fi",
-            "if nc -vzw1 $ipAddress 53 2>/dev/null; then echo 'Checking TCP port 53: PASSED'; else echo 'Checking TCP port 53: FAILED'; fi",
-            "((stepNumber=stepNumber+1))",
-            "echo '\\n''================================================'",
-            "echo ''$stepNumber') Testing required UDP ports on '$ipAddress':\\n================================================'",
-            "if nc -vzw1 -u $ipAddress 389 2>/dev/null; then echo 'Checking UDP port 389: PASSED'; else echo 'Checking UDP port 389: FAILED'; fi",
-            "if nc -vzw1 -u $ipAddress 88 2>/dev/null; then echo 'Checking UDP port 88: PASSED'; else echo 'Checking UDP port 88: FAILED'; fi",
-            "if nc -vzw1 -u $ipAddress 53 2>/dev/null; then echo 'Checking UDP port 53: PASSED'; else echo 'Checking UDP port 53: FAILED'; fi",
-            "((stepNumber=stepNumber+1))",
+            "",
+            "# Function to test specific TCP and UDP ports",
+            "test_port_connectivity() {",
+            "  local ip=\"$1\"",
+            "  local port=\"$2\"",
+            "  local protocol=\"$3\"",
+            "  local label=\"$4\"",
+            "",
+            "  if nc -vz\"$protocol\"w1 \"$ip\" \"$port\" &>/dev/null; then",
+            "    echo \"Checking $label port $port: PASSED\"",
+            "  else",
+            "    echo \"Checking $label port $port: FAILED\"",
+            "  fi",
+            "}",
+            "",
+            "# TCP and UDP port lists",
+            "tcp_ports=(389 88 53)",
+            "udp_ports=(389 88 53)",
+            "",
+            "# Test TCP and UDP ports on each DNS IP address",
+            "for ipAddress in $dnsIps; do",
+            "  echo -e \"\\n================================================\"",
+            "  echo \"2) Testing required TCP ports on $ipAddress:\"",
+            "  echo \"================================================\"",
+            "",
+            "  for port in \"${tcp_ports[@]}\"; do",
+            "    test_port_connectivity \"$ipAddress\" \"$port\" \"\" \"TCP\"",
+            "  done",
+            "  ",
+            "  echo -e \"\\n================================================\"",
+            "  echo \"3) Testing required UDP ports on $ipAddress:\"",
+            "  echo \"================================================\"",
+            "  ",
+            "  for port in \"${udp_ports[@]}\"; do",
+            "    test_port_connectivity \"$ipAddress\" \"$port\" \"u\" \"UDP\"",
+            "  done",
             "done"
           ]
         }
@@ -564,8 +681,8 @@
       "action": "aws:deleteStack",
       "description": "Deletes the AWS CloudFormation stack.",
       "maxAttempts": 3,
-      "timeoutSeconds": 500,
-      "isCritical": "true",
+      "timeoutSeconds": 600,
+      "isCritical": true,
       "onFailure": "step:handleDeleteStackFailure",
       "inputs": {
         "StackName": "{{ createHelperEC2InstancesStack.stackId }}"
@@ -576,17 +693,15 @@
       "name": "handleDeleteStackFailure",
       "action": "aws:executeScript",
       "description": "Outputs instructions about how to manually delete the AWS CloudFormation stack if the automation fails to delete the stack.",
-      "maxAttempts": 3,
-      "timeoutSeconds": 120,
-      "isCritical": "false",
+      "isCritical": false,
       "onFailure": "Continue",
       "inputs": {
         "Runtime": "python3.11",
-        "Handler": "handleDeleteStackFailure_handler",
+        "Handler": "handle_delete_stack_failure_handler",
         "InputPayload": {
-          "stackId": "{{ createHelperEC2InstancesStack.stackId }}"
+          "StackId": "{{ createHelperEC2InstancesStack.stackId }}"
         },
-        "Script": "def handleDeleteStackFailure_handler(events, context):\n\n    import boto3\n    from botocore.exceptions import ClientError,ParamValidationError\n\n    #Capturing the stack ID from the event.\n    stackIdArn = events['stackId']\n\n    #Constructing boto3 client and getting stack name\n    client = boto3.client('cloudformation')\n    try:\n        response = client.describe_stacks(StackName=stackIdArn)\n        stackName = response['Stacks'][0]['StackName']\n    except ClientError as e:\n        raise Exception (\"[ERROR]\",e)\n\n    Message = (\"\\n**[WARNING]** The deleteStack step has failed. To manually delete the stack: \\n\\n\"  \n    \"1. Open the AWS CloudFormation console at https://console.aws.amazon.com/cloudformation. \\n\"\n    \"2. On the Stacks page in the CloudFormation console, select the stack: \") + stackName + \"\\n3. In the stack details pane, choose Delete. \"\n\n    Docs = (\"\\n\\nFor more information on how to delete the stack, follow : https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html\")\n\n    Result = Message + Docs\n\n    return Result\n"
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nimport boto3\nfrom botocore.exceptions import ClientError, ValidationError\n\nsys.tracebacklimit = 0\n\n\ndef handle_delete_stack_failure_handler(events, _):\n    \"\"\"\n    Determines if the AWS Cloudformation stack exists.\n\n    Args:\n        events(dict): Input event from the automation step.\n            - StackId(str): Cloudformation Stack Id\n\n    Returns:\n        result(str): Result of the evaluation.\n    \"\"\"\n\n    # Capturing the stack ID from the event.\n    stack_id_arn = events[\"StackId\"]\n\n    # Constructing boto3 client and getting stack name\n    client = boto3.client(\"cloudformation\")\n    try:\n        response = client.describe_stacks(StackName=stack_id_arn)\n        stack_name = response[\"Stacks\"][0][\"StackName\"]\n\n        message = (\n            (\n                \"\\n**[WARNING]** The deleteStack step has failed. To manually delete the stack: \\n\\n\"\n                \"1. Open the AWS CloudFormation console at https://console.aws.amazon.com/cloudformation. \\n\"\n                \"2. On the Stacks page in the CloudFormation console, select the stack: \"\n            )\n            + stack_name\n            + \"\\n3. In the stack details pane, choose Delete. \"\n        )\n\n        docs = \"\\n\\nFor more information on how to delete the stack, follow : https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html\"\n\n        result = message + docs\n    except ValidationError:\n        result = f\"[Success] Stack,{stack_id_arn}, has already been deleted.\"\n\n    except ClientError as e:\n        raise RuntimeError(f\"[ERROR] {e}\") from None\n\n    return result\n"
       },
       "outputs": [
         {

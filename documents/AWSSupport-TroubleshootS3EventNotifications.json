@@ -1,0 +1,252 @@
+{
+  "description": "The **AWSSupport-TroubleshootS3EventNotifications** automation runbook helps troubleshoot Amazon Simple Storage Service (Amazon S3) event notification configurations with AWS Lambda functions, Amazon Simple Notification Service (Amazon SNS) topics, or Amazon Simple Queue Service (Amazon SQS) queues. **Important**: This runbook can only evaluate event notification configurations if the Amazon S3 bucket owner is the same as the AWS account owner where the automation runbook is being executed. Additionally, this runbook cannot evaluate policies on resources that are hosted in another AWS account.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the Amazon S3 bucket configured with event notification(s)."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateInputs",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "nextStep": "GetBucketNotificationConfiguration",
+      "description": "Validate that the Amazon S3 bucket provided belongs to the same account where the automation is executed.",
+      "inputs": {
+        "InputPayload": {
+          "BucketName": "{{ S3BucketName }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nfrom typing import Dict\n\nimport boto3\nfrom botocore.errorfactory import ClientError\n\nsys.tracebacklimit = 0\n\ns3_client = boto3.client(\"s3\")\n\n\ndef same_acc_checker(bucket_name: str, account_id: int) -> str:\n    \"\"\"Validates if the Amazon S3 bucket exists in current account and gets the associated region\n\n    Args:\n        bucket_name: The name of the Amazon S3 bucket.\n        account_id: Account number where the automation is being executed.\n\n    Returns:\n        Returns the region where the Amazon S3 bucket is hosted.\n\n    Raises:\n        ClientError: An error occurred calling the get_bucket_location API.\n    \"\"\"\n    try:\n        location = s3_client.get_bucket_location(\n            Bucket=bucket_name,\n            ExpectedBucketOwner=account_id,\n        ).get(\"LocationConstraint\")\n        return \"us-east-1\" if location is None else location\n    except ClientError as err:\n        err_code = err.response[\"Error\"][\"Code\"]\n        err_message = err.response[\"Error\"][\"Message\"]\n        if err_code == \"AccessDenied\":\n            raise RuntimeError(\n                \"You can only use this runbook to evaluate access issues if the requester account is in same account as the bucket owner.\"\n            )\n        else:\n            raise RuntimeError(\n                f\"An error occurred calling the get_bucket_location API: {err_code}:{err_message}\"\n            ) from None\n\n\ndef script_handler(events: Dict[str, str], context: Dict[str, str]) -> dict:\n    bucket_name = events.get(\"BucketName\")\n    account_id = context.get(\"global:ACCOUNT_ID\")\n\n    bucket_location = same_acc_checker(bucket_name, account_id)\n\n    try:\n        return {\"region\": bucket_location}\n    except Exception as e:\n        raise RuntimeError(\n            f\"An error has occurred when trying to validate the bucket owner account and region: {str(e)}.\"\n        ) from None\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "onFailure": "Abort",
+      "isCritical": true,
+      "outputs": [
+        {
+          "Name": "S3BucketRegion",
+          "Selector": "$.Payload.region",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetBucketNotificationConfiguration",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "Calls `s3:GetBucketNotificationConfiguration` API to review event notifications configured with the Amazon S3 bucket and formats output.",
+      "nextStep": "BranchOnSQSResourcePolicy",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "BucketName": "{{ S3BucketName }}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nfrom typing import Dict\n\nimport boto3\nfrom botocore.errorfactory import ClientError\n\nsys.tracebacklimit = 0\n\ns3_client = boto3.client(\"s3\")\n\n\ndef get_bucket_notification_configuration(bucket_name: str) -> dict:\n    \"\"\"Gets the event notifications configured with the Amazon S3 Bucket.\n\n    Args:\n        bucket_name: The name of the Amazon S3 bucket.\n\n    Returns:\n        Returns the event notifications configured with the Amazon S3 Bucket.\n\n    Raises:\n        ClientError: An error occurred calling the get_bucket_notification_configuration API.\n    \"\"\"\n    try:\n        event_notifications = s3_client.get_bucket_notification_configuration(\n            Bucket=bucket_name,\n        )\n        return event_notifications\n    except ClientError as err:\n        err_code = err.response[\"Error\"][\"Code\"]\n        err_message = err.response[\"Error\"][\"Message\"]\n        if err_code == \"AccessDenied\":\n            raise RuntimeError(\n                \"You can only use this runbook to evaluate access issues if the requester account is in same account as the bucket owner.\"\n            )\n        else:\n            raise RuntimeError(f\"An error occurred calling the get_bucket_location API: {err_code}:{err_message}\")\n\n\ndef script_handler(events: Dict[str, str], _) -> dict:\n    bucket_name = events.get(\"BucketName\")\n\n    event_notifications = get_bucket_notification_configuration(bucket_name)\n    sns_notifications = event_notifications.get(\"TopicConfigurations\")\n    sns_notifications = (\n        set([sns_topic.get(\"TopicArn\") for sns_topic in sns_notifications]) if sns_notifications is not None else None\n    )  # using set() to remove duplications in List as it is possible to have different event notifications configured with the same resource (SQS, SNS or Lambda)\n    sqs_notifications = event_notifications.get(\"QueueConfigurations\")\n    sqs_notifications = (\n        set([sqs_queue.get(\"QueueArn\") for sqs_queue in sqs_notifications]) if sqs_notifications is not None else None\n    )\n    lambda_notifications = event_notifications.get(\"LambdaFunctionConfigurations\")\n    lambda_notifications = (\n        set([lambda_function.get(\"LambdaFunctionArn\") for lambda_function in lambda_notifications])\n        if lambda_notifications is not None\n        else None\n    )\n\n    try:\n        return {\n            \"TopicConfigurations\": {\n                \"Configurations\": list(sns_notifications) if isinstance(sns_notifications, set) else \"None\",\n                \"IsSet\": \"True\" if isinstance(sns_notifications, set) else \"False\",\n            },\n            \"QueueConfigurations\": {\n                \"Configurations\": list(sqs_notifications) if isinstance(sqs_notifications, set) else \"None\",\n                \"IsSet\": \"True\" if isinstance(sqs_notifications, set) else \"False\",\n            },\n            \"LambdaFunctionConfigurations\": {\n                \"Configurations\": list(lambda_notifications) if isinstance(lambda_notifications, set) else \"None\",\n                \"IsSet\": \"True\" if isinstance(lambda_notifications, set) else \"False\",\n            },\n        }\n    except Exception as e:\n        raise RuntimeError(\n            f\"An error has occurred when trying to get the event notifications configured with the s3 bucket: {str(e)}.\"\n        )\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "TopicConfigurations",
+          "Selector": "$.Payload.TopicConfigurations.Configurations",
+          "Type": "StringList"
+        },
+        {
+          "Name": "TopicConfigurationsType",
+          "Selector": "$.Payload.TopicConfigurations.IsSet",
+          "Type": "String"
+        },
+        {
+          "Name": "QueueConfigurations",
+          "Selector": "$.Payload.QueueConfigurations.Configurations",
+          "Type": "StringList"
+        },
+        {
+          "Name": "QueueConfigurationsType",
+          "Selector": "$.Payload.QueueConfigurations.IsSet",
+          "Type": "String"
+        },
+        {
+          "Name": "LambdaFunctionConfigurations",
+          "Selector": "$.Payload.LambdaFunctionConfigurations.Configurations",
+          "Type": "StringList"
+        },
+        {
+          "Name": "LambdaFunctionConfigurationsType",
+          "Selector": "$.Payload.LambdaFunctionConfigurations.IsSet",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnSQSResourcePolicy",
+      "action": "aws:branch",
+      "timeoutSeconds": 300,
+      "nextStep": "ValidateSQSResourcePolicy",
+      "description": "Branches on whether there are Amazon SQS event notifications configured.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnSNSResourcePolicy",
+            "Variable": "{{ GetBucketNotificationConfiguration.QueueConfigurationsType }}",
+            "StringEquals": "False"
+          }
+        ],
+        "Default": "ValidateSQSResourcePolicy"
+      }
+    },
+    {
+      "name": "ValidateSQSResourcePolicy",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "Validate that the resource policy on SQS queue attributes has `sqs:SendMessage` permission for S3. If the SQS queue is encrypted, check KMS key permissions.",
+      "nextStep": "BranchOnSNSResourcePolicy",
+      "onFailure": "Abort",
+      "inputs": {
+        "Attachment": "artifact.zip",
+        "InputPayload": {
+          "QueueConfigurations": "{{ GetBucketNotificationConfiguration.QueueConfigurations }}",
+          "S3BucketRegion": "{{ ValidateInputs.S3BucketRegion }}",
+          "BucketName": "{{ S3BucketName }}"
+        },
+        "Handler": "validate_sqs_policy.script_handler",
+        "Runtime": "python3.11"
+      },
+      "outputs": [
+        {
+          "Name": "SQSEvaluationResults",
+          "Selector": "$.Payload.EvaluationResults",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnSNSResourcePolicy",
+      "timeoutSeconds": 300,
+      "action": "aws:branch",
+      "description": "Branches on whether there are Amazon SNS event notifications.",
+      "nextStep": "ValidateSNSResourcePolicy",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnLambdaFunctionResourcePolicy",
+            "Variable": "{{ GetBucketNotificationConfiguration.TopicConfigurationsType }}",
+            "StringEquals": "False"
+          }
+        ],
+        "Default": "ValidateSNSResourcePolicy"
+      }
+    },
+    {
+      "name": "ValidateSNSResourcePolicy",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "Validate that the resource policy on SNS topic attributes has `sns:Publish` permission for Amazon S3. If the SNS topic is encrypted, check KMS key permissions.",
+      "nextStep": "BranchOnLambdaFunctionResourcePolicy",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "TopicConfigurations": "{{ GetBucketNotificationConfiguration.TopicConfigurations }}",
+          "S3BucketRegion": "{{ ValidateInputs.S3BucketRegion }}",
+          "BucketName": "{{ S3BucketName }}"
+        },
+        "Handler": "validate_sns_policy.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "SNSEvaluationResults",
+          "Selector": "$.Payload.EvaluationResults",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnLambdaFunctionResourcePolicy",
+      "action": "aws:branch",
+      "timeoutSeconds": 300,
+      "description": "Branches on whether there are AWS Lambda event notifications.",
+      "nextStep": "ValidateLambdaFunctionResourcePolicy",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "Variable": "{{ GetBucketNotificationConfiguration.LambdaFunctionConfigurationsType }}",
+            "StringEquals": "False"
+          }
+        ],
+        "Default": "ValidateLambdaFunctionResourcePolicy"
+      }
+    },
+    {
+      "name": "ValidateLambdaFunctionResourcePolicy",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "Validate that the resource policy on the Lambda function has permission for Amazon S3.",
+      "nextStep": "GenerateReport",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "LambdaFunctionConfigurations": "{{ GetBucketNotificationConfiguration.LambdaFunctionConfigurations }}",
+          "S3BucketRegion": "{{ ValidateInputs.S3BucketRegion }}",
+          "BucketName": "{{ S3BucketName }}"
+        },
+        "Handler": "validate_lambda_policy.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "LambdaEvaluationResults",
+          "Selector": "$.Payload.EvaluationResults",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "GenerateReport",
+      "description": "Returns details of the runbook steps outputs, and recommendations to resolve any issue with the event notifications configured with the Amazon S3 bucket.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "S3BucketName": "{{ S3BucketName }}",
+          "AutomationID": "{{automation:EXECUTION_ID}}"
+        },
+        "Script": "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport json\nimport sys\nfrom string import Template\n\nimport boto3\nfrom botocore.errorfactory import ClientError\n\nsys.tracebacklimit = 0\n\nssm_client = boto3.client(\"ssm\")\n\n# report spacing settings\nRESOURCE_PADDING = 108\nDESCRIPTION_PADDING = 28\nVALUE_PADDING = 80\nDASH_PADDING = 110\n\n# Results Indicators\nresults = {\n    \"pass\": \"\\u2705[PASSED]: \",\n    \"fail\": \"\\u274C[FAILED]: \",\n    \"info\": \"\\u27A4[INFO]: \",\n    \"skip\": \"\\u2757[SKIPPED]: \",\n}\n\nmessages = {\n    # SQS/SNS Resource checks\n    \"resource_exist\": \"The resource exists in the S3 Bucket Region.\",\n    \"resource_doesnt_exist\": \"The resource does NOT exist in the S3 Bucket Region.\",\n    \"resource_policy_validated\": \"The resource policy is properly configured for use with S3 Bucket.\",\n    \"resource_policy_invalid\": \"The resource policy is NOT properly configured for use with S3 Bucket. Please update the resource policy using this guide: https://docs.aws.amazon.com/AmazonS3/latest/userguide/grant-destinations-permissions-to-s3.html\",\n    # Additional Lambda Resource checks\n    \"resource_policy_missing\": \"No S3 permissions found on Lambda resource policy. Please update the Lambda resource with S3 permissions using this guide: https://docs.aws.amazon.com/AmazonS3/latest/userguide/grant-destinations-permissions-to-s3.html#grant-lambda-invoke-permission-to-s3\",\n    \"resource_policy_not_found\": \"The Lambda resource policy is empty. Please update the resource with a valid policy using this guide: https://docs.aws.amazon.com/AmazonS3/latest/userguide/grant-destinations-permissions-to-s3.html\",\n    # KMS checks\n    \"key_enabled\": \"The KMS key is enabled.\",\n    \"key_disabled\": \"The KMS key is disabled.\",\n    \"kms_policy_alias\": \"Amazon S3 Event Notifications does not support using SQS or SNS targets encrypted using AWS managed keys, i.e., aws/sns or aws/sqs respectively.\",\n    \"kms_resource_policy_invalid\": \"The resource policy on the KMS key does not allow S3 permissions. Please update the key policy using this guide: https://docs.aws.amazon.com/AmazonS3/latest/userguide/grant-destinations-permissions-to-s3.html#key-policy-sns-sqs\",\n    # general\n    \"not_applicable\": \"Not Applicable.\",\n    \"not_applicable_cross_account\": \"The resource is hosted in another AWS account. This runbook cannot validate resources hosted in another AWS account other than that used to invoke this automation. Please ensure that the resource in the other AWS account allows s3 permissions in the resource policy and associated KMS key (if any). Please refer to this guide: https://repost.aws/knowledge-center/lambda-invoke-error-s3-bucket-permission\",\n}\n\n\ndef render_message(result=None, message_code=None, **kwargs) -> str:\n    template = Template(messages[message_code])\n    message = template.safe_substitute(**kwargs)\n    return f\"{results[result]}{message}\"\n\n\ndef generate_sqs_report(sqs_evaluation_results) -> str:\n    counter = 1\n    return_data = []\n    evaluation_results = sqs_evaluation_results.get(\"EvaluationResults\")\n    for sqs_arn in evaluation_results:\n        sqs_queue_data = evaluation_results.get(sqs_arn)\n        kms_data = sqs_queue_data.get(\"kms_policy\")\n        kms_key = kms_data.get(\"kms_key\")\n        return_data.extend(\n            [\n                f\"\\n| SQS Queue {f'{counter}: {sqs_arn} | KMS Key: {kms_key}':<{RESOURCE_PADDING}}\",\n                f\"\\n| {'SQS resource check':<{DESCRIPTION_PADDING}}|\"\n                f\"{generate_resource_exists_render_message(sqs_queue_data.get('resource_exists')):<{VALUE_PADDING}}\",\n                f\"\\n| {'SQS access policy check':<{DESCRIPTION_PADDING}}|\"\n                f\"{generate_resource_policy_render_message(sqs_queue_data.get('resource_policy'),sqs_queue_data.get('resource_exists')):<{VALUE_PADDING}}\",\n                f\"\\n| {'KMS key check':<{DESCRIPTION_PADDING}}|\"\n                f\"{generate_kms_key_check_render_message(kms_data.get('kms_key_exists'), kms_data.get('kms_policy_evaluation_result')):<{VALUE_PADDING}}\",\n                f\"\\n| {'KMS key status check':<{DESCRIPTION_PADDING}}|\"\n                f\"{generate_kms_key_enabled_render_message(kms_data.get('kms_key_enabled')):<{VALUE_PADDING}}\",\n                f\"\\n| {'KMS key policy check':<{DESCRIPTION_PADDING}}|\"\n                f\"{generate_kms_policy_render_message(kms_data.get('kms_policy_evaluation_result')):<{VALUE_PADDING}}\",\n                \"\\n\",\n            ]\n        )\n        counter += 1\n    return_data.append(\"\\n{:-<{width}}\".format(\"\", width=DASH_PADDING))\n    return_data = \"\".join(return_data)\n    return return_data\n\n\ndef generate_sns_report(sns_evaluation_results) -> str:\n    counter = 1\n    return_data = []\n    evaluation_results = sns_evaluation_results.get(\"EvaluationResults\")\n    for sns_arn in evaluation_results:\n        sns_queue_data = evaluation_results.get(sns_arn)\n        kms_data = sns_queue_data.get(\"kms_policy\")\n        return_data.extend(\n            [\n                \"\\n| SNS Topic {:<{width}}\".format(\n                    f'{counter}: {sns_arn} | KMS Key: {kms_data.get(\"kms_key\")}', width=RESOURCE_PADDING\n                ),\n                f\"\\n| {'SNS resource check':<{DESCRIPTION_PADDING}}|\",\n                f\"{generate_resource_exists_render_message(sns_queue_data.get('resource_exists')):<{VALUE_PADDING}}\",\n                f\"\\n| {'SNS access policy check':<{DESCRIPTION_PADDING}}|\",\n                f\"{generate_resource_policy_render_message(sns_queue_data.get('resource_policy'), sns_queue_data.get('resource_exists')):<{VALUE_PADDING}}\",\n                f\"\\n| {'KMS key check':<{DESCRIPTION_PADDING}}|\",\n                f\"{generate_kms_key_check_render_message(kms_data.get('kms_key_exists'), kms_data.get('kms_policy_evaluation_result')):<{VALUE_PADDING}}\",\n                f\"\\n| {'KMS key status check':<{DESCRIPTION_PADDING}}|\",\n                f\"{generate_kms_key_enabled_render_message(kms_data.get('kms_key_enabled')):<{VALUE_PADDING}}\",\n                f\"\\n| {'KMS key policy check':<{DESCRIPTION_PADDING}}|\",\n                f\"{generate_kms_policy_render_message(kms_data.get('kms_policy_evaluation_result')):<{VALUE_PADDING}}\",\n                \"\\n\",\n            ]\n        )\n        counter += 1\n    return_data.append(\"\\n{:-<{width}}\".format(\"\", width=DASH_PADDING))\n    return_data = \"\".join(return_data)\n    return return_data\n\n\ndef generate_lambda_report(lambda_evaluation_results) -> str:\n    counter = 1\n    return_data = []\n    evaluation_results = lambda_evaluation_results.get(\"EvaluationResults\")\n    for lambda_function in evaluation_results:\n        lambda_function_data = evaluation_results.get(lambda_function)\n        return_data.extend(\n            [\n                f\"\\n| Lambda Function {f'{counter}: {lambda_function}':<{RESOURCE_PADDING}}\",\n                f\"\\n| {'Lambda resource check':<{DESCRIPTION_PADDING}}|\",\n                f\"{generate_resource_exists_render_message(lambda_function_data.get('resource_exists')):<{VALUE_PADDING}}\",\n                f\"\\n| {'Lambda access policy check':<{DESCRIPTION_PADDING}}|\",\n                f\"{generate_resource_policy_render_message(lambda_function_data.get('resource_policy'), lambda_function_data.get('resource_exists')):<{VALUE_PADDING}}\",\n                \"\\n\",\n            ]\n        )\n        counter += 1\n    return_data.append(\"\\n{:-<{width}}\".format(\"\", width=DASH_PADDING))\n    return_data = \"\".join(return_data)\n    return return_data\n\n\ndef generate_resource_exists_render_message(check_resource) -> str:\n    if check_resource is True:\n        result = render_message(result=\"pass\", message_code=\"resource_exist\")\n    elif check_resource == \"NotApplicableCrossAccount\":\n        result = render_message(result=\"skip\", message_code=\"not_applicable_cross_account\")\n    else:\n        result = render_message(result=\"fail\", message_code=\"resource_doesnt_exist\")\n    return result\n\n\ndef generate_resource_policy_render_message(check_resource_policy, check_resource) -> str:\n    if check_resource_policy == \"allowed\":\n        result = render_message(result=\"pass\", message_code=\"resource_policy_validated\")\n    elif check_resource_policy == \"NoPolicyFound\":\n        result = render_message(result=\"fail\", message_code=\"resource_policy_not_found\")\n    elif check_resource == \"NotApplicableCrossAccount\":\n        result = render_message(result=\"skip\", message_code=\"not_applicable_cross_account\")\n    else:\n        result = render_message(result=\"fail\", message_code=\"resource_policy_invalid\")\n    return result\n\n\ndef generate_kms_key_check_render_message(check_resource, check_resource_policy) -> str:\n    if check_resource is True:\n        result = render_message(result=\"pass\", message_code=\"resource_exist\")\n    elif check_resource == \"NotApplicable\" and check_resource_policy == \"implicitAllowed\":\n        result = render_message(result=\"info\", message_code=\"not_applicable\")\n    elif check_resource_policy == \"unencrypted\":\n        result = render_message(result=\"info\", message_code=\"not_applicable\")\n    elif check_resource == \"NotApplicableCrossAccount\":\n        result = render_message(result=\"skip\", message_code=\"not_applicable_cross_account\")\n    else:\n        result = render_message(result=\"fail\", message_code=\"resource_doesnt_exist\")\n    return result\n\n\ndef generate_kms_key_enabled_render_message(kms_key_status) -> str:\n    if kms_key_status is True:\n        result = render_message(result=\"pass\", message_code=\"key_enabled\")\n    elif kms_key_status is False:\n        result = render_message(result=\"fail\", message_code=\"key_disabled\")\n    elif kms_key_status == \"NotApplicableCrossAccount\":\n        result = render_message(result=\"skip\", message_code=\"not_applicable_cross_account\")\n    else:\n        result = render_message(result=\"info\", message_code=\"not_applicable\")\n    return result\n\n\ndef generate_kms_policy_render_message(check_resource_policy) -> str:\n    if check_resource_policy == \"allowed\":\n        result = render_message(result=\"pass\", message_code=\"resource_policy_validated\")\n    elif check_resource_policy == \"alias\":\n        result = render_message(result=\"fail\", message_code=\"kms_policy_alias\")\n    elif (\n        (check_resource_policy == \"unencrypted\")\n        or (check_resource_policy == \"implicitAllowed\")\n        or (check_resource_policy is None)\n    ):\n        result = render_message(result=\"info\", message_code=\"not_applicable\")\n    elif check_resource_policy == \"NotApplicableCrossAccount\":\n        result = render_message(result=\"skip\", message_code=\"not_applicable_cross_account\")\n    else:\n        result = render_message(result=\"fail\", message_code=\"kms_resource_policy_invalid\")\n    return result\n\n\ndef get_automation_step_execution(step_name, automation_execution_id):\n    try:\n        response = ssm_client.describe_automation_step_executions(\n            AutomationExecutionId=automation_execution_id,\n            Filters=[\n                {\n                    \"Key\": \"StepName\",\n                    \"Values\": [\n                        step_name,\n                    ],\n                },\n            ],\n        ).get(\"StepExecutions\")[0]\n\n        output = response.get(\"Outputs\")\n        output = json.loads(output[\"OutputPayload\"][0]) if output else None\n        return output.get(\"Payload\") if output else None\n\n    except ClientError as err:\n        err_code = err.response[\"Error\"][\"Code\"]\n        err_message = err.response[\"Error\"][\"Message\"]\n        raise RuntimeError(\n            f\"An error occurred calling the describe_automation_step_executions API: {err_code}: {err_message}\"\n        ) from None\n\n\ndef make_final_report(events, context) -> str:\n    s3_bucket_name = events.get(\"S3BucketName\")\n    automation_execution_id = events.get(\"AutomationID\")\n    sqs_evaluation_results = get_automation_step_execution(\"ValidateSQSResourcePolicy\", automation_execution_id)\n    sns_evaluation_results = get_automation_step_execution(\"ValidateSNSResourcePolicy\", automation_execution_id)\n    lambda_evaluation_results = get_automation_step_execution(\n        \"ValidateLambdaFunctionResourcePolicy\", automation_execution_id\n    )\n\n    return_data = []\n    return_data.append(\"{:-<{width}}\".format(\"\", width=DASH_PADDING))\n    return_data.append(\n        \"\\n|{:^{width}}|\".format(\n            f\"Amazon S3 Event Notification Troubleshooting Results for S3 Bucket {s3_bucket_name}\",\n            width=RESOURCE_PADDING,\n        )\n    )\n    return_data.append(\"\\n{:-<{width}}\".format(\"\", width=DASH_PADDING))\n\n    notification_results = []\n\n    if sqs_evaluation_results:\n        notification_results.append(\"\\n|{:^{width}}|\".format(\"Amazon SQS Event Notifications\", width=RESOURCE_PADDING))\n        notification_results.append(\"\\n{:-<{width}}\".format(\"\", width=DASH_PADDING))\n        notification_results.append(generate_sqs_report(sqs_evaluation_results))\n\n    if sns_evaluation_results:\n        notification_results.append(\"\\n|{:^{width}}|\".format(\"Amazon SNS Event Notifications\", width=RESOURCE_PADDING))\n        notification_results.append(\"\\n{:-<{width}}\".format(\"\", width=DASH_PADDING))\n        notification_results.append(generate_sns_report(sns_evaluation_results))\n\n    if lambda_evaluation_results:\n        notification_results.append(\"\\n|{:^{width}}|\".format(\"AWS Lambda Event Notifications\", width=RESOURCE_PADDING))\n        notification_results.append(\"\\n{:-<{width}}\".format(\"\", width=DASH_PADDING))\n        notification_results.append(generate_lambda_report(lambda_evaluation_results))\n\n    notification_results = \"\".join(notification_results)\n\n    (\n        return_data.append(notification_results)\n        if notification_results\n        else return_data.append(\"\\n|{:^{width}}|\".format(\"No event notifications found\", width=RESOURCE_PADDING))\n    )\n    return_data = \"\".join(return_data)\n    return return_data\n\n\ndef script_handler(events, context) -> dict:\n    result = make_final_report(events, context)\n    return {\"result\": result}\n",
+        "Handler": "script_handler",
+        "Runtime": "python3.11"
+      },
+      "isEnd": true,
+      "outputs": [
+        {
+          "Name": "Output",
+          "Selector": "$.Payload.result",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateReport.Output"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "a3a4125552cdc41e54f5901ca47cba86200a10cb7e0e697f2b7e7e8ad765a69b"
+      }
+    }
+  }
+}
