@@ -1,17 +1,21 @@
 {
   "schemaVersion": "0.3",
-  "description": "This document will use the EC2Rescue tool on the specified EC2 instance to re-enable password decryption via the EC2 Console (Windows), or to generate and add a new SSH key pair (Linux). If you lost your key pair, this automation will create a password-enabled AMI that you can use to launch a new EC2 instance with a key pair you own (Windows).",
+  "description": "The **AWSSupport-ResetAccess** runbook runs the Amazon EC2 [Rescue for Linux (ec2rl)](https://github.com/awslabs/aws-ec2rescue-linux) or [Rescue for Windows Server](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/Windows-Server-EC2Rescue.html) tool on the target EC2 instance in order to re-enable password decryption via the EC2 Console (Windows), or to generate and add a new SSH key pair (Linux). If you lost your key pair, this automation will create a password-enabled AMI that you can use to launch a new EC2 instance with a key pair you own (Windows).",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
     "InstanceId": {
       "type": "AWS::EC2::Instance::Id",
-      "description": "(Required) ID of the EC2 instance you want to reset access for. IMPORTANT: AWS Systems Manager Automation stops this instance, and creates an AMI before attempting any operations. Data stored in instance store volumes will be lost. The public IP address will change if you are not using an Elastic IP.",
-      "allowedPattern": "^[m]{0,1}i-[a-z0-9]{8,17}$"
+      "description": "(Required) ID of the EC2 instance you want to reset access for. Important: AWS Systems Manager Automation stops this instance, and creates an AMI before attempting any operations. Data stored in instance store volumes will be lost. The public IP address will change if you are not using an Elastic IP."
     },
     "EC2RescueInstanceType": {
       "type": "String",
-      "description": "(Required) The EC2 instance type for the EC2Rescue instance. Recommended size: t2.small.",
-      "default": "t2.small",
+      "description": "(Optional) The EC2 instance type for the EC2Rescue instance.",
+      "default": "t3.medium",
       "allowedValues": [
         "t2.small",
         "t2.medium",
@@ -24,26 +28,46 @@
     },
     "SubnetId": {
       "type": "String",
-      "description": "(Optional) The subnet ID for the EC2Rescue instance. By default, AWS Systems Manager Automation creates a new VPC. Alternatively, Use SelectedInstanceSubnet to use the same subnet as your instance, or specify a custom subnet ID. IMPORTANT: The subnet must be in the same Availability Zone as InstanceId, and it must allow access to the SSM endpoints.",
+      "description": "(Optional) The subnet ID for the EC2Rescue instance. By default, the runbook creates a new VPC. This parameter support the following values: `SelectedInstanceSubnet`, `CreateNewVPC`, or a specific subnet ID. Important: If you provide a custom subnet, it must be in the same Availability Zone as InstanceId, and it must allow access to the AWS Systems Manager and Amazon S3 endpoints.",
       "default": "CreateNewVPC",
       "allowedPattern": "^SelectedInstanceSubnet$|^CreateNewVPC$|^subnet-[a-z0-9]{8,17}$"
-    },
-    "AutomationAssumeRole": {
-      "type": "AWS::IAM::Role::Arn",
-      "description": "(Optional) The IAM role for this execution. If no role is specified, AWS Systems Manager Automation will use the permissions of the user that executes this document.",
-      "default": ""
     },
     "HelperInstanceProfileName": {
       "type": "String",
       "description": "(Optional) The name of an existing IAM instance profile for the EC2Rescue instance.",
       "default": "",
       "allowedPattern": "^$|^[\\w+=,.@-]{1,128}$"
+    },
+    "AllowEncryptedVolume": {
+      "type": "String",
+      "description": "(Optional) Set it to `True` to allow the runbook to perform the EC2Rescue actions on Amazon EBS encrypted root volumes. WARNING: Make sure the AWS KMS key used to encrypt the EBS volume is **enabled** and in a **valid** state. For more information see 'How Amazon Elastic Block Store (Amazon EBS) uses AWS KMS' in https://docs.aws.amazon.com/kms/latest/developerguide/services-ebs.html.",
+      "default": "False",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "AssociatePublicIpAddress": {
+      "type": "String",
+      "description": "(Optional) Set it to `False` to indicate that the runbook does not need to assign a public IP address to the helper instance.",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "HelperInstanceSecurityGroupId": {
+      "type": "String",
+      "description": "(Optional) The security group ID that will be associated to the temporary EC2 instance. If not provided, the default VPC security group is used. Note: The helper instance security group must allow HTTPS (port 443) outbound traffic to the Amazon S3 and AWS Systems Manager endpoints.",
+      "allowedPattern": "^$|sg-[a-z0-9]{8,17}$",
+      "default": ""
     }
   },
   "mainSteps": [
     {
       "name": "assertInstanceIsWindows",
       "action": "aws:assertAwsResourceProperty",
+      "description": "Asserts if the target instance is Windows Server",
       "onFailure": "step:runEC2RescueForLinux",
       "inputs": {
         "Service": "ec2",
@@ -56,17 +80,21 @@
           "windows"
         ]
       },
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "runEC2RescueForWindows"
     },
     {
       "name": "runEC2RescueForWindows",
+      "description": "Invokes AWSSupport-StartEC2RescueWorkflow with the EC2Rescue for Windows Server reset access script.",
       "onFailure": "Continue",
       "action": "aws:executeAutomation",
       "inputs": {
         "RuntimeParameters": {
           "InstanceId": [
             "{{ InstanceId }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
           ],
           "OfflineScript": [
             "SW1wb3J0LU1vZHVsZSBFQzJSZXNjdWUKSW52b2tlLUVDMlJlc2N1ZUVuYWJsZVBhc3N3b3JkR2VuZXJhdGlvbiAtQmxvY2tEZXZpY2VOYW1lICR7ZW52OkVDMlJFU0NVRV9PRkZMSU5FX0VCU19ERVZJQ0V9"
@@ -80,6 +108,15 @@
           "HelperInstanceProfileName": [
             "{{ HelperInstanceProfileName }}"
           ],
+          "HelperInstanceSecurityGroupId": [
+            "{{ HelperInstanceSecurityGroupId }}"
+          ],
+          "AllowEncryptedVolume": [
+            "{{ AllowEncryptedVolume }}"
+          ],
+          "AssociatePublicIpAddress": [
+            "{{ AssociatePublicIpAddress }}"
+          ],
           "CreatePostEC2RescueBackup": [
             "True"
           ],
@@ -87,11 +124,12 @@
         },
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "getWindowsBackupAmi"
     },
     {
       "name": "getWindowsBackupAmi",
+      "description": "Retrieves the backup AMI ID from the AWSSupport-StartEC2RescueWorkflow automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -106,11 +144,12 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "getWindowsPasswordEnabledAmi"
     },
     {
       "name": "getWindowsPasswordEnabledAmi",
+      "description": "Retrieves the password-enabled AMI ID from the AWSSupport-StartEC2RescueWorkflow automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -125,11 +164,12 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "getEC2RescueForWindowsResult"
     },
     {
       "name": "getEC2RescueForWindowsResult",
+      "description": "Retrieves the EC2Rescue summary from the AWSSupport-StartEC2RescueWorkflow automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Abort",
       "inputs": {
@@ -144,11 +184,12 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
-      "isEnd": "true"
+      "isCritical": false,
+      "isEnd": true
     },
     {
       "name": "runEC2RescueForLinux",
+      "description": "Invokes AWSSupport-StartEC2RescueWorkflow with the EC2Rescue for Linux reset access script.",
       "onFailure": "Continue",
       "action": "aws:executeAutomation",
       "inputs": {
@@ -156,8 +197,11 @@
           "InstanceId": [
             "{{ InstanceId }}"
           ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
           "OfflineScript": [
-            "ZXJyb3JfdHJhcCgpCnsKICAgIGlmIHRlc3QgLW4gIiQxIiA7IHRoZW4KICAgICAgICBwcmludGYgIiVzXFxuIiAiJDEiCiAgICBmaQogICAgcHJpbnRmICIlLnM9IiAkKHNlcSAxIDgwKQogICAgcHJpbnRmICJcXG5UaGUgRUMyUmVzY3VlIGV4ZWN1dGlvbiBkaWQgbm90IGNvbXBsZXRlIHN1Y2Nlc3NmdWxseS5cXG4iCiAgICBleGl0IDEKfQoKcHJpbnRmICJHZW5lcmF0aW5nIG5ldyBrZXkgcGFpclxcbiIKCk5FV19QVUJMSUNfS0VZPSIkKCR7RUMyUkVTQ1VFX1BZVEhPTn0gLWMgIgojIFRoaXMgUHl0aG9uIHNuaXBwZXQgaXMgZnJvbSB0aGUgRUMyIFJlc2N1ZSBmb3IgTGludXggb3BlbnNzaCBtb2R1bGUKZnJvbSBfX2Z1dHVyZV9fIGltcG9ydCBwcmludF9mdW5jdGlvbgppbXBvcnQgb3MKaW1wb3J0IHNobGV4CmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKCnN5cy5wYXRoLmluc2VydCgwLCBvcy5wYXRoLmpvaW4ob3MuZW52aXJvblsnRUMyUkVTQ1VFX0VDMlJMX0RJUiddLCAnbGliJykpCgppbXBvcnQgcmVxdWVzdHMKaW1wb3J0IGJvdG8zCmltcG9ydCBib3RvY29yZQoKCmRlZiBnZW5lcmF0ZV9yc2Ffa2V5X3BhaXIoa2V5X3BhdGgpOgogICAgdHJ5OgogICAgICAgIGtleV9wYXRoID0gb3MucGF0aC5qb2luKGtleV9wYXRoLCAnZWMycmxfb3BlbnNzaHJlc2V0YWNjZXNzJykKICAgICAgICBrZXlzX2RpY3QgPSB7J3ByaXZhdGUnOiBOb25lLCAncHVibGljJzogTm9uZX0KICAgICAgICBzdWJwcm9jZXNzLmNoZWNrX2NhbGwoCiAgICAgICAgICAgIHNobGV4LnNwbGl0KCdzc2gta2V5Z2VuIC1xIC10IHJzYSAtYiA0MDk2IC1mIHt9IC1OIFwnXCcgLUMgXCdBZGRlZCBieSBFQzIgUmVzY3VlIGZvciBMaW51eFwnJy5mb3JtYXQoCiAgICAgICAgICAgICAgICBrZXlfcGF0aCkpLAogICAgICAgICAgICBzdGRlcnI9c3VicHJvY2Vzcy5TVERPVVQpCgogICAgICAgIHdpdGggb3Blbigne30ucHViJy5mb3JtYXQoa2V5X3BhdGgpLCAncicpIGFzIHB1Yl9mcDoKICAgICAgICAgICAga2V5c19kaWN0WydwdWJsaWMnXSA9IHB1Yl9mcC5yZWFkKCkKICAgICAgICB3aXRoIG9wZW4oa2V5X3BhdGgsICdyJykgYXMgcHJpdl9mcDoKICAgICAgICAgICAga2V5c19kaWN0Wydwcml2YXRlJ10gPSBwcml2X2ZwLnJlYWQoKQogICAgICAgIHJldHVybiBrZXlzX2RpY3QKICAgIGZpbmFsbHk6CiAgICAgICAgIyBBbHdheXMgcmVtb3ZlIHRoZSBrZXkgZmlsZXMgZXZlbiBpbiB0aGUgZXZlbnQgb2YgYW4gZXhjZXB0aW9uIGJlaW5nIHJhaXNlZAogICAgICAgICMgSXQgaXMgcG9zc2libGUgdGhhdCBhbiBleGNlcHRpb24gaXMgcmFpc2VkIGJlZm9yZSB0aGUga2V5IGZpbGVzIGFyZSBjcmVhdGVkIHNvIGNhdGNoIHRob3NlIGV4Y2VwdGlvbnMKICAgICAgICAjIElPRXJyb3IvUHl0aG9uIDIsIE9TRXJyb3IvUHl0aG9uIDMgKEZpbGVOb3RGb3VuZEVycm9yLCBldGMpCiAgICAgICAgdHJ5OgogICAgICAgICAgICBvcy5yZW1vdmUoa2V5X3BhdGgpCiAgICAgICAgZXhjZXB0IChPU0Vycm9yLCBJT0Vycm9yKToKICAgICAgICAgICAgcGFzcwogICAgICAgIHRyeToKICAgICAgICAgICAgb3MucmVtb3ZlKCd7fS5wdWInLmZvcm1hdChrZXlfcGF0aCkpCiAgICAgICAgZXhjZXB0IChPU0Vycm9yLCBJT0Vycm9yKToKICAgICAgICAgICAgcGFzcwoKCmRlZiBydW4oKToKICAgIGtleXMgPSBnZW5lcmF0ZV9yc2Ffa2V5X3BhaXIoJy9yb290JykKICAgIG5ld19wdWJsaWNfa2V5ID0ga2V5c1sncHVibGljJ10KICAgIGluc3RhbmNlX2lkID0gb3MuZW52aXJvblsnRUMyUkVTQ1VFX1NPVVJDRV9JTlNUQU5DRSddCiAgICB0cnk6CiAgICAgICAgcmVzcCA9IHJlcXVlc3RzLmdldCgnaHR0cDovLzE2OS4yNTQuMTY5LjI1NC9sYXRlc3QvbWV0YS1kYXRhL3BsYWNlbWVudC9hdmFpbGFiaWxpdHktem9uZScpCiAgICAgICAgcmVzcC5yYWlzZV9mb3Jfc3RhdHVzKCkKICAgICAgICBpbnN0YW5jZV9yZWdpb24gPSByZXNwLnRleHRbOi0xXQogICAgZXhjZXB0IHJlcXVlc3RzLmV4Y2VwdGlvbnMuUmVxdWVzdEV4Y2VwdGlvbiBhcyByZToKICAgICAgICBwcmludChyZSkKICAgICAgICByZXR1cm4gMQoKICAgIHRyeToKICAgICAgICBjbGllbnQgPSBib3RvMy5jbGllbnQoJ3NzbScsIHJlZ2lvbl9uYW1lPWluc3RhbmNlX3JlZ2lvbikKICAgICAgICBwYXJhbWV0ZXJfZGljdCA9IHsKICAgICAgICAgICAgJ05hbWUnOiAnL2VjMnJsL29wZW5zc2gve30va2V5Jy5mb3JtYXQoaW5zdGFuY2VfaWQpLAogICAgICAgICAgICAnRGVzY3JpcHRpb24nOiAnUHJpdmF0ZSBrZXkgYWRkZWQgdG8gaW5zdGFuY2Uge30gYnkgRUMyIFJlc2N1ZSBmb3IgTGludXguJy5mb3JtYXQoaW5zdGFuY2VfaWQpLAogICAgICAgICAgICAnVmFsdWUnOiBrZXlzWydwcml2YXRlJ10sCiAgICAgICAgICAgICdUeXBlJzogJ1NlY3VyZVN0cmluZycsCiAgICAgICAgICAgICdPdmVyd3JpdGUnOiBUcnVlCiAgICAgICAgfQogICAgICAgIGNsaWVudC5wdXRfcGFyYW1ldGVyKCoqcGFyYW1ldGVyX2RpY3QpCiAgICBleGNlcHQgYm90b2NvcmUuZXhjZXB0aW9ucy5Ob0NyZWRlbnRpYWxzRXJyb3I6CiAgICAgICAgcHJpbnQoJ05vIEFXUyBDcmVkZW50aWFscyBjb25maWd1cmVkLiBQbGVhc2UgY29uZmlndXJlIHRoZW0gYW5kIHRyeSBhZ2Fpbi4nKQogICAgICAgIHJldHVybiAxCiAgICBleGNlcHQgYm90b2NvcmUuZXhjZXB0aW9ucy5DbGllbnRFcnJvciBhcyBjZToKICAgICAgICBwcmludChjZSkKICAgICAgICByZXR1cm4gMQoKICAgIHByaW50KG5ld19wdWJsaWNfa2V5KQoKCmlmIF9fbmFtZV9fID09ICdfX21haW5fXyc6CiAgICBzeXMuZXhpdChydW4oKSkKIikiIHx8IGVycm9yX3RyYXAKIyBNYWtlIHRoZSBuZXcgcHVibGljIGtleSBhdmFpbGFibGUgaW5zaWRlIHRoZSBjaHJvb3QgaGVyZS1kb2MKZXhwb3J0IE5FV19QVUJMSUNfS0VZCgpwcmludGYgIlN0YXJ0aW5nIGNocm9vdFxcbiIKY2hyb290ICIke0VDMlJFU0NVRV9PRkZMSU5FX1NZU1RFTV9ST09UfSIgL2Jpbi9iYXNoIDw8ICdDSFJPT1RfSEVSRScKIyEvYmluL2Jhc2gKZXJyb3JfdHJhcCgpCnsKICAgIGlmIHRlc3QgLW4gIiQxIiA7IHRoZW4KICAgICAgICBwcmludGYgIiVzXFxuIiAiJDEiCiAgICBmaQogICAgcHJpbnRmICIlLnM9IiAkKHNlcSAxIDgwKQogICAgcHJpbnRmICJcXG5UaGUgRUMyUmVzY3VlIGV4ZWN1dGlvbiBkaWQgbm90IGNvbXBsZXRlIHN1Y2Nlc3NmdWxseS5cXG4iCiAgICBleGl0IDEKfQouIC9ldGMvcHJvZmlsZQoKIyBDaGVjayB0aGF0IGEgY29tcGF0aWJsZSBQeXRob24gaW50ZXJwcmV0ZXIgaXMgYXZhaWxhYmxlIGluIHRoZSBjaHJvb3QgZW52aXJvbm1lbnQKaWYgY29tbWFuZCAtdiBweXRob24zID4gL2Rldi9udWxsOyB0aGVuCiAgICBQWVRIT049cHl0aG9uMwplbGlmIGNvbW1hbmQgLXYgcHl0aG9uMi43ID4gL2Rldi9udWxsOyB0aGVuCiAgICBQWVRIT049cHl0aG9uMi43CmVsc2UKICAgIGVycm9yX3RyYXAgIkZhaWxlZCB0byBmaW5kIGNvbXBhdGlibGUgUHl0aG9uIGVudmlyb25tZW50ISIKZmkKCnByaW50ZiAiUnVubmluZyBFQzIgUmVzY3VlIGZvciBMaW51eFxcbiIKZWMycmwgcnVuIC0tcmVtZWRpYXRlIC0tb25seS1tb2R1bGVzPW9wZW5zc2ggLS1pbmplY3Qta2V5LW9ubHkgLS1uZXctc3NoLWtleT0iJHtORVdfUFVCTElDX0tFWX0iIHx8IGVycm9yX3RyYXAKCkNIUk9PVF9IRVJFCgppZiB0ZXN0ICIkPyIgIT0gMDsgdGhlbgogICAgZXJyb3JfdHJhcCAiRXJyb3I6IGV4ZWN1dGlvbiBmYWlsdXJlIGluc2lkZSBjaHJvb3QgZW52aXJvbm1lbnQuIgpmaQ=="
+            "ZXJyb3JfdHJhcCgpCnsKICAgIGlmIHRlc3QgLW4gIiQxIiA7IHRoZW4KICAgICAgICBwcmludGYgIiVzXFxuIiAiJDEiCiAgICBmaQogICAgcHJpbnRmICIlLnM9IiAkKHNlcSAxIDgwKQogICAgcHJpbnRmICJcXG5UaGUgRUMyUmVzY3VlIGV4ZWN1dGlvbiBkaWQgbm90IGNvbXBsZXRlIHN1Y2Nlc3NmdWxseS5cXG4iCiAgICBleGl0IDEKfQoKcHJpbnRmICJHZW5lcmF0aW5nIG5ldyBrZXkgcGFpclxcbiIKCk5FV19QVUJMSUNfS0VZPSIkKCR7RUMyUkVTQ1VFX1BZVEhPTn0gLWMgIiIiCiMgVGhpcyBQeXRob24gc25pcHBldCBpcyBmcm9tIHRoZSBFQzIgUmVzY3VlIGZvciBMaW51eCBvcGVuc3NoIG1vZHVsZQpmcm9tIF9fZnV0dXJlX18gaW1wb3J0IHByaW50X2Z1bmN0aW9uCmltcG9ydCBvcwppbXBvcnQgc2hsZXgKaW1wb3J0IHN1YnByb2Nlc3MKaW1wb3J0IHN5cwoKc3lzLnBhdGguaW5zZXJ0KDAsIG9zLnBhdGguam9pbihvcy5lbnZpcm9uWydFQzJSRVNDVUVfRUMyUkxfRElSJ10sICdsaWInKSkKCmltcG9ydCByZXF1ZXN0cwppbXBvcnQgYm90bzMKaW1wb3J0IGJvdG9jb3JlCgoKZGVmIGdlbmVyYXRlX3JzYV9rZXlfcGFpcihrZXlfcGF0aCk6CiAgICB0cnk6CiAgICAgICAga2V5X3BhdGggPSBvcy5wYXRoLmpvaW4oa2V5X3BhdGgsICdlYzJybF9vcGVuc3NocmVzZXRhY2Nlc3MnKQogICAgICAgIGtleXNfZGljdCA9IHsncHJpdmF0ZSc6IE5vbmUsICdwdWJsaWMnOiBOb25lfQogICAgICAgIHN1YnByb2Nlc3MuY2hlY2tfY2FsbCgKICAgICAgICAgICAgc2hsZXguc3BsaXQoJ3NzaC1rZXlnZW4gLXEgLXQgcnNhIC1iIDQwOTYgLWYge30gLU4gXCdcJyAtQyBcJ0FkZGVkIGJ5IEVDMiBSZXNjdWUgZm9yIExpbnV4XCcnLmZvcm1hdCgKICAgICAgICAgICAgICAgIGtleV9wYXRoKSksCiAgICAgICAgICAgIHN0ZGVycj1zdWJwcm9jZXNzLlNURE9VVCkKCiAgICAgICAgd2l0aCBvcGVuKCd7fS5wdWInLmZvcm1hdChrZXlfcGF0aCksICdyJykgYXMgcHViX2ZwOgogICAgICAgICAgICBrZXlzX2RpY3RbJ3B1YmxpYyddID0gcHViX2ZwLnJlYWQoKQogICAgICAgIHdpdGggb3BlbihrZXlfcGF0aCwgJ3InKSBhcyBwcml2X2ZwOgogICAgICAgICAgICBrZXlzX2RpY3RbJ3ByaXZhdGUnXSA9IHByaXZfZnAucmVhZCgpCiAgICAgICAgcmV0dXJuIGtleXNfZGljdAogICAgZmluYWxseToKICAgICAgICAjIEFsd2F5cyByZW1vdmUgdGhlIGtleSBmaWxlcyBldmVuIGluIHRoZSBldmVudCBvZiBhbiBleGNlcHRpb24gYmVpbmcgcmFpc2VkCiAgICAgICAgIyBJdCBpcyBwb3NzaWJsZSB0aGF0IGFuIGV4Y2VwdGlvbiBpcyByYWlzZWQgYmVmb3JlIHRoZSBrZXkgZmlsZXMgYXJlIGNyZWF0ZWQgc28gY2F0Y2ggdGhvc2UgZXhjZXB0aW9ucwogICAgICAgICMgSU9FcnJvci9QeXRob24gMiwgT1NFcnJvci9QeXRob24gMyAoRmlsZU5vdEZvdW5kRXJyb3IsIGV0YykKICAgICAgICB0cnk6CiAgICAgICAgICAgIG9zLnJlbW92ZShrZXlfcGF0aCkKICAgICAgICBleGNlcHQgKE9TRXJyb3IsIElPRXJyb3IpOgogICAgICAgICAgICBwYXNzCiAgICAgICAgdHJ5OgogICAgICAgICAgICBvcy5yZW1vdmUoJ3t9LnB1YicuZm9ybWF0KGtleV9wYXRoKSkKICAgICAgICBleGNlcHQgKE9TRXJyb3IsIElPRXJyb3IpOgogICAgICAgICAgICBwYXNzCgpkZWYgZ2VuZXJhdGVfaW1kc3YyX3Rva2VuKCk6CiAgICB0cnk6CiAgICAgICAgcmVzcCA9IHJlcXVlc3RzLnB1dCgnaHR0cDovLzE2OS4yNTQuMTY5LjI1NC9sYXRlc3QvYXBpL3Rva2VuJywgaGVhZGVycz17J1gtYXdzLWVjMi1tZXRhZGF0YS10b2tlbi10dGwtc2Vjb25kcyc6ICcyMTYwMCd9KQogICAgICAgIHJlc3AucmFpc2VfZm9yX3N0YXR1cygpCiAgICAgICAgdG9rZW4gPSByZXNwLnRleHQKICAgIGV4Y2VwdCByZXF1ZXN0cy5leGNlcHRpb25zLlJlcXVlc3RFeGNlcHRpb24gYXMgcmU6CiAgICAgICAgcHJpbnQocmUpCiAgICAgICAgdG9rZW4gPSBOb25lCiAgICByZXR1cm4gdG9rZW4KCmRlZiBydW4oKToKICAgIGtleXMgPSBnZW5lcmF0ZV9yc2Ffa2V5X3BhaXIoJy9yb290JykKICAgIG5ld19wdWJsaWNfa2V5ID0ga2V5c1sncHVibGljJ10KICAgIGluc3RhbmNlX2lkID0gb3MuZW52aXJvblsnRUMyUkVTQ1VFX1NPVVJDRV9JTlNUQU5DRSddCgogICAgdHJ5OgogICAgICAgIHJlc3AgPSByZXF1ZXN0cy5nZXQoJ2h0dHA6Ly8xNjkuMjU0LjE2OS4yNTQvbGF0ZXN0L21ldGEtZGF0YS9wbGFjZW1lbnQvYXZhaWxhYmlsaXR5LXpvbmUnLCBoZWFkZXJzPXsnWC1hd3MtZWMyLW1ldGFkYXRhLXRva2VuJzogZ2VuZXJhdGVfaW1kc3YyX3Rva2VuKCl9KQogICAgICAgIHJlc3AucmFpc2VfZm9yX3N0YXR1cygpCiAgICAgICAgaW5zdGFuY2VfcmVnaW9uID0gcmVzcC50ZXh0WzotMV0KICAgIGV4Y2VwdCByZXF1ZXN0cy5leGNlcHRpb25zLlJlcXVlc3RFeGNlcHRpb24gYXMgcmU6CiAgICAgICAgcHJpbnQocmUpCiAgICAgICAgcmV0dXJuIDEKCiAgICB0cnk6CiAgICAgICAgY2xpZW50ID0gYm90bzMuY2xpZW50KCdzc20nLCByZWdpb25fbmFtZT1pbnN0YW5jZV9yZWdpb24pCiAgICAgICAgcGFyYW1ldGVyX2RpY3QgPSB7CiAgICAgICAgICAgICdOYW1lJzogJy9lYzJybC9vcGVuc3NoL3t9L2tleScuZm9ybWF0KGluc3RhbmNlX2lkKSwKICAgICAgICAgICAgJ0Rlc2NyaXB0aW9uJzogJ1ByaXZhdGUga2V5IGFkZGVkIHRvIGluc3RhbmNlIHt9IGJ5IEVDMiBSZXNjdWUgZm9yIExpbnV4LicuZm9ybWF0KGluc3RhbmNlX2lkKSwKICAgICAgICAgICAgJ1ZhbHVlJzoga2V5c1sncHJpdmF0ZSddLAogICAgICAgICAgICAnVHlwZSc6ICdTZWN1cmVTdHJpbmcnLAogICAgICAgICAgICAnT3ZlcndyaXRlJzogVHJ1ZQogICAgICAgIH0KICAgICAgICBjbGllbnQucHV0X3BhcmFtZXRlcigqKnBhcmFtZXRlcl9kaWN0KQogICAgZXhjZXB0IGJvdG9jb3JlLmV4Y2VwdGlvbnMuTm9DcmVkZW50aWFsc0Vycm9yOgogICAgICAgIHByaW50KCdObyBBV1MgQ3JlZGVudGlhbHMgY29uZmlndXJlZC4gUGxlYXNlIGNvbmZpZ3VyZSB0aGVtIGFuZCB0cnkgYWdhaW4uJykKICAgICAgICByZXR1cm4gMQogICAgZXhjZXB0IGJvdG9jb3JlLmV4Y2VwdGlvbnMuQ2xpZW50RXJyb3IgYXMgY2U6CiAgICAgICAgcHJpbnQoY2UpCiAgICAgICAgcmV0dXJuIDEKCiAgICBwcmludChuZXdfcHVibGljX2tleSkKCgppZiBfX25hbWVfXyA9PSAnX19tYWluX18nOgogICAgc3lzLmV4aXQocnVuKCkpCgoiIiIKKSIgfHwgZXJyb3JfdHJhcAoKIyBNYWtlIHRoZSBuZXcgcHVibGljIGtleSBhdmFpbGFibGUgaW5zaWRlIHRoZSBjaHJvb3QgaGVyZS1kb2MKZXhwb3J0IE5FV19QVUJMSUNfS0VZCgpwcmludGYgIlN0YXJ0aW5nIGNocm9vdFxcbiIKY2hyb290ICIke0VDMlJFU0NVRV9PRkZMSU5FX1NZU1RFTV9ST09UfSIgL2Jpbi9iYXNoIDw8ICdDSFJPT1RfSEVSRScKIyEvYmluL2Jhc2gKZXJyb3JfdHJhcCgpCnsKICAgIGlmIHRlc3QgLW4gIiQxIiA7IHRoZW4KICAgICAgICBwcmludGYgIiVzXFxuIiAiJDEiCiAgICBmaQogICAgcHJpbnRmICIlLnM9IiAkKHNlcSAxIDgwKQogICAgcHJpbnRmICJcXG5UaGUgRUMyUmVzY3VlIGV4ZWN1dGlvbiBkaWQgbm90IGNvbXBsZXRlIHN1Y2Nlc3NmdWxseS5cXG4iCiAgICBleGl0IDEKfQouIC9ldGMvcHJvZmlsZQoKIyBDaGVjayB0aGF0IGEgY29tcGF0aWJsZSBQeXRob24gaW50ZXJwcmV0ZXIgaXMgYXZhaWxhYmxlIGluIHRoZSBjaHJvb3QgZW52aXJvbm1lbnQKaWYgY29tbWFuZCAtdiBweXRob24zID4gL2Rldi9udWxsOyB0aGVuCiAgICBQWVRIT049cHl0aG9uMwplbGlmIGNvbW1hbmQgLXYgcHl0aG9uMi43ID4gL2Rldi9udWxsOyB0aGVuCiAgICBQWVRIT049cHl0aG9uMi43CmVsc2UKICAgIGVycm9yX3RyYXAgIkZhaWxlZCB0byBmaW5kIGNvbXBhdGlibGUgUHl0aG9uIGVudmlyb25tZW50ISIKZmkKCnByaW50ZiAiUnVubmluZyBFQzIgUmVzY3VlIGZvciBMaW51eFxcbiIKZWMycmwgcnVuIC0tcmVtZWRpYXRlIC0tb25seS1tb2R1bGVzPW9wZW5zc2ggLS1pbmplY3Qta2V5LW9ubHkgLS1uZXctc3NoLWtleT0iJHtORVdfUFVCTElDX0tFWX0iIHx8IGVycm9yX3RyYXAKCkNIUk9PVF9IRVJFCgppZiB0ZXN0ICIkPyIgIT0gMDsgdGhlbgogICAgZXJyb3JfdHJhcCAiRXJyb3I6IGV4ZWN1dGlvbiBmYWlsdXJlIGluc2lkZSBjaHJvb3QgZW52aXJvbm1lbnQuIgpmaQ=="
           ],
           "SubnetId": [
             "{{ SubnetId }}"
@@ -168,15 +212,25 @@
           "HelperInstanceProfileName": [
             "{{ HelperInstanceProfileName }}"
           ],
+          "HelperInstanceSecurityGroupId": [
+            "{{ HelperInstanceSecurityGroupId }}"
+          ],
+          "AllowEncryptedVolume": [
+            "{{ AllowEncryptedVolume }}"
+          ],
+          "AssociatePublicIpAddress": [
+            "{{ AssociatePublicIpAddress }}"
+          ],
           "UniqueId": "{{ automation:EXECUTION_ID }}"
         },
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
       },
-      "isCritical": "true",
+      "isCritical": true,
       "nextStep": "getLinuxBackupAmi"
     },
     {
       "name": "getLinuxBackupAmi",
+      "description": "Retrieves the backup AMI ID from the AWSSupport-StartEC2RescueWorkflow automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -191,11 +245,12 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "getLinuxSSHKeyParameter"
     },
     {
       "name": "getLinuxSSHKeyParameter",
+      "description": "Retrieves the AWS Systems Manager parameter name for the injected SSH key.",
       "action": "aws:executeAwsApi",
       "onFailure": "Continue",
       "inputs": {
@@ -211,11 +266,12 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
+      "isCritical": false,
       "nextStep": "getEC2RescueForLinuxResult"
     },
     {
       "name": "getEC2RescueForLinuxResult",
+      "description": "Retrieves the EC2Rescue summary from the AWSSupport-StartEC2RescueWorkflow automation.",
       "action": "aws:executeAwsApi",
       "onFailure": "Abort",
       "inputs": {
@@ -230,8 +286,8 @@
           "Type": "String"
         }
       ],
-      "isCritical": "false",
-      "isEnd": "true"
+      "isCritical": false,
+      "isEnd": true
     }
   ],
   "outputs": [

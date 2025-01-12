@@ -49,6 +49,27 @@
         "t3.large",
         "i3.large"
       ]
+    },
+    "AllowEncryptedVolume": {
+      "type": "String",
+      "description": "(Optional) Offline only - Set it to `True` to allow the runbook to perform the EC2Rescue actions on Amazon EBS encrypted root volumes. Warning: Make sure the AWS KMS key used to encrypt the EBS volume is **enabled** and in a **valid** state. For more information see 'How Amazon Elastic Block Store (Amazon EBS) uses AWS KMS' in https://docs.aws.amazon.com/kms/latest/developerguide/services-ebs.html.",
+      "default": "False",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "HelperInstanceProfileName": {
+      "type": "String",
+      "description": "(Optional) Offline only - The name of an existing IAM instance profile for the EC2Rescue instance.",
+      "default": "",
+      "allowedPattern": "^$|^[\\w+=,.@-]{1,128}$"
+    },
+    "HelperInstanceSecurityGroupId": {
+      "type": "String",
+      "description": "(Optional) Offline only - The security group ID that will be associated to the temporary EC2 instance. If not provided, the default VPC security group is used. Note: The helper instance security group must allow HTTPS (port 443) outbound traffic to the Amazon S3 and AWS Systems Manager endpoints.",
+      "allowedPattern": "^$|sg-[a-z0-9]{8,17}$",
+      "default": ""
     }
   },
   "mainSteps": [
@@ -194,7 +215,7 @@
             "    $productname -match $matchstr | Out-Null",
             "    $prodtype = $matches[0]",
             "    $keyname = $winVer + \"-\" + $prodtype",
-            "    if ($winVer = \"2008\") {",
+            "    if ($winVer -eq \"2008\") {",
             "        #Only 2008 has with and without hyper-v flavors.",
             "        if (test-path 'HKLM:\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Hyper-V') {",
             "            $keyname = $keyname + \"-HYPERV\"",
@@ -205,7 +226,9 @@
             "        return $key",
             "",
             "    }",
-            "    else {throw \"No KMS key found for $OSVersion!\"}",
+            "    else {",
+            "        throw \"No KMS key found for $OSVersion!\"",
+            "    }",
             "}",
             "",
             "function Test-ActivationStatus {",
@@ -255,12 +278,12 @@
             "function Get-PrimaryInterface {",
             "",
             "    # Adding the Try Catch mechanism to support IMDSv2",
-            "    try{",
+            "    try {",
             "        $macAddress = (Invoke-RestMethod -Uri \"http://169.254.169.254/latest/meta-data/mac\")",
             "    }",
-            "    catch{",
-            "        $token = Invoke-RestMethod -Headers @{\"X-aws-ec2-metadata-token-ttl-seconds\" = \"21600\"} -Method PUT –Uri \"http://169.254.169.254/latest/api/token\"",
-            "        $macAddress = (Invoke-RestMethod -Headers @{\"X-aws-ec2-metadata-token\" = $token} -Method GET -Uri \"http://169.254.169.254/latest/meta-data/mac\")",
+            "    catch {",
+            "        $token = Invoke-RestMethod -Headers @{\"X-aws-ec2-metadata-token-ttl-seconds\" = \"21600\"} -Method PUT -Uri \"http://169.254.169.254/latest/api/token\"",
+            "        $macAddress = Invoke-RestMethod -Headers @{\"X-aws-ec2-metadata-token\" = $token} -Method GET -Uri \"http://169.254.169.254/latest/meta-data/mac\"",
             "    }",
             "",
             "    $adapter = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.MACAddress -eq $macAddress }",
@@ -297,7 +320,6 @@
             "    Param(",
             "        [parameter(Mandatory = $true)]",
             "        [String] $KMSServer,",
-            "        [parameter(Mandatory = $true)]",
             "        [Int32]    $KMSPort = 1688",
             "    )",
             "",
@@ -430,7 +452,7 @@
             "{{ InstanceId }}"
           ],
           "OfflineScript": [
-            "IyBDb3B5cmlnaHQgMjAyNCBBbWF6b24uY29tLCBJbmMuIG9yIGl0cyBhZmZpbGlhdGVzLiBBbGwgUmlnaHRzIFJlc2VydmVkLgojIFNQRFgtTGljZW5zZS1JZGVudGlmaWVyOiBMaWNlbnNlUmVmLS5hbWF6b24uY29tLi1BbXpuU0wtMS4wCiMgTGljZW5zZWQgdW5kZXIgdGhlIEFtYXpvbiBTb2Z0d2FyZSBMaWNlbnNlOiBodHRwOi8vYXdzLmFtYXpvbi5jb20vYXNsLwoKJGN1cnJlbnRWZXJzaW9uID0gW1N5c3RlbS5WZXJzaW9uXSAkZW52OkVDMlJFU0NVRV9PRkZMSU5FX0tFUk5FTF9WRVIKJGVjMkxhdW5jaE9TVmVyc2lvbiA9IFtTeXN0ZW0uVmVyc2lvbl0gIjEwLjAiCmlmICgkY3VycmVudFZlcnNpb24gLWdlICRlYzJMYXVuY2hPU1ZlcnNpb24pIHsKICAgIFdyaXRlLUhvc3QgIkNvbmZpZ3VyaW5nIEVDMkxhdW5jaCB0byByZXBhaXIgV2luZG93cyBhY3RpdmF0aW9uIGF0IG5leHQgYm9vdCIKICAgICRmaXhXaW5kb3dzQWN0aXZhdGlvbkRTQ1NjcmlwdCA9IEAiCkNvbmZpZ3VyYXRpb24gRml4V2luZG93c0FjdGl2YXRpb24KewogICAgSW1wb3J0LURzY1Jlc291cmNlIC1Nb2R1bGVOYW1lIFBTRGVzaXJlZFN0YXRlQ29uZmlndXJhdGlvbgogICAgTm9kZSBsb2NhbGhvc3QKICAgIHsKICAgICAgICBTY3JpcHQgRml4V2luZG93c0FjdGl2YXRpb24gewogICAgICAgICAgICBHZXRTY3JpcHQgID0gewogICAgICAgICAgICAgICAgcmV0dXJuIEB7CiAgICAgICAgICAgICAgICAgICAgJ1Jlc3VsdCcgPSAnV2luZG93cyBhY3RpdmF0aW9uIGZpeCBhcHBsaWVkJwogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9CiAgICAgICAgICAgIFRlc3RTY3JpcHQgPSB7CiAgICAgICAgICAgICAgICBgJHN0YXR1cyA9IEdldC1XTUlPYmplY3QgU29mdHdhcmVMaWNlbnNpbmdQcm9kdWN0IC1GaWx0ZXIgIkFwcGxpY2F0aW9uSUQgPSAnNTVjOTI3MzQtZDY4Mi00ZDcxLTk4M2UtZDZlYzNmMTYwNTlmJyIgfCBXaGVyZS1PYmplY3QgeyBgJF8ubGljZW5zZXN0YXR1cyAtZXEgMSB9CiAgICAgICAgICAgICAgICBpZiAoYCRzdGF0dXMpIHsKICAgICAgICAgICAgICAgICAgICByZXR1cm4gYCR0cnVlCiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICBlbHNlIHsKICAgICAgICAgICAgICAgICAgICByZXR1cm4gYCRmYWxzZQogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9CiAgICAgICAgICAgIFNldFNjcmlwdCAgPSB7CiAgICAgICAgICAgICAgICBXcml0ZS1WZXJib3NlICJSdW5uaW5nIHNjcmlwdCB0byBmaXggV2luZG93cyBhY3RpdmF0aW9uIgogICAgICAgICAgICAgICAgQzpcUHJvZ3JhbURhdGFcQW1hem9uXEVDMi1XaW5kb3dzXExhdW5jaFxTY3JpcHRzXEluaXRpYWxpemVJbnN0YW5jZS5wczEKICAgICAgICAgICAgICAgICYgY3NjcmlwdCAiYCR7ZW52OlNZU1RFTVJPT1R9XHN5c3RlbTMyXHNsbWdyLnZicyIgL2F0bwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgfQp9CiJACgogICAgV3JpdGUtT3V0cHV0ICd7IAogICAgInNldENvbXB1dGVyTmFtZSI6IGZhbHNlLAogICAgInNldFdhbGxwYXBlciI6IHRydWUsCiAgICAiYWRkRG5zU3VmZml4TGlzdCI6IHRydWUsCiAgICAiZXh0ZW5kQm9vdFZvbHVtZVNpemUiOiB0cnVlLAogICAgImFkbWluUGFzc3dvcmRUeXBlIjogIkRvTm90aGluZyIsCiAgICAiYWRtaW5QYXNzd29yZCI6ICAiIgogICAgfScgPiAke2VudjpFQzJSRVNDVUVfT0ZGTElORV9EUklWRX1Qcm9ncmFtRGF0YVxBbWF6b25cRUMyLVdpbmRvd3NcTGF1bmNoXENvbmZpZ1xMYXVuY2hDb25maWcuanNvbgoKICAgIEludm9rZS1FeHByZXNzaW9uICRmaXhXaW5kb3dzQWN0aXZhdGlvbkRTQ1NjcmlwdAogICAgRml4V2luZG93c0FjdGl2YXRpb24gfCBPdXQtTnVsbAogICAgQ29weS1JdGVtIC5cRml4V2luZG93c0FjdGl2YXRpb25cbG9jYWxob3N0Lm1vZiAtRGVzdGluYXRpb24gIiR7ZW52OkVDMlJFU0NVRV9PRkZMSU5FX1NZU1RFTV9ST09UfVxTeXN0ZW0zMlxDb25maWd1cmF0aW9uXFBlbmRpbmcubW9mIiAtRm9yY2UKfQplbHNlIHsKICAgIFdyaXRlLUhvc3QgIkNvbmZpZ3VyaW5nIEVDMkNvbmZpZyB0byByZXBhaXIgV2luZG93cyBhY3RpdmF0aW9uIGF0IG5leHQgYm9vdCIKICAgICRjb25maWd1cmF0aW9uRmlsZSA9ICIke2VudjpFQzJSRVNDVUVfT0ZGTElORV9QUk9HUkFNX0ZJTEVTX0RJUn1cQW1hem9uXEVjMkNvbmZpZ1NlcnZpY2VcU2V0dGluZ3NcY29uZmlnLnhtbCIKICAgIFt4bWxdJHhtbCA9IEdldC1Db250ZW50ICRjb25maWd1cmF0aW9uRmlsZQogICAgJHhtbC5FYzJDb25maWd1cmF0aW9uU2V0dGluZ3MuUGx1Z2lucy5QbHVnaW4gfCBXaGVyZS1PYmplY3QgeyAkXy5OYW1lIC1lcSAiRWMyV2luZG93c0FjdGl2YXRlIiB9IHwgRm9yRWFjaC1PYmplY3QgeyAkXy5TdGF0ZSA9ICJFbmFibGVkIiB9CiAgICAkeG1sLkVjMkNvbmZpZ3VyYXRpb25TZXR0aW5ncy5HbG9iYWxTZXR0aW5ncy5TaG91bGRBZGRSb3V0ZXMgPSAidHJ1ZSIKICAgICR4bWwuU2F2ZSgkY29uZmlndXJhdGlvbkZpbGUpCn0="
+            "IyBDb3B5cmlnaHQgMjAyNCBBbWF6b24uY29tLCBJbmMuIG9yIGl0cyBhZmZpbGlhdGVzLiBBbGwgUmlnaHRzIFJlc2VydmVkLgojIFNQRFgtTGljZW5zZS1JZGVudGlmaWVyOiBMaWNlbnNlUmVmLS5hbWF6b24uY29tLi1BbXpuU0wtMS4wCiMgTGljZW5zZWQgdW5kZXIgdGhlIEFtYXpvbiBTb2Z0d2FyZSBMaWNlbnNlOiBodHRwOi8vYXdzLmFtYXpvbi5jb20vYXNsLwoKJGN1cnJlbnRWZXJzaW9uID0gW1N5c3RlbS5WZXJzaW9uXSAkZW52OkVDMlJFU0NVRV9PRkZMSU5FX0tFUk5FTF9WRVIKJGVjMkxhdW5jaE9TVmVyc2lvbiA9IFtTeXN0ZW0uVmVyc2lvbl0gIjEwLjAiCmlmICgkY3VycmVudFZlcnNpb24gLWdlICRlYzJMYXVuY2hPU1ZlcnNpb24pIHsKICAgIFdyaXRlLU91dHB1dCAiQ29uZmlndXJpbmcgRUMyTGF1bmNoIHRvIHJlcGFpciBXaW5kb3dzIGFjdGl2YXRpb24gYXQgbmV4dCBib290IgogICAgJGZpeFdpbmRvd3NBY3RpdmF0aW9uRFNDU2NyaXB0ID0gQCIKQ29uZmlndXJhdGlvbiBGaXhXaW5kb3dzQWN0aXZhdGlvbgp7CiAgICBJbXBvcnQtRHNjUmVzb3VyY2UgLU1vZHVsZU5hbWUgUFNEZXNpcmVkU3RhdGVDb25maWd1cmF0aW9uCiAgICBOb2RlIGxvY2FsaG9zdAogICAgewogICAgICAgIFNjcmlwdCBGaXhXaW5kb3dzQWN0aXZhdGlvbiB7CiAgICAgICAgICAgIEdldFNjcmlwdCAgPSB7CiAgICAgICAgICAgICAgICByZXR1cm4gQHsKICAgICAgICAgICAgICAgICAgICAnUmVzdWx0JyA9ICdXaW5kb3dzIGFjdGl2YXRpb24gZml4IGFwcGxpZWQnCiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH0KICAgICAgICAgICAgVGVzdFNjcmlwdCA9IHsKICAgICAgICAgICAgICAgIGAkc3RhdHVzID0gR2V0LVdNSU9iamVjdCBTb2Z0d2FyZUxpY2Vuc2luZ1Byb2R1Y3QgLUZpbHRlciAiQXBwbGljYXRpb25JRCA9ICc1NWM5MjczNC1kNjgyLTRkNzEtOTgzZS1kNmVjM2YxNjA1OWYnIiB8IFdoZXJlLU9iamVjdCB7IGAkXy5saWNlbnNlc3RhdHVzIC1lcSAxIH0KICAgICAgICAgICAgICAgIGlmIChgJHN0YXR1cykgewogICAgICAgICAgICAgICAgICAgIHJldHVybiBgJHRydWUKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIGVsc2UgewogICAgICAgICAgICAgICAgICAgIHJldHVybiBgJGZhbHNlCiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH0KICAgICAgICAgICAgU2V0U2NyaXB0ICA9IHsKICAgICAgICAgICAgICAgIFdyaXRlLVZlcmJvc2UgIlJ1bm5pbmcgc2NyaXB0IHRvIGZpeCBXaW5kb3dzIGFjdGl2YXRpb24iCiAgICAgICAgICAgICAgICBDOlxQcm9ncmFtRGF0YVxBbWF6b25cRUMyLVdpbmRvd3NcTGF1bmNoXFNjcmlwdHNcSW5pdGlhbGl6ZUluc3RhbmNlLnBzMQogICAgICAgICAgICAgICAgJiBjc2NyaXB0ICJgJHtlbnY6U1lTVEVNUk9PVH1cc3lzdGVtMzJcc2xtZ3IudmJzIiAvYXRvCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICB9Cn0KIkAKCiAgICBXcml0ZS1PdXRwdXQgJ3sKICAgICJzZXRDb21wdXRlck5hbWUiOiBmYWxzZSwKICAgICJzZXRXYWxscGFwZXIiOiB0cnVlLAogICAgImFkZERuc1N1ZmZpeExpc3QiOiB0cnVlLAogICAgImV4dGVuZEJvb3RWb2x1bWVTaXplIjogdHJ1ZSwKICAgICJhZG1pblBhc3N3b3JkVHlwZSI6ICJEb05vdGhpbmciLAogICAgImFkbWluUGFzc3dvcmQiOiAgIiIKICAgIH0nID4gJHtlbnY6RUMyUkVTQ1VFX09GRkxJTkVfRFJJVkV9UHJvZ3JhbURhdGFcQW1hem9uXEVDMi1XaW5kb3dzXExhdW5jaFxDb25maWdcTGF1bmNoQ29uZmlnLmpzb24KCiAgICBJbnZva2UtRXhwcmVzc2lvbiAkZml4V2luZG93c0FjdGl2YXRpb25EU0NTY3JpcHQKICAgIEZpeFdpbmRvd3NBY3RpdmF0aW9uIHwgT3V0LU51bGwKICAgIENvcHktSXRlbSAuXEZpeFdpbmRvd3NBY3RpdmF0aW9uXGxvY2FsaG9zdC5tb2YgLURlc3RpbmF0aW9uICIke2VudjpFQzJSRVNDVUVfT0ZGTElORV9TWVNURU1fUk9PVH1cU3lzdGVtMzJcQ29uZmlndXJhdGlvblxQZW5kaW5nLm1vZiIgLUZvcmNlCn0KZWxzZSB7CiAgICBXcml0ZS1PdXRwdXQgIkNvbmZpZ3VyaW5nIEVDMkNvbmZpZyB0byByZXBhaXIgV2luZG93cyBhY3RpdmF0aW9uIGF0IG5leHQgYm9vdCIKICAgICRjb25maWd1cmF0aW9uRmlsZSA9ICIke2VudjpFQzJSRVNDVUVfT0ZGTElORV9QUk9HUkFNX0ZJTEVTX0RJUn1cQW1hem9uXEVjMkNvbmZpZ1NlcnZpY2VcU2V0dGluZ3NcY29uZmlnLnhtbCIKICAgIFt4bWxdJHhtbCA9IEdldC1Db250ZW50ICRjb25maWd1cmF0aW9uRmlsZQogICAgJHhtbC5FYzJDb25maWd1cmF0aW9uU2V0dGluZ3MuUGx1Z2lucy5QbHVnaW4gfCBXaGVyZS1PYmplY3QgeyAkXy5OYW1lIC1lcSAiRWMyV2luZG93c0FjdGl2YXRlIiB9IHwgRm9yRWFjaC1PYmplY3QgeyAkXy5TdGF0ZSA9ICJFbmFibGVkIiB9CiAgICAkeG1sLkVjMkNvbmZpZ3VyYXRpb25TZXR0aW5ncy5HbG9iYWxTZXR0aW5ncy5TaG91bGRBZGRSb3V0ZXMgPSAidHJ1ZSIKICAgICR4bWwuU2F2ZSgkY29uZmlndXJhdGlvbkZpbGUpCn0K"
           ],
           "SubnetId": [
             "{{ SubnetId }}"
@@ -440,6 +462,15 @@
           ],
           "EC2RescueInstanceType": [
             "{{ EC2RescueInstanceType }}"
+          ],
+          "AllowEncryptedVolume": [
+            "{{ AllowEncryptedVolume }}"
+          ],
+          "HelperInstanceProfileName": [
+            "{{ HelperInstanceProfileName }}"
+          ],
+          "HelperInstanceSecurityGroupId": [
+            "{{ HelperInstanceSecurityGroupId }}"
           ]
         },
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow"
