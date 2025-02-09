@@ -1,0 +1,176 @@
+{
+  "description": "The **AWSSupport-TroubleshootIAMAccessDeniedEvents** automation runbook helps in troubleshooting AWS Identity and Access Management (IAM) access denied issues found in AWS CloudTrail. The runbook queries AWS CloudTrail for recent access denied events related to the specified IAM entity (user or role) and AWS service event source. Each identified access denied event is examined to help understand the context of the denial and the attempted actions.\nThe automation analyzes both identity-based and resource-based IAM policies. For identity-based policies, it describes and evaluates the inline and managed policies attached to the IAM entity. For resource-based policies, it describes and evaluates the policies. The following AWS services are supported for resource-based policies evaluation: Amazon Simple Storage Service (S3), AWS Key Management Service (KMS), AWS Lambda, Amazon Simple Notification Service (SNS), Amazon Elastic Container Registry (ECR), Amazon API Gateway, AWS CodeArtifact, Amazon Elastic File System (EFS), Amazon Simple Queue Service (SQS), Amazon OpenSearch Service, AWS Signer, AWS Serverless Application Repository, AWS Secrets Manager, Amazon EventBridge, and AWS Backup. The runbook leverages IAM's policy simulation capabilities through both [SimulatePrincipalPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_SimulatePrincipalPolicy.html) for IAM users and [SimulateCustomPolicy](https://docs.aws.amazon.com/IAM/latest/APIReference/API_SimulateCustomPolicy.html) for IAM roles to evaluate these policies against the denied actions found in the CloudTrail events.\nThe automation outputs a report that helps identify the specific actions that were denied, differentiating between implicit and explicit denies.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "RequesterArn": {
+      "type": "String",
+      "description": "(Required) The ARN of the IAM user or role for which you want to investigate the access permissions on a specific AWS resource. The runbook requires permissions to describe the target IAM user or role associated IAM policies.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:(role|user)\\/[\\w+\\/=,.@-]+$"
+    },
+    "ResourceARN": {
+      "type": "String",
+      "description": "(Optional) The ARN of AWS the resource for which the access denied is evaluated. Note: The AWS target resource should exist in the same region where the automation runbook is executed. The runbook requires permissions to describe the target resource associated IAM policies.",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):([a-zA-Z0-9\\-]{1,63}):([a-z0-9\\-]{0,63})?:(\\d{12})?:([a-zA-Z0-9\\-_/:.]{1,1024})$",
+      "default": ""
+    },
+    "EventSource": {
+      "type": "String",
+      "description": "(Required) The Amazon API endpoint where the event originated. For example: `s3.amazonaws.com`.",
+      "allowedPattern": "^([a-zA-Z0-9.-]+)\\.amazonaws\\.com$"
+    },
+    "EventName": {
+      "type": "String",
+      "description": "(Optional) The Amazon API action name associated with the AWS CloudTrail event. For example: `s3:CreateBucket`.",
+      "allowedPattern": "^$|^[a-z0-9]+:[A-Za-z0-9]+$",
+      "default": ""
+    },
+    "LookBackHours": {
+      "type": "Integer",
+      "description": "(Optional) The number of hours to look back in the AWS CloudTrail events when searching for `Access Denied` events. Valid range: `1` to `24` hours. Default value is `12` hours.",
+      "allowedPattern": "^([1-9]|1[0-9]|2[0-4])$",
+      "default": 12
+    },
+    "MaxEvents": {
+      "type": "Integer",
+      "description": "(Optional) The maximum number of AWS CloudTrail `Access Denied` events returned when searching for events. Valid range: `1` to `5` events. Default value is `3` events.",
+      "allowedPattern": "^[1-5]$",
+      "default": 3
+    },
+    "UseContextEntries": {
+      "type": "Boolean",
+      "description": "(Optional) If you specify `true`, the automation extracts details about the context of the API request from the AWS CloudTrail event and include them for the IAM policy simulation.",
+      "default": false
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateRequesterArn",
+      "action": "aws:executeScript",
+      "description": "Validates and deconstructs the `RequesterArn` ARN, retrieving information about the target IAM user or role.",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "GetCloudTrailEventsWithAccessDeniedError",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "RequesterArn": "{{ RequesterArn }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport re\nimport sys\n\nimport boto3\n\nsys.tracebacklimit = 0\nclient = boto3.client(\"iam\")\n\n\ndef get_iam_entity_details(iam_arn, account_id):\n    \"\"\"Get IAM entity details\n\n    Get the IAM type, account number, username/role name of the IAM entity (User/Role/AssumedRole)\n    Args:\n        iam_arn : ARN of either role, user, or assumed role.\n        account_id : The account ID to validate against.\n    Returns:\n        dict : Account number, role name or username, IAM ID, IAM type, and partition.\n    \"\"\"\n    try:\n        arn_regex = r\"^arn:(aws|aws-cn|aws-us-gov|aws-iso(?:-[a-z])?):(?:iam|sts)::(\\d{12}):(.+)$\"\n        match = re.match(arn_regex, iam_arn)\n        if not match:\n            raise ValueError(f\"Invalid IAM ARN format: {iam_arn}\")\n\n        partition, account_number, entity_path = match.groups()\n\n        if account_id != account_number:\n            raise ValueError(\n                \"User or role is in a different account. Please run this runbook in the correct AWS Account\"\n            )\n\n        iam_dictionary = {\n            \"AccountNumber\": account_number,\n            \"IamRoot\": f\"arn:{partition}:iam::{account_number}:root\",\n            \"IamId\": \"\",\n            \"IamAssumedArn\": \"\",\n            \"IamAssumedId\": \"\",\n            \"Partition\": partition,\n        }\n\n        if entity_path.startswith(\"user/\"):\n            iam_type = \"User\"\n            iam_entity_name = entity_path.split(\"/\", 1)[1]\n            response = client.get_user(UserName=iam_entity_name)\n            iam_id = response[\"User\"][\"UserId\"]\n        elif entity_path.startswith(\"role/\"):\n            iam_type = \"Role\"\n            iam_entity_name = entity_path.split(\"/\", 1)[1]\n            response = client.get_role(RoleName=iam_entity_name)\n            iam_id = response[\"Role\"][\"RoleId\"]\n        elif entity_path.startswith(\"assumed-role/\"):\n            iam_type = \"AssumedRole\"\n            role_name, session_name = entity_path.split(\"/\")[1:3]\n            iam_entity_name = role_name\n            response = client.get_role(RoleName=role_name)\n            role_id = response[\"Role\"][\"RoleId\"]\n            iam_id = f\"{role_id}:{session_name}\"\n            iam_dictionary[\"IamAssumedArn\"] = iam_arn\n            iam_dictionary[\"IamAssumedId\"] = iam_id\n        else:\n            raise ValueError(f\"Unsupported IAM entity type in ARN: {iam_arn}\")\n\n        iam_dictionary.update(\n            {\n                \"IamType\": iam_type,\n                \"IamEntityName\": iam_entity_name,\n                \"IamId\": iam_id,\n            }\n        )\n\n        return iam_dictionary\n\n    except Exception as e:\n        raise RuntimeError(f\"An error occurred when getting details from the role or user: {str(e)}\") from None\n\n\ndef script_handler(events, context):\n    try:\n        iam_arn = events[\"RequesterArn\"]\n        account_id = context.get(\"global:ACCOUNT_ID\")\n\n        results = get_iam_entity_details(iam_arn, account_id)\n\n    except KeyError as e:\n        raise RuntimeError(f\"An error has occured when executing the step: {str(e)}.\") from None\n    else:\n        return results\n"
+      },
+      "outputs": [
+        {
+          "Name": "IamEntityName",
+          "Selector": "$.Payload.IamEntityName",
+          "Type": "String"
+        },
+        {
+          "Name": "AccountNumber",
+          "Selector": "$.Payload.AccountNumber",
+          "Type": "String"
+        },
+        {
+          "Name": "IamType",
+          "Selector": "$.Payload.IamType",
+          "Type": "String"
+        },
+        {
+          "Name": "IamAssumedArn",
+          "Selector": "$.Payload.IamAssumedArn",
+          "Type": "String"
+        },
+        {
+          "Name": "IamRoot",
+          "Selector": "$.Payload.IamRoot",
+          "Type": "String"
+        },
+        {
+          "Name": "IamId",
+          "Selector": "$.Payload.IamId",
+          "Type": "String"
+        },
+        {
+          "Name": "IamAssumedId",
+          "Selector": "$.Payload.IamAssumedId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetCloudTrailEventsWithAccessDeniedError",
+      "action": "aws:executeScript",
+      "description": "Queries the AWS CloudTrail events for recent access denied events related to the specified IAM entity and AWS service Event Source.",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "nextStep": "EvaluateIAMRequesterPolicies",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "EventSource": "{{ EventSource }}",
+          "EventName": "{{ EventName }}",
+          "LookBackHours": "{{ LookBackHours }}",
+          "MaxEvents": "{{ MaxEvents }}",
+          "RequesterArn": "{{ RequesterArn }}",
+          "IamId": "{{ ValidateRequesterArn.IamId }}",
+          "IamType": "{{ ValidateRequesterArn.IamType }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "import json\nimport sys\nfrom datetime import datetime, timedelta, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\nclient = boto3.client(\"cloudtrail\")\n\n\ndef serialize_dict(obj):\n    if isinstance(obj, dict):\n        return {key: serialize_dict(value) for key, value in obj.items()}\n    elif isinstance(obj, list):\n        return [serialize_dict(element) for element in obj]\n    elif isinstance(obj, datetime):\n        return obj.isoformat()\n    elif isinstance(obj, (str, int, float, bool, type(None))):\n        return obj\n    else:\n        raise TypeError(f\"Object of type {obj.__class__.__name__} is not JSON serializable\")\n\n\ndef get_access_denied_error_events(\n    event_source, event_name, requester_arn, iam_entity_id, iam_type, look_back_hours, max_events\n):\n    \"\"\"Get access denied error events from CloudTrail.\n    Args:\n        event_source (str): The AWS service source of the events.\n        requester_arn (str): The ARN of the requester.\n        iam_entity_id (str): The ID of the IAM entity.\n        iam_type (str): The type of IAM entity (e.g., \"Role\", \"User\").\n        look_back_hours (int): Number of hours to look back in CloudTrail logs.\n    Returns:\n        List: Access denied error CloudTrail events.\n    \"\"\"\n    error_events = []\n    try:\n        attribute = {\"AttributeKey\": \"EventSource\", \"AttributeValue\": event_source}\n        if event_name:\n            attribute = {\"AttributeKey\": \"EventName\", \"AttributeValue\": event_name.split(\":\")[1]}\n\n        paginator = client.get_paginator(\"lookup_events\")\n        ctrail_events_iterator = paginator.paginate(\n            LookupAttributes=[attribute],\n            StartTime=datetime.now(timezone.utc) - timedelta(hours=look_back_hours),\n        )\n\n        for page in ctrail_events_iterator:\n            for ctrail_event in page[\"Events\"]:\n                ctrail_event_json = json.loads(ctrail_event[\"CloudTrailEvent\"])\n\n                if iam_type == \"Role\":\n                    if ctrail_event_json.get(\"sessionContext\", {}).get(\"sessionIssuer\", {}).get(\"arn\") == requester_arn:\n                        error_events.append(ctrail_event)\n                    elif ctrail_event_json.get(\"errorCode\") == \"AccessDenied\" and (\n                        ctrail_event_json.get(\"userIdentity\", {}).get(\"arn\") == requester_arn\n                        or ctrail_event_json.get(\"userIdentity\", {}).get(\"principalId\", \"\").split(\":\")[0]\n                        == iam_entity_id\n                    ):\n                        error_events.append(ctrail_event)\n                else:\n                    if (\n                        ctrail_event_json.get(\"errorCode\") == \"AccessDenied\"\n                        and ctrail_event_json.get(\"userIdentity\", {}).get(\"arn\") == requester_arn\n                    ):\n                        error_events.append(ctrail_event)\n\n                # Check if we have enough events\n                if len(error_events) >= max_events:\n                    return serialize_dict(error_events)\n\n    except ClientError as e:\n        raise RuntimeError(f\"AWS API error when querying CloudTrail: {str(e)}\") from None\n    except json.JSONDecodeError as e:\n        raise RuntimeError(f\"Error decoding CloudTrail event JSON: {str(e)}\") from None\n    except Exception as e:\n        raise RuntimeError(f\"Unexpected error when processing CloudTrail events: {str(e)}\") from None\n\n    if not error_events:\n        raise ValueError(\"No access denied errors found for the provided IAM entity and event source.\")\n\n    # Return the events we found (less than max_events)\n    return serialize_dict(error_events)\n\n\ndef script_handler(events, context):\n    try:\n        event_source = events[\"EventSource\"]\n        event_name = events[\"EventName\"]\n        requester_arn = events[\"RequesterArn\"]\n        look_back_hours = int(events[\"LookBackHours\"])\n        max_events = int(events[\"MaxEvents\"])\n        iam_entity_id = events[\"IamId\"]\n        iam_type = events[\"IamType\"]\n\n        access_denied_error_events = get_access_denied_error_events(\n            event_source, event_name, requester_arn, iam_entity_id, iam_type, look_back_hours, max_events\n        )\n\n        return {\"Events\": access_denied_error_events}\n\n    except KeyError as e:\n        raise ValueError(f\"Missing required parameter: {str(e)}\") from None\n    except ValueError as e:\n        raise ValueError(f\"Invalid parameter value: {str(e)}\") from None\n    except RuntimeError as e:\n        raise RuntimeError(f\"Error retrieving CloudTrail events: {str(e)}\") from None\n    except Exception as e:\n        raise RuntimeError(f\"Unexpected error: {str(e)}\") from None\n"
+      },
+      "outputs": [
+        {
+          "Name": "Events",
+          "Selector": "$.Payload.Events",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "EvaluateIAMRequesterPolicies",
+      "action": "aws:executeScript",
+      "description": "Evaluates the IAM permissions of the requester IAM entity against the actions from AWS CloudTrail events. This evaluation includes analyzing both identity-based and resource-based policies associated with the requester. The automation utilizes AWS IAM's policy simulation capabilities to assess these policies in the context of the denied actions identified in the AWS CloudTrail events.",
+      "maxAttempts": 3,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResourceArn": "{{ ResourceARN }}",
+          "RequesterArn": "{{ RequesterArn }}",
+          "IamType": "{{ ValidateRequesterArn.IamType }}",
+          "Events": "{{ GetCloudTrailEventsWithAccessDeniedError.Events }}",
+          "EventSource": "{{ EventSource }}",
+          "UseContextEntries": "{{ UseContextEntries }}"
+        },
+        "Handler": "evaluate_iam_permissions.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "PermissionEvaluationResults",
+          "Selector": "$.Payload.Results",
+          "Type": "StringList"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "EvaluateIAMRequesterPolicies.PermissionEvaluationResults"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "44d82862b34b32cff0ec97264497a3ee156ee7321ddb707b54ca67839573ceb7"
+      }
+    }
+  }
+}
