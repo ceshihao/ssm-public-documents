@@ -1,0 +1,136 @@
+{
+  "description": "The AWS-UpdateSQSPermissions runbook updates SQS queue encryption settings and resource-based policy permissions. If KMS encryption is enabled for a queue, the setting updates to use SQS-managed encryption. The queue's resource-based policy is also updated to grant the following permissions to the principal you specify.\n\n- sqs:DeleteMessage\n- sqs:GetQueueAttributes\n- sqs:GetQueueUrl\n- sqs:ReceiveMessage\n- sqs:SendMessage\n\nWarning: For resources that are managed by CloudFormation stacks, it is recommended to modify the resource only through Cloudformation. Manual modification may result in a drift between the resource state and it's definition in the stack.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:aws[a-z0-9-]*:iam::\\d{12}:role\\/[\\w-\\/.@+=,]{1,1017}$"
+    },
+    "Principal": {
+      "type": "String",
+      "description": "The principal to grant SQS permissions to.",
+      "allowedPattern": "^([a-zA-Z0-9:/._-]{3,1024})$"
+    },
+    "SQSQueueUrl": {
+      "type": "String",
+      "description": "The SQS queue you want to update.",
+      "allowedPattern": "^https:\\/\\/sqs\\.[a-z0-9\\-]+\\.amazonaws\\.com(.cn)?\\/\\d{12}\\/([\\w\\-]{1,80})$"
+    }
+  },
+  "mainSteps": [
+    {
+      "description": "Gets the QueueAttributes of the SQS queue",
+      "name": "GetSqsQueueAttributes",
+      "action": "aws:executeAwsApi",
+      "nextStep": "CheckKmsEncryptionState",
+      "isEnd": false,
+      "inputs": {
+        "Service": "sqs",
+        "Api": "GetQueueAttributes",
+        "QueueUrl": "{{ SQSQueueUrl }}",
+        "AttributeNames": [
+          "All"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "QueueAttributes",
+          "Selector": "$.Attributes",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "description": "Checks if KMS encryption is enabled for the SQS queue",
+      "name": "CheckKmsEncryptionState",
+      "action": "aws:executeScript",
+      "nextStep": "DecideOnEncryptionRollback",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "check_sqs_kms_encryption_state",
+        "Script": "def check_sqs_kms_encryption_state(events, context):\n  queue_attributes = events['queueAttributes']\n  return {'IsKmsEncryptionEnabled': queue_attributes.get('KmsMasterKeyId') is not None}",
+        "InputPayload": {
+          "queueAttributes": "{{ GetSqsQueueAttributes.QueueAttributes }}"
+        }
+      },
+      "outputs": [
+        {
+          "Type": "Boolean",
+          "Name": "IsKmsEncryptionEnabled",
+          "Selector": "$.Payload.IsKmsEncryptionEnabled"
+        }
+      ]
+    },
+    {
+      "name": "DecideOnEncryptionRollback",
+      "description": "Determine the next step of the runbook based on the CheckKmsEncryptionState step",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RollbackEncryption",
+            "Variable": "{{ CheckKmsEncryptionState.IsKmsEncryptionEnabled }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "CheckAndUpdateResourceBasedPolicy"
+      }
+    },
+    {
+      "description": "Rollback SQS queue encryption settings to SQS-managed encryption",
+      "name": "RollbackEncryption",
+      "action": "aws:executeAwsApi",
+      "nextStep": "CheckAndUpdateResourceBasedPolicy",
+      "isEnd": false,
+      "inputs": {
+        "Service": "sqs",
+        "Api": "SetQueueAttributes",
+        "QueueUrl": "{{ SQSQueueUrl }}",
+        "Attributes": {
+          "KmsMasterKeyId": "",
+          "SqsManagedSseEnabled": "true"
+        }
+      }
+    },
+    {
+      "description": "Checks the resource-based policy of the SQS queue and updates it if necessary with additional permissions for the input principal",
+      "name": "CheckAndUpdateResourceBasedPolicy",
+      "action": "aws:executeScript",
+      "nextStep": "SetQueueAttributes",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "upsert_policy",
+        "Script": "import json\ndef upsert_policy(events, context):\n\n  queue_attributes = events[\"queueAttributes\"]\n\n  if 'Policy' not in events[\"queueAttributes\"]:\n    policy = {\n        \"Version\": \"2012-10-17\",\n        \"Statement\": []\n    }\n  else:\n    policy = json.loads(events[\"queueAttributes\"]['Policy'])\n\n  # Create new statement\n  principal = events[\"principal\"]\n\n  actions = [\n      \"sqs:DeleteMessage\",\n      \"sqs:GetQueueAttributes\",\n      \"sqs:GetQueueUrl\",\n      \"sqs:ReceiveMessage\",\n      \"sqs:SendMessage\"\n  ]\n\n  for stmt in policy[\"Statement\"]:\n    if \"Allow\" in stmt[\"Effect\"] and principal in stmt[\"Principal\"][\"AWS\"]:\n      actions = [action for action in actions if action not in stmt[\"Action\"]]\n      if len(actions) == 0:\n          return {'Policy': json.dumps(policy)}\n\n  sid_index = len(policy[\"Statement\"])+1\n  queue_arn = queue_attributes[\"QueueArn\"]\n\n  new_statement = {\n    \"Sid\": f\"Sid-{sid_index}\",\n    \"Effect\": \"Allow\",\n    \"Principal\": {\n        \"AWS\": f\"{principal}\"\n    },\n    \"Action\": actions,\n    \"Resource\": f\"{queue_arn}\"\n  }\n\n  policy[\"Statement\"].append(new_statement)\n\n  return {'Policy': json.dumps(policy)}",
+        "InputPayload": {
+          "queueAttributes": "{{ GetSqsQueueAttributes.QueueAttributes }}",
+          "principal": "{{ Principal }}"
+        }
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "UpdatedPolicy",
+          "Selector": "$.Payload.Policy"
+        }
+      ]
+    },
+    {
+      "description": "Sets the SQS queue's resource-based policy to the updated policy",
+      "name": "SetQueueAttributes",
+      "action": "aws:executeAwsApi",
+      "isEnd": true,
+      "inputs": {
+        "Service": "sqs",
+        "Api": "SetQueueAttributes",
+        "QueueUrl": "{{ SQSQueueUrl }}",
+        "Attributes": {
+          "Policy": "{{ CheckAndUpdateResourceBasedPolicy.UpdatedPolicy }}"
+        }
+      }
+    }
+  ]
+}

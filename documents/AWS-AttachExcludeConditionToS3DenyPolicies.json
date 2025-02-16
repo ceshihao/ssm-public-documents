@@ -1,0 +1,78 @@
+{
+  "description": "The AWS-AttachExcludeConditionToS3DenyPolicies runbook excludes the specified principal from all Deny statements of an S3 bucket's resource based policies. The operation is skipped if the specified principal is already excluded using an ArnNotLike condition operator.\n\nWarning: For resources that are managed by CloudFormation stacks, it is recommended to modify the resource only through Cloudformation. Manual modification may result in a drift between the resource state and it's definition in the stack.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "BucketName": {
+      "type": "String",
+      "description": "The name of the S3 bucket whose resource based policies you want to update.",
+      "allowedPattern": "^[A-Za-z\\d][\\w.-]{1,253}[A-Za-z\\d]$"
+    },
+    "PrincipalToRemoveFromDenyPolicy": {
+      "type": "String",
+      "description": "The principal ARN to exclude from the Deny statement. The principal must be an ARN of one of the following: IAM role, IAM user, AWS STS federated user session, or AWS account root user.",
+      "allowedPattern": "^([a-zA-Z0-9:/._-]{3,1024})$"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "allowedPattern": "^arn:aws[a-z0-9-]*:iam::\\d{12}:role\\/[\\w-\\/.@+=,]{1,1017}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "description": "Gets the S3 bucket's existing resource-based policy.",
+      "name": "getBucketPolicy",
+      "action": "aws:executeAwsApi",
+      "nextStep": "modifyPolicy",
+      "isEnd": false,
+      "inputs": {
+        "Service": "s3",
+        "Api": "GetBucketPolicy",
+        "Bucket": "{{ BucketName }}"
+      },
+      "outputs": [
+        {
+          "Name": "PolicyDocument",
+          "Selector": "$.Policy",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Adds or updates exclude conditions for any deny statements in the bucket policy that contains the specified principal.",
+      "name": "modifyPolicy",
+      "action": "aws:executeScript",
+      "nextStep": "updateBucketPolicy",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "modify_policy",
+        "Script": "import json\n\ndef add_exclusion_condition(statement, principal_to_remove):\n    if not statement['Effect'] == 'Deny':\n        return statement\n    if 'Condition' in statement:\n        if 'ArnNotEquals' in statement['Condition']:\n            if 'aws:PrincipalArn' in statement['Condition']['ArnNotEquals']:\n                if isinstance(statement['Condition']['ArnNotEquals']['aws:PrincipalArn'],list) and principal_to_remove not in statement['Condition']['ArnNotEquals']['aws:PrincipalArn']:\n                    statement['Condition']['ArnNotEquals']['aws:PrincipalArn'].append(principal_to_remove)\n                elif not principal_to_remove == statement['Condition']['ArnNotEquals']['aws:PrincipalArn']:\n                    statement['Condition']['ArnNotEquals']['aws:PrincipalArn'] = [statement['Condition']['ArnNotEquals']['aws:PrincipalArn'],principal_to_remove]\n            else:\n                statement['Condition']['ArnNotEquals']['aws:PrincipalArn'] = principal_to_remove\n        else:\n            statement['Condition']['ArnNotEquals'] = {'aws:PrincipalArn': principal_to_remove}\n    else:\n        statement['Condition'] = {'ArnNotEquals': {'aws:PrincipalArn': principal_to_remove}}\n    return statement\n\ndef modify_policy(events, context):\n    policy = json.loads(events['policy'])\n    policy['Statement'] = [add_exclusion_condition(stmt,events['principal_to_remove']) for stmt in policy['Statement']]\n    return {'ModifiedPolicy': json.dumps(policy)}",
+        "InputPayload": {
+          "policy": "{{ getBucketPolicy.PolicyDocument }}",
+          "principal_to_remove": "{{ PrincipalToRemoveFromDenyPolicy }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ModifiedPolicy",
+          "Selector": "$.Payload.ModifiedPolicy",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Updates the bucket's resource-based policy with the modified policy.",
+      "name": "updateBucketPolicy",
+      "action": "aws:executeAwsApi",
+      "isEnd": true,
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutBucketPolicy",
+        "Bucket": "{{ BucketName }}",
+        "Policy": "{{ modifyPolicy.ModifiedPolicy }}"
+      }
+    }
+  ]
+}

@@ -15,8 +15,21 @@
       "default": ""
     },
     "AutomationAssumeRole": {
-      "type": "AWS::IAM::Role::Arn",
+      "type": "String",
       "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to execute this document.",
+      "allowedPattern": "^(arn:aws:iam::\\d+:role/[a-zA-Z0-9-]*||null|empty)$",
+      "default": ""
+    },
+    "S3BucketLog": {
+      "type": "String",
+      "description": "(Optional) The S3 bucket name for storing logs. If you provide this parameter, you must also provide runCommandAssumeRole",
+      "allowedPattern": "^([a-z0-9][a-z0-9-]{1,61}[a-z0-9]||null|empty)$",
+      "default": ""
+    },
+    "runCommandAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role trusted by ssm.amazonaws.com, with AmazonSSMManagedInstanceCore policy + permission to upload logs to your S3BucketLog.",
+      "allowedPattern": "^(arn:aws:iam::\\d+:role/[a-zA-Z0-9-]*||null|empty)$",
       "default": ""
     }
   },
@@ -129,9 +142,44 @@
     },
     {
       "name": "installMissingOSUpdates",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "installMissingOSUpdatesWithS3Output",
+            "Variable": "{{ runCommandAssumeRole }}",
+            "StartsWith": "arn:"
+          }
+        ],
+        "Default": "installMissingOSUpdatesWithoutS3Output"
+      }
+    },
+    {
+      "name": "installMissingOSUpdatesWithS3Output",
       "action": "aws:runCommand",
       "maxAttempts": 1,
-      "onFailure": "Continue",
+      "nextStep": "SleepToCompleteInstall",
+      "isEnd": false,
+      "onFailure": "step:SleepToCompleteInstall",
+      "inputs": {
+        "DocumentName": "AWS-RunPatchBaseline",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "Operation": "Install"
+        },
+        "OutputS3BucketName": "{{ S3BucketLog }}",
+        "ServiceRoleArn": "{{ runCommandAssumeRole }}"
+      }
+    },
+    {
+      "name": "installMissingOSUpdatesWithoutS3Output",
+      "action": "aws:runCommand",
+      "maxAttempts": 1,
+      "nextStep": "SleepToCompleteInstall",
+      "isEnd": false,
+      "onFailure": "step:SleepToCompleteInstall",
       "inputs": {
         "DocumentName": "AWS-RunPatchBaseline",
         "InstanceIds": [
@@ -140,8 +188,7 @@
         "Parameters": {
           "Operation": "Install"
         }
-      },
-      "nextStep": "SleepToCompleteInstall"
+      }
     },
     {
       "name": "SleepToCompleteInstall",
