@@ -1,0 +1,846 @@
+{
+  "description": "The **AWSSupport-TroubleshootEbsCsiDriversForEks** automation runbook helps troubleshoot issues with Amazon Elastic Block Store (EBS) volume mounts in Amazon Elastic Kubernetes Service (Amazon EKS) and EBS Container Storage Interface (CSI) driver issues. The EKS cluster's authentication mode must be set to one of [API, API_AND_CONFIG_MAP].",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "GenerateReport.EvalReport"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "EksClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the target Amazon Elastic Kubernetes Service (EKS) cluster.",
+      "allowedPattern": "^[a-zA-Z0-9][a-zA-Z0-9-_]{0,99}$"
+    },
+    "ApplicationPodName": {
+      "type": "String",
+      "description": "(Required) The name of the Kubernetes (K8s) application pod having issues with the EBS CSI driver.",
+      "allowedPattern": "^[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$"
+    },
+    "ApplicationNamespace": {
+      "type": "String",
+      "description": "(Required) The Kubernetes (K8s) namespace for the application pod having issues with the EBS CSI driver.",
+      "allowedPattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+    },
+    "EbsCsiControllerDeploymentName": {
+      "type": "String",
+      "description": "(Optional) The deployment name for the EBS CSI controller pod. The default value is `ebs-csi-controller`.",
+      "allowedPattern": "^$|^[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$",
+      "default": "ebs-csi-controller"
+    },
+    "EbsCsiControllerNamespace": {
+      "type": "String",
+      "description": "(Optional) The Kubernetes (K8s) namespace for the EBS CSI controller pod. The default value is `kube-system`.",
+      "allowedPattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+      "default": "kube-system"
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Optional) The target Amazon S3 bucket name where the troubleshooting logs will be uploaded.",
+      "default": ""
+    },
+    "LambdaRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the IAM role that allows the AWS Lambda function to access the required AWS services and resources. If no role is specified, this Systems Manager Automation will create one IAM role for Lambda in your account with the name `Automation-K8sProxy-Role-<ExecutionId>` that includes the managed policies: `AWSLambdaBasicExecutionRole` and `AWSLambdaVPCAccessExecutionRole`. It is recommended that you provide your own role with these required permissions.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertIfTargetClusterExists",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Asserts if the provided target EKS Cluster specified in the `EksClusterName` parameter exists and is in the `ACTIVE` state.",
+      "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Service": "eks",
+        "Api": "DescribeCluster",
+        "name": "{{ EksClusterName }}",
+        "PropertySelector": "$.cluster.status",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      },
+      "nextStep": "ExecuteEksManagedAddOnHealthChecks"
+    },
+    {
+      "name": "ExecuteEksManagedAddOnHealthChecks",
+      "action": "aws:executeScript",
+      "description": "Checks if the EKS managed addon `aws-ebs-csi-driver` exists on the EKS cluster, gets the EKS version, the addon status, version, and health issues if they exist.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}"
+        },
+        "Handler": "dispatcher.get_eks_addon_health_check",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EksClusterVersion",
+          "Selector": "$.Payload.EksClusterVersion",
+          "Type": "String"
+        },
+        {
+          "Name": "EksManagedAddOnExists",
+          "Selector": "$.Payload.EksManagedAddOnExists",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AddonStatus",
+          "Selector": "$.Payload.AddonStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "AddonStable",
+          "Selector": "$.Payload.AddonStable",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AddonHealthIssues",
+          "Selector": "$.Payload.AddonHealthIssues",
+          "Type": "MapList"
+        }
+      ],
+      "nextStep": "BranchOnEksManagedAddOnStatus"
+    },
+    {
+      "name": "BranchOnEksManagedAddOnStatus",
+      "action": "aws:branch",
+      "description": "Verifies if the addon is Amazon EKS managed or self-managed. If the addon is Amazon EKS managed, it proceeds to check if the addon version is compatible with the EKS cluster version. Otherwise, if it is self-managed, it executes the `AWSSupport-SetupK8sApiProxyForEKS` to deploy the resources required to make k8s API calls, before checking compatibility.",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DeployK8sAuthApisResourcesForSelfManagedAddon",
+            "Variable": "{{ ExecuteEksManagedAddOnHealthChecks.EksManagedAddOnExists }}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "CheckIfManagedAddonCompatibleWithCluster",
+            "Variable": "{{ ExecuteEksManagedAddOnHealthChecks.EksManagedAddOnExists }}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "DeployK8sAuthApisResourcesForSelfManagedAddon",
+      "action": "aws:executeAutomation",
+      "description": "Executes the SAW Document `AWSSupport-SetupK8sApiProxyForEKS` to deploy a Lambda function as a proxy to make authenticated API calls.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ EksClusterName }}"
+          ],
+          "Operation": [
+            "Setup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "LambdaRoleArn": [
+            "{{ LambdaRoleArn }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "isCritical": true,
+      "nextStep": "AssertIfSelfManagedAddOnExists",
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure"
+    },
+    {
+      "name": "AssertIfSelfManagedAddOnExists",
+      "action": "aws:executeScript",
+      "description": "Checks if a self-managed addon exists on the EKS cluster.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "ebs_csi_controller_namespace": "{{EbsCsiControllerNamespace}}",
+          "ebs_csi_controller_deployment_name": "{{EbsCsiControllerDeploymentName}}",
+          "lambda_function_arn": "{{ DeployK8sAuthApisResourcesForSelfManagedAddon.Output}}"
+        },
+        "Handler": "dispatcher.get_self_managed_addon",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EksSelfManagedAddOnExists",
+          "Selector": "$.Payload.EksSelfManagedAddOnExists",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnSelfManagedAddonStatus"
+    },
+    {
+      "name": "BranchOnSelfManagedAddonStatus",
+      "action": "aws:branch",
+      "description": "Verifies that the self-managed addon exists.",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckIfSelfManagedAddonCompatibleWithCluster",
+            "Variable": "{{ AssertIfSelfManagedAddOnExists.EksSelfManagedAddOnExists }}",
+            "BooleanEquals": true
+          },
+          {
+            "NextStep": "CleanupK8sAuthenticationInfrastructure",
+            "Variable": "{{ AssertIfSelfManagedAddOnExists.EksSelfManagedAddOnExists }}",
+            "BooleanEquals": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "CheckIfSelfManagedAddonCompatibleWithCluster",
+      "action": "aws:executeScript",
+      "description": "Checks if the self managed addon `aws-ebs-csi-driver` version is compatible with the EKS cluster version.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_managed_addon_exist": "{{ExecuteEksManagedAddOnHealthChecks.EksManagedAddOnExists}}",
+          "eks_self_managed_addon_exist": "{{AssertIfSelfManagedAddOnExists.EksSelfManagedAddOnExists}}",
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "lambda_function_arn": "{{ DeployK8sAuthApisResourcesForSelfManagedAddon.Output}}",
+          "ebs_csi_controller_namespace": "{{EbsCsiControllerNamespace}}",
+          "ebs_csi_controller_deployment_name": "{{EbsCsiControllerDeploymentName}}"
+        },
+        "Handler": "dispatcher.check_addon_compatibility",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AddonCompatible",
+          "Selector": "$.Payload.AddonCompatible",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnVersionCompatibility"
+    },
+    {
+      "name": "CheckIfManagedAddonCompatibleWithCluster",
+      "action": "aws:executeScript",
+      "description": "Checks if the managed addon `aws-ebs-csi-driver` version is compatible with the EKS cluster version.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_managed_addon_exist": "{{ExecuteEksManagedAddOnHealthChecks.EksManagedAddOnExists}}",
+          "eks_self_managed_addon_exist": "{{AssertIfSelfManagedAddOnExists.EksSelfManagedAddOnExists}}",
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "ebs_csi_controller_namespace": "{{EbsCsiControllerNamespace}}",
+          "ebs_csi_controller_deployment_name": "{{EbsCsiControllerDeploymentName}}"
+        },
+        "Handler": "dispatcher.check_addon_compatibility",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AddonCompatible",
+          "Selector": "$.Payload.AddonCompatible",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnVersionCompatibility"
+    },
+    {
+      "name": "BranchOnVersionCompatibility",
+      "action": "aws:branch",
+      "description": "Verifies if the addon is Amazon EKS managed or self-managed. If the addon is Amazon EKS managed, it proceeds to check if the addon version is compatible with the EKS cluster version. Otherwise, if it is self-managed, it executes the `AWSSupport-SetupK8sApiProxyForEKS` before checking compatibility.",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ ExecuteEksManagedAddOnHealthChecks.EksManagedAddOnExists}}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ CheckIfManagedAddonCompatibleWithCluster.AddonCompatible }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "DeployK8sAuthApisResourcesForEksManagedAddon"
+          },
+          {
+            "And": [
+              {
+                "Variable": "{{ ExecuteEksManagedAddOnHealthChecks.EksManagedAddOnExists }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ AssertIfSelfManagedAddOnExists.EksSelfManagedAddOnExists }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ CheckIfSelfManagedAddonCompatibleWithCluster.AddonCompatible }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "RunEbsCsiControllerChecksSelfManagedAddon"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DeployK8sAuthApisResourcesForEksManagedAddon",
+      "action": "aws:executeAutomation",
+      "description": "Executes the SAW Document `SetupK8sApiProxyForEKS` to deploy a Lambda function as a proxy to make authenticated API calls.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ EksClusterName }}"
+          ],
+          "Operation": [
+            "Setup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "LambdaRoleArn": [
+            "{{ LambdaRoleArn }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "isCritical": true,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "nextStep": "RunEbsCsiControllerChecksManagedAddon"
+    },
+    {
+      "name": "RunEbsCsiControllerChecksManagedAddon",
+      "action": "aws:executeScript",
+      "description": "Runs EBS CSI controller checks for EKS managed addon.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "ebs_csi_controller_namespace": "{{EbsCsiControllerNamespace}}",
+          "ebs_csi_controller_deployment_name": "{{EbsCsiControllerDeploymentName}}",
+          "lambda_function_arn": "{{ DeployK8sAuthApisResourcesForEksManagedAddon.Output }}"
+        },
+        "Handler": "dispatcher.ebs_csi_controller_check",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "LambdaFunctionName",
+          "Selector": "$.Payload.LambdaFunctionName",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "RunIAMPermissionsChecks"
+    },
+    {
+      "name": "RunEbsCsiControllerChecksSelfManagedAddon",
+      "action": "aws:executeScript",
+      "description": "Runs EBS CSI controller checks for self managed addon.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "ebs_csi_controller_namespace": "{{EbsCsiControllerNamespace}}",
+          "ebs_csi_controller_deployment_name": "{{EbsCsiControllerDeploymentName}}",
+          "lambda_function_arn": "{{ DeployK8sAuthApisResourcesForSelfManagedAddon.Output}}"
+        },
+        "Handler": "dispatcher.ebs_csi_controller_check",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "LambdaFunctionName",
+          "Selector": "$.Payload.LambdaFunctionName",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "RunIAMPermissionsChecks"
+    },
+    {
+      "name": "RunIAMPermissionsChecks",
+      "action": "aws:executeScript",
+      "description": "Runs IAM permissions check on the node role or service account role.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "ebs_csi_controller_namespace": "{{EbsCsiControllerNamespace}}",
+          "ebs_csi_controller_deployment_name": "{{EbsCsiControllerDeploymentName}}",
+          "lambda_function_name_managed": "{{RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName}}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}"
+        },
+        "Handler": "dispatcher.iam_permissions_checks",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "RunDiagnosePvCreation"
+    },
+    {
+      "name": "RunDiagnosePvCreation",
+      "action": "aws:executeScript",
+      "description": "Runs diagnosis to determine the persistent volumes creation of application Pod",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "app_pod_namespace": "{{ ApplicationNamespace }}",
+          "app_pod_name": "{{ ApplicationPodName }}",
+          "lambda_function_name_managed": "{{ RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName }}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}"
+        },
+        "Handler": "dispatcher.diagnose_pvc",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringList"
+        },
+        {
+          "Name": "EbsPvNames",
+          "Selector": "$.Payload.EbsPvNames",
+          "Type": "StringList"
+        },
+        {
+          "Name": "EbsPvClaimNames",
+          "Selector": "$.Payload.EbsPvClaimNames",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "CheckNodeToPodScheduling"
+    },
+    {
+      "name": "CheckNodeToPodScheduling",
+      "action": "aws:executeScript",
+      "description": "Runs diagnosis to check the Node and Pod scheduling for application Pod",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "app_pod_namespace": "{{ ApplicationNamespace }}",
+          "app_pod_name": "{{ ApplicationPodName }}",
+          "lambda_function_name_managed": "{{ RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName }}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}"
+        },
+        "Handler": "dispatcher.check_node_pod_scheduling",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringList"
+        },
+        {
+          "Name": "CheckAppPodEvents",
+          "Selector": "$.Payload.CheckAppPodEvents",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "CheckAppPodEvents"
+    },
+    {
+      "name": "CheckAppPodEvents",
+      "action": "aws:executeScript",
+      "description": "Checks the Kubernetes events for the Application pod",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "app_pod_namespace": "{{ ApplicationNamespace }}",
+          "app_pod_name": "{{ ApplicationPodName }}",
+          "lambda_function_name_managed": "{{ RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName }}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}",
+          "check_app_pod_events": "{{ CheckNodeToPodScheduling.CheckAppPodEvents }}"
+        },
+        "Handler": "dispatcher.check_app_pod_events",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "CollectLogToS3"
+    },
+    {
+      "name": "CollectLogToS3",
+      "action": "aws:executeScript",
+      "description": "Collect Kubernetes and application logs, and uploads them to the S3 bucket.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "app_pod_namespace": "{{ ApplicationNamespace }}",
+          "app_pod_name": "{{ ApplicationPodName }}",
+          "lambda_function_name_managed": "{{ RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName }}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}",
+          "ebs_csi_controller_namespace": "{{EbsCsiControllerNamespace}}",
+          "ebs_csi_controller_deployment_name": "{{EbsCsiControllerDeploymentName}}",
+          "ebs_pv_names": "{{ RunDiagnosePvCreation.EbsPvNames }}",
+          "ebs_pv_claim_names": "{{ RunDiagnosePvCreation.EbsPvClaimNames }}",
+          "s3_bucket_name": "{{ S3BucketName }}"
+        },
+        "Handler": "dispatcher.collect_log_to_s3",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "GetNodeInformation"
+    },
+    {
+      "name": "GetNodeInformation",
+      "action": "aws:executeScript",
+      "description": "Get Node information and potential SSM managed instances that can perform runCommand action",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": false,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "app_pod_namespace": "{{ ApplicationNamespace }}",
+          "app_pod_name": "{{ ApplicationPodName }}",
+          "ebs_csi_controller_namespace": "{{ EbsCsiControllerNamespace }}",
+          "ebs_csi_controller_deployment_name": "{{ EbsCsiControllerDeploymentName }}",
+          "lambda_function_name_managed": "{{RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName}}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}"
+        },
+        "Handler": "dispatcher.get_node_information",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EbsCsiControllerPodInstanceIDs",
+          "Selector": "$.Payload.EbsCsiControllerPodInstanceIDs",
+          "Type": "StringList"
+        },
+        {
+          "Name": "AppPodInstanceIDs",
+          "Selector": "$.Payload.AppPodInstanceIDs",
+          "Type": "StringList"
+        },
+        {
+          "Name": "AppPodNodeName",
+          "Selector": "$.Payload.AppPodNodeName",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckNodeHealth"
+    },
+    {
+      "name": "CheckNodeHealth",
+      "action": "aws:executeScript",
+      "description": "Runs diagnosis to determine the health of the EKS nodes.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "app_pod_node_name": "{{ GetNodeInformation.AppPodNodeName }}",
+          "app_pod_node_instance_id": "{{ GetNodeInformation.AppPodInstanceIDs }}",
+          "lambda_function_name_managed": "{{RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName}}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}"
+        },
+        "Handler": "dispatcher.node_health_checks",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "CheckEKSNodeConnectivityWithEC2Endpoint"
+    },
+    {
+      "name": "CheckEKSNodeConnectivityWithEC2Endpoint",
+      "action": "aws:runCommand",
+      "description": "Run curl to check if the EKS worker node instances running EBS CSI controller are able to connect with the EC2 endpoint. This step will fail if nodes are not SSM managed instances and continue other check.",
+      "onFailure": "step:CheckEbsPVAttachment",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": "{{ GetNodeInformation.EbsCsiControllerPodInstanceIDs }}",
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "# Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "#",
+            "# This script is used to test the connectivity to the AWS EC2 endpoint",
+            "",
+            "token=$(curl -s -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\")",
+            "region=$(curl -s -H \"X-aws-ec2-metadata-token: $token\" http://169.254.169.254/latest/meta-data/placement/region)",
+            "instance_id=$(curl -s -H \"X-aws-ec2-metadata-token: $token\" http://169.254.169.254/latest/meta-data/instance-id)",
+            "response_code=$(curl -s -o /dev/null -w \"%{http_code}\" https://ec2.${region}.amazonaws.com -L)",
+            "if [ \"$response_code\" = \"200\" ]; then",
+            "  echo \"CONNECTED\"",
+            "  exit 0",
+            "else",
+            "  echo \"The connectivity to EC2 endpoint (ec2.${region}.amazonaws.com) on EC2 instance $instance_id in region $region seems is not working (HTTP status code: $response_code).\"",
+            "  exit 1",
+            "fi"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ConnectivityStatus",
+          "Selector": "$.Output",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckEbsPVAttachment"
+    },
+    {
+      "name": "CheckEbsPVAttachment",
+      "action": "aws:executeScript",
+      "description": "Checks the Kubernetes persistent volume attachment statuses of the EBS volumes attached with the node.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "lambda_function_name_managed": "{{ RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName }}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}",
+          "ebs_csi_controller_namespace": "{{ EbsCsiControllerNamespace }}",
+          "ebs_csi_controller_deployment_name": "{{ EbsCsiControllerDeploymentName }}",
+          "pv_names": "{{ RunDiagnosePvCreation.EbsPvNames }}"
+        },
+        "Handler": "dispatcher.check_ebs_pv_attachment",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "LsblkPVonHost"
+    },
+    {
+      "name": "LsblkPVonHost",
+      "action": "aws:runCommand",
+      "description": "Run lsblk to get all block device on the host that running application Pod. This step will fail if nodes are not SSM managed instances and continue other check.",
+      "onFailure": "step:ReviewPVBlock",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": "{{ GetNodeInformation.AppPodInstanceIDs }}",
+        "Parameters": {
+          "commands": [
+            "lsblk"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CommandOutput",
+          "Selector": "$.Output",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ReviewPVBlock"
+    },
+    {
+      "name": "ReviewPVBlock",
+      "action": "aws:executeScript",
+      "description": "Review the block device from previous output and check if desired Kubernetes persistent volume is mounted.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "app_pod_namespace": "{{ ApplicationNamespace }}",
+          "app_pod_name": "{{ ApplicationPodName }}",
+          "lambda_function_name_managed": "{{ RunEbsCsiControllerChecksManagedAddon.LambdaFunctionName }}",
+          "lambda_function_name_self_managed": "{{ RunEbsCsiControllerChecksSelfManagedAddon.LambdaFunctionName}}",
+          "lsblk_command_output": "{{ LsblkPVonHost.CommandOutput }}",
+          "pv_names": "{{ RunDiagnosePvCreation.EbsPvNames }}"
+        },
+        "Handler": "dispatcher.review_pv_block",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Response",
+          "Selector": "$.Payload.Response",
+          "Type": "StringList"
+        }
+      ],
+      "nextStep": "CleanupK8sAuthenticationInfrastructure"
+    },
+    {
+      "name": "CleanupK8sAuthenticationInfrastructure",
+      "action": "aws:executeAutomation",
+      "description": "Executes the SAW Document `SetupK8sApiProxyForEKS` using the `Cleanup` operation to clean up resources created as part of the automation.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ EksClusterName }}"
+          ],
+          "Operation": [
+            "Cleanup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "LambdaRoleArn": [
+            "{{ LambdaRoleArn }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "isCritical": true,
+      "onFailure": "Abort",
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "Compiles the output of the previous steps and outputs a report.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "check_addon_compatibility": [
+            "TODO: Message from addon compatibility checks"
+          ],
+          "node_health_checks": "{{ CheckNodeHealth.Response }}",
+          "pvc_creation_checks": "{{ RunDiagnosePvCreation.Response }}",
+          "eks_node_ec2_endpoint_connectivity_checks": "{{ CheckEKSNodeConnectivityWithEC2Endpoint.ConnectivityStatus }}",
+          "ebs_pv_attachment_checks": "{{ CheckEbsPVAttachment.Response }}",
+          "ebs_pv_block_checks": "{{ ReviewPVBlock.Response }}",
+          "node_pod_scheduling_checks": "{{ CheckNodeToPodScheduling.Response }}",
+          "app_pod_events": "{{ CheckAppPodEvents.Response }}",
+          "iam_permission_checks": "{{ RunIAMPermissionsChecks.Response }}",
+          "collect_logs_to_s3": "{{ CollectLogToS3.Response }}"
+        },
+        "Handler": "dispatcher.generate_report",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EvalReport",
+          "Selector": "$.Payload.Result",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "SHA256": "2b5ed76ae85135aa4dd4c2eeb2291f7ccd434600ee2c0aea0e75aedee0f3f0c3"
+      }
+    }
+  }
+}
