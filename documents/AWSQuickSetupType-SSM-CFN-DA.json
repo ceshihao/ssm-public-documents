@@ -243,6 +243,19 @@
                 }
               ]
             },
+            "AccessLogsBucketName": {
+              "Fn::If": [
+                "IsHomeRegion",
+                [
+                  {
+                    "Ref": "AccessLogsBucket"
+                  }
+                ],
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            },
             "OperationalAccountId": [
               {
                 "Ref": "DelegatedAccountId"
@@ -299,6 +312,120 @@
         },
         "Condition": "ShouldCreateDAResourcesInHomeRegion"
       },
+      "AccessLogsBucket": {
+        "Type": "AWS::S3::Bucket",
+        "Properties": {
+          "BucketName": {
+            "Fn::Sub": "do-not-delete-ssm-logs-${AWS::AccountId}-${HomeRegion}-${QSConfigurationId}"
+          },
+          "PublicAccessBlockConfiguration": {
+            "BlockPublicAcls": true,
+            "BlockPublicPolicy": true,
+            "IgnorePublicAcls": true,
+            "RestrictPublicBuckets": true
+          },
+          "BucketEncryption": {
+            "ServerSideEncryptionConfiguration": [
+              {
+                "ServerSideEncryptionByDefault": {
+                  "Fn::If": [
+                    "S3BucketDefaultEncryption",
+                    {
+                      "SSEAlgorithm": "AES256"
+                    },
+                    {
+                      "SSEAlgorithm": "aws:kms",
+                      "KMSMasterKeyID": {
+                        "Ref": "S3BucketEncryptionKeyArn"
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "Condition": "ShouldCreateDAResourcesInHomeRegion"
+      },
+      "AccessLogsBucketPolicy": {
+        "Type": "AWS::S3::BucketPolicy",
+        "Properties": {
+          "Bucket": {
+            "Ref": "AccessLogsBucket"
+          },
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "DenyHTTPRequests",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:*",
+                "Resource": [
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${AccessLogsBucket}"
+                  },
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${AccessLogsBucket}/*"
+                  }
+                ],
+                "Condition": {
+                  "Bool": {
+                    "aws:SecureTransport": "false"
+                  }
+                }
+              },
+              {
+                "Sid": "DenyNonSigV4Requests",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:*",
+                "Resource": [
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${AccessLogsBucket}"
+                  },
+                  {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${AccessLogsBucket}/*"
+                  }
+                ],
+                "Condition": {
+                  "StringNotEquals": {
+                    "s3:SignatureVersion": "AWS4-HMAC-SHA256"
+                  }
+                }
+              },
+              {
+                "Action": [
+                  "s3:PutObject"
+                ],
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "logging.s3.amazonaws.com"
+                },
+                "Resource": {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${AccessLogsBucket}/access-logs/*"
+                },
+                "Condition": {
+                  "ArnLike": {
+                    "aws:SourceArn": {
+                      "Fn::GetAtt": [
+                        "DiagnosisBucket",
+                        "Arn"
+                      ]
+                    }
+                  },
+                  "StringEquals": {
+                    "aws:SourceAccount": {
+                      "Fn::Sub": "${AWS::AccountId}"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "Condition": "ShouldCreateDAResourcesInHomeRegion"
+      },
       "DiagnosisBucket": {
         "Type": "AWS::S3::Bucket",
         "Properties": {
@@ -332,6 +459,9 @@
             ]
           },
           "LoggingConfiguration": {
+            "DestinationBucketName": {
+              "Ref": "AccessLogsBucket"
+            },
             "LogFilePrefix": "access-logs/"
           },
           "VersioningConfiguration": {
@@ -355,7 +485,10 @@
             ]
           }
         },
-        "Condition": "ShouldCreateDAResourcesInHomeRegion"
+        "Condition": "ShouldCreateDAResourcesInHomeRegion",
+        "DependsOn": [
+          "AccessLogsBucket"
+        ]
       },
       "DiagnosisBucketPolicy": {
         "Type": "AWS::S3::BucketPolicy",
@@ -382,33 +515,6 @@
                 "Condition": {
                   "Bool": {
                     "aws:SecureTransport": "false"
-                  }
-                }
-              },
-              {
-                "Action": [
-                  "s3:PutObject"
-                ],
-                "Effect": "Allow",
-                "Principal": {
-                  "Service": "logging.s3.amazonaws.com"
-                },
-                "Resource": {
-                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${DiagnosisBucket}/access-logs/*"
-                },
-                "Condition": {
-                  "ArnLike": {
-                    "aws:SourceArn": {
-                      "Fn::GetAtt": [
-                        "DiagnosisBucket",
-                        "Arn"
-                      ]
-                    }
-                  },
-                  "StringEquals": {
-                    "aws:SourceAccount": {
-                      "Fn::Sub": "${AWS::AccountId}"
-                    }
                   }
                 }
               },
