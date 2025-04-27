@@ -1,0 +1,239 @@
+{
+  "schemaVersion": "1.0",
+  "templateBody": {
+    "Metadata": {
+      "Version": "1.0"
+    },
+    "Parameters": {
+      "QSType": {
+        "Type": "String",
+        "AllowedValues": [
+          "DA"
+        ],
+        "Default": "DA",
+        "Description": "(Required) Specifies whether the Quick Setup applies to the local account or an AWS organization."
+      },
+      "QSConfigurationId": {
+        "Type": "String",
+        "Description": "(Required) Unique identifier of the deployed configuration."
+      },
+      "DelegatedAccountId": {
+        "Type": "String",
+        "AllowedPattern": "^\\d{12}$",
+        "Description": "(Required) The ID of the member account in your organization you want to register as a delegated administrator."
+      },
+      "HomeRegion": {
+        "Type": "String",
+        "Description": "(Required) Name of the AWS Region to deploy global resources such as S3 buckets."
+      },
+      "IdentityProviderSetting": {
+        "Type": "String",
+        "AllowedValues": [
+          "IAM",
+          "SSO",
+          ""
+        ],
+        "Default": "",
+        "Description": "(Optional) Specifies identity provider IAM Identity Access Management (IAM) or Single Sign-On (SSO) used for determining who is the current access control template approver."
+      }
+    },
+    "Conditions": {
+      "IdentityProviderSettingExists": {
+        "Fn::Not": [
+          {
+            "Fn::Equals": [
+              {
+                "Ref": "IdentityProviderSetting"
+              },
+              ""
+            ]
+          }
+        ]
+      },
+      "IsOrgDeployment": {
+        "Fn::Not": [
+          {
+            "Fn::Equals": [
+              {
+                "Ref": "QSType"
+              },
+              "LA"
+            ]
+          }
+        ]
+      },
+      "IsDelegatedAccount": {
+        "Fn::Equals": [
+          {
+            "Ref": "DelegatedAccountId"
+          },
+          {
+            "Ref": "AWS::AccountId"
+          }
+        ]
+      },
+      "IsHomeRegion": {
+        "Fn::Equals": [
+          {
+            "Ref": "HomeRegion"
+          },
+          {
+            "Ref": "AWS::Region"
+          }
+        ]
+      },
+      "ShouldPropagatePolicies": {
+        "Fn::And": [
+          {
+            "Condition": "IsHomeRegion"
+          },
+          {
+            "Condition": "IsDelegatedAccount"
+          }
+        ]
+      }
+    },
+    "Resources": {
+      "RoleForAutomation": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": {
+            "Fn::Sub": "AWS-QuickSetup-EnableJITNA-DA-${AWS::Region}"
+          },
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "ssm.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWSQuickSetupManageJITNAResourcesExecutionPolicy"
+            }
+          ]
+        },
+        "Condition": "IsDelegatedAccount"
+      },
+      "AssociationForCreatingResouces": {
+        "Type": "AWS::SSM::Association",
+        "Properties": {
+          "AssociationName": {
+            "Fn::Sub": [
+              "AWS-QuickSetup-EnableJITNA-DA-${QSConfigurationId}",
+              {
+                "QSConfigurationId": {
+                  "Ref": "QSConfigurationId"
+                }
+              }
+            ]
+          },
+          "Name": "AWSQuickSetupType-SetupJITNAResources",
+          "Parameters": {
+            "AutomationAssumeRole": [
+              {
+                "Fn::GetAtt": [
+                  "RoleForAutomation",
+                  "Arn"
+                ]
+              }
+            ],
+            "IdentityProviderSetting": {
+              "Fn::If": [
+                "IdentityProviderSettingExists",
+                [
+                  {
+                    "Ref": "IdentityProviderSetting"
+                  }
+                ],
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            }
+          },
+          "ScheduleExpression": {
+            "Fn::If": [
+              "IsOrgDeployment",
+              "rate(1 day)",
+              {
+                "Ref": "AWS::NoValue"
+              }
+            ]
+          }
+        },
+        "Condition": "IsDelegatedAccount"
+      },
+      "RoleForPolicyPropagationAutomation": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": {
+            "Fn::Sub": "SSMJustInTimeNodeAccessPolicyPropagationRole-${QSConfigurationId}"
+          },
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "ssm.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "Path": "/",
+          "ManagedPolicyArns": [
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWSSystemsManagerJustInTimeNodeAccessRolePropagationPolicy"
+            }
+          ]
+        },
+        "Condition": "ShouldPropagatePolicies"
+      },
+      "AssociationForPolicyPropagation": {
+        "Type": "AWS::SSM::Association",
+        "Properties": {
+          "AssociationName": {
+            "Fn::Sub": "AWS-QuickSetup-SSMJustInTimeNodeAccessPolicyPropagation-${QSConfigurationId}"
+          },
+          "Name": "AWSQuickSetupType-PropagateJustInTimeNodeAccessPolicies",
+          "Parameters": {
+            "AutomationAssumeRole": [
+              {
+                "Fn::GetAtt": [
+                  "RoleForPolicyPropagationAutomation",
+                  "Arn"
+                ]
+              }
+            ]
+          },
+          "ScheduleExpression": {
+            "Fn::If": [
+              "IsOrgDeployment",
+              "rate(30 minutes)",
+              {
+                "Ref": "AWS::NoValue"
+              }
+            ]
+          }
+        },
+        "Condition": "ShouldPropagatePolicies",
+        "DependsOn": "RoleForPolicyPropagationAutomation"
+      }
+    }
+  }
+}

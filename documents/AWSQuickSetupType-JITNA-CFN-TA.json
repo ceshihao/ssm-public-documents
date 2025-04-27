@@ -1,0 +1,158 @@
+{
+  "schemaVersion": "1.0",
+  "templateBody": {
+    "Metadata": {
+      "Version": "1.0"
+    },
+    "Parameters": {
+      "QSType": {
+        "Type": "String",
+        "AllowedValues": [
+          "TA",
+          "LA"
+        ],
+        "Default": "TA",
+        "Description": "(Required) Specifies whether the Quick Setup applies to the local account or an AWS organization."
+      },
+      "QSConfigurationId": {
+        "Type": "String",
+        "Default": "",
+        "Description": "(Required) Unique identifier of the deployed configuration."
+      },
+      "DelegatedAccountId": {
+        "Type": "String",
+        "AllowedPattern": "^$|^\\d{12}$",
+        "Default": "",
+        "Description": "(Required) The ID of the member account in your organization you want to register as a delegated administrator."
+      },
+      "HomeRegion": {
+        "Type": "String",
+        "Description": "(Required) Name of the AWS Region to deploy global resources such as S3 buckets."
+      },
+      "IdentityProviderSetting": {
+        "Type": "String",
+        "AllowedValues": [
+          "IAM",
+          "SSO",
+          ""
+        ],
+        "Default": "",
+        "Description": "(Optional) Specifies identity provider IAM Identity Access Management (IAM) or Single Sign-On (SSO) used for determining who is the current access control template approver."
+      }
+    },
+    "Conditions": {
+      "IdentityProviderSettingExists": {
+        "Fn::Not": [
+          {
+            "Fn::Equals": [
+              {
+                "Ref": "IdentityProviderSetting"
+              },
+              ""
+            ]
+          }
+        ]
+      },
+      "IsOrgDeployment": {
+        "Fn::Not": [
+          {
+            "Fn::Equals": [
+              {
+                "Ref": "QSType"
+              },
+              "LA"
+            ]
+          }
+        ]
+      },
+      "IsNonDelegatedAccount": {
+        "Fn::Not": [
+          {
+            "Fn::Equals": [
+              {
+                "Ref": "DelegatedAccountId"
+              },
+              {
+                "Ref": "AWS::AccountId"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "Resources": {
+      "RoleForAutomation": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": {
+            "Fn::Sub": "AWS-QuickSetup-EnableJITNA-${QSType}-${AWS::Region}"
+          },
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "ssm.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWSQuickSetupManageJITNAResourcesExecutionPolicy"
+            }
+          ]
+        },
+        "Condition": "IsNonDelegatedAccount"
+      },
+      "AssociationForCreatingResouces": {
+        "Type": "AWS::SSM::Association",
+        "Properties": {
+          "Name": "AWSQuickSetupType-SetupJITNAResources",
+          "AssociationName": {
+            "Fn::Sub": "AWS-QuickSetup-EnableJITNA-${QSType}-${QSConfigurationId}"
+          },
+          "Parameters": {
+            "AutomationAssumeRole": [
+              {
+                "Fn::GetAtt": [
+                  "RoleForAutomation",
+                  "Arn"
+                ]
+              }
+            ],
+            "IdentityProviderSetting": {
+              "Fn::If": [
+                "IdentityProviderSettingExists",
+                [
+                  {
+                    "Ref": "IdentityProviderSetting"
+                  }
+                ],
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            }
+          },
+          "ScheduleExpression": {
+            "Fn::If": [
+              "IsOrgDeployment",
+              "rate(1 day)",
+              {
+                "Ref": "AWS::NoValue"
+              }
+            ]
+          }
+        },
+        "Condition": "IsNonDelegatedAccount"
+      }
+    }
+  }
+}

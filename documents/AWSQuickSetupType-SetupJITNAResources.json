@@ -1,0 +1,62 @@
+{
+  "description": "*Server Access Management enables users to utilize a cross-account and cross-region approach to approve session manager usage within an organization, this runbook creates the roles, sharing, and logging permissions to enable this workflow.*\n\n ---",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "The Amazon Resource Name (ARN) of the role that allows AWS Systems Manager Automation to perform the actions on your behalf."
+    },
+    "IdentityProviderSetting": {
+      "type": "String",
+      "description": "Select identity provider (IAM or SSO) used for determining who is the current access control template approver.",
+      "default": "",
+      "allowedPattern": "^$|IAM|SSO"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "UpdateIdentitySelection",
+      "action": "aws:executeScript",
+      "nextStep": "CreateJustInTimeAccessSLR",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "Script": "import boto3\n\ndef script_handler(event, context):\n    ssm = boto3.client('ssm')\n    setting_id = '/ssm/just-in-time-access/identity-provider'\n    setting_value = event['IdentityProviderSetting']\n\n    if setting_value:\n        response = ssm.update_service_setting(SettingId=setting_id, SettingValue=setting_value)\n        return response\n    else:\n        print(\"Skipping update_service_setting call for Identity Selection as the setting_value is null or empty.\")\n        return {}",
+        "InputPayload": {
+          "IdentityProviderSetting": "{{ IdentityProviderSetting }}"
+        }
+      }
+    },
+    {
+      "name": "CreateJustInTimeAccessSLR",
+      "action": "aws:executeScript",
+      "nextStep": "CreateJustInTimeAccessInvocationRole",
+      "isCritical": false,
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "Script": "import boto3\nimport botocore\ndef script_handler(event, context):\n    iam = boto3.client('iam')\n    roles_to_create = [\n        {\n            \"role_name\": \"AWSServiceRoleForSystemsManagerJustInTimeAccess\",\n            \"service_name\": \"justintimeaccess.ssm.amazonaws.com\",\n            \"description\": \"Service-linked role for Systems Manager Just in time access.\"\n        },\n        {\n            \"role_name\": \"AWSServiceRoleForSystemsManagerNotifications\",\n            \"service_name\": \"notifications.ssm.amazonaws.com\",\n            \"description\": \"Service-linked role for Systems Manager Notifications.\"\n        }\n    ]\n\n    results = []\n\n    for role in roles_to_create:\n        try:\n            response = iam.create_service_linked_role(\n                AWSServiceName=role[\"service_name\"],\n                Description=role[\"description\"]\n            )\n            results.append({\n                \"RoleName\": role[\"role_name\"],\n                \"Status\": \"Role Created\"\n            })\n        except botocore.exceptions.ClientError as error:\n            if error.response['Error']['Code'] == 'InvalidInput':\n                results.append({\n                    \"RoleName\": role[\"role_name\"],\n                    \"Status\": \"Role Already Exists\"\n                })\n            else:\n                results.append({\n                    \"RoleName\": role[\"role_name\"],\n                    \"Status\": f\"Error: {str(error)}\"\n                })\n\n    return {\n        \"Status\": \"Complete\",\n        \"Details\": results\n    }"
+      }
+    },
+    {
+      "name": "CreateJustInTimeAccessInvocationRole",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "main",
+        "Script": "import boto3\nimport json\nimport botocore\n\ndef main(events, context):\n    iam = boto3.client('iam')\n    role_name = 'SSM-JustInTimeAccessTokenRole'\n    policy_arn = 'arn:aws:iam::aws:policy/AWSSystemsManagerJustInTimeAccessTokenPolicy'\n\n    trust_policy_document = {\n        \"Version\": \"2012-10-17\",\n        \"Statement\": [\n            {\n                \"Effect\": \"Allow\",\n                \"Principal\": {\n                    \"Service\": [ \n                        \"justintimeaccess.ssm.amazonaws.com\"\n                    ]\n                },\n                \"Action\": [\n                    \"sts:AssumeRole\",\n                    \"sts:TagSession\"\n                ]\n            }\n        ]\n    }\n\n    try:\n        # Try to create the role\n        iam.create_role(\n            RoleName=role_name,\n            AssumeRolePolicyDocument=json.dumps(trust_policy_document),\n            Description=\"This Role allows Systems Manager to generate access tokens used for just-in-time node access.\",\n            Tags=[\n                {\n                    'Key': 'QuickSetupDocument',\n                    'Value': 'AWSQuickSetupType-JITNA'\n                }\n            ]\n        )\n\n        # Attach the AWS managed policy\n        iam.attach_role_policy(\n            RoleName=role_name,\n            PolicyArn=policy_arn\n        )\n\n        print(f\"Role '{role_name}' created successfully.\")\n    except botocore.exceptions.ClientError as e:\n        if e.response['Error']['Code'] == 'EntityAlreadyExists':\n            print(f\"Role '{role_name}' already exists. Skipping role creation.\")\n        else:\n            raise e\n\n    return {\n        'result': f\"JITNA Invocation Role '{role_name}' has been configured.\"\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "result",
+          "Selector": "$.result",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}
