@@ -1,0 +1,263 @@
+{
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "description": "The **AWSSupport-TroubleshootDMSTableErrors** automation runbook is designed to automate the troubleshooting process for `table errors` in AWS Database Migration Service (AWS DMS). These errors occur when tables fail to migrate from the source endpoint to the target endpoint during Database Migration Tasks or Serverless Replications created in AWS DMS service. The runbook analyzes signature error messages from Amazon CloudWatch logs, specifically focusing on task logs for traditional AWS DMS tasks and serverless logs for AWS DMS serverless replications. It also provides targeted suggestions and remediation steps for common error messages encountered during AWS DMS migrations.\n\n### Pre-checks performed by the Runbook:\n\nBefore analyzing the logs, the runbook verifies the following conditions:\n\n* **Migration Task or Serverless Replication Must Be Started**: The specified AWS DMS migration task or serverless replication must be in a started state.\n* **Table Error State**: At least one table must be in a \"Table error\" state. This can be verified in the \"Table statistics\" section on the migration task console or serverless replication console.\n* **CloudWatch Logging**: Amazon CloudWatch logging must be enabled for the migration task or serverless replication.\n\n### Important:\n\nThere are output size limitations for each step in the AWS Systems Manager document. In cases where the log analysis step exceeds these limitations or times out due to extensive log data, we recommend providing specific timestamp values in the StartTimeRange and EndTimeRange parameters when executing this runbook. By specifying a time range, the runbook will focus the analysis on a defined period, which often results in faster execution, reduced likelihood of timeouts, and output within the system limits. To determine appropriate timestamp values, you can check the last updated time of tables that have encountered errors in the Table Statistics section of your AWS DMS Migration task or Serverless replication details. This information can help you pinpoint the relevant time period for analysis and troubleshooting.",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "DMSArn": {
+      "type": "String",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):dms:[a-z0-9-]+:\\d{12}:(task|replication-config):[a-zA-Z0-9-]+$",
+      "description": "(Required) The ARN of the DMS Migration Task or DMS Replication Config."
+    },
+    "StartTimeRange": {
+      "type": "String",
+      "allowedPattern": "^$|^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})Z$",
+      "default": "",
+      "description": "(Optional) The beginning of the time range for Amazon CloudWatch logs analysis of the given AWS DMS Migration task or AWS DMS Serverless replication. When provided, only logs generated from this specific time onward will be collected and analyzed. Please note, there is a possibility that the automation could time out if the time range between the StartTimeRange and EndTimeRange is too long. The value should be provided in ISO 8601 date time format."
+    },
+    "EndTimeRange": {
+      "type": "String",
+      "allowedPattern": "^$|^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})Z$",
+      "default": "",
+      "description": "(Optional) The end of the time range for Amazon CloudWatch logs analysis of the given AWS DMS Migration task or AWS DMS Serverless replication. When provided, only logs generated until this specific time will be collected and analyzed. Please note, there is a possibility that the automation could time out if the time range between the StartTimeRange and EndTimeRange is too long. The value should be provided in ISO 8601 date time format."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateDMSInputTypeAndGatherDetails",
+      "description": "Validates the specified AWS DMS ARN input and gathers the basic details of the AWS DMS Migration task or AWS DMS Serverless replication that are required in the next steps.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "nextStep": "BranchOnTableErrors",
+      "inputs": {
+        "InputPayload": {
+          "DMSArn": "{{ DMSArn }}",
+          "StartTime": "{{ StartTimeRange }}",
+          "EndTime": "{{ EndTimeRange }}"
+        },
+        "Handler": "validate_dms_input.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DMSId",
+          "Selector": "$.Payload.DMSId",
+          "Type": "String"
+        },
+        {
+          "Name": "RegionName",
+          "Selector": "$.Payload.RegionName",
+          "Type": "String"
+        },
+        {
+          "Name": "TableErrorsCount",
+          "Selector": "$.Payload.TableErrorsCount",
+          "Type": "Integer"
+        },
+        {
+          "Name": "CWLoggingStatus",
+          "Selector": "$.Payload.CWLoggingStatus",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "FreshStartDate",
+          "Selector": "$.Payload.FreshStartDate",
+          "Type": "String"
+        },
+        {
+          "Name": "CWLogGroup",
+          "Selector": "$.Payload.CWLogGroup",
+          "Type": "String"
+        },
+        {
+          "Name": "CWLogStream",
+          "Selector": "$.Payload.CWLogStream",
+          "Type": "String"
+        },
+        {
+          "Name": "DMSInputType",
+          "Selector": "$.Payload.DMSInputType",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceEndpointDetails",
+          "Selector": "$.Payload.SourceEndpointDetails",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "TargetEndpointDetails",
+          "Selector": "$.Payload.TargetEndpointDetails",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnTableErrors",
+      "description": "Branches the automation based on the number of table errors found in the previous step. If the count is greater than 0, proceeds to BranchOnCWLoggingStatus step. Otherwise, proceeds to OutputNoTableErrors step.",
+      "action": "aws:branch",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnCWLoggingStatus",
+            "Variable": "{{ ValidateDMSInputTypeAndGatherDetails.TableErrorsCount }}",
+            "NumericGreater": 0
+          }
+        ],
+        "Default": "OutputNoTableErrors"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "BranchOnCWLoggingStatus",
+      "description": "Branches the automation based on the Amazon CloudWatch logging status found in the previous step. If enabled, proceeds to GatherTableDetails step. Otherwise, proceeds to OutputNoCWLoggingEnabled step.",
+      "action": "aws:branch",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GatherTableDetails",
+            "Variable": "{{ ValidateDMSInputTypeAndGatherDetails.CWLoggingStatus }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "OutputNoCWLoggingEnabled"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "OutputNoTableErrors",
+      "description": "Outputs a message stating that table errors are not found in the given AWS DMS Migration task or AWS DMS Serverless replication.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "DMSArn": "{{ DMSArn }}",
+          "DMSId": "{{ ValidateDMSInputTypeAndGatherDetails.DMSId }}",
+          "RegionName": "{{ ValidateDMSInputTypeAndGatherDetails.RegionName }}",
+          "DMSInputType": "{{ ValidateDMSInputTypeAndGatherDetails.DMSInputType }}",
+          "SourceEndpointDetails": "{{ ValidateDMSInputTypeAndGatherDetails.SourceEndpointDetails }}",
+          "TargetEndpointDetails": "{{ ValidateDMSInputTypeAndGatherDetails.TargetEndpointDetails }}"
+        },
+        "Handler": "output_no_table_errors.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "OutputNoCWLoggingEnabled",
+      "description": "Output a message stating that the CloudWatch logging is not enabled in the given DMS Migration Task/Serverless replication.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "DMSArn": "{{ DMSArn }}",
+          "DMSInputType": "{{ ValidateDMSInputTypeAndGatherDetails.DMSInputType }}",
+          "DMSId": "{{ ValidateDMSInputTypeAndGatherDetails.DMSId }}",
+          "RegionName": "{{ ValidateDMSInputTypeAndGatherDetails.RegionName }}"
+        },
+        "Handler": "output_no_cw_logs.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "GatherTableDetails",
+      "description": "Gathers the full load end time timestamps of the failed tables and calculates the time range values to analyze Amazon CloudWatch logs.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "DMSArn": "{{ DMSArn }}",
+          "DMSInputType": "{{ ValidateDMSInputTypeAndGatherDetails.DMSInputType }}",
+          "StartTime": "{{ StartTimeRange }}",
+          "EndTime": "{{ EndTimeRange }}"
+        },
+        "Handler": "gather_table_details.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload.StartTime",
+          "Type": "String"
+        },
+        {
+          "Name": "EndTime",
+          "Selector": "$.Payload.EndTime",
+          "Type": "String"
+        }
+      ],
+      "isEnd": false
+    },
+    {
+      "name": "AnalyzeCloudWatchLogs",
+      "description": "Analyzes the logs found in the Amazon CloudWatch log group and returns the analysis report.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "DMSArn": "{{ DMSArn }}",
+          "StartTime": "{{ GatherTableDetails.StartTime }}",
+          "EndTime": "{{ GatherTableDetails.EndTime }}",
+          "DMSInputType": "{{ ValidateDMSInputTypeAndGatherDetails.DMSInputType }}",
+          "CWLogGroup": "{{ ValidateDMSInputTypeAndGatherDetails.CWLogGroup }}",
+          "CWLogStream": "{{ ValidateDMSInputTypeAndGatherDetails.CWLogStream }}",
+          "TableErrorsCount": "{{ ValidateDMSInputTypeAndGatherDetails.TableErrorsCount }}"
+        },
+        "Handler": "analyze_cw_logs.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "AnalyzeCloudWatchLogs.Message",
+    "OutputNoTableErrors.Message",
+    "OutputNoCWLoggingEnabled.Message"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "6047b4738575af34a23fa33e3dfb66cb849ff23fcd63add5a90710188bd633cd"
+      }
+    }
+  }
+}

@@ -58,6 +58,15 @@
       "type": "String",
       "description": "(Required) Please read the complete details of the actions performed by this automation runbook and write 'Yes, I understand and acknowledge' if you acknowledge the steps.",
       "allowedPattern": "^Yes, I understand and acknowledge$"
+    },
+    "AllowInstanceStoreInstances": {
+      "type": "String",
+      "description": "(Optional) If you specify `yes`, the runbook runs on instances that have instance store volumes attached. **Warning:** data in the instance store volumes is lost when the instance is stopped. This parameter helps avoid accidental data loss.",
+      "default": "no",
+      "allowedValues": [
+        "no",
+        "yes"
+      ]
     }
   },
   "mainSteps": [
@@ -407,10 +416,17 @@
             "#!/bin/bash",
             "",
             "NVME_SUPPORT='{{getXenInstanceTypeDetails.NVMeSupport}}'",
+            "ALLOW_INSTANCE_STORE_VOLUMES='{{AllowInstanceStoreInstances}}'",
             "ERROR=\"\\n [ERROR] UnSupported Instance Type: instance store volumes attached. Exiting... \\n\"",
             "INFO=\"\\n [INFO] No instance store volumes are attached with the EC2 instance \\n\"",
+            "BYPASS_INFO=\"\\n [INFO] Instance store volumes detected, but check bypassed due to AllowInstanceStoreInstances set to yes \\n\"",
             "",
             "if [[ \"${AWS_SSM_INSTANCE_ID}\" =~ ^[i]-[a-z0-9]{8,17}$ ]]; then",
+            "    # If user has explicitly allowed instance store volumes, bypass the check",
+            "    if [ \"${ALLOW_INSTANCE_STORE_VOLUMES}\" = \"yes\" ]; then",
+            "        echo -e \"$BYPASS_INFO\"",
+            "        exit 0",
+            "    fi",
             "",
             "    if [ \"${NVME_SUPPORT}\" = \"required\" ]; then",
             "        if [ \"$(ls -l /dev/disk/by-id/ | grep Amazon_EC2_NVMe_Instance_Storage | grep -wv ns-1 | awk '{ print $11 }' | sed 's/[./]//g' > /dev/null; echo $?)\" == \"0\" ]; then",
@@ -420,7 +436,7 @@
             "                echo -en \"$INFO\"",
             "        fi",
             "    elif [ $NVME_SUPPORT = \"unsupported\" ]; then",
-            "        TOKEN =\"$(curl -s -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\")\" && curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/block-device-mapping/ | grep -vE 'ami|root|swap' > /dev/null; echo $?",
+            "        TOKEN=\"$(curl -s -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\")\" && curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/block-device-mapping/ | grep -vE 'ami|root|swap' > /dev/null; echo $?",
             "        if [ \"${TOKEN}\" = \"0\" ]; then",
             "                echo -en \"$ERROR\"",
             "                exit 1",
@@ -625,7 +641,7 @@
       "onFailure": "step:branchOnFailureType",
       "inputs": {
         "InstanceIds": [
-          "{{ launchInstanceInSameSubnet.ClonedInstanceId }}"
+          "{{ TargetInstanceId }}"
         ],
         "CheckStateOnly": false,
         "DesiredState": "stopped",
