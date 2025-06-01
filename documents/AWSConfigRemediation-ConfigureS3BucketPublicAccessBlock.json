@@ -1,5 +1,5 @@
 {
-  "description": "### Document Name - AWSConfigRemediation-ConfigureS3BucketPublicAccessBlock\n\n## What does this document do?\nThis document is used to create or modify the PublicAccessBlock configuration for an Amazon S3 bucket.\n\n## Input Parameters\n* BucketName: (Required) Name of the S3 bucket (not the ARN).\n* RestrictPublicBuckets: (Optional) Specifies whether Amazon S3 should restrict public bucket policies for this bucket. Setting this element to TRUE restricts access to this bucket to only AWS services and authorized users within this account if the bucket has a public policy.\n  * Default: \"true\"\n* BlockPublicAcls: (Optional) Specifies whether Amazon S3 should block public access control lists (ACLs) for this bucket and objects in this bucket.\n  * Default: \"true\"\n* IgnorePublicAcls: (Optional) Specifies whether Amazon S3 should ignore public ACLs for this bucket and objects in this bucket. Setting this element to TRUE causes Amazon S3 to ignore all public ACLs on this bucket and objects in this bucket.\n  * Default: \"true\"\n* BlockPublicPolicy: (Optional) Specifies whether Amazon S3 should block public bucket policies for this bucket. Setting this element to TRUE causes Amazon S3 to reject calls to PUT Bucket policy if the specified bucket policy allows public access.\n  * Default: \"true\"\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n## Output Parameters\n* GetBucketPublicAccessBlock.Output - JSON formatted response from the GetPublicAccessBlock API call\n",
+  "description": "### Document Name - AWSConfigRemediation-ConfigureS3BucketPublicAccessBlock\n\n## What does this document do?\nThis document is used to create or modify the PublicAccessBlock configuration for an Amazon S3 bucket.\n\n## Input Parameters\n* BucketName: (Required) Name of the S3 bucket (not the ARN).\n* RestrictPublicBuckets: (Optional) Specifies whether Amazon S3 should restrict public bucket policies for this bucket. Setting this element to TRUE restricts access to this bucket to only AWS services and authorized users within this account if the bucket has a public policy.\n  * Default: \"true\"\n* BlockPublicAcls: (Optional) Specifies whether Amazon S3 should block public access control lists (ACLs) for this bucket and objects in this bucket.\n  * Default: \"true\"\n* IgnorePublicAcls: (Optional) Specifies whether Amazon S3 should ignore public ACLs for this bucket and objects in this bucket. Setting this element to TRUE causes Amazon S3 to ignore all public ACLs on this bucket and objects in this bucket.\n  * Default: \"true\"\n* BlockPublicPolicy: (Optional) Specifies whether Amazon S3 should block public bucket policies for this bucket. Setting this element to TRUE causes Amazon S3 to reject calls to PUT Bucket policy if the specified bucket policy allows public access.\n  * Default: \"true\"\n* AutomationAssumeRole: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n* StabilizationPeriod: (Optional) Specifies an ISO 8601 duration to wait for remediation stabilization.\n\n## Output Parameters\n* GetBucketPublicAccessBlock.Output - JSON formatted response from the GetPublicAccessBlock API call\n",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
@@ -49,6 +49,12 @@
     "AutomationAssumeRole": {
       "type": "AWS::IAM::Role::Arn",
       "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "StabilizationPeriod": {
+      "type": "String",
+      "description": "(Optional) Specifies a duration to wait for remediation stabilization in seconds. Must be between 1 and 604799.",
+      "default": "300",
+      "allowedPattern": "^([1-9]\\d?\\d?\\d?\\d?|[1-5]\\d\\d\\d\\d\\d|60[0-3]\\d\\d\\d|604[0-7]\\d\\d)$"
     }
   },
   "mainSteps": [
@@ -56,7 +62,6 @@
       "name": "PutBucketPublicAccessBlock",
       "action": "aws:executeAwsApi",
       "description": "## PutBucketPublicAccessBlock\nCreates or modifies the PublicAccessBlock configuration for a S3 Bucket.\n",
-      "isEnd": false,
       "inputs": {
         "Service": "s3",
         "Api": "PutPublicAccessBlock",
@@ -68,16 +73,39 @@
           "BlockPublicPolicy": "{{ BlockPublicPolicy }}"
         }
       },
-      "isCritical": true,
       "maxAttempts": 2,
       "timeoutSeconds": 600
+    },
+    {
+      "name": "GetBucketPublicAccessBlockBeforeStabilization",
+      "action": "aws:executeScript",
+      "description": "## GetBucketPublicAccessBlockBeforeStabilization\nRetrieves the S3 PublicAccessBlock configuration for a S3 Bucket.\n## Outputs\n* Output: JSON formatted response from the GetPublicAccessBlock API call.\n",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "validate_s3_bucket_publicaccessblock",
+        "InputPayload": {
+          "Bucket": "{{BucketName}}",
+          "RestrictPublicBuckets": "{{ RestrictPublicBuckets }}",
+          "BlockPublicAcls": "{{ BlockPublicAcls }}",
+          "IgnorePublicAcls": "{{ IgnorePublicAcls }}",
+          "BlockPublicPolicy": "{{ BlockPublicPolicy }}"
+        },
+        "Script": "import boto3\n\ndef validate_s3_bucket_publicaccessblock(event, context):\n    s3_client      = boto3.client(\"s3\")\n    bucket         = event[\"Bucket\"]\n    bucket_pabs    = s3_client.get_public_access_block(Bucket=bucket)[\"PublicAccessBlockConfiguration\"]\n    all_pabs       = [\"BlockPublicAcls\", \"IgnorePublicAcls\", \"BlockPublicPolicy\", \"RestrictPublicBuckets\"]\n    unmatched_pabs = [pab for pab in all_pabs if bucket_pabs[pab] != event[pab]]\n\n    if unmatched_pabs:\n        info = \"CONFIGURATION VALUES DO NOT MATCH WITH PARAMETERS PROVIDED VALUES \"\n        for pab in unmatched_pabs:\n            info += f\"{pab}: {bucket_pabs[pab]}, \"\n        info.rstrip(\", \")\n        raise Exception(info)\n\n    return {\n        \"output\": {\n            \"message\": \"Bucket public access block configuration successfully set.\",\n            \"configuration\": bucket_pabs\n        }\n    }"
+      }
+    },
+    {
+      "name": "BucketPublicAccessBlockStabilization",
+      "action": "aws:sleep",
+      "inputs": {
+        "Duration": "PT{{ StabilizationPeriod }}S"
+      }
     },
     {
       "name": "GetBucketPublicAccessBlock",
       "action": "aws:executeScript",
       "description": "## GetBucketPublicAccessBlock\nRetrieves the S3 PublicAccessBlock configuration for a S3 Bucket.\n## Outputs\n* Output: JSON formatted response from the GetPublicAccessBlock API call.\n",
       "timeoutSeconds": 600,
-      "isCritical": true,
       "isEnd": true,
       "inputs": {
         "Runtime": "python3.11",
