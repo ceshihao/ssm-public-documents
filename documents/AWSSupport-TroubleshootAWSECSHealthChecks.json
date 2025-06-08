@@ -1,0 +1,689 @@
+{
+  "description": "The **TroubleshootAWSECSHealthChecks** automation runbook helps diagnose and troubleshoot issues where Amazon Elastic Container Service (Amazon ECS) tasks running on Amazon Elastic Compute Cloud (Amazon EC2) instances or AWS Fargate fail Application Load Balancer (ALB) health checks.\n\nThis runbook performs a systematic analysis by:\n\n1. Verifying network connectivity between ALBs and ECS tasks\n2. Checking if tasks are exiting unexpectedly\n3. Analyzing target group health status and response codes\n4. Examining ALB configuration and health check settings\n5. Validating service configuration including health check grace periods\n6. Performing custom diagnostics for response code mismatches\n\nFor advanced diagnostics, the runbook deploys temporary Lambda functions within your VPC to simulate health check requests from the same network perspective as your ALB. This allows the runbook to identify network connectivity issues. A Lambda execution role is required for these functions and can either be provided as a parameter or created temporarily by the runbook.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ECSClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon ECS cluster.",
+      "allowedPattern": "^[a-zA-Z0-9_-]{1,255}$"
+    },
+    "ECSServiceName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon ECS service.",
+      "allowedPattern": "^[a-zA-Z0-9_-]{1,255}$"
+    },
+    "LambdaExecutionRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the Lambda execution role that is used for the step of Lambda custom check. If no role is specified, This runbook will skip the step.",
+      "default": ""
+    }
+  },
+  "variables": {
+    "LambdaExecutionRole": {
+      "type": "String",
+      "default": "{{ LambdaExecutionRole }}"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckPermissions",
+      "action": "aws:executeScript",
+      "description": "Verifies IAM user/role who started the automation has the required IAM permissions. Additionally, it verifies the user/role and Lambda execution role has the required IAM permissions for the Lambda custom check",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "LambdaExecutionRole": "{{ LambdaExecutionRole }}"
+        },
+        "Handler": "iam_permission_handler.iam_permission_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "outputs": [
+        {
+          "Name": "SSMUserPermission",
+          "Selector": "$.Payload.ssm_user_perms",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "createLambdaPermission",
+          "Selector": "$.Payload.lambda_perms",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnPermissions"
+    },
+    {
+      "name": "BranchOnPermissions",
+      "action": "aws:branch",
+      "description": "Branches if IAM user/role has the required non mutating permissions",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckTargetClusterExistence",
+            "Variable": "{{ CheckPermissions.SSMUserPermission }}",
+            "BooleanEquals": true
+          },
+          {
+            "NextStep": "ExecutionResult",
+            "Variable": "{{ CheckPermissions.SSMUserPermission }}",
+            "BooleanEquals": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "CheckTargetClusterExistence",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Check if the provided ECS cluster exists in the account.",
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "inputs": {
+        "Service": "ecs",
+        "Api": "DescribeClusters",
+        "clusters": [
+          "{{ ECSClusterName }}"
+        ],
+        "PropertySelector": "$.clusters[0].status",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      },
+      "nextStep": "CheckEcsServiceExistence"
+    },
+    {
+      "name": "CheckEcsServiceExistence",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Check if the provided ECS service exists in the account.",
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Service": "ecs",
+        "Api": "DescribeServices",
+        "cluster": "{{ ECSClusterName }}",
+        "services": [
+          "{{ ECSServiceName }}"
+        ],
+        "PropertySelector": "$.services[0].status",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      },
+      "nextStep": "CheckNetworkConnectivity"
+    },
+    {
+      "name": "CheckNetworkConnectivity",
+      "action": "aws:executeScript",
+      "description": "Check network connectivity between Application Load Balancer (ALB) and ECS tasks.",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "ECSClusterName": "{{ ECSClusterName }}",
+          "ECSServiceName": "{{ ECSServiceName }}"
+        },
+        "Handler": "network_connectivity_handler.network_connectivity_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "outputs": [
+        {
+          "Name": "result",
+          "Selector": "$.Payload.result",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "ALBNetworkSetting",
+          "Selector": "$.Payload.alb_network_setting",
+          "Type": "MapList"
+        },
+        {
+          "Name": "TargetGroupArns",
+          "Selector": "$.Payload..target_group_arn",
+          "Type": "StringList"
+        },
+        {
+          "Name": "ALBArn1",
+          "Selector": "$.Payload.alb_network_setting[0].alb_arn",
+          "Type": "String"
+        },
+        {
+          "Name": "ALBArn2",
+          "Selector": "$.Payload.alb_network_setting[1].alb_arn",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetIdsALB1",
+          "Selector": "$.Payload.alb_network_setting[0].subnets_string",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetIdsALB2",
+          "Selector": "$.Payload.alb_network_setting[1].subnets_string",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIdsALB1",
+          "Selector": "$.Payload.alb_network_setting[0].security_groups_string",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIdsALB2",
+          "Selector": "$.Payload.alb_network_setting[1].security_groups_string",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckTasksAreExiting"
+    },
+    {
+      "name": "CheckTasksAreExiting",
+      "action": "aws:executeScript",
+      "description": "Checks if ECS tasks are exiting.",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "ECSClusterName": "{{ ECSClusterName }}",
+          "ECSServiceName": "{{ ECSServiceName }}"
+        },
+        "Handler": "task_exiting_handler.task_exiting_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "outputs": [
+        {
+          "Name": "result",
+          "Selector": "$.Payload.result",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnTasksAreExiting"
+    },
+    {
+      "name": "BranchOnTasksAreExiting",
+      "action": "aws:branch",
+      "description": "Branches if ECS tasks are exiting",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ CheckTasksAreExiting.result }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ CheckNetworkConnectivity.result }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "CheckTargetHealth"
+          }
+        ],
+        "Default": "ExecuteAdditionalCheck"
+      }
+    },
+    {
+      "name": "CheckTargetHealth",
+      "action": "aws:executeScript",
+      "description": "Checks if ECS tasks are healthy.",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "TargetGroupArns": "{{ CheckNetworkConnectivity.TargetGroupArns }}"
+        },
+        "Handler": "target_health_handler.target_health_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "outputs": [
+        {
+          "Name": "result",
+          "Selector": "$.Payload.result",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        },
+        {
+          "Name": "unhealthyTargetGroups",
+          "Selector": "$.Payload.unhealthy_targets",
+          "Type": "MapList"
+        },
+        {
+          "Name": "unhealthyReasonALB1",
+          "Selector": "$.Payload.unhealthy_targets[0].targets[0].reason",
+          "Type": "String"
+        },
+        {
+          "Name": "unhealthyReasonALB2",
+          "Selector": "$.Payload.unhealthy_targets[1].targets[0].reason",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnTargetHealthReasonCode"
+    },
+    {
+      "name": "BranchOnTargetHealthReasonCode",
+      "action": "aws:branch",
+      "description": "Branches if CheckTargetHealth.reasonCode is ResponseCodeMismatch",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Or": [
+                  {
+                    "Variable": "{{ CheckTargetHealth.unhealthyReasonALB1 }}",
+                    "StringEquals": "Target.ResponseCodeMismatch"
+                  },
+                  {
+                    "Variable": "{{ CheckTargetHealth.unhealthyReasonALB2 }}",
+                    "StringEquals": "Target.ResponseCodeMismatch"
+                  }
+                ]
+              },
+              {
+                "Variable": "{{ CheckPermissions.createLambdaPermission }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "BranchOnLambdaExecutionRole"
+          }
+        ],
+        "Default": "ExecuteAdditionalCheck"
+      }
+    },
+    {
+      "name": "BranchOnLambdaExecutionRole",
+      "action": "aws:branch",
+      "description": "Branches if Lambda execution role is provided",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ variable:LambdaExecutionRole }}",
+            "StringEquals": "",
+            "NextStep": "CreateLambdaExecutionRole"
+          }
+        ],
+        "Default": "BranchOnTargetHealthReasonCodeALB1"
+      }
+    },
+    {
+      "name": "CreateLambdaExecutionRole",
+      "action": "aws:createStack",
+      "description": "Creates a Lambda exectuion role.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:ExecutionResult",
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-lambda-role",
+        "OnFailure": "DELETE",
+        "TimeoutInMinutes": 30,
+        "Capabilities": [
+          "CAPABILITY_IAM",
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nParameters:\n  ExecutionId:\n    Type: String\n    Description: 'Execution ID of the step function'\n\nResources:\n  LambdaRole:\n    Type: 'AWS::IAM::Role'\n    Properties:\n      RoleName: !Sub 'NetworkToolSSMRunbook-${ExecutionId}'\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: lambda.amazonaws.com\n            Action: sts:AssumeRole\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'\n",
+        "ClientRequestToken": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-lambda-role",
+        "Parameters": [
+          {
+            "ParameterKey": "ExecutionId",
+            "ParameterValue": "{{ automation:EXECUTION_ID }}"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-lambda-role"
+          },
+          {
+            "Key": "AWSSupport-TroubleshootAWSECSHealthChecks-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "nextStep": "UpdateLambdaExecutionRole"
+    },
+    {
+      "name": "UpdateLambdaExecutionRole",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `LambdaExecutionRole`.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "step:DeleteLambdaExecutionRole",
+      "inputs": {
+        "Name": "variable:LambdaExecutionRole",
+        "Value": "arn:{{ global:AWS_PARTITION }}:iam::{{ global:ACCOUNT_ID }}:role/NetworkToolSSMRunbook-{{ automation:EXECUTION_ID }}"
+      },
+      "nextStep": "BranchOnTargetHealthReasonCodeALB1"
+    },
+    {
+      "name": "BranchOnTargetHealthReasonCodeALB1",
+      "action": "aws:branch",
+      "description": "Branches if checkTargetHealth.reasonCode is ResponseCodeMismatch",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "step:DeleteLambdaExecutionRole",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CheckTargetHealth.unhealthyReasonALB1 }}",
+            "StringEquals": "Target.ResponseCodeMismatch",
+            "NextStep": "CreateLambdaFunctionALB1"
+          }
+        ],
+        "Default": "BranchOnTargetHealthReasonCodeALB2"
+      }
+    },
+    {
+      "name": "CreateLambdaFunctionALB1",
+      "action": "aws:createStack",
+      "description": "Creates a Lambda function to check if ECS tasks are healthy.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:DeleteLambdaExecutionRole",
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB1",
+        "OnFailure": "DELETE",
+        "TimeoutInMinutes": 30,
+        "Capabilities": [
+          "CAPABILITY_AUTO_EXPAND"
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nTransform: 'AWS::LanguageExtensions'\nParameters:\n  ALBArn:\n    Type: String\n    Description: 'ARN of the Application Load Balancer'\n\n  SubnetIds:\n    Type: List<AWS::EC2::Subnet::Id>\n    Description: 'List of subnet IDs where Lambda functions will be created'\n    \n  SecurityGroupIds:\n    Type: List<AWS::EC2::SecurityGroup::Id>\n    Description: 'Security Group ID for Lambda functions'\n\n  LambdaExecutionRole:\n    Type: String\n    Description: 'ARN of the Lambda execution role'\n\nResources:\n  'Fn::ForEach::LambdaLoop':\n    - SubnetId\n    - !Split [\",\" ,!Join [\"\", !Split [\"subnet-\", !Join [\",\", !Ref SubnetIds]]]]\n    - Subnet${SubnetId}:\n        Type: AWS::Lambda::Function\n        Properties:\n          FunctionName: !Sub\n            - 'lambda-subnet-${SubnetId}-${ALBIdentifier}'\n            - ALBIdentifier: !Select [3, !Split ['/', !Ref ALBArn]]\n          Handler: index.lambda_handler\n          Role: !Ref LambdaExecutionRole\n          Code:\n            ZipFile: !Sub |\n              from socket import timeout\n              from urllib.parse import urlparse\n              import urllib.request as request\n              import urllib.error as request_error\n\n              def is_valid_url(url: str) -> bool:\n                try:\n                  result = urlparse(url)\n                  return all([result.scheme, result.netloc])\n                except ValueError:\n                  return False\n\n              def lambda_handler(event, context):\n                if 'url' not in event:\n                  raise ValueError(\"URL parameter is missing.\")\n\n                url = event[\"url\"]\n                if not is_valid_url(url):\n                  raise ValueError(f\"Invalid URL format: {url}\")\n\n                status: int = 0\n                reason: str  = \"\"\n                \n                req = request.Request(url)\n                try:\n                  with request.urlopen(req, timeout=10) as res:\n                    status = res.getcode()\n                except request_error.HTTPError as err:\n                  # When the response is 4XX or 5XX error.\n                  status = err.code\n                  reason = err.reason\n                except request_error.URLError as err:\n                  if isinstance(err.reason, timeout):\n                    reason = f\"Connection to {url} timed out.\"\n                  else:\n                    raise err\n                return {\n                  'response_code': status,\n                  'reason': reason\n                }\n          Runtime: python3.11\n          Timeout: 30\n          MemorySize: 128\n          VpcConfig:\n            SecurityGroupIds: \n              !Ref SecurityGroupIds\n            SubnetIds:\n              - !Sub 'subnet-${SubnetId}'",
+        "ClientRequestToken": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB1",
+        "Parameters": [
+          {
+            "ParameterKey": "ALBArn",
+            "ParameterValue": "{{ CheckNetworkConnectivity.ALBArn1 }}"
+          },
+          {
+            "ParameterKey": "SubnetIds",
+            "ParameterValue": "{{ CheckNetworkConnectivity.SubnetIdsALB1 }}"
+          },
+          {
+            "ParameterKey": "SecurityGroupIds",
+            "ParameterValue": "{{ CheckNetworkConnectivity.SecurityGroupIdsALB1 }}"
+          },
+          {
+            "ParameterKey": "LambdaExecutionRole",
+            "ParameterValue": "{{ variable:LambdaExecutionRole }}"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB1"
+          },
+          {
+            "Key": "AWSSupport-TroubleshootAWSECSHealthChecks-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "nextStep": "BranchOnTargetHealthReasonCodeALB2"
+    },
+    {
+      "name": "BranchOnTargetHealthReasonCodeALB2",
+      "action": "aws:branch",
+      "description": "Branches if checkTargetHealth.reasonCode is ResponseCodeMismatch",
+      "isEnd": true,
+      "timeoutSeconds": 60,
+      "onFailure": "step:DeleteLambdaFunctionALB1",
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CheckTargetHealth.unhealthyReasonALB2 }}",
+            "StringEquals": "Target.ResponseCodeMismatch",
+            "NextStep": "CreateLambdaFunctionALB2"
+          }
+        ],
+        "Default": "ExecuteCustomCheck"
+      }
+    },
+    {
+      "name": "CreateLambdaFunctionALB2",
+      "action": "aws:createStack",
+      "description": "Creates a Lambda function to check if ECS tasks are healthy.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "step:DeleteLambdaFunctionALB1",
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB2",
+        "OnFailure": "DELETE",
+        "TimeoutInMinutes": 30,
+        "Capabilities": [
+          "CAPABILITY_AUTO_EXPAND"
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nTransform: 'AWS::LanguageExtensions'\nParameters:\n  ALBArn:\n    Type: String\n    Description: 'ARN of the Application Load Balancer'\n\n  SubnetIds:\n    Type: List<AWS::EC2::Subnet::Id>\n    Description: 'List of subnet IDs where Lambda functions will be created'\n    \n  SecurityGroupIds:\n    Type: List<AWS::EC2::SecurityGroup::Id>\n    Description: 'Security Group ID for Lambda functions'\n\n  LambdaExecutionRole:\n    Type: String\n    Description: 'ARN of the Lambda execution role'\n\nResources:\n  'Fn::ForEach::LambdaLoop':\n    - SubnetId\n    - !Split [\",\" ,!Join [\"\", !Split [\"subnet-\", !Join [\",\", !Ref SubnetIds]]]]\n    - Subnet${SubnetId}:\n        Type: AWS::Lambda::Function\n        Properties:\n          FunctionName: !Sub\n            - 'lambda-subnet-${SubnetId}-${ALBIdentifier}'\n            - ALBIdentifier: !Select [3, !Split ['/', !Ref ALBArn]]\n          Handler: index.lambda_handler\n          Role: !Ref LambdaExecutionRole\n          Code:\n            ZipFile: !Sub |\n              from socket import timeout\n              from urllib.parse import urlparse\n              import urllib.request as request\n              import urllib.error as request_error\n\n              def is_valid_url(url: str) -> bool:\n                try:\n                  result = urlparse(url)\n                  return all([result.scheme, result.netloc])\n                except ValueError:\n                  return False\n\n              def lambda_handler(event, context):\n                if 'url' not in event:\n                  raise ValueError(\"URL parameter is missing.\")\n\n                url = event[\"url\"]\n                if not is_valid_url(url):\n                  raise ValueError(f\"Invalid URL format: {url}\")\n\n                status: int = 0\n                reason: str  = \"\"\n                \n                req = request.Request(url)\n                try:\n                  with request.urlopen(req, timeout=10) as res:\n                    status = res.getcode()\n                except request_error.HTTPError as err:\n                  # When the response is 4XX or 5XX error.\n                  status = err.code\n                  reason = err.reason\n                except request_error.URLError as err:\n                  if isinstance(err.reason, timeout):\n                    reason = f\"Connection to {url} timed out.\"\n                  else:\n                    raise err\n                return {\n                  'response_code': status,\n                  'reason': reason\n                }\n          Runtime: python3.11\n          Timeout: 30\n          MemorySize: 128\n          VpcConfig:\n            SecurityGroupIds: \n              !Ref SecurityGroupIds\n            SubnetIds:\n              - !Sub 'subnet-${SubnetId}'",
+        "ClientRequestToken": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB2",
+        "Parameters": [
+          {
+            "ParameterKey": "ALBArn",
+            "ParameterValue": "{{ CheckNetworkConnectivity.ALBArn2 }}"
+          },
+          {
+            "ParameterKey": "SubnetIds",
+            "ParameterValue": "{{ CheckNetworkConnectivity.SubnetIdsALB2 }}"
+          },
+          {
+            "ParameterKey": "SecurityGroupIds",
+            "ParameterValue": "{{ CheckNetworkConnectivity.SecurityGroupIdsALB2 }}"
+          },
+          {
+            "ParameterKey": "LambdaExecutionRole",
+            "ParameterValue": "{{ variable:LambdaExecutionRole }}"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB2"
+          },
+          {
+            "Key": "AWSSupport-TroubleshootAWSECSHealthChecks-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "nextStep": "ExecuteCustomCheck"
+    },
+    {
+      "name": "ExecuteCustomCheck",
+      "action": "aws:executeScript",
+      "description": "Execute Lambda custom check to troubleshoot ECS tasks failing the Application Load Balancer health checks.",
+      "timeoutSeconds": 600,
+      "onFailure": "step:DeleteLambdaFunctionALB1",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ALBNetworkSettings": "{{ CheckNetworkConnectivity.ALBNetworkSetting }}",
+          "UnhealthyTargets": "{{ CheckTargetHealth.unhealthyTargetGroups }}"
+        },
+        "Handler": "custom_check_handler.custom_check_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "diagnosticResults",
+          "Selector": "$.Payload.diagnostic_results",
+          "Type": "MapList"
+        },
+        {
+          "Name": "result",
+          "Selector": "$.Payload.result",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "DeleteLambdaFunctionALB1"
+    },
+    {
+      "name": "DeleteLambdaFunctionALB1",
+      "action": "aws:deleteStack",
+      "description": "Deletes the Lambda functions.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 2700,
+      "onFailure": "step:DeleteLambdaFunctionALB2",
+      "isCritical": true,
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB1"
+      },
+      "nextStep": "DeleteLambdaFunctionALB2"
+    },
+    {
+      "name": "DeleteLambdaFunctionALB2",
+      "action": "aws:deleteStack",
+      "description": "Deletes the Lambda functions.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 2700,
+      "onFailure": "step:DeleteLambdaExecutionRole",
+      "isCritical": true,
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-ALB2"
+      },
+      "nextStep": "DeleteLambdaExecutionRole"
+    },
+    {
+      "name": "DeleteLambdaExecutionRole",
+      "action": "aws:deleteStack",
+      "description": "Deletes the Lambda execution role.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "step:ExecuteAdditionalCheck",
+      "isCritical": true,
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootAWSECSHealthChecks-{{ automation:EXECUTION_ID }}-lambda-role"
+      },
+      "nextStep": "ExecuteAdditionalCheck"
+    },
+    {
+      "name": "ExecuteAdditionalCheck",
+      "action": "aws:executeScript",
+      "description": "Execute additional check to troubleshoot ECS tasks failing the Application Load Balancer health checks.",
+      "timeoutSeconds": 600,
+      "onFailure": "step:ExecutionResult",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ECSClusterName": "{{ ECSClusterName }}",
+          "ECSServiceName": "{{ ECSServiceName }}",
+          "ALBNetworkSettings": "{{ CheckNetworkConnectivity.ALBNetworkSetting }}"
+        },
+        "Handler": "additional_check_handler.additional_check_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "result",
+          "Selector": "$.Payload.result",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ExecutionResult"
+    },
+    {
+      "name": "ExecutionResult",
+      "action": "aws:executeScript",
+      "description": "Formats the output of the automation to return the results of the all steps to the console.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "IAMPermission": "{{ CheckPermissions.message }}",
+          "NetworkConnectivity": "{{ CheckNetworkConnectivity.message }}",
+          "TaskExiting": "{{ CheckTasksAreExiting.message }}",
+          "TargetHealth": "{{ CheckTargetHealth.message }}",
+          "CustomCheck": "{{ ExecuteCustomCheck.message }}",
+          "AdditionalCheck": "{{ ExecuteAdditionalCheck.message }}"
+        },
+        "Handler": "generate_report.generate_report",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "ExecutionResult.message"
+  ],
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "SHA256": "39a2ca9832f0a213b3ca5cc6e432448151e232b145774edc0e05ebabf3ba99a0"
+      }
+    }
+  }
+}
