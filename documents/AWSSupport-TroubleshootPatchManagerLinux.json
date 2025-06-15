@@ -1,5 +1,5 @@
 {
-  "description": "The **AWSSupport-TroubleshootPatchManagerLinux** runbook helps in evaluating and diagnosing failed executions of the **AWS-RunPatchBaseline** AWS Systems Manager document against Linux based AWS Systems Manager managed instances. AWS-RunPatchBaseline is the default AWS Systems Manager document used by the Patch Manager. The runbook analyzes the patching logs present on the instance to try to find the cause of the failure and provide recommended remediation steps for the errors found.\n\n### Supported operating systems:\n - Amazon Linux 2, and 2023\n - Red Hat Enterprise Linux 8.X, and 9.X\n - Centos 8.X, and 9.X\n - Ubuntu 18.04, 20.04, and 22.04\n - SUSE 15.X\n### Prerequisites:\n\n- The instance must be Linux-based and managed by AWS Systems Manager.\n- The following packages must be available on the instance: **Python 3.7 or later, wget or curl, and unzip. **Note:** We recommend upgrading to Python 3.8 or later to minimize impact of future update operations. Refer to this [public documentation](https://aws.amazon.com/blogs/developer/python-support-policy-updates-for-aws-sdks-and-tools/) for more information. \n- The instance can connect to the Amazon Simple Storage Service (Amazon S3) service endpoints to download the code from AWS owned bucket `arn:aws:s3:::aws-ssm-document-attachments-region/`.\n\n**Note**: The input parameter **RunCommandId** is optional. If you do not provide a specific Command ID to evaluate, the automation looks for last unsuccessful execution of `AWS-RunPatchBaseline` for the instance. If you provide a Command ID as the input, the Command ID must have been executed in last **30 days**. This is because the Run Command history retention period is 30 days.",
+  "description": "The **AWSSupport-TroubleshootPatchManagerLinux** runbook helps in evaluating and diagnosing failed executions of the **AWS-RunPatchBaseline** AWS Systems Manager document against Linux based AWS Systems Manager managed instances. AWS-RunPatchBaseline is the default AWS Systems Manager document used by the Patch Manager. The runbook analyzes the patching logs present on the instance to try to find the cause of the failure and provide recommended remediation steps for the errors found.\n\n### Supported operating systems:\n - Amazon Linux 2, and 2023\n - Red Hat Enterprise Linux 8.X 9.X and 10.X\n - Centos 8.X, and 9.X\n - Ubuntu 18.04-24.04\n - SUSE 15.X\n### Prerequisites:\n\n- The instance must be Linux-based and managed by AWS Systems Manager.\n- The following packages must be available on the instance: **Python 3.7 or later, wget or curl, and unzip**. **Note:** We recommend upgrading to Python 3.11 or later to minimize impact of future update operations. Refer to this [public documentation](https://aws.amazon.com/blogs/developer/python-support-policy-updates-for-aws-sdks-and-tools/) for more information. \n- The instance can connect to the Amazon Simple Storage Service (Amazon S3) service endpoints to download the code from AWS owned bucket `arn:aws:s3:::aws-ssm-document-attachments-region/`.\n\n**Note**: The input parameter **RunCommandId** is optional. If you do not provide a specific Command ID to evaluate, the automation looks for last unsuccessful execution of `AWS-RunPatchBaseline` for the instance. If you provide a Command ID as the input, the Command ID must have been executed in last **30 days**. This is because the Run Command history retention period is 30 days.",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
@@ -85,7 +85,7 @@
           "Instance": "{{ InstanceId }}",
           "CommandID": "{{ RunCommandId }}"
         },
-        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nERROR_ICON = \" \\u274C [ERROR]:\"\nINFO_ICON = \" \\u2705 [INFO]:\"\nWARN_ICON = \" \\u26A0 [WARNING]:\"\nNON_FAILED_STATUSES = [\"Pending\", \"InProgress\", \"Success\"]\nDOCUMENT_NAME = \"AWS-RunPatchBaseline\"\n\n\nssm_client = boto3.client(\"ssm\")\n\n\ndef script_handler(events, context=None):\n    instance_id = events[\"Instance\"]\n    command_id = events[\"CommandID\"]\n\n    if command_id:\n        print(\n            f\"{INFO_ICON} Looking for the execution '{command_id}' of '{DOCUMENT_NAME}' on the instance '{instance_id}'.\"\n        )\n        return get_command_invocation(instance_id, command_id)\n    else:\n        print(\n            f\"{INFO_ICON} No RunCommandID provided. Looking for latest failed execution of '{DOCUMENT_NAME}' on the instance.\"\n        )\n        return get_latest_failed_command_invocation(instance_id)\n\n\ndef get_command_invocation(instance_id: str, command_id: str) -> dict:\n    try:\n        response = ssm_client.get_command_invocation(InstanceId=instance_id, CommandId=command_id)\n        if not response or response.get(\"DocumentName\") != DOCUMENT_NAME:\n            raise RuntimeError(f\"{ERROR_ICON} Command ID {command_id} was not executed for {DOCUMENT_NAME}.\") from None\n\n        status = response.get(\"Status\", \"Unknown\")\n\n        print(f\"{INFO_ICON} Found '{DOCUMENT_NAME}' '{command_id}' execution for the instance in status {status}.\")\n        return {\"command\": command_id, \"status\": status}\n\n    except ClientError as e:\n        raise RuntimeError(f\"{ERROR_ICON} Failed to get command invocation for '{command_id}': {str(e)}\") from None\n\n\ndef get_latest_failed_command_invocation(instance_id: str) -> dict:\n    print(\n        f\"{INFO_ICON} No RunCommandID provided. Looking for the latest failed execution of '{DOCUMENT_NAME}' targeting the instance.\"\n    )\n    try:\n        paginator = ssm_client.get_paginator(\"list_command_invocations\")\n        response_iterator = paginator.paginate(\n            InstanceId=instance_id,\n            Filters=[\n                {\n                    \"key\": \"DocumentName\",\n                    \"value\": DOCUMENT_NAME,\n                },\n            ],\n            Details=False,\n        )\n\n        latest_failed_command_invocation = None\n        for page in response_iterator:\n            command_invocations = page.get(\"CommandInvocations\", [])\n            for invocation in command_invocations:\n                if invocation.get(\"Status\") not in NON_FAILED_STATUSES:\n                    # Get the most recent execution\n                    if not latest_failed_command_invocation or invocation.get(\n                        \"RequestedDateTime\"\n                    ) > latest_failed_command_invocation.get(\"RequestedDateTime\"):\n                        latest_failed_command_invocation = invocation\n\n        if latest_failed_command_invocation:\n            failed_command_id = latest_failed_command_invocation.get(\"CommandId\")\n            failed_status = latest_failed_command_invocation.get(\"Status\")\n            print(\n                f\"{INFO_ICON} Found '{DOCUMENT_NAME}' '{failed_command_id}' execution on the instance with status '{failed_status}'.\"\n            )\n            return {\"command\": failed_command_id, \"status\": failed_status}\n        else:\n            raise RuntimeError(\n                f\"{ERROR_ICON} No failed RunCommandID of {DOCUMENT_NAME} found for '{instance_id}'. Rerun this automation providing a RunCommandID that has failed execution.\"\n            ) from None\n\n    except ClientError as e:\n        raise RuntimeError(\n            f\"{ERROR_ICON} Failed to get the latest failed execution of '{DOCUMENT_NAME}' on the instance: {str(e)}\"\n        ) from None\n",
+        "Script": "# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nfrom datetime import datetime\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nERROR_ICON = \" \\u274C [ERROR]:\"\nINFO_ICON = \" \\u2705 [INFO]:\"\nWARN_ICON = \" \\u26A0 [WARNING]:\"\nNON_FAILED_STATUSES = [\"Pending\", \"InProgress\", \"Success\"]\nDOCUMENT_NAME = \"AWS-RunPatchBaseline\"\n\n\nssm_client = boto3.client(\"ssm\")\n\n\ndef script_handler(events, context=None):\n    instance_id = events[\"Instance\"]\n    command_id = events[\"CommandID\"]\n\n    if command_id:\n        print(\n            f\"{INFO_ICON} Looking for the execution '{command_id}' of '{DOCUMENT_NAME}' on the instance '{instance_id}'.\"\n        )\n\n        # Get command invocation details\n        result = get_command_invocation(instance_id, command_id)\n\n        # Check for concurrent executions when command_id is provided\n        concurrent_command = check_concurrent_patch_executions(\n            instance_id, command_id, result[\"start_time\"], result[\"end_time\"]\n        )\n        if concurrent_command:\n            result[\"concurrent_command_id\"] = concurrent_command\n        else:\n            result[\"concurrent_command_id\"] = \"None\"\n\n        return result\n    else:\n        print(\n            f\"{INFO_ICON} No RunCommandID provided. Looking for latest failed execution of '{DOCUMENT_NAME}' on the instance.\"\n        )\n\n        # First get the latest failed command invocation\n        result = get_latest_failed_command_invocation(instance_id)\n        failed_command_id = result.get(\"command\")\n\n        # Then check for concurrent executions using the retrieved command ID\n        concurrent_command = check_concurrent_patch_executions(\n            instance_id, failed_command_id, result[\"start_time\"], result[\"end_time\"]\n        )\n        if concurrent_command:\n            print(f\"{WARN_ICON} Found concurrent execution of '{DOCUMENT_NAME}' with command ID: {concurrent_command}\")\n            result[\"concurrent_command_id\"] = concurrent_command\n        else:\n            result[\"concurrent_command_id\"] = \"None\"\n\n        return result\n\n\ndef check_concurrent_patch_executions(instance_id: str, command_id: str, start_time: str, end_time: str):\n    \"\"\"\n    Check for concurrent executions of AWS-RunPatchBaseline on the same instance.\n    Returns the command ID of concurrent execution if found, None otherwise.\n    \"\"\"\n    try:\n        # Convert ISO format strings to datetime objects\n        original_start_time = datetime.fromisoformat(start_time) if start_time != \"Unknown\" else None\n        original_end_time = datetime.fromisoformat(end_time) if end_time != \"Unknown\" else None\n\n        if not original_start_time:\n            print(f\"{WARN_ICON} Could not determine start time of the original command for concurrent execution check.\")\n            return None\n\n        # If command hasn't finished, use current time as end time\n        if not original_end_time:\n            original_end_time = datetime.now(original_start_time.tzinfo)\n\n        # Look for other executions in this time window\n        paginator = ssm_client.get_paginator(\"list_command_invocations\")\n        response_iterator = paginator.paginate(\n            InstanceId=instance_id,\n            Filters=[\n                {\n                    \"key\": \"DocumentName\",\n                    \"value\": DOCUMENT_NAME,\n                },\n            ],\n            Details=True,\n        )\n\n        for page in response_iterator:\n            for invocation in page.get(\"CommandInvocations\", []):\n                # Skip the original command\n                if invocation.get(\"CommandId\") == command_id:\n                    continue\n\n                # Check each command's timing\n                command_plugins = invocation.get(\"CommandPlugins\", [])\n                for plugin in command_plugins:\n                    if plugin.get(\"Name\") == \"PatchLinux\":\n                        other_start_time = plugin.get(\"ResponseStartDateTime\")\n                        other_end_time = plugin.get(\"ResponseFinishDateTime\")\n\n                        if not other_start_time:\n                            continue\n\n                        if not other_end_time:\n                            other_end_time = datetime.now(other_start_time.tzinfo)\n\n                        # Check for overlap\n                        if other_start_time <= original_end_time and other_end_time >= original_start_time:\n                            print(\n                                f\"{WARN_ICON} Found concurrent execution of '{DOCUMENT_NAME}' \"\n                                f\"(Command ID: {invocation.get('CommandId')})\"\n                            )\n                            return invocation.get(\"CommandId\")\n\n        print(f\"{INFO_ICON} No concurrent executions found.\")\n        return None\n\n    except ClientError as e:\n        print(f\"{WARN_ICON} Error checking for concurrent executions: {str(e)}\")\n        return None\n\n\ndef get_command_invocation(instance_id: str, command_id: str) -> dict:\n    try:\n        # Use get_command_invocation for most of the information\n        response = ssm_client.get_command_invocation(InstanceId=instance_id, CommandId=command_id)\n        if not response or response.get(\"DocumentName\") != DOCUMENT_NAME:\n            raise RuntimeError(f\"{ERROR_ICON} Command ID {command_id} was not executed for {DOCUMENT_NAME}.\") from None\n\n        status = response.get(\"Status\", \"Unknown\")\n\n        # Get both start and end time from ListCommandInvocations with details flag\n        start_time = \"Unknown\"\n        end_time = \"Unknown\"\n\n        invocations = ssm_client.list_command_invocations(\n            CommandId=command_id, InstanceId=instance_id, Details=True\n        ).get(\"CommandInvocations\", [])\n\n        if invocations:\n            invocation = invocations[0]\n            # Get start and end time from PatchLinux plugin\n            command_plugins = invocation.get(\"CommandPlugins\", [])\n            for plugin in command_plugins:\n                if plugin.get(\"Name\") == \"PatchLinux\":\n                    response_start_time = plugin.get(\"ResponseStartDateTime\")\n                    response_finish_time = plugin.get(\"ResponseFinishDateTime\")\n                    if response_start_time and isinstance(response_start_time, datetime):\n                        start_time = response_start_time.isoformat()\n                    if response_finish_time and isinstance(response_finish_time, datetime):\n                        end_time = response_finish_time.isoformat()\n                    break\n\n        print(f\"{INFO_ICON} Found '{DOCUMENT_NAME}' '{command_id}' execution for the instance in status {status}.\")\n        return {\"command\": command_id, \"status\": status, \"start_time\": start_time, \"end_time\": end_time}\n\n    except ClientError as e:\n        raise RuntimeError(f\"{ERROR_ICON} Failed to get command invocation for '{command_id}': {str(e)}\") from None\n\n\ndef get_latest_failed_command_invocation(instance_id: str) -> dict:\n    print(\n        f\"{INFO_ICON} No RunCommandID provided. Looking for the latest failed execution of '{DOCUMENT_NAME}' targeting the instance.\"\n    )\n    try:\n        paginator = ssm_client.get_paginator(\"list_command_invocations\")\n        response_iterator = paginator.paginate(\n            InstanceId=instance_id,\n            Filters=[\n                {\n                    \"key\": \"DocumentName\",\n                    \"value\": DOCUMENT_NAME,\n                },\n            ],\n            Details=True,  # Changed to True to get plugin details\n        )\n\n        latest_failed_command_invocation = None\n        latest_start_time = None\n        command_result = {\"command\": None, \"status\": \"Unknown\", \"start_time\": \"Unknown\", \"end_time\": \"Unknown\"}\n\n        for page in response_iterator:\n            command_invocations = page.get(\"CommandInvocations\", [])\n            for invocation in command_invocations:\n                if invocation.get(\"Status\") not in NON_FAILED_STATUSES:\n                    # Get start and end time from PatchLinux plugin\n                    command_plugins = invocation.get(\"CommandPlugins\", [])\n                    for plugin in command_plugins:\n                        if plugin.get(\"Name\") == \"PatchLinux\":\n                            response_start_time = plugin.get(\"ResponseStartDateTime\")\n                            if response_start_time and isinstance(response_start_time, datetime):\n                                # Get the most recent execution based on ResponseStartDateTime\n                                if not latest_start_time or response_start_time > latest_start_time:\n                                    latest_start_time = response_start_time\n                                    latest_failed_command_invocation = invocation\n                                    command_result[\"command\"] = invocation.get(\"CommandId\")\n                                    command_result[\"status\"] = invocation.get(\"Status\", \"Unknown\")\n                                    command_result[\"start_time\"] = response_start_time.isoformat()\n\n                                    response_finish_time = plugin.get(\"ResponseFinishDateTime\")\n                                    if response_finish_time and isinstance(response_finish_time, datetime):\n                                        command_result[\"end_time\"] = response_finish_time.isoformat()\n                            break\n\n        if latest_failed_command_invocation:\n            print(\n                f\"{INFO_ICON} Found '{DOCUMENT_NAME}' '{command_result['command']}' execution on the instance with status '{command_result['status']}'.\"\n            )\n            return command_result\n        else:\n            raise RuntimeError(\n                f\"{ERROR_ICON} No failed RunCommandID of {DOCUMENT_NAME} found for '{instance_id}'. Rerun this automation providing a RunCommandID that has failed execution.\"\n            ) from None\n\n    except ClientError as e:\n        raise RuntimeError(\n            f\"{ERROR_ICON} Failed to get the latest failed execution of '{DOCUMENT_NAME}' on the instance: {str(e)}\"\n        ) from None\n",
         "Handler": "script_handler",
         "Runtime": "python3.11"
       },
@@ -99,6 +99,21 @@
           "Name": "status",
           "Selector": "$.Payload.status",
           "Type": "String"
+        },
+        {
+          "Name": "concurrent_command_id",
+          "Selector": "$.Payload.concurrent_command_id",
+          "Type": "String"
+        },
+        {
+          "Type": "String",
+          "Name": "startime",
+          "Selector": "$.Payload.start_time"
+        },
+        {
+          "Type": "String",
+          "Name": "endtime",
+          "Selector": "$.Payload.end_time"
         }
       ]
     },
@@ -398,6 +413,9 @@
             "URL=\"{{GetDownloadURL.URL}}\"  # The URL to download",
             "INSTANCE_ID=\"{{InstanceId}}\"",
             "RUNCOMMAND_ID=\"{{ValidateCommandID.commandId}}\"",
+            "CONCURRENT_RUNCOMMAND_ID=\"{{ValidateCommandID.concurrent_command_id}}\"",
+            "START_TIME=\"{{ValidateCommandID.startime}}\"",
+            "END_TIME=\"{{ValidateCommandID.endtime}}\"",
             "",
             "TMP_DIRECTORY=\"/var/lib/amazon/ssm/PatchManagerLogAnalyzer\"",
             "# Check if the PatchManagerLogAnalyzer exists",
@@ -423,8 +441,58 @@
             "[ $? -ne 0 ] && echo \"Error unzipping the file\" >&2 && exit 1",
             "",
             "cd $UnzippedDirectory",
-            "echo \"Starting 'python3 main.py $INSTANCE_ID $RUNCOMMAND_ID $OS $PLATFORM' \"",
-            "python3 main.py \"$INSTANCE_ID\" \"$RUNCOMMAND_ID\" \"$OS\" \"$PLATFORM\"",
+            "",
+            "# Find the latest Python 3 version available on the system",
+            "find_latest_python() {",
+            "    # Try to find all python3.x executables in PATH",
+            "    local python_versions=()",
+            "    local IFS=:",
+            "    for path_dir in $PATH; do",
+            "        if [ -d \"$path_dir\" ]; then",
+            "            for py_exec in \"$path_dir\"/python3*; do",
+            "                if [ -x \"$py_exec\" ] && [[ \"$py_exec\" =~ python3[.][0-9]+$ ]]; then",
+            "                    python_versions+=(\"$py_exec\")",
+            "                fi",
+            "            done",
+            "        fi",
+            "    done",
+            "",
+            "    # If specific versions were found, sort them and use the latest",
+            "    if [ ${#python_versions[@]} -gt 0 ]; then",
+            "        # Sort versions and get the latest",
+            "        local latest_python=$(printf '%s\\n' \"${python_versions[@]}\" | sort -V | tail -n 1)",
+            "        echo \"$latest_python\"",
+            "        return 0",
+            "    fi",
+            "",
+            "    # If no specific version found, try the default python3",
+            "    if command_exists python3; then",
+            "        echo \"python3\"",
+            "        return 0",
+            "    fi",
+            "",
+            "    # No Python 3 found",
+            "    echo \"No Python 3 installation found on the system.\" >&2",
+            "    return 1",
+            "}",
+            "",
+            "# Get the latest Python 3 executable",
+            "PYTHON_EXEC=$(find_latest_python)",
+            "if [ $? -ne 0 ]; then",
+            "    exit 1",
+            "fi",
+            "",
+            "echo \"Starting '$PYTHON_EXEC main.py $INSTANCE_ID $RUNCOMMAND_ID $OS $PLATFORM $CONCURRENT_RUNCOMMAND_ID' \"",
+            "ARGS=(",
+            "    \"$INSTANCE_ID\"",
+            "    \"$RUNCOMMAND_ID\"",
+            "    \"$OS\"",
+            "    \"$PLATFORM\"",
+            "    \"$CONCURRENT_RUNCOMMAND_ID\"",
+            "    \"$START_TIME\"",
+            "    \"$END_TIME\"",
+            ")",
+            "\"$PYTHON_EXEC\" main.py \"${ARGS[@]}\"",
             "",
             "",
             "# Clean up directory. Wait for 5 seconds in case of file locks.",
@@ -466,7 +534,7 @@
   "files": {
     "attachment.zip": {
       "checksums": {
-        "SHA256": "b37ffeb9483cec790109ae000718ee326379af971948f40d278a93f5dfa31740"
+        "SHA256": "0c96f81a9109d84026f574047e6d1848abfe48f8238a3a1ac60cf7a6f42f1866"
       }
     }
   }
