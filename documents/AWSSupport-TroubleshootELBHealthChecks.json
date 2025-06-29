@@ -1,0 +1,340 @@
+{
+  "description": "The **AWSSupport-TroubleshootELBHealthChecks** runbook helps troubleshoot AWS Elastic Load Balancing (ELB) health check issues by analyzing its related Amazon CloudWatch metrics, verifying network connectivity, and executing diagnostic commands on its target instances. \n\n### Use cases:\n1. There are unhealthy instances within the target instances of a load balancer or a target group.\n2. While there are no unhealthy instances, CloudWatch metrics indicate data points for \"UnHealthyHostCounts\".\n\n### Notes:\n1. The automation focuses on troubleshooting **instance** type targets.\n2. The maximum number of instances allowed for troubleshooting is `50`.\n3. The target instances must be managed by AWS Systems Manager (SSM) to enable the execution of diagnostic commands at the instance level.\n4. The `S3BucketName` parameter is optional, but certain diagnostic results, such as detailed firewall configurations and captured network packet data, are uploaded directly to the specified Amazon Simple Storage Service (Amazon S3) bucket and are not displayed in the automation output. If a bucket is not provided, the relevant commands (iptables and tcpdump on Linux, netsh and pktmon on Windows) will not be executed.\n5. The final report can be uploaded to an Amazon S3 bucket in a different region. However, data uploaded from an instance can only be sent to the Amazon S3 bucket in the same region due to security concerns.\n6. Please ensure there is sufficient disk space on the instances to capture the network packets.\n7. Analysis of the Amazon CloudWatch metrics for the use case 2 will only be performed if all targets are in a healthy state.\n8. IPv6 network connectivity troubleshooting is not supported.\n\n### Diagnostic Commands Executed on Instances:\n- Linux Shell: top, free, ss, curl, iptables, tcpdump\n- Windows PowerShell: Get-CimInstance, Get-NetFirewallProfile, Get-NetFirewallRule, Invoke-WebRequest, netstat, netsh, pktmon.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "LoadBalancerOrTargetGroupName": {
+      "type": "String",
+      "allowedPattern": "^[a-zA-Z0-9-]+$",
+      "description": "(Required) The name of a Classic Load Balancer, or the name of the target group associated with an Application Load Balancer or Network Load Balancer."
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook."
+    },
+    "ExecutionMode": {
+      "type": "String",
+      "allowedValues": [
+        "Complete",
+        "SkipRunCommands"
+      ],
+      "description": "(Required) Controls the automation execution mode. \"Complete\" runs all steps including runCommands on EC2 instances. \"SkipRunCommands\" executes all steps except running commands on instances."
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Optional) The name of the Amazon S3 bucket in your account where you want to upload the troubleshooting logs. Make sure the bucket policy does not grant unnecessary read/write permissions to parties that do not need access to the collected logs.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getBucketPublicStatus",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "nextStep": "getLoadBalancerDetails",
+      "description": "Checks if the target Amazon S3 bucket potentially grants **read** or **write** `public` access to its objects.",
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ S3BucketName }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.11",
+        "Attachment": "artifact_2.zip"
+      },
+      "onFailure": "Abort",
+      "isCritical": true,
+      "outputs": [
+        {
+          "Name": "bucketLocation",
+          "Selector": "$.Payload.location",
+          "Type": "String"
+        },
+        {
+          "Name": "bucketOwner",
+          "Selector": "$.Payload.bucket_owner",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "getLoadBalancerDetails",
+      "description": "Identifies the load balancer type and return a unified load balancer details object including the information that will be used in later steps.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "nextStep": "checkLoadBalancerType",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "loadBalancerOrTargetGroupName": "{{ LoadBalancerOrTargetGroupName }}"
+        },
+        "Handler": "get_load_balancer_details.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "type",
+          "Selector": "$.Payload.loadBalancerType"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "details",
+          "Selector": "$.Payload.loadBalancerDetails"
+        }
+      ]
+    },
+    {
+      "name": "checkLoadBalancerType",
+      "description": "Checks if the load balancer exists.",
+      "action": "aws:branch",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "getTargets",
+            "Not": {
+              "Variable": "{{ getLoadBalancerDetails.type }}",
+              "StringEquals": "NotFound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "getTargets",
+      "description": "Based on the different types of load balancers, query describe APIs to return a map of healthy and unhealthy targets details",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "nextStep": "checkCloudWatchMetrics",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "loadBalancerType": "{{ getLoadBalancerDetails.type }}",
+          "loadBalancerDetails": "{{ getLoadBalancerDetails.details }}"
+        },
+        "Handler": "get_targets.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "healthyInstances",
+          "Selector": "$.Payload.healthyInstances"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "unhealthyTargets",
+          "Selector": "$.Payload.unhealthyTargets"
+        },
+        {
+          "Type": "Integer",
+          "Name": "numberOfUnhealthyTargets",
+          "Selector": "$.Payload.numberOfUnhealthyTargets"
+        },
+        {
+          "Type": "Integer",
+          "Name": "numberOfAllTargets",
+          "Selector": "$.Payload.numberOfAllTargets"
+        },
+        {
+          "Type": "String",
+          "Selector": "$.Payload.error",
+          "Name": "error"
+        }
+      ]
+    },
+    {
+      "name": "checkCloudWatchMetrics",
+      "description": "Checks the Amazon CloudWatch metrics `HealthyHostCounts` and `UnHealthyHostCounts` and generate the Amazon CloudWatch links.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "nextStep": "checkUnhealthyReasons",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "loadBalancerType": "{{ getLoadBalancerDetails.type }}",
+          "loadBalancerDetails": "{{ getLoadBalancerDetails.details }}",
+          "numberOfAllTargets": "{{ getTargets.numberOfAllTargets }}",
+          "numberOfUnhealthyTargets": "{{ getTargets.numberOfUnhealthyTargets }}",
+          "healthyInstances": "{{ getTargets.healthyInstances }}"
+        },
+        "Handler": "check_cloud_watch_metrics.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "error",
+          "Selector": "$.Payload.error"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "metrics",
+          "Selector": "$.Payload.metrics"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "instancesToCheck",
+          "Selector": "$.Payload.instances_to_check"
+        }
+      ]
+    },
+    {
+      "name": "checkUnhealthyReasons",
+      "description": "Checks for unhealthy reasons and filter targets.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "nextStep": "checkConnectivity",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "unhealthyTargets": "{{ getTargets.unhealthyTargets }}",
+          "loadBalancerDetails": "{{ getLoadBalancerDetails.details }}",
+          "instancesToCheck": "{{ checkCloudWatchMetrics.instancesToCheck }}"
+        },
+        "Handler": "check_unhealthy_reasons.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "results",
+          "Selector": "$.Payload.results"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "instances",
+          "Selector": "$.Payload.instances"
+        }
+      ]
+    },
+    {
+      "name": "checkConnectivity",
+      "description": "Checks the connectivity between the load balancer and its instances.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "nextStep": "runCommands",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "loadBalancerDetails": "{{ getLoadBalancerDetails.details }}",
+          "healthyInstances": "{{ getTargets.healthyInstances }}",
+          "unhealthyInstances": "{{ checkUnhealthyReasons.instances }}"
+        },
+        "Handler": "check_connectivity.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "results",
+          "Selector": "$.Payload.results"
+        },
+        {
+          "Type": "String",
+          "Name": "error",
+          "Selector": "$.Payload.error"
+        }
+      ]
+    },
+    {
+      "name": "runCommands",
+      "description": "Runs troubleshooting commands on instances and uploads the output if the bucket name is provided.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 3600,
+      "nextStep": "generateReport",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "executionMode": "{{ ExecutionMode }}",
+          "loadBalancerDetails": "{{ getLoadBalancerDetails.details }}",
+          "instances": "{{ checkUnhealthyReasons.instances }}",
+          "bucketName": "{{ S3BucketName }}",
+          "bucketLocation": "{{ getBucketPublicStatus.bucketLocation }}"
+        },
+        "Handler": "run_commands.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "results",
+          "Selector": "$.Payload.results"
+        },
+        {
+          "Type": "String",
+          "Name": "error",
+          "Selector": "$.Payload.error"
+        }
+      ]
+    },
+    {
+      "name": "generateReport",
+      "description": "Generates the final report based on previous steps' output and uploads the report to the Amazon S3 bucket if the bucket name was specified.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "onFailure": "Continue",
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "loadBalancerType": "{{ getLoadBalancerDetails.type }}",
+          "loadBalancerDetails": "{{ getLoadBalancerDetails.details }}",
+          "unhealthyTargets": "{{ getTargets.unhealthyTargets }}",
+          "numberOfUnhealthyTargets": "{{ getTargets.numberOfUnhealthyTargets }}",
+          "numberOfAllTargets": "{{ getTargets.numberOfAllTargets }}",
+          "getTargetsError": "{{ getTargets.error }}",
+          "cloudWatchError": "{{ checkCloudWatchMetrics.error }}",
+          "metrics": "{{ checkCloudWatchMetrics.metrics }}",
+          "healthyInstancesToCheck": "{{ checkCloudWatchMetrics.instancesToCheck }}",
+          "reasonResults": "{{ checkUnhealthyReasons.results }}",
+          "instancesToCheck": "{{ checkUnhealthyReasons.instances }}",
+          "connectivityResults": "{{ checkConnectivity.results }}",
+          "connectivityError": "{{ checkConnectivity.error }}",
+          "commandsResults": "{{ runCommands.results }}",
+          "commandsError": "{{ runCommands.error }}",
+          "bucketName": "{{ S3BucketName }}",
+          "bucketLocation": "{{ getBucketPublicStatus.bucketLocation }}",
+          "name": "{{ LoadBalancerOrTargetGroupName }}"
+        },
+        "Handler": "generate_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "report",
+          "Selector": "$.Payload.report"
+        },
+        {
+          "Type": "StringList",
+          "Name": "errors",
+          "Selector": "$.Payload.errors"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "generateReport.report",
+    "getLoadBalancerDetails.type"
+  ],
+  "files": {
+    "artifact_2.zip": {
+      "checksums": {
+        "SHA256": "b8b4dece36d38e2bca276cdfa6890e64dc63e6d07ada5ee40bd6fbc9cfd7a2ae"
+      }
+    },
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "84ca018dca5cbcd603b4e9396adbcde7a75da87581a124474c0f12f1e507c4cd"
+      }
+    }
+  }
+}
