@@ -1,0 +1,67 @@
+{
+  "description": "### Document Name - AWSQuickSetupType-Scheduler-ApplyInstanceState\n## What does this document do?\nThis document finds EC2 instances with specified tags and starts or stops them based on the InstanceState parameter, but only when the change calendar state matches the ExpectedCalendarState.\n\n## Input Parameters\n* InstanceState: (Required) The operation to perform - either 'start' or 'stop'\n* TagKey: (Required) The tag name (key) to filter list of EC2 Instances\n* TagValue: (Required) The tag value to filter list of EC2 Instances\n* AutomationAssumeRole: (Optional) The ARN of the IAM role that this runbook will use to execute automation\n* ChangeCalendarName: (Required) Name of the change calendar to control when instances can be started or stopped\n* ExpectedCalendarState: (Required) The calendar state that should trigger the instance state change - either 'OPEN' or 'CLOSED'\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "InstanceState": {
+      "type": "String",
+      "description": "(Required) The operation to perform - either 'start' or 'stop'",
+      "allowedValues": [
+        "start",
+        "stop"
+      ]
+    },
+    "TagKey": {
+      "type": "String",
+      "description": "(Required) The tag name (key) to filter list of EC2 Instances - must be prefixed with 'tag:'",
+      "allowedPattern": "^tag:[a-zA-Z0-9+\\-=._/@\\s]{1,128}$"
+    },
+    "TagValue": {
+      "type": "String",
+      "description": "(Required) The tag value to filter list of EC2 Instances",
+      "allowedPattern": "^[a-zA-Z0-9+\\-=._:/@\\s]{0,256}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf."
+    },
+    "ChangeCalendarName": {
+      "type": "String",
+      "description": "(Required) Name of change calendar to use - format 'AWSQuickSetup-ChangeCalendar-{5chars}'",
+      "allowedPattern": "^AWSQuickSetup-ChangeCalendar-[a-zA-Z0-9]{5}$"
+    },
+    "ExpectedCalendarState": {
+      "type": "String",
+      "description": "(Required) Specifies the required Systems Manager Change Calendar state ('OPEN' or 'CLOSED') for the automation to proceed. If the calendar state doesn't match this expected value, the document will skip any instance state changes and complete successfully. This parameter acts as a safety check to ensure actions only occur during intended calendar windows.",
+      "allowedValues": [
+        "OPEN",
+        "CLOSED"
+      ]
+    }
+  },
+  "outputs": [
+    "startAndStopInstances.OutputPayload"
+  ],
+  "mainSteps": [
+    {
+      "name": "startAndStopInstances",
+      "description": "Start or stop the selected instances based on InstanceState parameter",
+      "maxAttempts": 3,
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "start_and_stop_instances",
+        "InputPayload": {
+          "instanceState": "{{InstanceState}}",
+          "tagKey": "{{TagKey}}",
+          "tagValue": "{{TagValue}}",
+          "changeCalendarName": "{{ChangeCalendarName}}",
+          "expectedCalendarState": "{{ExpectedCalendarState}}"
+        },
+        "Script": "def start_and_stop_instances(events, context):\n    import boto3\n    import time\n\n    # Initialize boto clients\n    ec2_resource = boto3.resource('ec2')\n    ec2_client = boto3.client('ec2')\n    ssm_client = boto3.client('ssm')\n\n    # Get input values to the script\n    instance_state = events['instanceState'].lower()\n    tag_key = events['tagKey']\n    tag_value = events['tagValue']\n    change_calendar_name = events['changeCalendarName']\n    expected_calendar_state = events['expectedCalendarState']\n\n    # Define the constant batch size for number of instances processed in one boto call\n    batch_size = 1000\n\n    def get_calendar_state(calendar_name):\n        return ssm_client.get_calendar_state(\n            CalendarNames=[calendar_name]\n        )\n\n    def get_tagged_instance_ids():\n        # Filter instances based on instance_state - stopped instances for start, running instances for stop\n        target_instance_state = 'stopped' if instance_state == 'start' else 'running'\n        \n        instances = ec2_resource.instances.filter(\n            Filters=[\n                {\n                    'Name': tag_key,\n                    'Values': [tag_value]\n                },\n                {\n                    'Name': 'instance-state-name',\n                    'Values': [target_instance_state]\n                }\n            ]\n        )\n\n        return [instance.id for instance in instances]\n\n    def create_batches(list_instance_ids):\n        for i in range(0, len(list_instance_ids), batch_size):\n            yield list_instance_ids[i:i + batch_size]\n\n    def process_instances(list_batches):\n        for batch in list_batches:\n            try:\n                if instance_state == 'start':\n                    ec2_client.start_instances(\n                        InstanceIds=batch\n                    )\n                elif instance_state == 'stop':\n                    ec2_client.stop_instances(\n                        InstanceIds=batch\n                    )\n            except Exception:\n                pass\n            time.sleep(0.5)\n\n    # Check calendar state against expected state\n    calendar_state = get_calendar_state(change_calendar_name)\n    \n    if calendar_state.get('State') == expected_calendar_state:\n        list_tagged_instance_ids = get_tagged_instance_ids()\n        batches = create_batches(list_tagged_instance_ids)\n        process_instances(list(batches))\n        return list_tagged_instance_ids\n    else:\n        # Return empty list when calendar state doesn't allow the operation\n        return []\n"
+      }
+    }
+  ]
+}
