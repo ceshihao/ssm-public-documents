@@ -1,0 +1,152 @@
+{
+  "description": "The **AWSSupport-TroubleshootSAMLIssues** automation runbook helps diagnose Security Assertion Markup Language (SAML) related issues by analyzing SAML response files stored in an Amazon S3 bucket. It performs comprehensive validation including schema verification, signature validation, audience restriction checking, and expiration time verification. The runbook decodes and extracts key SAML elements including issuer, assertions, subject, conditions, signatures, and attributes from the SAML response. For environments where SAML is used to access AWS resources (such as Amazon Connect or Amazon AppStream 2.0) through an IAM Identity Provider, it verifies whether the certificates in the SAML response signatures match the certificates configured in the IAM Identity Provider.\n\n**Key features**\n\n* Validates SAML response format and required elements\n* Decodes and extracts SAML response components (issuer, assertions, subject, conditions, signatures, attributes)\n* Verifies digital signatures against IAM Identity Provider certificates when provided\n* Checks audience restrictions and time validity\n* Provides detailed diagnostic information showing the parsed SAML structure and validation results\n\n**Required Permissions**\n\nThe following permissions are required to run this runbook:\n\n* s3:GetBucketLocation\n * s3:ListBucket\n * s3:GetBucketPublicAccessBlock\n * s3:GetAccountPublicAccessBlock\n * s3:GetObject\n * s3:GetBucketPolicyStatus\n * s3:GetEncryptionConfiguration\n * s3:GetBucketOwnershipControls\n * s3:GetBucketAcl\n * s3:GetBucketPolicy\n * s3:PutObject\n * iam:GetSAMLProvider\n * sts:AssumeRole\n\n\n**Output Format**\n\nThe runbook stores the analysis result file in the same S3 bucket as the input file. This file is in a structured JSON format with the following main sections::\n\n* **validation_result**: contains basic validation results of the SAML response\n    * **saml_info**: key SAML information including issuer, signatures, and assertions\n    * **schema_validation**: results of SAML schema validation\n* **verification_result**: provides more detailed diagnostic results\n    * **signature**: results of signature verification\n    * **audience**: results of audience restriction validation\n    * **expiration**: results of expiration time verification\n\n\n**Importants**\n\n* Before using this runbook, customers must capture and store a Base64-encoded SAML response(txt file) in an S3 bucket. Instructions for capturing SAML responses can be found in [this document](https://docs.aws.amazon.com/IAM/latest/UserGuide/troubleshoot_saml_view-saml-response.html).\n* This runbook doesn't validate S3 write permissions. If the automation role or the user doesn't have write permissions for the target S3 bucket, the automation may fail to upload the analysis report.\n* This runbook is specifically designed to analyze SAML responses and diagnose configuration issues. For general SAML troubleshooting guidance, you can refer to the AWS documentation covering SAML federation with various AWS services.\n    * [IAM SAML Troubleshooting](https://docs.aws.amazon.com/IAM/latest/UserGuide/troubleshoot_saml.html)\n    * [Amazon Connect SAML Troubleshooting](https://docs.aws.amazon.com/connect/latest/adminguide/troubleshoot-saml.html)\n    * [Amazon WorkSpaces SAML Authentication Issues](https://repost.aws/knowledge-center/workspaces-saml-authentication-issues)\n    * [AWS IAM Identity Center Troubleshooting](https://docs.aws.amazon.com/singlesignon/latest/userguide/troubleshooting.html#issue8)\n    * [Amazon Cognito Invalid SAML Response Errors](https://repost.aws/knowledge-center/cognito-invalid-saml-response-errors)",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "InputFileS3URI": {
+      "type": "String",
+      "description": "(Required) S3 URI of SAML Response txt file (e.g., s3://bucket-name/path/to/file.txt).",
+      "allowedPattern": "^s3://([a-z0-9.-]+)(/[a-zA-Z0-9._-]+)*/[a-zA-Z0-9._-]+\\.txt$"
+    },
+    "S3OutputPrefix": {
+      "type": "String",
+      "description": "(Optional) The analysis output files are stored in the input bucket under the name 'saml_analysis_<executionID of the runbook>.json'. You can use this parameter if you want to output a file with a specific prefix. The default value is “output/”, in which case the file URI that output the result will be 's3://bucket-name/output/saml_analysis_<executionID of the runbook>.json'.",
+      "allowedPattern": "^[a-zA-Z0-9+=,.@\\-_/]*/$",
+      "default": "output/"
+    },
+    "ExpectedAudience": {
+      "type": "String",
+      "description": "(Optional) Expected audience value in the SAML response. If not specified, we use 'urn:amazon:webservices'. If you have configured a specific audience value in your IdP and SP setup, please provide the exact format (e.g., 'urn:amazon:webservices', 'https://signin.aws.amazon.com/saml').",
+      "default": "urn:amazon:webservices",
+      "allowedPattern": "^[a-zA-Z0-9:/_.-]+$"
+    },
+    "IamIdProviderArn": {
+      "type": "String",
+      "description": "(Optional) If you are using an IAM ID Provider entity to directly link your IdP with AWS IAM, please provide its ARN (e.g., arn:aws:iam::<account-id>:saml-provider/<provider-name>).",
+      "default": "",
+      "allowedPattern": "^$|^arn:aws(-(cn|us-gov|iso-[a-z]))?:iam::[0-9]{12}:saml-provider/[a-zA-Z0-9_-]+$"
+    },
+    "SAMLAuthenticationTime": {
+      "type": "String",
+      "description": "(Optional) The date and time when SAML authentication was performed. Timezone must be UTC. Must be in YYYY-MM-DDThh:mm:ss format (e.g., 2025-02-01T10:00:00). If this parameter is not provided, expiration checks will be performed against the current timestamp.",
+      "default": "",
+      "allowedPattern": "^$|^\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+    },
+    "S3BucketOwnerRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) IAM Role ARN to access the S3 buckets. The ARN of the IAM role with permissions to get the Amazon S3 bucket and account block public access settings, bucket encryption configuration, the bucket ACLs, the bucket policy status, and upload objects to the bucket. If this parameter is not specified, the runbook uses the `AutomationAssumeRole` (if specified) or user that starts this runbook (if `AutomationAssumeRole` is not specified).",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateIAMIDProvider",
+      "description": "Validates the provided IAM ID Provider ARN by checking if it exists and is accessible. If no ARN is provided, the validation is skipped and the step completes successfully. If validation is skipped or is successful, the bucket name and object key are extracted from the input for subsequent steps.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "nextStep": "CheckS3BucketPublicStatus",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "IamIdProviderArn": "{{ IamIdProviderArn }}",
+          "InputFileS3URI": "{{ InputFileS3URI }}"
+        },
+        "Handler": "validate_iam_id_provider.handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "BucketName",
+          "Selector": "$.Payload.bucket_name",
+          "Type": "String"
+        },
+        {
+          "Name": "ObjectKey",
+          "Selector": "$.Payload.object_key",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckS3BucketPublicStatus",
+      "description": "Checks if the Amazon S3 bucket allows anonymous, or public read or write access permissions. If the bucket allows these permissions, the automation stops at this step.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "nextStep": "CheckS3ObjectExistence",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ ValidateIAMIDProvider.BucketName }}",
+          "BucketOwnerRoleArn": "{{ S3BucketOwnerRoleArn }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      }
+    },
+    {
+      "name": "CheckS3ObjectExistence",
+      "description": "Validates access to the S3 buckets. Checks if the object exists, and if the automation role has read permissions to the object.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "nextStep": "AnalyzeSAMLResponse",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ ValidateIAMIDProvider.BucketName }}",
+          "Objectkey": "{{ ValidateIAMIDProvider.ObjectKey }}",
+          "S3BucketOwnerRoleArn": "{{ S3BucketOwnerRoleArn }}"
+        },
+        "Handler": "check_s3_object_existence.handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      }
+    },
+    {
+      "name": "AnalyzeSAMLResponse",
+      "description": "Analyzes the SAML response file by performing the checks (schema validation, signature verification, audience validation, expiration checking). Generates a detailed JSON report and saves it to the specified S3 location.",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ ValidateIAMIDProvider.BucketName }}",
+          "Objectkey": "{{ ValidateIAMIDProvider.ObjectKey }}",
+          "S3OutputPrefix": "{{ S3OutputPrefix }}",
+          "ExpectedAudience": "{{ ExpectedAudience }}",
+          "IamIdProviderArn": "{{ IamIdProviderArn }}",
+          "SAMLAuthenticationTime": "{{ SAMLAuthenticationTime }}",
+          "ExecutionID": "{{ automation:EXECUTION_ID }}",
+          "S3BucketOwnerRoleArn": "{{ S3BucketOwnerRoleArn }}"
+        },
+        "Handler": "analyze_saml_response.handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "AnalyzeSAMLResponse.Message"
+  ],
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "SHA256": "f049a9282dba25fcd3251946ad28bebd5557492c45bc39e4aac3aa161a33d390"
+      }
+    }
+  }
+}
