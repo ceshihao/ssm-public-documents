@@ -1,0 +1,174 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Creates all resources necessary for the Resource Explorer QuickSetup",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "default": "arn:aws:iam::629124890785:role/AWS-QuickSetup-ResourceExplorerRole-f8mxb-us-east-1",
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "type": "String"
+    },
+    "ForceUpdateParam": {
+      "default": "1740107519654",
+      "description": "(Required) This parameter can be used to force a stack update to repair resources.",
+      "type": "String"
+    },
+    "ReplaceExistingAggregator": {
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "default": "true",
+      "description": "(Required) Whether or not to replace the Aggregator Index in an account if it exists outside the Selected Aggregator Region.",
+      "type": "String"
+    },
+    "SelectedAggregatorRegion": {
+      "default": "us-east-1",
+      "description": "(Required) The Region selected to contain the Aggregator Index.",
+      "type": "String"
+    }
+  },
+  "mainSteps": [
+    {
+      "inputs": {
+        "Script": "import boto3\nimport time\nfrom botocore.exceptions import ClientError\n\nresource_explorer = boto3.client('resource-explorer-2')\n\n\ndef get_aggregator_index():\n    try:\n        paginator = resource_explorer.get_paginator('list_indexes')\n        response_iterator = paginator.paginate(\n            Type='AGGREGATOR',\n        )\n    except ClientError as error:\n        print(f'Failed to list Aggregator Index: {error}')\n        raise error\n\n    aggregator_index = []\n    for page in response_iterator:\n        aggregator_index += page['Indexes']\n\n    return aggregator_index[0] if aggregator_index else aggregator_index\n\n\ndef script_handler(events, context):\n    current_region = events['AWS_REGION']\n    selected_aggregator_region = events['selectedAggregatorRegion']\n    replace_existing_aggregator = events['replaceExistingAggregator']\n\n    # Is the current Region the same as the selected Aggregator Region?\n    if current_region != selected_aggregator_region:\n        print(\n            f'No-op; the current Region ({current_region}) is not the same as the selected Aggregator Region ({selected_aggregator_region})')\n        return\n\n    aggregator_index = get_aggregator_index()\n    # Does an Aggregator Index already exist in any Region?\n    if not aggregator_index:\n        print('No-op; an Aggregator Index does not exist in any Region')\n        return\n\n    aggregator_index_region = aggregator_index.get('Region')\n    # Did the user choose to replace the existing Aggregator Index?\n    if replace_existing_aggregator == 'false':\n        print(\n            f'No-op; the user chose not to replace the existing Aggregator Index in {aggregator_index_region}')\n        return\n\n    # Is the existing Aggregator Index in the selected/current Region?\n    if aggregator_index_region == current_region:\n        print(\n            f'No-op; the existing Aggregator Index is already in the selected Aggregator Region ({selected_aggregator_region})')\n        return\n\n    try:\n        print('Demoting the existing Aggregator Index to a Local Index...')\n        regional_resource_explorer = boto3.client(\n            'resource-explorer-2', region_name=aggregator_index_region)\n        response = regional_resource_explorer.update_index_type(\n            Arn=aggregator_index['Arn'],\n            Type='LOCAL'\n        )\n        response.pop('ResponseMetadata', {})\n        print(response)\n\n        # Wait for Index to get into ACTIVE State for up to 18 * 30 (540) seconds, or 9 minutes\n        counter = 0\n        while counter < 18:\n            index_state = regional_resource_explorer.get_index()['State']\n            if index_state == 'ACTIVE':\n                print('Demotion complete!')\n                return\n            counter += 1\n            time.sleep(30)\n\n        raise AssertionError(\n            'Timed out while waiting for the demotion to complete.')\n    except ClientError as error:\n        print(\n            f'Failed to demote the existing Aggregator Index to a Local Index: {error}')\n        raise error\n",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "AWS_REGION": "{{ global:REGION }}",
+          "replaceExistingAggregator": "{{ ReplaceExistingAggregator }}",
+          "selectedAggregatorRegion": "{{ SelectedAggregatorRegion }}"
+        },
+        "Handler": "script_handler"
+      },
+      "name": "DemoteAggregatorIndexIfNecessary",
+      "action": "aws:executeScript",
+      "description": "Demote the aggregator index if it exists outside the selected aggregator region and customer chose to replace it."
+    },
+    {
+      "outputs": [
+        {
+          "Type": "Boolean",
+          "Name": "toPromote",
+          "Selector": "$.Payload.toPromote"
+        }
+      ],
+      "inputs": {
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\nresource_explorer = boto3.client('resource-explorer-2')\n\ntags = {\n    'Type': 'QuickSetup'\n}\n\npromote = {\n    'toPromote': True\n}\n\nnotPromote = {\n    'toPromote': False\n}\n\n\ndef create_index():\n    print('Creating an Index...')\n    try:\n        resource_explorer.create_index(\n            Tags=tags\n        )\n        print('Index created successfully')\n    except ClientError as error:\n        if error.response['Error']['Code'] == 'ConflictException':\n            print('No-op; an Index already exists')\n            return\n        print(f'Failed to create an Index: {error}')\n        raise error\n\n\ndef get_aggregator_index():\n    try:\n        paginator = resource_explorer.get_paginator('list_indexes')\n        response_iterator = paginator.paginate(\n            Type='AGGREGATOR',\n        )\n    except ClientError as error:\n        print(f'Failed to list Aggregator Index: {error}')\n        raise error\n\n    aggregator_index = []\n    for page in response_iterator:\n        aggregator_index += page['Indexes']\n\n    return aggregator_index[0] if aggregator_index else {}\n\n\ndef script_handler(events, context):\n    create_index()\n\n    current_region = events['AWS_REGION']\n    selected_aggregator_region = events['selectedAggregatorRegion']\n    replace_existing_aggregator = events['replaceExistingAggregator']\n\n    # Is the current Region the same as the selected Aggregator Region?\n    if current_region != selected_aggregator_region:\n        print(\n            f'The current Region ({current_region}) is not the same as the selected Aggregator Region ({selected_aggregator_region}). Skipping promotion...')\n        return notPromote\n\n    aggregator_index = get_aggregator_index()\n\n    # Did the user choose to replace the existing Aggregator Index?\n    if replace_existing_aggregator == 'false':\n        print('The user chose not to replace the existing Aggregator Index')\n        # Does an Aggregator Index already exist in any Region?\n        if aggregator_index:\n            aggregator_index_region = aggregator_index.get('Region')\n            print(\n                f'An Aggregator Index already exists in {aggregator_index_region}. Skipping promotion...')\n            return notPromote\n        print(\n            'An Aggregator Index does not exist in any Region. Proceeding to promotion...')\n        return promote\n    else:\n        print('The user chose to replace the existing Aggregator Index')\n        # Is there an existing Aggregator Index, and is it in the selected/current region?\n        if aggregator_index.get('Region') == current_region:\n            print(\n                'The existing Index in the selected Aggregator Region is already an Aggregator Index. Skipping promotion...')\n            return notPromote\n        print('The existing Index in the selected Aggregator Region is not an Aggregator Index. Proceeding to promotion...')\n        return promote\n",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "AWS_REGION": "{{ global:REGION }}",
+          "replaceExistingAggregator": "{{ ReplaceExistingAggregator }}",
+          "selectedAggregatorRegion": "{{ SelectedAggregatorRegion }}"
+        },
+        "Handler": "script_handler"
+      },
+      "name": "CreateIndexIfNecessary",
+      "action": "aws:executeScript",
+      "description": "Create an index in this region if one does not already exist, and determine whether to promote the index to aggregator."
+    },
+    {
+      "inputs": {
+        "Choices": [
+          {
+            "StringEquals": "{{ global:REGION }}",
+            "Variable": "{{ SelectedAggregatorRegion }}",
+            "NextStep": "PromoteIndexOrCreateViewsIfNecessary"
+          }
+        ]
+      },
+      "name": "EndIfNotAggregatorRegion",
+      "action": "aws:branch",
+      "description": "End the automation if it is running outside the selected aggregator region. If not, continue to next step.",
+      "isEnd": true
+    },
+    {
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CreateIndexIfNecessary.toPromote }}",
+            "BooleanEquals": false,
+            "NextStep": "CreateViewsIfNecessary"
+          }
+        ]
+      },
+      "name": "PromoteIndexOrCreateViewsIfNecessary",
+      "action": "aws:branch",
+      "description": "If the index needs to be promoted, continue to PromoteIndex step. If not, jump to CreateViewsIfNecessary step."
+    },
+    {
+      "outputs": [
+        {
+          "Type": "Boolean",
+          "Name": "toSleep",
+          "Selector": "$.Payload.toSleep"
+        }
+      ],
+      "inputs": {
+        "Script": "import boto3\nimport time\nfrom botocore.exceptions import ClientError\n\nresource_explorer = boto3.client('resource-explorer-2')\n\nsleep = {\n    'toSleep': True\n}\n\nnotSleep = {\n    'toSleep': False\n}\n\n\ndef get_index_arn():\n    print('Getting the Arn of the Index in the current Region...')\n    try:\n        response = resource_explorer.get_index()\n        index_arn = response['Arn']\n        print(f'The Index Arn is {index_arn}')\n        return index_arn\n    except ClientError as error:\n        print(f'Failed to get the Index Arn: {error}')\n        raise error\n\n\ndef promote_index(index_arn):\n    print(f'Promoting the Index with the Arn {index_arn} to Aggregator...')\n    try:\n        resource_explorer.update_index_type(\n            Arn=index_arn,\n            Type='AGGREGATOR'\n        )\n\n        # Wait for Index to get into ACTIVE State for up to 18 * 30 (540) seconds, or 9 minutes\n        counter = 0\n        while counter < 18:\n            index_state = resource_explorer.get_index()['State']\n            if index_state == 'ACTIVE':\n                print('Index Promotion complete!')\n                return notSleep\n            counter += 1\n            time.sleep(30)\n        raise AssertionError(\n            'Timed out while waiting for the promotion to complete.')\n    except ClientError as error:\n        if error.response['Error']['Code'] != 'ServiceQuotaExceededException':\n            print(f'Failed to promote the Index to Aggregator: {error}')\n            raise error\n        return sleep\n\n\ndef script_handler(events, context):\n    index_arn = get_index_arn()\n    sleep_action = promote_index(index_arn)\n    return sleep_action\n",
+        "Runtime": "python3.8",
+        "Handler": "script_handler"
+      },
+      "name": "PromoteIndex",
+      "action": "aws:executeScript",
+      "description": "Promote the index to aggregator."
+    },
+    {
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ PromoteIndex.toSleep }}",
+            "BooleanEquals": false,
+            "NextStep": "CreateViewsIfNecessary"
+          }
+        ]
+      },
+      "name": "SleepOrCreateViewsIfNecessary",
+      "action": "aws:branch",
+      "description": "If the account is in 24-hour cooldown period, continue to Sleep step. If not, jump to CreateViewsIfNecessary step."
+    },
+    {
+      "inputs": {
+        "Duration": "PT24H5M"
+      },
+      "name": "Sleep",
+      "action": "aws:sleep",
+      "description": "Pauses the execution of the automation document for 24 hours and 5 minutes to account for the cooldown period."
+    },
+    {
+      "maxAttempts": 2,
+      "inputs": {
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\nssm_client = boto3.client('ssm')\n\n\ndef get_document_name_and_version(automation_execution_id):\n    print('Getting document name and version from the current automation execution...')\n    automation_execution = ssm_client.get_automation_execution(\n        AutomationExecutionId=automation_execution_id\n    )\n    document_name = automation_execution['AutomationExecution']['DocumentName']\n    document_version = automation_execution['AutomationExecution']['DocumentVersion']\n    print(f'Document name and version: {document_name}, {document_version}')\n    return document_name, document_version\n\n\ndef get_current_document_version_and_parameters(document_name):\n    print(\n        f'Getting the current document version and parameters for the document: {document_name}...')\n    document = ssm_client.describe_document(\n        Name=document_name\n    )\n    current_document_version = document['Document']['DocumentVersion']\n    current_document_parameters = document['Document']['Parameters']\n    print(\n        f'Current document version and parameters: {current_document_version}, {current_document_parameters}')\n    return current_document_version, current_document_parameters\n\n\ndef get_current_selected_aggregator_region(current_document_parameters):\n    for param in current_document_parameters:\n        if param['Name'] == 'SelectedAggregatorRegion':\n            return param['DefaultValue']\n\n\ndef stop_automation_execution(automation_execution_id):\n    print('Stopping automation execution...')\n    ssm_client.stop_automation_execution(\n        AutomationExecutionId=automation_execution_id\n    )\n    print('Automation execution stopped successfully')\n\n\ndef script_handler(events, context):\n    try:\n        automation_execution_id = events['automationExecutionId']\n        selected_aggregator_region = events['selectedAggregatorRegion']\n\n        document_name, document_version = get_document_name_and_version(\n            automation_execution_id)\n\n        current_document_version, current_document_parameters = get_current_document_version_and_parameters(\n            document_name)\n\n        if document_version == current_document_version:\n            print(\n                'No-op; the document versions match, indicating there was no change to the document')\n            return\n\n        current_selected_aggregator_region = get_current_selected_aggregator_region(\n            current_document_parameters)\n\n        if selected_aggregator_region == current_selected_aggregator_region:\n            print(\n                'No-op; the selected Aggregator Index Region has not changed')\n            return\n\n        print('The selected Aggregator Index Region has changed')\n        stop_automation_execution(automation_execution_id)\n    except ClientError as error:\n        print(\n            f'Failed to determine if the automation document needs to be cancelled: {error}')\n        raise error\n",
+        "Runtime": "python3.8",
+        "InputPayload": {
+          "automationExecutionId": "{{ automation:EXECUTION_ID }}",
+          "selectedAggregatorRegion": "{{ SelectedAggregatorRegion }}"
+        },
+        "Handler": "script_handler"
+      },
+      "name": "CancelExecutionIfNecessary",
+      "action": "aws:executeScript",
+      "description": "Cancel automation execution if the region is no longer the selected aggregator region."
+    },
+    {
+      "inputs": {
+        "Script": "import boto3\nimport time\nfrom botocore.exceptions import ClientError\n\nresource_explorer = boto3.client('resource-explorer-2')\n\n\ndef get_index():\n    print('Getting the Index in the current Region...')\n    try:\n        index = resource_explorer.get_index()\n        print(f'The Index is {index}')\n        return index\n    except ClientError as error:\n        print(f'Failed to get the Index: {error}')\n        raise error\n\n\ndef promote_index(index_arn):\n    print(f'Promoting the Index with the Arn {index_arn} to Aggregator...')\n    try:\n        resource_explorer.update_index_type(\n            Arn=index_arn,\n            Type='AGGREGATOR'\n        )\n        # Wait for Index to get into ACTIVE State for up to 18 * 30 (540) seconds, or 9 minutes\n        counter = 0\n        while counter < 18:\n            index_state = resource_explorer.get_index()['State']\n            if index_state == 'ACTIVE':\n                print('Index Promotion complete!')\n                return\n            counter += 1\n            time.sleep(30)\n        raise AssertionError(\n            'Timed out while waiting for the promotion to complete.')\n    except ClientError as error:\n        print(f'Failed to promote the Index to Aggregator: {error}')\n        raise error\n\n\ndef script_handler(events, context):\n    index = get_index()\n    if index['Type'] == 'AGGREGATOR':\n        print('No-op; the Index is already of type AGGREGATOR')\n        return\n    promote_index(index['Arn'])\n",
+        "Runtime": "python3.8",
+        "Handler": "script_handler"
+      },
+      "name": "PromoteIndexRetry",
+      "action": "aws:executeScript",
+      "description": "Promote the index to aggregator after the Sleep step has completed."
+    },
+    {
+      "maxAttempts": 2,
+      "inputs": {
+        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\nVIEWNAME = 'all-resources'\nTAGS = {\n    'Type': 'QuickSetup'\n}\n\n\ndef create_qs_view(aggregator_region):\n    '''\n    If successful, returns view_arn\n    '''\n    print(f'Creating QuickSetup View named {VIEWNAME}...')\n    regional_resource_explorer = boto3.client(\n        'resource-explorer-2', region_name=aggregator_region\n    )\n\n    try:\n        response = regional_resource_explorer.create_view(\n            Tags=TAGS,\n            ViewName=VIEWNAME,\n            IncludedProperties=[\n                {\n                    'Name': 'tags'\n                },\n            ]\n        )\n    except ClientError as error:\n        print(\n            f'Failed to create QuickSetup View named {VIEWNAME} in aggregator region {aggregator_region}: {error}')\n        raise error\n\n    view_arn = response['View']['ViewArn']\n    print(\n        f'QuickSetup View with ViewArn {view_arn} created in aggregator region {aggregator_region}')\n    return view_arn\n\n\ndef get_aggregator_index():\n    re_client = boto3.client('resource-explorer-2')\n    try:\n        paginator = re_client.get_paginator('list_indexes')\n        response_iterator = paginator.paginate(\n            Type='AGGREGATOR',\n        )\n    except ClientError as error:\n        print(f'Failed to list Aggregator Index: {error}')\n        raise error\n\n    aggregator_index = []\n    for page in response_iterator:\n        aggregator_index += page['Indexes']\n\n    return aggregator_index[0] if aggregator_index else aggregator_index\n\n\ndef get_existing_qs_view_arn(existing_views):\n    for view_arn in existing_views:\n        if view_arn.find(f'/{VIEWNAME}/') >= 0:\n            return view_arn\n\n\ndef get_views_in_region(aggregator_region):\n    try:\n        regional_resource_explorer = boto3.client(\n            'resource-explorer-2', region_name=aggregator_region\n        )\n        views = []\n        paginator = regional_resource_explorer.get_paginator('list_views')\n        response_iterator = paginator.paginate()\n        for page in response_iterator:\n            views += page['Views']\n        return views\n    except ClientError as error:\n        print(f'Failed to list Views: {error}')\n        raise error\n\n\ndef set_default_view(view_arn, aggregator_region):\n    print(f'Setting QuickSetup View named {VIEWNAME} as default...')\n    regional_resource_explorer = boto3.client(\n        'resource-explorer-2', region_name=aggregator_region\n    )\n    try:\n        regional_resource_explorer.associate_default_view(\n            ViewArn=view_arn\n        )\n        print('QuickSetup View set as default successfully!')\n\n    except ClientError as error:\n        print(\n            f'Failed to set QuickSetup View named {VIEWNAME} as default: {error}')\n        raise error\n\n\ndef get_default_view_arn(aggregator_region):\n    try:\n        regional_resource_explorer = boto3.client(\n            'resource-explorer-2', region_name=aggregator_region\n        )\n        default_view_arn = regional_resource_explorer.get_default_view().get('ViewArn')\n        return default_view_arn\n    except ClientError as error:\n        print(f'Failed to retrieve default View: {error}')\n        raise error\n\n\ndef handle_existing_views(existing_views, aggregator_region):\n    default_view_arn = get_default_view_arn(aggregator_region)\n    if default_view_arn:\n        print(\n            f'No-Op: Default view {default_view_arn} already exists in {aggregator_region}')\n        return\n\n    try:\n        qs_view_arn = create_qs_view(aggregator_region)\n        set_default_view(qs_view_arn, aggregator_region)\n    except ClientError as error:\n        if error.response['Error']['Code'] == 'ConflictException':\n            existing_qs_view_arn = get_existing_qs_view_arn(existing_views)\n            set_default_view(existing_qs_view_arn, aggregator_region)\n\n        if error.response['Error']['Code'] == 'ServiceQuotaExceededException':\n            existing_qs_view_arn = get_existing_qs_view_arn(existing_views)\n            if existing_qs_view_arn:\n                set_default_view(existing_qs_view_arn, aggregator_region)\n\n\ndef handle_no_existing_views(aggregator_region):\n    view_arn = create_qs_view(aggregator_region)\n    set_default_view(view_arn, aggregator_region)\n\n\ndef script_handler(events, context):\n    aggregator_index = get_aggregator_index()\n    if not aggregator_index:\n        raise ValueError('Aggregator Index does not exist in this account')\n\n    aggregator_region = aggregator_index['Region']\n\n    existing_views = get_views_in_region(aggregator_region)\n    if existing_views:\n        handle_existing_views(existing_views, aggregator_region)\n    else:\n        handle_no_existing_views(aggregator_region)\n",
+        "Runtime": "python3.8",
+        "Handler": "script_handler"
+      },
+      "name": "CreateViewsIfNecessary",
+      "action": "aws:executeScript",
+      "description": "If a default view does not already exist, create a QuickSetup view named 'all-resources' in the aggregator region and set it as a default view."
+    }
+  ]
+}
