@@ -5,28 +5,34 @@
   "parameters": {
     "ResourceSetArn": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) ARN for the Amazon Route53 Application Recovery Controller LoadBalancer resource set."
     },
     "AutomationAssumeRole": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) ARN for the role that allows execution of this test to perform the actions on your behalf. If no role is specified, SSM uses the current session IAM permissions to run this script."
     },
     "ReadinessCheckName": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) Name of readiness check which should cause NOT_READY status after injection of the failure and return to READY state after the rollback process at the end of the test."
     },
     "UnhealthyHealthCheckPort": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Optional) The port that supposed to be closed or return unexpected result for LB health check",
       "default": "65534"
     },
     "IsRollback": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`). Can be either true or false.",
       "default": "false"
     },
     "PreviousExecutionId": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
       "default": ""
     }
@@ -59,7 +65,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "get_inputs_from_ssm_execution",
         "InputPayload": {
           "ExecutionId": "{{ PreviousExecutionId }}"
@@ -99,7 +105,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "get_output_from_ssm_step_execution",
         "InputPayload": {
           "ExecutionId": "{{ PreviousExecutionId }}",
@@ -114,7 +120,7 @@
       "description": "Restore original Load Balancer target groups port",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "restore_targets_healthcheck_port_unknown_region",
         "Script": "import json\nimport logging\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nITS_TIME_TO_SLEEP_A_LITTLE = 0.1\nANGRY_WORD = 'Property to wait type mismatch: only str, int or list allowed'\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef _construct_client_in_given_region(given_region: str):\n    \"\"\"\n    constructs boto3 application load balancer client\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    return boto3.client('elbv2', config=config, region_name=given_region)\n\n\n\ndef _obtain_region_by_elb_arn(elb_arn: str):\n    \"\"\"\n    provide region from the elastic load balancer arn\n    \"\"\"\n    return elb_arn.split(':')[3]\n\n\n\ndef _restore_targets_healthcheck_port(elb_client, events: dict, context: dict) -> None:\n    target_groups = json.loads(events['TargetGroups'])\n    for target_group in target_groups:\n        target_group.pop('LoadBalancerArn')\n        elb_client.modify_target_group(**target_group)\n\n\n\ndef restore_targets_healthcheck_port_unknown_region(events: dict, context: dict) -> None:\n    required_params = [\n        \"TargetGroups\",\n        \"LoadBalancerArn\"\n    ]\n    check_required_params(required_params, events)\n    load_balancer_arn = events['LoadBalancerArn']\n    elb_client = _construct_client_in_given_region(_obtain_region_by_elb_arn(load_balancer_arn))\n    _restore_targets_healthcheck_port(elb_client, events, context)",
         "InputPayload": {
@@ -128,7 +134,7 @@
       "action": "aws:executeScript",
       "description": "Confirm validness of rollback parameters",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "confirm_load_balancer_target_groups",
         "Script": "import json\nimport logging\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nITS_TIME_TO_SLEEP_A_LITTLE = 0.1\nANGRY_WORD = 'Property to wait type mismatch: only str, int or list allowed'\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef _construct_client_in_given_region(given_region: str):\n    \"\"\"\n    constructs boto3 application load balancer client\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    return boto3.client('elbv2', config=config, region_name=given_region)\n\n\n\ndef _obtain_region_by_elb_arn(elb_arn: str):\n    \"\"\"\n    provide region from the elastic load balancer arn\n    \"\"\"\n    return elb_arn.split(':')[3]\n\n\n\ndef _check_equal_target_groups_health_check_attributes(target_group1, target_group2):\n    return (target_group1['HealthCheckEnabled'] == target_group2['HealthCheckEnabled']\n            and target_group1['HealthCheckIntervalSeconds'] == target_group2['HealthCheckIntervalSeconds']\n            and target_group1['HealthyThresholdCount'] == target_group2['HealthyThresholdCount']\n            and target_group1['HealthCheckPort'] == target_group2['HealthCheckPort'])\n\n\n\ndef confirm_load_balancer_target_groups(events: dict, context: dict):\n    \"\"\"\n    confirm load balancer has pre-defined target groups\n    \"\"\"\n    required_params = ['LoadBalancerArn', 'TargetGroups']\n    check_required_params(required_params, events)\n\n    load_balancer_arn = events['LoadBalancerArn']\n    original_target_groups = json.loads(events['TargetGroups'])\n    elb_client = _construct_client_in_given_region(_obtain_region_by_elb_arn(load_balancer_arn))\n    actual_target_groups = elb_client.describe_target_groups(LoadBalancerArn=load_balancer_arn)['TargetGroups']\n    for actual_target_group in actual_target_groups:\n        original_target_group = next(group for group in original_target_groups\n                                     if group['TargetGroupArn'] == actual_target_group['TargetGroupArn'])\n        if not _check_equal_target_groups_health_check_attributes(actual_target_group, original_target_group):\n            raise ValueError(f'{\"Actual target groups differs from original target groups.\"}')\n    else:\n        return True",
         "InputPayload": {
@@ -151,7 +157,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "choose_random_lb_arn",
         "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef get_random_resource_of_type(resource_set_arn, resource_set_type):\n    \"\"\"\n    Get ARN of a random resource from the resource set of the specified type\n    \"\"\"\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    response = client.list_resource_sets()\n    if not response or not response.get('ResourceSets'):\n        raise ValueError('ResourceSets not found in us-west-2.')\n\n    resource_sets = response['ResourceSets']\n    while 'NextToken' in response:\n        response = client.list_resource_sets(NextToken=response['NextToken'])\n        resource_sets.extend(response['ResourceSets'])\n\n    resource_set = [item for item in resource_sets if item['ResourceSetArn'] == resource_set_arn]\n    if not resource_set:\n        raise ValueError(f'Resource set with ARN {resource_set_arn} not found')\n    resource_set = resource_set[0]\n    if resource_set['ResourceSetType'] != resource_set_type:\n        raise ValueError(f'Found resource set is of unexpected type: {resource_set[\"ResourceSetType\"]}, '\n                         f'expected: {resource_set_type}')\n    resources = [item['ResourceArn'] for item in resource_set['Resources']]\n    if not resources:\n        raise ValueError(f'Found resource set: {resource_set[\"ResourceSetArn\"]}, '\n                         f'doesnt contain any Resource')\n    random_resource = random.choice(resources)\n    logger.info(f'Continue with random resource: {random_resource}')\n    return random_resource\n\n\n\ndef choose_random_lb_arn(events, context):\n    \"\"\"\n    Choose random load balancer arn from ResourceSet\n    \"\"\"\n    required_params = ['ResourceSetArn']\n    check_required_params(required_params, events)\n\n    resource_set_arn = events['ResourceSetArn']\n    load_balancer_arn = get_random_resource_of_type(\n        resource_set_arn, 'AWS::ElasticLoadBalancingV2::LoadBalancer')\n    return {'RandomLoadBalancerArn': load_balancer_arn}",
         "InputPayload": {
@@ -166,7 +172,7 @@
       "onFailure": "Abort",
       "maxAttempts": 1,
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "assert_readiness_check_state",
         "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")",
         "InputPayload": {
@@ -195,7 +201,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "backup_lb_arn_and_targets",
         "Script": "import json\nimport logging\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nITS_TIME_TO_SLEEP_A_LITTLE = 0.1\nANGRY_WORD = 'Property to wait type mismatch: only str, int or list allowed'\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef _construct_client_in_given_region(given_region: str):\n    \"\"\"\n    constructs boto3 application load balancer client\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    return boto3.client('elbv2', config=config, region_name=given_region)\n\n\n\ndef _obtain_region_by_elb_arn(elb_arn: str):\n    \"\"\"\n    provide region from the elastic load balancer arn\n    \"\"\"\n    return elb_arn.split(':')[3]\n\n\n\ndef _backup_targets(elb_client, events: dict, context: dict) -> str:\n    paginator = elb_client.get_paginator('describe_target_groups')\n    pages = paginator.paginate(\n        LoadBalancerArn=events['LoadBalancerArn']\n    )\n    res = []\n    for page in pages:\n        target_groups = page.get('TargetGroups')\n        for target_group in target_groups:\n\n            backed_group = {\n                'LoadBalancerArn': events['LoadBalancerArn'],\n            }\n            for key in [\n                'TargetGroupArn',\n                'HealthCheckProtocol',\n                'HealthCheckPort',\n                'HealthCheckEnabled',\n                'HealthCheckIntervalSeconds',\n                'HealthCheckTimeoutSeconds',\n                'HealthyThresholdCount',\n                'UnhealthyThresholdCount',\n                'HealthCheckPath'\n            ]:\n                if target_group.get(key):\n                    backed_group[key] = target_group.get(key)\n\n            res.append(backed_group)\n    return json.dumps(res)\n\n\n\ndef backup_targets_unknown_region(events: dict, context: dict) -> str:\n    required_params = ['LoadBalancerArn']\n    check_required_params(required_params, events)\n    load_balancer_arn = events['LoadBalancerArn']\n    elb_client = _construct_client_in_given_region(_obtain_region_by_elb_arn(load_balancer_arn))\n    return _backup_targets(elb_client, events, context)\n\n\n\ndef backup_lb_arn_and_targets(events: dict, context: dict):\n    load_balancer_arn = events['LoadBalancerArn']\n    targets = backup_targets_unknown_region(events, context)\n    return {'LoadBalancerArn': load_balancer_arn, 'TargetGroups': targets}",
         "InputPayload": {
@@ -210,7 +216,7 @@
       "description": "Inject failure by updating the port of the target groups, this will return unexpected result for LB health check",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "break_targets_healthcheck_port_unknown_region",
         "Script": "import json\nimport logging\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nITS_TIME_TO_SLEEP_A_LITTLE = 0.1\nANGRY_WORD = 'Property to wait type mismatch: only str, int or list allowed'\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef _construct_client_in_given_region(given_region: str):\n    \"\"\"\n    constructs boto3 application load balancer client\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    return boto3.client('elbv2', config=config, region_name=given_region)\n\n\n\ndef _obtain_region_by_elb_arn(elb_arn: str):\n    \"\"\"\n    provide region from the elastic load balancer arn\n    \"\"\"\n    return elb_arn.split(':')[3]\n\n\n\ndef _break_targets_healthcheck_port(elb_client, events: dict, context: dict):\n    target_groups = json.loads(events['TargetGroups'])\n    for target_group in target_groups:\n        elb_client.modify_target_group(\n            TargetGroupArn=target_group['TargetGroupArn'],\n            HealthCheckEnabled=True,\n            HealthCheckIntervalSeconds=10,\n            HealthyThresholdCount=2,\n            HealthCheckPort=str(events['HealthCheckPort'])\n        )\n\n\n\ndef break_targets_healthcheck_port_unknown_region(events: dict, context: dict) -> None:\n    required_params = [\n        \"TargetGroups\",\n        \"HealthCheckPort\"\n    ]\n    check_required_params(required_params, events)\n    load_balancer_arn = events['LoadBalancerArn']\n    elb_client = _construct_client_in_given_region(_obtain_region_by_elb_arn(load_balancer_arn))\n    _break_targets_healthcheck_port(elb_client, events, context)",
         "InputPayload": {
@@ -228,7 +234,7 @@
       "onCancel": "step:TriggerRollback",
       "maxAttempts": 1,
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "assert_readiness_check_state",
         "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")",
         "InputPayload": {
@@ -246,7 +252,7 @@
       "maxAttempts": 5,
       "onCancel": "step:TriggerRollback",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "restore_targets_healthcheck_port_unknown_region",
         "Script": "import json\nimport logging\n\nimport boto3\nfrom botocore.config import Config\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\nITS_TIME_TO_SLEEP_A_LITTLE = 0.1\nANGRY_WORD = 'Property to wait type mismatch: only str, int or list allowed'\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef _construct_client_in_given_region(given_region: str):\n    \"\"\"\n    constructs boto3 application load balancer client\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    return boto3.client('elbv2', config=config, region_name=given_region)\n\n\n\ndef _obtain_region_by_elb_arn(elb_arn: str):\n    \"\"\"\n    provide region from the elastic load balancer arn\n    \"\"\"\n    return elb_arn.split(':')[3]\n\n\n\ndef _restore_targets_healthcheck_port(elb_client, events: dict, context: dict) -> None:\n    target_groups = json.loads(events['TargetGroups'])\n    for target_group in target_groups:\n        target_group.pop('LoadBalancerArn')\n        elb_client.modify_target_group(**target_group)\n\n\n\ndef restore_targets_healthcheck_port_unknown_region(events: dict, context: dict) -> None:\n    required_params = [\n        \"TargetGroups\",\n        \"LoadBalancerArn\"\n    ]\n    check_required_params(required_params, events)\n    load_balancer_arn = events['LoadBalancerArn']\n    elb_client = _construct_client_in_given_region(_obtain_region_by_elb_arn(load_balancer_arn))\n    _restore_targets_healthcheck_port(elb_client, events, context)",
         "InputPayload": {
@@ -261,7 +267,7 @@
       "action": "aws:executeScript",
       "maxAttempts": 1,
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "assert_readiness_check_state",
         "Script": "import logging\nimport random\nimport time\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    \"\"\"\n    Check for required parameters in events.\n    \"\"\"\n    for key in required_params:\n        if not events.get(key):\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef assert_readiness_check_state(events, context):\n    \"\"\"\n    Assert ReadinessCheck state\n    \"\"\"\n    required_params = ['ReadinessCheckName', 'DesiredValue', 'Timeout']\n    check_required_params(required_params, events)\n    # Route52-recovery-readiness api working only at us-west-2\n    r53arc_config = Config(\n        region_name='us-west-2',\n        signature_version='v4',\n        retries={\n            'max_attempts': 10,\n            'mode': 'standard'\n        }\n    )\n    client = boto3.client('route53-recovery-readiness', config=r53arc_config)\n    passed = 0\n    iteration = 1\n    time_to_wait = events['Timeout']\n    start = time.time()\n    while passed < time_to_wait:\n        response = client.get_readiness_check_status(\n            ReadinessCheckName=events['ReadinessCheckName']\n        )\n        readiness_check_status = response['Readiness']\n        if readiness_check_status == events['DesiredValue']:\n            logging.info(f'#{iteration}; ReadinessCheck has the expected state: {readiness_check_status} '\n                         f'Elapsed: {passed} sec;')\n            return\n        logging.info(f'#{iteration}; ReadinessCheck has not changed the state: {readiness_check_status} '\n                     f'Elapsed: {passed} sec; Sleep for 10 seconds')\n        time.sleep(10)\n        end = time.time()\n        passed = end - start\n        iteration += 1\n\n    raise TimeoutError(f\"Waiting for ReadinessCheck {events['ReadinessCheckName']} \"\n                       f\"to change state to {events['DesiredValue']}\")",
         "InputPayload": {
@@ -285,7 +291,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "start_rollback_execution",
         "InputPayload": {
           "ExecutionId": "{{automation:EXECUTION_ID}}"

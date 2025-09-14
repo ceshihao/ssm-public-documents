@@ -5,28 +5,34 @@
   "parameters": {
     "FileSystemId": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The EFS File System ID"
     },
     "AutomationAssumeRole": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
     },
     "ClientConnectionsAlarmName": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The name of ClientConnections Alarm for specified FileSystemId."
     },
     "MountTargetIds": {
       "type": "StringList",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Optional) The list of identifiers of the mount targets. The script disassociates security group(-s) from mount target(-s). Empty list means *ALL* targets in randomly selected AZ of the current Region. Provided as a YAML list",
       "default": []
     },
     "IsRollback": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Optional) Run rollback step of the given previous execution (parameter `PreviousExecutionId`). Can be either true or false.",
       "default": "false"
     },
     "PreviousExecutionId": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Optional) Previous execution id for which resources need to be cleaned up.",
       "default": ""
     }
@@ -60,7 +66,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "get_inputs_from_ssm_execution",
         "InputPayload": {
           "ExecutionId": "{{ PreviousExecutionId }}"
@@ -95,7 +101,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "get_output_from_ssm_step_execution",
         "InputPayload": {
           "ExecutionId": "{{ PreviousExecutionId }}",
@@ -110,14 +116,14 @@
       "description": "Restore original list of security groups of the mount target",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "revert_fs_security_groups",
         "InputPayload": {
           "MountTargetIdToSecurityGroupsMap": "{{ GetSecurityGroupsMapFromPreviousExecution.MountTargetIdToSecurityGroupsMap }}",
           "FileSystemId": "{{ GetInputsFromPreviousExecution.FileSystemId }}",
           "ExecutionId": "{{ PreviousExecutionId }}"
         },
-        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef revert_fs_security_groups(events, context):\n    required_params = [\"MountTargetIdToSecurityGroupsMap\", \"ExecutionId\"]\n    check_required_params(required_params, events)\n    efs_client = boto3.client(\"efs\")\n    ec2_client = boto3.client(\"ec2\")\n    for mt_map in events[\"MountTargetIdToSecurityGroupsMap\"]:\n        mount_target, security_groups_str = mt_map.split(\":\", 2)\n        security_groups_list = security_groups_str.split(\",\")\n        logger.info(\n            f\"Reverting Security groups: {security_groups_list} for MountPoint: {mount_target}\"\n        )\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mount_target, SecurityGroups=security_groups_list\n        )\n        try:\n            logger.info(\n                f'Deleting empty security group: EmptySG-{mount_target}-{events[\"ExecutionId\"]}'\n            )\n            sg_id = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        \"Name\": \"group-name\",\n                        \"Values\": [\n                            f\"EmptySG-{mount_target}-{events['ExecutionId']}\",\n                        ],\n                    },\n                ]\n            )[\"SecurityGroups\"][0][\"GroupId\"]\n            logger.info(f\"Deleting empty security group: {sg_id}\")\n            ec2_client.delete_security_group(GroupId=sg_id)\n        except ClientError as error:\n            if error.response[\"Error\"][\"Code\"] == \"InvalidGroup.NotFound\":\n                logger.info(\n                    f\"Empty security group doesn't exist: EmptySG-{mount_target}\"\n                )\n            else:\n                raise error"
+        "Script": "import json\nimport logging\nimport subprocess\nimport sys\nimport time\nimport uuid\nfrom typing import List\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef revert_fs_security_groups(events, context):\n    required_params = [\"MountTargetIdToSecurityGroupsMap\", \"ExecutionId\"]\n    check_required_params(required_params, events)\n    efs_client = boto3.client(\"efs\")\n    ec2_client = boto3.client(\"ec2\")\n    for mt_map in events[\"MountTargetIdToSecurityGroupsMap\"]:\n        mount_target, security_groups_str = mt_map.split(\":\", 2)\n        security_groups_list = security_groups_str.split(\",\")\n        logger.info(\n            f\"Reverting Security groups: {security_groups_list} for MountPoint: {mount_target}\"\n        )\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mount_target, SecurityGroups=security_groups_list\n        )\n        try:\n            logger.info(\n                f'Deleting empty security group: EmptySG-{mount_target}-{events[\"ExecutionId\"]}'\n            )\n            sg_id = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        \"Name\": \"group-name\",\n                        \"Values\": [\n                            f\"EmptySG-{mount_target}-{events['ExecutionId']}\",\n                        ],\n                    },\n                ]\n            )[\"SecurityGroups\"][0][\"GroupId\"]\n            logger.info(f\"Deleting empty security group: {sg_id}\")\n            ec2_client.delete_security_group(GroupId=sg_id)\n        except ClientError as error:\n            if error.response[\"Error\"][\"Code\"] == \"InvalidGroup.NotFound\":\n                logger.info(\n                    f\"Empty security group doesn't exist: EmptySG-{mount_target}\"\n                )\n            else:\n                raise error"
       }
     },
     {
@@ -176,13 +182,13 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "search_for_mount_target_ids",
         "InputPayload": {
           "FileSystemId": "{{ FileSystemId }}",
           "MountTargetIds": "{{ MountTargetIds }}"
         },
-        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef search_for_mount_target_ids(events, context):\n    required_params = [\"FileSystemId\"]\n    check_required_params(required_params, events)\n    mount_target_ids = []\n    efs_client = boto3.client(\"efs\")\n    logger.info(f\"Getting MountPoints with the following args: {events}\")\n    if events.get(\"MountTargetIds\"):\n        for mt in events[\"MountTargetIds\"]:\n            mt_info = efs_client.describe_mount_targets(  # no need to paginate, only one MT can have the specified id\n                MountTargetId=mt\n            )\n            if mt_info[\"MountTargets\"][0][\"FileSystemId\"] != events[\"FileSystemId\"]:\n                raise AssertionError(\n                    f\"MountTarget {mt} doesn't belong to filesystem {events['FileSystemId']}\"\n                )\n        mount_target_ids = events[\"MountTargetIds\"]\n    else:\n        # There can be only one MT for each EFS volume in each AZ\n        # so we grab any MT and assume it's the only one important for AZ failure test\n        # so no need for pagination\n        logger.info(f\"Getting all MT for FS: {events['FileSystemId']}\")\n        mount_target = efs_client.describe_mount_targets(\n            FileSystemId=events[\"FileSystemId\"], MaxItems=1\n        )[\"MountTargets\"][0]\n        mount_target_ids.append(mount_target[\"MountTargetId\"])\n    return {\"MountTargetIds\": mount_target_ids, \"FileSystemId\": events[\"FileSystemId\"]}"
+        "Script": "import json\nimport logging\nimport subprocess\nimport sys\nimport time\nimport uuid\nfrom typing import List\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef search_for_mount_target_ids(events, context):\n    required_params = [\"FileSystemId\"]\n    check_required_params(required_params, events)\n    mount_target_ids = []\n    efs_client = boto3.client(\"efs\")\n    logger.info(f\"Getting MountPoints with the following args: {events}\")\n    if events.get(\"MountTargetIds\"):\n        for mt in events[\"MountTargetIds\"]:\n            mt_info = efs_client.describe_mount_targets(  # no need to paginate, only one MT can have the specified id\n                MountTargetId=mt\n            )\n            if mt_info[\"MountTargets\"][0][\"FileSystemId\"] != events[\"FileSystemId\"]:\n                raise AssertionError(\n                    f\"MountTarget {mt} doesn't belong to filesystem {events['FileSystemId']}\"\n                )\n        mount_target_ids = events[\"MountTargetIds\"]\n    else:\n        # There can be only one MT for each EFS volume in each AZ\n        # so we grab any MT and assume it's the only one important for AZ failure test\n        # so no need for pagination\n        logger.info(f\"Getting all MT for FS: {events['FileSystemId']}\")\n        mount_target = efs_client.describe_mount_targets(\n            FileSystemId=events[\"FileSystemId\"], MaxItems=1\n        )[\"MountTargets\"][0]\n        mount_target_ids.append(mount_target[\"MountTargetId\"])\n    return {\"MountTargetIds\": mount_target_ids, \"FileSystemId\": events[\"FileSystemId\"]}"
       }
     },
     {
@@ -199,12 +205,12 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "list_security_groups_for_mount_targets",
         "InputPayload": {
           "MountTargetIds": "{{ SearchForMountTargetIds.MountTargetIds }}"
         },
-        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef list_security_groups_for_mount_targets(events, context):\n    required_params = [\"MountTargetIds\"]\n    check_required_params(required_params, events)\n\n    mt_to_sg_map = []\n    efs_client = boto3.client(\"efs\")\n\n    for mt in events[\"MountTargetIds\"]:\n        response = efs_client.describe_mount_target_security_groups(MountTargetId=mt)\n        mt_to_sg_map.append(f\"{mt}:{','.join(response['SecurityGroups'])}\")\n    return {\"MountTargetIdToSecurityGroupsMap\": mt_to_sg_map}"
+        "Script": "import json\nimport logging\nimport subprocess\nimport sys\nimport time\nimport uuid\nfrom typing import List\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef list_security_groups_for_mount_targets(events, context):\n    required_params = [\"MountTargetIds\"]\n    check_required_params(required_params, events)\n\n    mt_to_sg_map = []\n    efs_client = boto3.client(\"efs\")\n\n    for mt in events[\"MountTargetIds\"]:\n        response = efs_client.describe_mount_target_security_groups(MountTargetId=mt)\n        mt_to_sg_map.append(f\"{mt}:{','.join(response['SecurityGroups'])}\")\n    return {\"MountTargetIdToSecurityGroupsMap\": mt_to_sg_map}"
       }
     },
     {
@@ -214,13 +220,13 @@
       "onFailure": "step:RollbackCurrentExecution",
       "onCancel": "step:TriggerRollback",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "empty_security_groups_for_mount_targets",
         "InputPayload": {
           "MountTargetIds": "{{SearchForMountTargetIds.MountTargetIds}}",
           "ExecutionId": "{{automation:EXECUTION_ID}}"
         },
-        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef empty_security_groups_for_mount_targets(events, context):\n    required_params = [\"MountTargetIds\", \"ExecutionId\"]\n    check_required_params(required_params, events)\n    efs_client = boto3.client(\"efs\")\n    ec2_client = boto3.client(\"ec2\")\n\n    if not events[\"MountTargetIds\"]:\n        raise AssertionError(\n            \"MountTargetIds parameter is empty. It past contain at least one MountTarget\"\n        )\n\n    for mt in events[\"MountTargetIds\"]:\n        logger.info(f\"Emptying Security groups for mount point:{mt}\")\n        vpc_id = efs_client.describe_mount_targets(MountTargetId=mt)[\"MountTargets\"][0][\n            \"VpcId\"\n        ]\n        group_id = ec2_client.create_security_group(\n            Description=\"Empty SG\",\n            GroupName=f'EmptySG-{mt}-{events[\"ExecutionId\"]}',\n            VpcId=vpc_id,\n        )[\"GroupId\"]\n\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mt, SecurityGroups=[group_id]\n        )"
+        "Script": "import json\nimport logging\nimport subprocess\nimport sys\nimport time\nimport uuid\nfrom typing import List\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef empty_security_groups_for_mount_targets(events, context):\n    required_params = [\"MountTargetIds\", \"ExecutionId\"]\n    check_required_params(required_params, events)\n    efs_client = boto3.client(\"efs\")\n    ec2_client = boto3.client(\"ec2\")\n\n    if not events[\"MountTargetIds\"]:\n        raise AssertionError(\n            \"MountTargetIds parameter is empty. It past contain at least one MountTarget\"\n        )\n\n    for mt in events[\"MountTargetIds\"]:\n        logger.info(f\"Emptying Security groups for mount point:{mt}\")\n        vpc_id = efs_client.describe_mount_targets(MountTargetId=mt)[\"MountTargets\"][0][\n            \"VpcId\"\n        ]\n        group_id = ec2_client.create_security_group(\n            Description=\"Empty SG\",\n            GroupName=f'EmptySG-{mt}-{events[\"ExecutionId\"]}',\n            VpcId=vpc_id,\n        )[\"GroupId\"]\n\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mt, SecurityGroups=[group_id]\n        )"
       }
     },
     {
@@ -248,7 +254,7 @@
       "onFailure": "step:TriggerRollback",
       "onCancel": "step:TriggerRollback",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "revert_fs_security_groups",
         "InputPayload": {
           "MountTargetIdToSecurityGroupsMap": "{{ BackupEfsSecurityGroups.MountTargetIdToSecurityGroupsMap }}",
@@ -256,7 +262,7 @@
           "FileSystemId": "{{ FileSystemId }}",
           "ExecutionId": "{{automation:EXECUTION_ID}}"
         },
-        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef revert_fs_security_groups(events, context):\n    required_params = [\"MountTargetIdToSecurityGroupsMap\", \"ExecutionId\"]\n    check_required_params(required_params, events)\n    efs_client = boto3.client(\"efs\")\n    ec2_client = boto3.client(\"ec2\")\n    for mt_map in events[\"MountTargetIdToSecurityGroupsMap\"]:\n        mount_target, security_groups_str = mt_map.split(\":\", 2)\n        security_groups_list = security_groups_str.split(\",\")\n        logger.info(\n            f\"Reverting Security groups: {security_groups_list} for MountPoint: {mount_target}\"\n        )\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mount_target, SecurityGroups=security_groups_list\n        )\n        try:\n            logger.info(\n                f'Deleting empty security group: EmptySG-{mount_target}-{events[\"ExecutionId\"]}'\n            )\n            sg_id = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        \"Name\": \"group-name\",\n                        \"Values\": [\n                            f\"EmptySG-{mount_target}-{events['ExecutionId']}\",\n                        ],\n                    },\n                ]\n            )[\"SecurityGroups\"][0][\"GroupId\"]\n            logger.info(f\"Deleting empty security group: {sg_id}\")\n            ec2_client.delete_security_group(GroupId=sg_id)\n        except ClientError as error:\n            if error.response[\"Error\"][\"Code\"] == \"InvalidGroup.NotFound\":\n                logger.info(\n                    f\"Empty security group doesn't exist: EmptySG-{mount_target}\"\n                )\n            else:\n                raise error"
+        "Script": "import json\nimport logging\nimport subprocess\nimport sys\nimport time\nimport uuid\nfrom typing import List\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f\"Requires {key} in events\")\n\n\n\ndef revert_fs_security_groups(events, context):\n    required_params = [\"MountTargetIdToSecurityGroupsMap\", \"ExecutionId\"]\n    check_required_params(required_params, events)\n    efs_client = boto3.client(\"efs\")\n    ec2_client = boto3.client(\"ec2\")\n    for mt_map in events[\"MountTargetIdToSecurityGroupsMap\"]:\n        mount_target, security_groups_str = mt_map.split(\":\", 2)\n        security_groups_list = security_groups_str.split(\",\")\n        logger.info(\n            f\"Reverting Security groups: {security_groups_list} for MountPoint: {mount_target}\"\n        )\n        efs_client.modify_mount_target_security_groups(\n            MountTargetId=mount_target, SecurityGroups=security_groups_list\n        )\n        try:\n            logger.info(\n                f'Deleting empty security group: EmptySG-{mount_target}-{events[\"ExecutionId\"]}'\n            )\n            sg_id = ec2_client.describe_security_groups(\n                Filters=[\n                    {\n                        \"Name\": \"group-name\",\n                        \"Values\": [\n                            f\"EmptySG-{mount_target}-{events['ExecutionId']}\",\n                        ],\n                    },\n                ]\n            )[\"SecurityGroups\"][0][\"GroupId\"]\n            logger.info(f\"Deleting empty security group: {sg_id}\")\n            ec2_client.delete_security_group(GroupId=sg_id)\n        except ClientError as error:\n            if error.response[\"Error\"][\"Code\"] == \"InvalidGroup.NotFound\":\n                logger.info(\n                    f\"Empty security group doesn't exist: EmptySG-{mount_target}\"\n                )\n            else:\n                raise error"
       }
     },
     {
@@ -292,7 +298,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "start_rollback_execution",
         "InputPayload": {
           "ExecutionId": "{{automation:EXECUTION_ID}}"

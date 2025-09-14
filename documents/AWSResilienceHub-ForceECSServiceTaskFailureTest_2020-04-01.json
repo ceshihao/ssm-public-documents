@@ -5,18 +5,22 @@
   "parameters": {
     "ClusterName": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The name of the ECS Cluster"
     },
     "ServiceName": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The name of ECS Service"
     },
     "AutomationAssumeRole": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
     },
     "CanaryAlarmName": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The Synthetic Alarm which should be green within recovery time."
     },
     "PercentageOfTasksToStop": {
@@ -72,7 +76,7 @@
       "action": "aws:executeScript",
       "description": "Fail if PercentageOfTasksToStop is less than 1 or greater than 100.",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "raise_exception",
         "InputPayload": {
           "ErrorMessage": "PercentageOfTasksToStop should be greater than 0 and less than 100."
@@ -86,7 +90,7 @@
       "action": "aws:executeScript",
       "description": "Stop percentage of tasks",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "stop_selected_tasks",
         "Script": "import logging\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef stop_selected_tasks(events, context):\n    \"\"\"\n    Stop NumberOfTasksToStop or total number of tasks running\n    if NumberOfTasksToStop is greater than the total number.\n    :param events: The object which contains passed parameters from SSM document\n     * `ServiceName` - Required. Name of ECS Service\n     * `ClusterName` - Required. Name of ECS Cluster\n     * `NumberOfTasksToStop` - Required. Number of tasks to stop\n    :param context: context\n    :return: True or error\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ecs_client = boto3.client('ecs', config=config)\n\n    paginator = ecs_client.get_paginator('list_tasks')\n    pages = paginator.paginate(serviceName=events['ServiceName'],\n                               cluster=events['ClusterName'],\n                               desiredStatus='RUNNING')\n\n    desired_count = ecs_client.describe_services(services=[events['ServiceName']],\n                                                 cluster=events['ClusterName'])[\"services\"][0][\"desiredCount\"]\n\n    percentage_of_task_to_stop = events['PercentageOfTasksToStop']\n    number_of_task_to_stop = 0\n\n    if desired_count:\n        number_of_task_to_stop = round(desired_count * percentage_of_task_to_stop / 100)\n\n    tasks_stopped = 0\n    for page in pages:\n        task_arns = page.get('taskArns')\n        for task_arn in task_arns:\n            if tasks_stopped >= number_of_task_to_stop:\n                break\n            ecs_client.stop_task(\n                cluster=events['ClusterName'],\n                task=task_arn\n            )\n            tasks_stopped += 1\n\n    return True",
         "InputPayload": {
@@ -101,7 +105,7 @@
       "action": "aws:executeScript",
       "description": "Wait for all status tasks in ECS application to be in \"RUNNING\" state",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "wait_services_stable",
         "Script": "import logging\n\nimport boto3\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef check_required_params(required_params, events):\n    for key in required_params:\n        if key not in events:\n            raise KeyError(f'Requires {key} in events')\n\n\n\ndef wait_services_stable(events, context):\n    \"\"\"\n    Wait while service will be stable.\n    :param events: The object which contains passed parameters from SSM document\n     * `ServiceName` - Required. Name of ECS Service\n     * `ClusterName` - Required. Name of ECS Cluster\n    :param context: context\n    :return: True or error\n    \"\"\"\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    ecs_client = boto3.client('ecs', config=config)\n\n    cluster_name = events['ClusterName']\n    service = events.get('ServiceName')\n\n    if service:\n        services = [service]\n    else:\n        services = []\n        paginator = ecs_client.get_paginator('list_services')\n        pages = paginator.paginate(cluster=cluster_name)\n\n        for page in pages:\n            service_arns = page.get('serviceArns')\n            services.extend(service_arns)\n\n    waiter = ecs_client.get_waiter('services_stable')\n    waiter.wait(\n        cluster=cluster_name,\n        services=services,\n        WaiterConfig={\n            'Delay': 15,\n            'MaxAttempts': 20\n        }\n    )\n    return True",
         "InputPayload": {

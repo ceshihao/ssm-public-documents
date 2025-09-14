@@ -5,30 +5,37 @@
   "parameters": {
     "FileSystemId": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The EFS File System ID"
     },
     "AutomationAssumeRole": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
     },
     "PercentIOLimitAlarmName": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The name of PercentIOLimit Alarm for the specified FileSystemId."
     },
     "InstanceId1": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The ID of the first EC2 Instance which has the EFS filesystem mounted."
     },
     "InstanceId2": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The ID of the second EC2 Instance which has the EFS filesystem mounted."
     },
     "MountPath1": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The path on the filesystem of the first instance where the EFS file system is mounted."
     },
     "MountPath2": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The path on the filesystem of the second instance where the EFS file system is mounted."
     }
   },
@@ -56,7 +63,7 @@
       "description": "Cause an IO spike in 2 EC2 instances which have the EFS filesystem mounted.",
       "action": "aws:executeScript",
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "cause_io_spike",
         "InputPayload": {
           "InstanceId1": "{{ InstanceId1 }}",
@@ -64,7 +71,7 @@
           "MountPath1": "{{ MountPath1 }}",
           "MountPath2": "{{ MountPath2 }}"
         },
-        "Script": "import logging\nimport time\nfrom typing import List\nimport json\nimport uuid\nimport sys\nimport subprocess\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef cause_io_spike(events: dict, context: dict):\n    ssm_client = boto3.client(\"ssm\")\n    instance_id1: str = events.get(\"InstanceId1\") or \"\"\n    instance_id2: str = events.get(\"InstanceId2\") or \"\"\n    mount_path1 = events.get(\"MountPath1\") or \"\"\n    mount_path2 = events.get(\"MountPath2\") or \"\"\n\n    mount_paths = [mount_path1, mount_path2]\n    instance_ids = [instance_id1, instance_id2]\n    command_ids = []\n    command_statuses = []\n\n    for i in range(2):\n        commands = [\n            f\"[ -d {mount_paths[i]}/PercentIOLimit_Alarm{i+1} ] || \"\n            f\"mkdir {mount_paths[i]}/PercentIOLimit_Alarm{i+1}\",\n            \"fio --version || (sudo yum update -y && sudo yum install fio -y) || \"\n            \"(sudo apt-get update -y && sudo apt-get install -y fio)\",\n            f\"sudo fio --directory={mount_paths[i]}/PercentIOLimit_Alarm{i+1} --name fio_test_file{i+1} \"\n            \"--rw=randwrite --bs=1k --size=1g --runtime=300 --time_based=1 \"\n            \"--direct=1 --norandommap --ioengine=libaio --iodepth=64\",\n            f\"rm -rf {mount_paths[i]}/PercentIOLimit_Alarm{i+1}\"\n        ]\n\n        send_command_res_instance = ssm_client.send_command(\n            InstanceIds=[instance_ids[i]],\n            DocumentName=\"AWS-RunShellScript\",\n            TimeoutSeconds=600,\n            Comment=f\"RunShellScriptOnInstanceNumber{i+1}ForTest\",\n            Parameters={\"commands\": commands},\n        )\n        command_ids.append(send_command_res_instance[\"Command\"][\"CommandId\"])\n        logging.info(f\"CommandId{i+1}: {command_ids[i]}\")\n        command_statuses.append(send_command_res_instance[\"Command\"][\"Status\"])\n\n    while any(\n        [status == \"Pending\" or status == \"InProgress\" for status in command_statuses]\n    ):\n        command_statuses = []\n        logging.info(\"sleeping 10 seconds...\")\n        time.sleep(10)\n\n        command_invocation_responses = []\n        for i in range(2):\n            get_command_invocation_res = ssm_client.get_command_invocation(\n                InstanceId=instance_ids[i], CommandId=command_ids[i]\n            )\n            command_invocation_responses.append(get_command_invocation_res)\n\n            command_statuses.append(get_command_invocation_res[\"Status\"])\n            logging.info(f\"CommandStatus{i+1}: {command_statuses[i]}\")\n\n    logging.info(\"Finished running commands on all instances.\")"
+        "Script": "import json\nimport logging\nimport subprocess\nimport sys\nimport time\nimport uuid\nfrom typing import List\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nlogger = logging.getLogger(__name__)\nlogger.setLevel(logging.INFO)\n\n\n\ndef cause_io_spike(events: dict, context: dict):\n    ssm_client = boto3.client(\"ssm\")\n    instance_id1: str = events.get(\"InstanceId1\") or \"\"\n    instance_id2: str = events.get(\"InstanceId2\") or \"\"\n    mount_path1 = events.get(\"MountPath1\") or \"\"\n    mount_path2 = events.get(\"MountPath2\") or \"\"\n\n    mount_paths = [mount_path1, mount_path2]\n    instance_ids = [instance_id1, instance_id2]\n    command_ids = []\n    command_statuses = []\n\n    for i in range(2):\n        commands = [\n            f\"[ -d {mount_paths[i]}/PercentIOLimit_Alarm{i+1} ] || \"\n            f\"mkdir {mount_paths[i]}/PercentIOLimit_Alarm{i+1}\",\n            \"fio --version || (sudo yum update -y && sudo yum install fio -y) || \"\n            \"(sudo apt-get update -y && sudo apt-get install -y fio)\",\n            f\"sudo fio --directory={mount_paths[i]}/PercentIOLimit_Alarm{i+1} --name fio_test_file{i+1} \"\n            \"--rw=randwrite --bs=1k --size=1g --runtime=300 --time_based=1 \"\n            \"--direct=1 --norandommap --ioengine=libaio --iodepth=64\",\n            f\"rm -rf {mount_paths[i]}/PercentIOLimit_Alarm{i+1}\"\n        ]\n\n        send_command_res_instance = ssm_client.send_command(\n            InstanceIds=[instance_ids[i]],\n            DocumentName=\"AWS-RunShellScript\",\n            TimeoutSeconds=600,\n            Comment=f\"RunShellScriptOnInstanceNumber{i+1}ForTest\",\n            Parameters={\"commands\": commands},\n        )\n        command_ids.append(send_command_res_instance[\"Command\"][\"CommandId\"])\n        logging.info(f\"CommandId{i+1}: {command_ids[i]}\")\n        command_statuses.append(send_command_res_instance[\"Command\"][\"Status\"])\n\n    while any(\n        [status == \"Pending\" or status == \"InProgress\" for status in command_statuses]\n    ):\n        command_statuses = []\n        logging.info(\"sleeping 10 seconds...\")\n        time.sleep(10)\n\n        command_invocation_responses = []\n        for i in range(2):\n            get_command_invocation_res = ssm_client.get_command_invocation(\n                InstanceId=instance_ids[i], CommandId=command_ids[i]\n            )\n            command_invocation_responses.append(get_command_invocation_res)\n\n            command_statuses.append(get_command_invocation_res[\"Status\"])\n            logging.info(f\"CommandStatus{i+1}: {command_statuses[i]}\")\n\n    logging.info(\"Finished running commands on all instances.\")"
       }
     },
     {

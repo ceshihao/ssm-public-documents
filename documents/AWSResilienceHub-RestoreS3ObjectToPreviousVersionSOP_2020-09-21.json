@@ -5,18 +5,22 @@
   "parameters": {
     "S3BucketName": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The S3 Bucket Name."
     },
     "S3BucketObjectKey": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The S3 Bucket Object Key."
     },
     "AutomationAssumeRole": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf."
     },
     "Timestamp": {
       "type": "String",
+      "allowedPattern": "^[0-9a-zA-Z.\\-_/:]+$",
       "description": "(Optional) The timestamp you would like to restore the object to. The object will be restored to the closest version before that timestamp. Supported formats: 1. an ISO-8601 timestamp (e.g 2020-01-26T08:33:54Z). 2. a date in the following format - 01-24-2020 23:59:50 +2 (if no offset is specified UTC is assumed). 3. A minus sign followed by the number of seconds to go back (e.g -300 means go back 5 minutes). If unspecified the document will go back 1 version.",
       "default": ""
     }
@@ -40,7 +44,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "start_time",
         "Script": "import logging\nimport time\nfrom datetime import datetime, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef start_time(events, context):\n    return datetime.now(timezone.utc).isoformat()"
       }
@@ -72,14 +76,14 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "restore_to_the_previous_version",
         "InputPayload": {
           "S3BucketName": "{{S3BucketName}}",
           "S3BucketObjectKey": "{{S3BucketObjectKey}}",
           "Timestamp": "{{Timestamp}}"
         },
-        "Script": "from datetime import datetime, timezone\nimport boto3\nfrom botocore.config import Config\nimport time\nimport dateutil.parser\n\n\n\n\ndef restore_to_the_previous_version(events, context):\n    \"\"\"\n    Restore to the previous version the object\n    :return: Restore time, actual version, old version\n    \"\"\"\n    if 'S3BucketObjectKey' not in events or 'S3BucketName' not in events:\n        raise KeyError('Requires S3BucketObjectKey and S3BucketName in events')\n\n    start = datetime.utcnow()\n\n    s3_bucket_name = events['S3BucketName']\n    s3_bucket_object_key = events['S3BucketObjectKey']\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    s3_client = boto3.client('s3', config=config)\n    if events['Timestamp']:\n        if events['Timestamp'].startswith('-'):\n            timestamp = datetime.fromtimestamp(time.time() - int(events['Timestamp'][1:]), timezone.utc)\n        else:\n            timestamp = dateutil.parser.parse(events['Timestamp'])\n            if not timestamp.tzinfo:\n                timestamp = timestamp.replace(tzinfo=timezone.utc)\n\n    else:\n        timestamp = None\n\n    list_object_versions_response = s3_client.list_object_versions(Bucket=s3_bucket_name,\n                                                                   Prefix=s3_bucket_object_key,\n                                                                   MaxKeys=2)\n    if \"Versions\" not in list_object_versions_response:\n        raise AssertionError(f'No versions for object {s3_bucket_object_key} in bucket {s3_bucket_name}.')\n    latest_version_id = list_object_versions_response[\"Versions\"][0]['VersionId']\n    number_of_versions_went_back = 1\n\n    if timestamp:\n        version_to_restore_to, went_back_number = find_version_to_restore_to_using_timestamp(\n            s3_bucket_name, s3_bucket_object_key, timestamp)\n        number_of_versions_went_back = went_back_number\n    else:\n        if len(list_object_versions_response[\"Versions\"]) < 2:\n            raise AssertionError(f'The file {s3_bucket_object_key} has less than 2 versions: '\n                                 f'{list_object_versions_response[\"Versions\"]}. Can not restore to the previous one.')\n\n        previous_version = list_object_versions_response[\"Versions\"][1]['VersionId']\n        version_to_restore_to = previous_version\n\n    print(f'Restore {s3_bucket_object_key} file from the {latest_version_id} (latest) '\n          f'version to the {version_to_restore_to} version '\n          f'in the bucket {s3_bucket_object_key}...')\n    copy_source = {\n        'Bucket': s3_bucket_name,\n        'Key': s3_bucket_object_key,\n        'VersionId': version_to_restore_to,\n    }\n    s3_client.copy(copy_source, s3_bucket_name, s3_bucket_object_key)\n    print(f'The file {s3_bucket_object_key} file was successfully restored from the'\n          f' {latest_version_id} (latest) '\n          f'version to the {version_to_restore_to} version')\n\n    return {'RestoreTimeSeconds': str((datetime.utcnow() - start).total_seconds()),\n            'ActualVersion': version_to_restore_to,\n            'OldVersion': latest_version_id,\n            'NumberOfVersionsWentBack': number_of_versions_went_back}\n\n\n\ndef find_version_to_restore_to_using_timestamp(s3_bucket_name, s3_bucket_object_key, timestamp: datetime):\n    s3_client = boto3.client('s3')\n    paginator = s3_client.get_paginator('list_object_versions')\n    page_iterator = paginator.paginate(Bucket=s3_bucket_name, Prefix=s3_bucket_object_key)\n    number_of_versions_went_back = 0\n\n    for page in page_iterator:\n        versions = page[\"Versions\"]\n\n        for i, version in enumerate(versions):\n            version_date = version[\"LastModified\"]\n\n            if version_date <= timestamp:\n                return version['VersionId'], number_of_versions_went_back\n\n            # If there are no more versions and timestamp is still older, return the oldest version.\n            if i + 1 == len(versions) and \"NextToken\" not in page:\n                last_version = version['VersionId'], number_of_versions_went_back\n\n            number_of_versions_went_back += 1\n\n    return last_version"
+        "Script": "import time\nfrom datetime import datetime, timezone\n\nimport boto3\nimport dateutil.parser\nfrom botocore.config import Config\n\n\n\n\ndef restore_to_the_previous_version(events, context):\n    \"\"\"\n    Restore to the previous version the object\n    :return: Restore time, actual version, old version\n    \"\"\"\n    if 'S3BucketObjectKey' not in events or 'S3BucketName' not in events:\n        raise KeyError('Requires S3BucketObjectKey and S3BucketName in events')\n\n    start = datetime.utcnow()\n\n    s3_bucket_name = events['S3BucketName']\n    s3_bucket_object_key = events['S3BucketObjectKey']\n    config = Config(retries={'max_attempts': 20, 'mode': 'standard'})\n    s3_client = boto3.client('s3', config=config)\n    if events['Timestamp']:\n        if events['Timestamp'].startswith('-'):\n            timestamp = datetime.fromtimestamp(time.time() - int(events['Timestamp'][1:]), timezone.utc)\n        else:\n            timestamp = dateutil.parser.parse(events['Timestamp'])\n            if not timestamp.tzinfo:\n                timestamp = timestamp.replace(tzinfo=timezone.utc)\n\n    else:\n        timestamp = None\n\n    list_object_versions_response = s3_client.list_object_versions(Bucket=s3_bucket_name,\n                                                                   Prefix=s3_bucket_object_key,\n                                                                   MaxKeys=2)\n    if \"Versions\" not in list_object_versions_response:\n        raise AssertionError(f'No versions for object {s3_bucket_object_key} in bucket {s3_bucket_name}.')\n    latest_version_id = list_object_versions_response[\"Versions\"][0]['VersionId']\n    number_of_versions_went_back = 1\n\n    if timestamp:\n        version_to_restore_to, went_back_number = find_version_to_restore_to_using_timestamp(\n            s3_bucket_name, s3_bucket_object_key, timestamp)\n        number_of_versions_went_back = went_back_number\n    else:\n        if len(list_object_versions_response[\"Versions\"]) < 2:\n            raise AssertionError(f'The file {s3_bucket_object_key} has less than 2 versions: '\n                                 f'{list_object_versions_response[\"Versions\"]}. Can not restore to the previous one.')\n\n        previous_version = list_object_versions_response[\"Versions\"][1]['VersionId']\n        version_to_restore_to = previous_version\n\n    print(f'Restore {s3_bucket_object_key} file from the {latest_version_id} (latest) '\n          f'version to the {version_to_restore_to} version '\n          f'in the bucket {s3_bucket_object_key}...')\n    copy_source = {\n        'Bucket': s3_bucket_name,\n        'Key': s3_bucket_object_key,\n        'VersionId': version_to_restore_to,\n    }\n    s3_client.copy(copy_source, s3_bucket_name, s3_bucket_object_key)\n    print(f'The file {s3_bucket_object_key} file was successfully restored from the'\n          f' {latest_version_id} (latest) '\n          f'version to the {version_to_restore_to} version')\n\n    return {'RestoreTimeSeconds': str((datetime.utcnow() - start).total_seconds()),\n            'ActualVersion': version_to_restore_to,\n            'OldVersion': latest_version_id,\n            'NumberOfVersionsWentBack': number_of_versions_went_back}\n\n\n\ndef find_version_to_restore_to_using_timestamp(s3_bucket_name, s3_bucket_object_key, timestamp: datetime):\n    s3_client = boto3.client('s3')\n    paginator = s3_client.get_paginator('list_object_versions')\n    page_iterator = paginator.paginate(Bucket=s3_bucket_name, Prefix=s3_bucket_object_key)\n    number_of_versions_went_back = 0\n\n    for page in page_iterator:\n        versions = page[\"Versions\"]\n\n        for i, version in enumerate(versions):\n            version_date = version[\"LastModified\"]\n\n            if version_date <= timestamp:\n                return version['VersionId'], number_of_versions_went_back\n\n            # If there are no more versions and timestamp is still older, return the oldest version.\n            if i + 1 == len(versions) and \"NextToken\" not in page:\n                last_version = version['VersionId'], number_of_versions_went_back\n\n            number_of_versions_went_back += 1\n\n    return last_version"
       }
     },
     {
@@ -94,7 +98,7 @@
         }
       ],
       "inputs": {
-        "Runtime": "python3.8",
+        "Runtime": "python3.11",
         "Handler": "recovery_time",
         "Script": "import logging\nimport time\nfrom datetime import datetime, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\nfrom dateutil import parser\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n\n\ndef recovery_time(events, context):\n    return (datetime.now(timezone.utc) - parser.parse(events['StartTime'])).seconds",
         "InputPayload": {
