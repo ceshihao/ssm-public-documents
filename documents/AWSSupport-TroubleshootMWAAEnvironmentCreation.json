@@ -1,7 +1,7 @@
 {
-  "description": "The **AWSSupport-TroubleshootMWAAEnvironmentCreation** helps you print information to debug Amazon Managed Workflows for Apache Airflow (Amazon MWAA) Environment creation issues perform checks along with the documented reasons on a best effort basis to help identify the failure. Important: This runbook does not check the VPC Endpoint policies.",
+  "description": "The **AWSSupport-TroubleshootMWAAEnvironmentCreation** helps you diagnose Amazon Managed Workflows for Apache Airflow (Amazon MWAA) environment creation failures by performing comprehensive checks on AWS Identity and Access Management (IAM) execution role permissions, AWS Key Management Service (AWS KMS) key policies, Amazon CloudWatch log groups, network configuration (subnets, security groups, NACLs, routes), service endpoint connectivity, and Amazon S3 bucket settings along with documented reasons on a best effort basis to help identify the failure. Important: This runbook does not check the VPC Endpoint policies.",
   "schemaVersion": "0.3",
-  "assumeRole": "{{AutomationAssumeRole}}",
+  "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "AutomationAssumeRole": {
       "type": "AWS::IAM::Role::Arn",
@@ -24,6 +24,7 @@
       "nextStep": "CheckIAMPermissionsOnExecutionRole",
       "onFailure": "Abort",
       "isCritical": true,
+      "maxAttempts": 3,
       "inputs": {
         "Service": "mwaa",
         "Api": "GetEnvironment",
@@ -75,13 +76,12 @@
     {
       "name": "CheckIAMPermissionsOnExecutionRole",
       "action": "aws:executeScript",
-      "description": "Verifies if the execution role has the required permissions for Airflow, S3, Logs, CloudWatch, and SQS resources. If a Customer Managed KMS key is detected, the automation validates the key's required permissions.",
+      "description": "Verifies if the execution role has the required permissions for Airflow, Amazon S3, Logs, Amazon CloudWatch, and Amazon SQS resources. If a Customer Managed KMS key is detected, the automation validates the key's required permissions.",
       "nextStep": "CheckKMSPolicyOnKMSKey",
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "check_iam_permissions.check_iam_permissions",
         "InputPayload": {
           "EnvironmentArn": "{{GetMWAAEnvironmentDetails.EnvironmentArn}}",
           "ExecutionRoleArn": "{{GetMWAAEnvironmentDetails.ExecutionRoleArn}}",
@@ -89,7 +89,9 @@
           "SourceBucketArn": "{{GetMWAAEnvironmentDetails.SourceBucketArn}}",
           "EnvironmentName": "{{EnvironmentName}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "check_iam_permissions.check_iam_permissions",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -112,18 +114,19 @@
     {
       "name": "CheckKMSPolicyOnKMSKey",
       "action": "aws:executeScript",
-      "description": "Checks if the KMS key policy allows the MWAA environment to use the key for CloudWatch Logs encryption. If the KMS key is AWS managed, the automation does not perform any checks.",
+      "description": "Checks if the KMS key policy allows the MWAA environment to use the key for Amazon CloudWatch Logs encryption. If the KMS key is AWS managed, the automation does not perform any checks.",
       "nextStep": "CheckIfRequiredLogGroupsExists",
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "check_kms_key_policy.check_kms_key_policy",
         "InputPayload": {
           "KmsKey": "{{CheckIAMPermissionsOnExecutionRole.KmsKey}}",
           "TopLevelDomain": "{{CheckIAMPermissionsOnExecutionRole.TopLevelDomain}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "check_kms_key_policy.check_kms_key_policy",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -136,19 +139,20 @@
     {
       "name": "CheckIfRequiredLogGroupsExists",
       "action": "aws:executeScript",
-      "description": "Checks if the MWAA environment required CloudWatch Log Groups exist, if not the automation checks CloudTrail in order to locate CreateLogGroup and DeletelogGroup events.",
+      "description": "Checks if the MWAA environment required Amazon CloudWatch Log Groups exist, if not the automation checks AWS CloudTrail in order to locate CreateLogGroup and DeletelogGroup events.",
       "nextStep": "BranchOnLogGroupsFindings",
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "check_log_groups.check_log_groups",
         "InputPayload": {
           "EnvironmentName": "{{EnvironmentName}}",
           "LoggingConfiguration": "{{GetMWAAEnvironmentDetails.LoggingConfiguration}}",
           "CreatedAt": "{{GetMWAAEnvironmentDetails.CreatedAt}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "check_log_groups.check_log_groups",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -171,7 +175,7 @@
     {
       "name": "BranchOnLogGroupsFindings",
       "action": "aws:branch",
-      "description": "Branches on the existente of CloudWatch log groups related to the MWAA environment. If at least one log group exist the automation parses it in order to locate errors.",
+      "description": "Branches on the existente of Amazon CloudWatch log groups related to the MWAA environment. If at least one log group exist the automation parses it in order to locate errors.",
       "nextStep": "GetRequiredEndPointsDetails",
       "inputs": {
         "Choices": [
@@ -187,18 +191,19 @@
     {
       "name": "CheckForErrorsInLogGroups",
       "action": "aws:executeScript",
-      "description": "Parses existing MWAA environment CloudWatch log groups in order to locate errors.",
+      "description": "Parses existing MWAA environment Amazon CloudWatch log groups in order to locate errors.",
       "nextStep": "GetRequiredEndPointsDetails",
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "check_for_failing_logs.check_for_failing_logs",
         "InputPayload": {
           "EnvironmentName": "{{EnvironmentName}}",
           "LogGroupsNames": "{{CheckIfRequiredLogGroupsExists.LogGroupsNames}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "check_for_failing_logs.check_for_failing_logs",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -214,15 +219,16 @@
       "description": "Retrieves the services' endpoints utilized by the MWAA environment.",
       "nextStep": "CheckNetworkConfiguration",
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "get_required_endpoints_details.get_required_endpoints_details",
         "InputPayload": {
           "TopLevelDomain": "{{CheckIAMPermissionsOnExecutionRole.TopLevelDomain}}",
           "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "get_required_endpoints_details.get_required_endpoints_details",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -243,16 +249,17 @@
       "description": "Verifies if the MWAA environment's network configuration is properly configured, this step verifies multiple networking resources.",
       "nextStep": "CheckEndpointsConnectivity",
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "check_network_reachability.networking_check",
         "InputPayload": {
           "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}",
           "VpcId": "{{GetRequiredEndPointsDetails.VpcId}}",
           "SecurityGroupsIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "check_network_reachability.networking_check",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -283,17 +290,18 @@
       "description": "Verifies if the MWAA environment is able to access the required endpoints, for this the automation invokes the 'AWSSupport-ConnectivityTroubleshooter' automation.",
       "nextStep": "CheckS3BlockPublicAccess",
       "onFailure": "Continue",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "check_service_connectivity.check_connectivity_to_dep_services",
         "InputPayload": {
           "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}",
           "VpcId": "{{GetRequiredEndPointsDetails.VpcId}}",
           "SecurityGroupsIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}",
           "EndPointsDetails": "{{GetRequiredEndPointsDetails.EndPointsDetails}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "check_service_connectivity.check_connectivity_to_dep_services",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -306,17 +314,18 @@
     {
       "name": "CheckS3BlockPublicAccess",
       "action": "aws:executeScript",
-      "description": "Checks if the MWAA environment S3 bucket has Block Public Access enabled, also checks the account's S3 Block Public Access settings.",
+      "description": "Checks if the MWAA environment Amazon S3 bucket has Block Public Access enabled, also checks the account's Amazon S3 Block Public Access settings.",
       "nextStep": "GenerateReport",
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "check_s3_block_public_access.is_bucket_public",
         "InputPayload": {
           "SourceBucketArn": "{{GetMWAAEnvironmentDetails.SourceBucketArn}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "check_s3_block_public_access.is_bucket_public",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -332,10 +341,9 @@
       "description": "Generates a report with the findings of the automation.",
       "isEnd": true,
       "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
       "inputs": {
-        "Runtime": "python3.11",
-        "Attachment": "attachment.zip",
-        "Handler": "generate_report.generate_report",
         "InputPayload": {
           "EnvironmentName": "{{EnvironmentName}}",
           "ExecutionRoleEvaluation": "{{CheckIAMPermissionsOnExecutionRole.ExecutionRoleEvaluation}}",
@@ -349,7 +357,9 @@
           "ConnectivityEvaluation": "{{CheckEndpointsConnectivity.ConnectivityEvaluation}}",
           "S3BlockPublicAccessEvaluation": "{{CheckS3BlockPublicAccess.S3BlockPublicAccessEvaluation}}"
         },
-        "Script": "%PYTHONSCRIPT%"
+        "Handler": "generate_report.generate_report",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
       },
       "outputs": [
         {
@@ -364,9 +374,9 @@
     "GenerateReport.AutomationReport"
   ],
   "files": {
-    "attachment.zip": {
+    "attachments.zip": {
       "checksums": {
-        "sha256": "80d2d57488b7e199c39d01626c58192314637db9551c649ac3ea4dd31770c26c"
+        "SHA256": "1bd981a77bf6bb3a52fea960200a6665646111c7e7f086e0fac408f5f9da41f6"
       }
     }
   }

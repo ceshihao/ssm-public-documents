@@ -1,0 +1,155 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The **AWSSupport-InstallEC2Rescue** runbook installs and runs the Amazon EC2 [Rescue for Linux (ec2rl)](https://github.com/awslabs/aws-ec2rescue-linux) or [Rescue for Windows Server](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/Windows-Server-EC2Rescue.html) tool on the target Amazon Elastic Compute Cloud (Amazon EC2) instance.\n\n### Prerequisites:\n> * For Linux instances, the Amazon EC2 Rescue for Linux (ec2rl) requires Python 2.7.9, 3.2, or a later version installed on the target instance.\n> * For Windows instances, the Amazon EC2 Rescue for Windows requires .NET Framework 3.5 SP1 or later and the AWS Tools for PowerShell installed on the target instance.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The ID of your EC2 instance."
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "Version": {
+      "type": "String",
+      "description": "(Optional) The EC2Rescue version you want to install (only applies to EC2Rescue for Windows).",
+      "allowedPattern": "^(([0-9]{1,2}.){0,3}[0-9]{1,2}|latest|beta|alpha)$",
+      "default": "latest"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "installEC2Rescue",
+      "description": "Installs the `AWSSupport-EC2Rescue` distributor package via `AWS-ConfigureAWSPackage`.",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWS-ConfigureAWSPackage",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "name": "AWSSupport-EC2Rescue",
+          "action": "Install"
+        }
+      },
+      "isCritical": true,
+      "nextStep": "describeInstance"
+    },
+    {
+      "name": "describeInstance",
+      "description": "Describes the target instance to get the instance platform.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "Platform",
+          "Selector": "$.Reservations[0].Instances[0].Platform",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnInstancePlatform"
+    },
+    {
+      "name": "branchOnInstancePlatform",
+      "description": "Branches on the instance platform.",
+      "action": "aws:branch",
+      "nextStep": "runScriptForLinux",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "runScriptForWindows",
+            "Variable": "{{ describeInstance.Platform }}",
+            "StringEquals": "windows"
+          }
+        ],
+        "Default": "runScriptForLinux"
+      }
+    },
+    {
+      "name": "runScriptForLinux",
+      "description": "Runs the Amazon EC2 Rescue for Linux (ec2rl) tool on the target instance.",
+      "action": "aws:runCommand",
+      "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "#!/bin/sh",
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License  http://aws.amazon.com/asl/",
+            "",
+            "error_trap()",
+            "{",
+            "    error_message=\"$1\"",
+            "    printf \"%s\\n\" \"$error_message\"",
+            "    printf \"%.s=\" $(seq 1 80)",
+            "    printf \"\\nThe EC2Rescue execution did not complete successfully.\\n\"",
+            "    exit 1",
+            "}",
+            "",
+            "printf \"Running EC2 Rescue for Linux\\n\"",
+            "output=$(sudo ec2rl run --only-modules=date 2>&1) || error_trap \"$output\"",
+            "",
+            "printf \"Done\\n\""
+          ]
+        }
+      },
+      "isEnd": true
+    },
+    {
+      "name": "runScriptForWindows",
+      "description": "Runs the Amazon EC2 Rescue for Rescue for Windows Server tool on the target instance.",
+      "action": "aws:runCommand",
+      "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "# Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0",
+            "# Licensed under the Amazon Software License: http://aws.amazon.com/asl/",
+            "",
+            "Import-Module EC2Rescue",
+            "",
+            "try {",
+            "    $env:EC2RESCUE_EC2RW_DIR = \"${env:PROGRAMFILES}\\Amazon\\EC2Rescue\"",
+            "    & \"${env:EC2RESCUE_EC2RW_DIR}\\EC2RescueCmd.exe\" /accepteula /online /collect:ssm-agent /output:output.txt",
+            "    Exit 0",
+            "}",
+            "catch {",
+            "    Write-Host $_.Exception.Message",
+            "    Exit 1",
+            "}"
+          ]
+        }
+      },
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "installEC2Rescue.Output"
+  ]
+}

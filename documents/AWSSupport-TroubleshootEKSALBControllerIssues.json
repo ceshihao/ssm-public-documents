@@ -1,0 +1,436 @@
+{
+  "description": "The **AWSSupport-TroubleshootEKSALBControllerIssues** automation runbook is designed to diagnose common issues that prevent the AWS Load Balancer Controller from properly provisioning and managing Application Load Balancers (ALB) and Network Load Balancers (NLB) for Kubernetes ingresses and services. **Note:** This automation runbook is designed for Amazon Elastic Kubernetes Service (Amazon EKS) clusters using Amazon EC2 node groups and does not currently support Amazon EKS Fargate profiles.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, AWS Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "EksClusterName": {
+      "type": "String",
+      "description": "(Required) Name of the Amazon Elastic Kubernetes Service (EKS) cluster.",
+      "allowedPattern": "^[0-9A-Za-z][A-Za-z0-9-_]{0,99}$"
+    },
+    "ALBControllerDeploymentName": {
+      "type": "String",
+      "description": "(Optional) The name of the AWS Load Balancer Controller deployment in your EKS cluster. This is typically 'aws-load-balancer-controller' unless you've customized it during installation. This name is used to identify and interact with the controller deployment during troubleshooting.",
+      "allowedPattern": "^[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$",
+      "default": "aws-load-balancer-controller"
+    },
+    "ALBControllerNamespace": {
+      "type": "String",
+      "description": "(Optional) The Kubernetes namespace where the AWS Load Balancer Controller is deployed. By default, this is 'kube-system', but it may be different if you've installed the controller in a custom namespace. This namespace is used to locate and interact with the controller resources.",
+      "allowedPattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+      "default": "kube-system"
+    },
+    "ServiceAccountName": {
+      "type": "String",
+      "description": "(Optional) The name of the Kubernetes Service Account associated with the AWS Load Balancer Controller. This is typically 'aws-load-balancer-controller' unless customized during installation. This Service Account is crucial for the controller's permissions within the cluster.",
+      "allowedPattern": "^[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$",
+      "default": "aws-load-balancer-controller"
+    },
+    "ServiceAccountNamespace": {
+      "type": "String",
+      "description": "(Optional) The Kubernetes namespace where the Service Account for the AWS Load Balancer Controller is located. This is typically 'kube-system', but may differ if you've used a custom namespace. This namespace is used to locate and verify the Service Account configuration.",
+      "allowedPattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+      "default": "kube-system"
+    },
+    "IngressName": {
+      "type": "String",
+      "description": "(Optional) Name of the Ingress resource to validate Application Load Balancer (ALB). If not specified, Ingress validation will be skipped.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$"
+    },
+    "IngressNamespace": {
+      "type": "String",
+      "description": "(Optional) Namespace of the Ingress resource. Required if IngressName is specified.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$"
+    },
+    "ServiceName": {
+      "type": "String",
+      "description": "(Optional) Name of a specific Service resource to validate Network Load Balancer (NLB) annotations. If not specified, Service resources validation will be skipped.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$"
+    },
+    "ServiceNamespace": {
+      "type": "String",
+      "description": "(Optional) Namespace of the Service resource. Required if ServiceName is specified.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$"
+    },
+    "LambdaRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the IAM role that allows the AWS Lambda function to access the required AWS services and resources. Associate the AWS managed policies: `AWSLambdaBasicExecutionRole` and `AWSLambdaVPCAccessExecutionRole` to your lambda function execution IAM role."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateAccessEntryAndOIDCProvider",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnInvalidAccessEntryOrOIDC",
+      "description": "Validates EKS cluster IAM setup by checking access entry permissions and OIDC provider configuration.",
+      "onFailure": "step:GenerateReport",
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}"
+        },
+        "Handler": "validate_access_entry_and_oidc_provider.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "OIDCARN",
+          "Selector": "$.Payload.details.oidc.arn",
+          "Type": "String"
+        },
+        {
+          "Name": "Result",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "Valid",
+          "Selector": "$.Payload.valid",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnInvalidAccessEntryOrOIDC",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "description": "Evaluates the results of OIDC Provider, Access Entry and Cluster. If valid flag is true: continues with K8s authentication setup, else skips further checks and generates the report.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "SetupK8sAuthenticationClient",
+            "Variable": "{{ ValidateAccessEntryAndOIDCProvider.Valid }}",
+            "BooleanEquals": true
+          },
+          {
+            "NextStep": "GenerateReport",
+            "Variable": "{{ ValidateAccessEntryAndOIDCProvider.Valid }}",
+            "BooleanEquals": false
+          }
+        ]
+      },
+      "isEnd": true,
+      "isCritical": true
+    },
+    {
+      "name": "SetupK8sAuthenticationClient",
+      "action": "aws:executeAutomation",
+      "description": "Execute the SAW Document AWSSupport-SetupK8sApiProxyForEKS to set up an AWS Lambda function to run Amazon EKS API call on the cluster.",
+      "nextStep": "VerifyALBControllerAndIRSASetup",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ EksClusterName }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "Operation": [
+            "Setup"
+          ],
+          "LambdaRoleArn": [
+            "{{ LambdaRoleArn }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true
+    },
+    {
+      "name": "VerifyALBControllerAndIRSASetup",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnFargate",
+      "description": "Checks whether the given Service Account & Application Load Balancer (ALB) controller exists in their respective namespaces. Also checks ALB controller's Service Account Role Annotation & Trust policy",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}",
+          "LambdaARN": "{{ SetupK8sAuthenticationClient.Output }}",
+          "ALBControllerDeploymentName": "{{ ALBControllerDeploymentName }}",
+          "ALBControllerNamespace": "{{ ALBControllerNamespace }}",
+          "ServiceAccountName": "{{ ServiceAccountName }}",
+          "ServiceAccountNamespace": "{{ ServiceAccountNamespace }}",
+          "OIDCARN": "{{ ValidateAccessEntryAndOIDCProvider.OIDCARN }}"
+        },
+        "Handler": "verify_albc_and_irsa_setup.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "IsFargate",
+          "Selector": "$.Payload.isFargate",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnFargate",
+      "action": "aws:branch",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "timeoutSeconds": 300,
+      "description": "Evaluates if ALB Controller is running on Fargate. If running on Fargate, aborts and generates report as this automation is designed for EC2 nodes only. Otherwise, continues with pod identity webhook validation.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "VerifyPodIdentityWebhookAndEnv",
+            "Variable": "{{ VerifyALBControllerAndIRSASetup.IsFargate }}",
+            "BooleanEquals": false
+          },
+          {
+            "NextStep": "CleanupK8sAuthenticationClient",
+            "Variable": "{{ VerifyALBControllerAndIRSASetup.IsFargate }}",
+            "BooleanEquals": true
+          }
+        ]
+      },
+      "isEnd": true,
+      "isCritical": true
+    },
+    {
+      "name": "VerifyPodIdentityWebhookAndEnv",
+      "action": "aws:executeScript",
+      "nextStep": "ValidateSubnetRequirements",
+      "description": "Checks whether pod-identity-webhook is running. Also checks whether IRSA is injected into pod's ENV variables.",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}",
+          "LambdaARN": "{{ SetupK8sAuthenticationClient.Output }}",
+          "ALBControllerDeploymentName": "{{ ALBControllerDeploymentName }}",
+          "ALBControllerNamespace": "{{ ALBControllerNamespace }}"
+        },
+        "Handler": "verify_pod_identity_webhook.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "ValidateSubnetRequirements",
+      "action": "aws:executeScript",
+      "nextStep": "CheckLoadBalancerLimitsAndUsage",
+      "description": "Validates that at least two subnets in two Availability Zones have 8 available IP addresses, and verifies proper subnet tagging exists for public/private load balancers.",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}"
+        },
+        "Handler": "check_subnets.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CheckLoadBalancerLimitsAndUsage",
+      "action": "aws:executeScript",
+      "nextStep": "CheckIngressOrServiceAnnotations",
+      "description": "Compares the account quota against the number of Amazon Application Load Balancers and Network Load Balancers",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}"
+        },
+        "Handler": "check_alb_limits.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CheckIngressOrServiceAnnotations",
+      "action": "aws:executeScript",
+      "nextStep": "CheckWorkerNodeSecurityGroupTags",
+      "description": "Checks for correct annotations and specifications in Ingress and Service resources to ensure they are properly configured for ALB and NLB usage.",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}",
+          "LambdaARN": "{{ SetupK8sAuthenticationClient.Output }}",
+          "IngressName": "{{ IngressName }}",
+          "IngressNamespace": "{{ IngressNamespace }}",
+          "ServiceName": "{{ ServiceName }}",
+          "ServiceNamespace": "{{ ServiceNamespace }}"
+        },
+        "Handler": "check_ingress_annotations.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CheckWorkerNodeSecurityGroupTags",
+      "action": "aws:executeScript",
+      "nextStep": "CaptureALBControllerLogs",
+      "description": "Validates that exactly one security group attached to the worker nodes has the required cluster tag.",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}",
+          "LambdaARN": "{{ SetupK8sAuthenticationClient.Output }}",
+          "ALBControllerDeploymentName": "{{ ALBControllerDeploymentName }}",
+          "ALBControllerNamespace": "{{ ALBControllerNamespace }}"
+        },
+        "Handler": "check_sg_tags.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CaptureALBControllerLogs",
+      "action": "aws:executeScript",
+      "nextStep": "CleanupK8sAuthenticationClient",
+      "description": "Retrieves latest diagnostic logs from the Application Load Balancer Controller pods running in the AWS EKS cluster.",
+      "onFailure": "step:CleanupK8sAuthenticationClient",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}",
+          "LambdaARN": "{{ SetupK8sAuthenticationClient.Output }}",
+          "ALBControllerNamespace": "{{ ALBControllerNamespace }}"
+        },
+        "Handler": "capture_albc_logs.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CleanupK8sAuthenticationClient",
+      "action": "aws:executeAutomation",
+      "nextStep": "GenerateReport",
+      "description": "Executes the SAW Document 'AWSSupport-SetupK8sApiProxyForEKS' using the 'Cleanup' operation to clean up resources created as part of the automation.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ EksClusterName }}"
+          ],
+          "Operation": [
+            "Cleanup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "LambdaRoleArn": [
+            "{{ LambdaRoleArn }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "isCritical": true,
+      "onFailure": "step:GenerateReport"
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "description": "Generates the automation report",
+      "inputs": {
+        "InputPayload": {
+          "ValidateAccessEntryAndOIDCProvider": "{{ ValidateAccessEntryAndOIDCProvider.OutputPayload }}",
+          "VerifyALBControllerAndIRSASetup": "{{ VerifyALBControllerAndIRSASetup.OutputPayload }} ",
+          "VerifyPodIdentityWebhookAndEnv": "{{ VerifyPodIdentityWebhookAndEnv.OutputPayload }}",
+          "ValidateSubnetRequirements": "{{ ValidateSubnetRequirements.OutputPayload }}",
+          "CheckLoadBalancerLimitsAndUsage": "{{ CheckLoadBalancerLimitsAndUsage.OutputPayload }}",
+          "CheckIngressOrServiceAnnotations": "{{ CheckIngressOrServiceAnnotations.OutputPayload }}",
+          "CheckWorkerNodeSecurityGroupTags": "{{ CheckWorkerNodeSecurityGroupTags.OutputPayload }}",
+          "CleanupK8sAuthenticationClient": "{{ CleanupK8sAuthenticationClient.Status }}",
+          "CaptureALBControllerLogs": "{{ CaptureALBControllerLogs.OutputPayload }}"
+        },
+        "Handler": "generate_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateReport.Report"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "de16c33dcc7683d4d90b89155ad3d688081ce5e3a4fce248df3b9825dbb93381"
+      }
+    }
+  }
+}

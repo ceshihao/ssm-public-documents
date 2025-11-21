@@ -10,7 +10,7 @@
     },
     "IpAddressToBlock": {
       "type": "String",
-      "description": "(Optional) Additional Ipv4 or Ipv6 address to block access from (ex:1.2.3.4/32)",
+      "description": "(Optional) Ipv4 or Ipv6 address to block access from (ex:1.2.3.4/32). If left empty, blocks all SSH and RDP access from Ipv4 and Ipv6 addresses",
       "allowedPattern": "(^$)|^((25[0-5]|(2[0-4]\\d|[0-1]?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|[0-1]?\\d?\\d)){3})|(^((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)::((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?))|(^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}))\\/(25[0-5]|2[0-4]\\d|[0-1]?\\d?\\d)$",
       "default": ""
     },
@@ -148,7 +148,7 @@
           }
         ]
       },
-      "isEnd": true,
+      "nextStep": "ProcessPrefixLists",
       "onFailure": "Continue"
     },
     {
@@ -193,7 +193,7 @@
           }
         ]
       },
-      "isEnd": true,
+      "nextStep": "ProcessPrefixLists",
       "onFailure": "Continue"
     },
     {
@@ -237,6 +237,23 @@
             ]
           }
         ]
+      },
+      "nextStep": "ProcessPrefixLists",
+      "onFailure": "Continue"
+    },
+    {
+      "name": "ProcessPrefixLists",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "description": "Processes and removes prefix list rules from the security group based on the following conditions:\n- If IpAddressToBlock is provided, removes prefix list rules that contain only the specified IP address\n- If no IpAddressToBlock is provided, removes prefix list rules that contain only public CIDRs (0.0.0.0/0 or ::/0)\n- Only processes rules for SSH (port 22) and RDP (port 3389)\n- Maintains exact rule properties when removing rules\n",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "restrict_incoming_traffic_prefix_lists",
+        "InputPayload": {
+          "GroupId": "{{GroupId}}",
+          "IpAddressToBlock": "{{IpAddressToBlock}}"
+        },
+        "Script": "import boto3\n\nPUBLIC_IPV4_CIDR = '0.0.0.0/0'\nPUBLIC_IPV6_CIDR = '::/0'\nSSH_PORT = 22\nRDP_PORT = 3389\n\ndef analyze_prefix_list(ec2_client, prefix_list_id, ip_to_block=None):\n    \"\"\"\n    Analyzes prefix list based on whether ip_to_block is provided or not.\n    If ip_to_block is provided, checks if prefix list only contains that IP.\n    If not provided, checks for public CIDRs (0.0.0.0/0 or ::/0).\n    \"\"\"\n    try:\n      paginator = ec2_client.get_paginator('get_managed_prefix_list_entries')\n      \n      if ip_to_block:\n          entry_count = 0\n          for page in paginator.paginate(PrefixListId=prefix_list_id):\n              for entry in page['Entries']:\n                  entry_count += 1\n                  if entry_count > 1 or entry['Cidr'] != ip_to_block:\n                      return {'only_target_ip': False}\n      \n          # If we got here, we found exactly one entry and it matched ip_to_block\n          return {'only_target_ip': entry_count == 1}\n      else:\n          # Check for public CIDRs\n          has_public_cidr = False\n          has_other_cidrs = False\n      \n          for page in paginator.paginate(PrefixListId=prefix_list_id):\n              for entry in page['Entries']:\n                  if entry['Cidr'] in [PUBLIC_IPV4_CIDR, PUBLIC_IPV6_CIDR]:\n                      has_public_cidr = True\n                  else:\n                      has_other_cidrs = True\n      \n                  # Stop processing if we've found both types\n                  if has_public_cidr and has_other_cidrs:\n                      return {'public_cidr': False}\n      \n          return {'public_cidr': has_public_cidr and not has_other_cidrs}\n\n    except Exception as e:\n        print(f\"Error checking prefix list {prefix_list_id}: {str(e)}\")\n        raise e\n\ndef restrict_incoming_traffic_prefix_lists(events, context):\n    ec2_client = boto3.client('ec2')\n    group_id = events['GroupId']\n    ip_to_block = events.get('IpAddressToBlock', '')\n    \n    try:\n        sg_description = ec2_client.describe_security_groups(GroupIds=[group_id])\n        rules_to_revoke = []\n        \n        for rule in sg_description['SecurityGroups'][0]['IpPermissions']:\n            if ('FromPort' in rule and 'ToPort' in rule and \n                rule['FromPort'] == rule['ToPort'] and \n                rule['FromPort'] in [SSH_PORT, RDP_PORT]):\n                \n                if 'PrefixListIds' in rule and rule['PrefixListIds']:\n                    port = rule['FromPort']\n                    for prefix_list in rule['PrefixListIds']:\n                        prefix_list_id = prefix_list['PrefixListId']\n                        \n                        if ip_to_block:\n                            # Handle case when specific IP is provided\n                            analysis = analyze_prefix_list(ec2_client, prefix_list_id, ip_to_block)\n                            should_revoke = analysis['only_target_ip']\n                        else:\n                            # Handle case for public CIDRs\n                            analysis = analyze_prefix_list(ec2_client, prefix_list_id)\n                            should_revoke = analysis['public_cidr']\n\n                        if should_revoke:\n                          revoke_rule = {\n                          'FromPort': rule['FromPort'],\n                          'ToPort': rule['ToPort'],\n                          'IpProtocol': rule['IpProtocol'],\n                          'PrefixListIds': [prefix_list]\n                        }\n                          if 'Description' in rule:\n                            revoke_rule['Description'] = rule['Description']\n                          rules_to_revoke.append(revoke_rule)\n        # Remove identified rules\n        for rule in rules_to_revoke:\n            try:\n                response = ec2_client.revoke_security_group_ingress(\n                    GroupId=group_id,\n                    IpPermissions=[rule]\n                )\n                if not response.get('Return', False):\n                    print(f\"Failed to remove rule for port {rule['FromPort']}\")\n\n            except ec2_client.exceptions.InvalidPermission.NotFound as e:\n                print(f\"Rule not found: {str(e)}\")\n            except Exception as e:\n                print(f\"Error removing rule: {str(e)}\")\n        \n        return {\n            \"ProcessedGroupId\": group_id\n        }\n        \n    except Exception as e:\n        print(f\"Error processing security group {group_id}: {str(e)}\")\n        raise e\n"
       },
       "isEnd": true,
       "onFailure": "Continue"

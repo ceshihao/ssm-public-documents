@@ -1,0 +1,838 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The **AWSSupport-TroubleshootEC2ConnectivityToRedshift** automation document provides comprehensive troubleshooting for Amazon Elastic Compute Cloud (Amazon EC2) instances that cannot connect to Amazon Redshift clusters. It systematically analyzes network connectivity paths, security configurations, and provides detailed remediation recommendations.\n\n## Supported Connectivity Scenarios\n\n* **Same VPC connectivity** - Direct connection within the same Amazon Virtual Private Cloud (VPC)\n* **Cross-VPC connectivity** - Connection across different VPCs using VPC Peering or AWS Transit Gateway\n* **Public vs Private Redshift clusters** - Different connectivity patterns based on cluster accessibility\n* **Internet-based access** - Amazon EC2 instances connecting to publicly accessible Amazon Redshift clusters via Internet Gateway or NAT Gateway\n\n## Key Features\n\n**VPC Reachability Analyzer Integration**\n\nThe document leverages AWS VPC Reachability Analyzer as the primary diagnostic tool to quickly identify connectivity issues:\n\n* Fast Path Analysis: Performs immediate network path analysis between EC2 instance and Redshift cluster\n* Intelligent Fallback: If reachability analysis succeeds, skips detailed manual checks and proceeds to DNS check then final reporting\n* Regional Compatibility: If VPC Reachability Analyzer is not supported in your region or fails for any reason, the runbook automatically falls back to comprehensive standard connectivity checks\n* Comprehensive Coverage: Analyzes security groups, NACLs, route tables, and network interfaces in a single operation\n\n### Considerations:\n\n> * You are charged per analysis run between a source and destination. For more information, see the **Network Analysis** section in [Amazon VPC Pricing](http://aws.amazon.com/vpc/pricing/).\n> * This automation creates a network insights path and network insights analysis in your account using Reachability Analyzer. If the automation completes successfully, the runbook deletes these resources. If the cleanup step fails, the network insights path is not deleted by the runbook and you will need to delete it manually. If you don't delete the network insights path manually, it continues to count towards the quota for your AWS account. For more information about quotas for Reachability Analyzer, see [Quotas for Reachability Analyzer](https://docs.aws.amazon.com/vpc/latest/reachability/reachability-analyzer-limits.html).\n> * Operating system-level configurations such as the use of a firewall, proxy, local DNS resolver, or hosts file can affect connectivity even if the reachability analyzer returns `PASS`.\n> * Review the evaluation of all checks performed by the analyzer. If any of the checks return with a status of `FAIL`, that might affect connectivity even if the overall reachability check returns a status of `PASS`.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "SourceInstance": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The Amazon Elastic Compute Cloud (Amazon EC2) instance ID experiencing connectivity issues with the Amazon Redshift cluster.",
+      "allowedPattern": "^i-[0-9a-f]{8,17}$"
+    },
+    "ClusterIdentifier": {
+      "type": "String",
+      "description": "(Required) The Amazon Redshift cluster identifier for connectivity troubleshooting.",
+      "allowedPattern": "^[a-z][a-z0-9-]*[a-z0-9]$",
+      "minChars": 1,
+      "maxChars": 63
+    }
+  },
+  "variables": {
+    "instanceIP": {
+      "type": "String",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CollectEC2Metadata",
+      "description": "Collects comprehensive metadata about the Amazon EC2 instance including Amazon VPC configuration, subnet details, IP addresses, security groups, and instance state to understand the source connectivity environment.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ SourceInstance }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "EC2VpcId",
+          "Selector": "$.Reservations[0].Instances[0].VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2SubnetId",
+          "Selector": "$.Reservations[0].Instances[0].SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2PrivateIp",
+          "Selector": "$.Reservations[0].Instances[0].PrivateIpAddress",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2PublicIp",
+          "Selector": "$.Reservations[0].Instances[0].PublicIpAddress",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2SecurityGroups",
+          "Selector": "$.Reservations[0].Instances[0].SecurityGroups",
+          "Type": "MapList"
+        },
+        {
+          "Name": "EC2InstanceState",
+          "Selector": "$.Reservations[0].Instances[0].State.Name",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "InitializeInstanceIP"
+    },
+    {
+      "name": "InitializeInstanceIP",
+      "description": "Initializes the instanceIP variable with the Amazon EC2 instance's private IP address as the starting point. This variable will be dynamically updated throughout the troubleshooting process based on the determined connectivity path.",
+      "action": "aws:updateVariable",
+      "inputs": {
+        "Name": "variable:instanceIP",
+        "Value": "{{ CollectEC2Metadata.EC2PrivateIp }}"
+      },
+      "onFailure": "Abort",
+      "timeoutSeconds": 30,
+      "maxAttempts": 1,
+      "nextStep": "AnalyzeEC2SubnetType"
+    },
+    {
+      "name": "AnalyzeEC2SubnetType",
+      "description": "Analyzes the Amazon EC2 instance's subnet routing configuration to determine subnet type and internet connectivity capabilities. Examines route tables for Internet Gateway routes, NAT Gateway routes, or VPC-local only routing. Also identifies NAT Gateway public IP addresses if present.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "EC2SubnetId": "{{ CollectEC2Metadata.EC2SubnetId }}"
+        },
+        "Handler": "analyze_ec2subnet_type.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EC2SubnetType",
+          "Selector": "$.Payload.EC2SubnetType",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2HasInternetAccess",
+          "Selector": "$.Payload.EC2HasInternetAccess",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "EC2InternetGatewayId",
+          "Selector": "$.Payload.EC2InternetGatewayId",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2NATGatewayId",
+          "Selector": "$.Payload.EC2NATGatewayId",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2NATGatewayPublicIP",
+          "Selector": "$.Payload.EC2NATGatewayPublicIP",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2RouteTableId",
+          "Selector": "$.Payload.EC2RouteTableId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CollectRedshiftMetadata"
+    },
+    {
+      "name": "CollectRedshiftMetadata",
+      "description": "Retrieves comprehensive Amazon Redshift cluster configuration including VPC details, endpoint information, port configuration, public accessibility settings, security groups, and network interface details required for connectivity analysis.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "redshift",
+        "Api": "DescribeClusters",
+        "ClusterIdentifier": "{{ ClusterIdentifier }}"
+      },
+      "outputs": [
+        {
+          "Name": "RedshiftVpcId",
+          "Selector": "$.Clusters[0].VpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "RedshiftEndpoint",
+          "Selector": "$.Clusters[0].Endpoint.Address",
+          "Type": "String"
+        },
+        {
+          "Name": "RedshiftPort",
+          "Selector": "$.Clusters[0].Endpoint.Port",
+          "Type": "Integer"
+        },
+        {
+          "Name": "RedshiftPublicAccess",
+          "Selector": "$.Clusters[0].PubliclyAccessible",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "RedshiftSecurityGroups",
+          "Selector": "$.Clusters[0].VpcSecurityGroups",
+          "Type": "MapList"
+        },
+        {
+          "Name": "RedshiftSubnetGroup",
+          "Selector": "$.Clusters[0].ClusterSubnetGroupName",
+          "Type": "String"
+        },
+        {
+          "Name": "RedshiftClusterStatus",
+          "Selector": "$.Clusters[0].ClusterStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "RedshiftENI",
+          "Selector": "$.Clusters[0].Endpoint.VpcEndpoints[0].NetworkInterfaces[0].NetworkInterfaceId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CollectRedshiftSubnetInfo"
+    },
+    {
+      "name": "CollectRedshiftSubnetInfo",
+      "description": "Retrieves detailed information about the Amazon Redshift cluster's subnet group configuration including all associated subnets and VPC details to understand the target connectivity environment.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "redshift",
+        "Api": "DescribeClusterSubnetGroups",
+        "ClusterSubnetGroupName": "{{ CollectRedshiftMetadata.RedshiftSubnetGroup }}"
+      },
+      "outputs": [
+        {
+          "Name": "RedshiftSubnets",
+          "Selector": "$.ClusterSubnetGroups[0].Subnets[0].SubnetIdentifier",
+          "Type": "StringList"
+        },
+        {
+          "Name": "RedshiftSubnetGroupVpcId",
+          "Selector": "$.ClusterSubnetGroups[0].VpcId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "RunReachabilityAnalysis"
+    },
+    {
+      "name": "RunReachabilityAnalysis",
+      "description": "Executes Amazon VPC Reachability Analyzer as the primary diagnostic tool to perform comprehensive network path analysis between the Amazon EC2 instance and Amazon Redshift cluster. Analyzes security groups, NACLs, route tables, and network interfaces in a single operation to quickly identify connectivity issues.",
+      "action": "aws:executeScript",
+      "onFailure": "step:AnalyzeRedshiftSubnetType",
+      "nextStep": "BranchOnReachabilityResults",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "SourceInstance": "{{ SourceInstance }}",
+          "RedshiftENI": "{{ CollectRedshiftMetadata.RedshiftENI }}",
+          "RedshiftPort": "{{ CollectRedshiftMetadata.RedshiftPort }}",
+          "Protocol": "tcp",
+          "ShouldPersistFlag": false,
+          "EC2HasInternetAccess": "{{ AnalyzeEC2SubnetType.EC2HasInternetAccess }}",
+          "RedshiftPublicAccess": "{{ CollectRedshiftMetadata.RedshiftPublicAccess }}"
+        },
+        "Handler": "run_reachability_analysis.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ReachabilityAnalysisSuccess",
+          "Selector": "$.Payload.ReachabilityAnalysisSuccess",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AnalysisStatus",
+          "Selector": "$.Payload.AnalysisStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "NetworkPathFound",
+          "Selector": "$.Payload.NetworkPathFound",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "Issues",
+          "Selector": "$.Payload.Issues",
+          "Type": "String"
+        },
+        {
+          "Name": "Recommendations",
+          "Selector": "$.Payload.Recommendations",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectivityMethod",
+          "Selector": "$.Payload.ConnectivityMethod",
+          "Type": "String"
+        },
+        {
+          "Name": "RawResults",
+          "Selector": "$.Payload.RawResults",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "DisconnectedVpcsWithInternet",
+          "Selector": "$.Payload.DisconnectedVpcsWithInternet",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnReachabilityResults",
+      "description": "Decision point that determines the troubleshooting path based on Amazon VPC Reachability Analyzer results. If analysis succeeds and finds a network path, skips detailed manual checks and proceeds directly to DNS validation. If analysis fails or finds no path, continues with comprehensive manual troubleshooting.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AnalyzeRedshiftSubnetType",
+            "Variable": "{{ RunReachabilityAnalysis.AnalysisStatus }}",
+            "StringEquals": "failed"
+          },
+          {
+            "NextStep": "UpdateInstanceIPForPublicAccess",
+            "Variable": "{{ RunReachabilityAnalysis.DisconnectedVpcsWithInternet }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "ValidateDNSConfiguration"
+      },
+      "nextStep": "ValidateDNSConfiguration"
+    },
+    {
+      "name": "AnalyzeRedshiftSubnetType",
+      "description": "Analyzes the Amazon Redshift cluster's subnet routing configuration to determine subnet type and internet connectivity capabilities. Examines route tables for the first Redshift subnet to understand the target network environment.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "RedshiftSubnets": "{{ CollectRedshiftSubnetInfo.RedshiftSubnets }}"
+        },
+        "Handler": "analyze_redshift_subnet_type.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "RedshiftSubnetType",
+          "Selector": "$.Payload.RedshiftSubnetType",
+          "Type": "String"
+        },
+        {
+          "Name": "RedshiftHasInternetAccess",
+          "Selector": "$.Payload.RedshiftHasInternetAccess",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "RedshiftRoutetableId",
+          "Selector": "$.Payload.RedshiftRoutetableId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnCompareVpcIds"
+    },
+    {
+      "name": "BranchOnCompareVpcIds",
+      "description": "Determines the main connectivity troubleshooting path by comparing VPC IDs of the Amazon EC2 instance and Amazon Redshift cluster. Routes to same-VPC troubleshooting if both resources are in the same VPC, otherwise proceeds to cross-VPC analysis.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ValidateSameVpcRequirements",
+            "Variable": "{{ CollectEC2Metadata.EC2VpcId }}",
+            "StringEquals": "{{ CollectRedshiftMetadata.RedshiftVpcId }}"
+          }
+        ],
+        "Default": "DetectCrossVpcConnectivity"
+      },
+      "nextStep": "ValidateSameVpcRequirements"
+    },
+    {
+      "name": "ValidateSameVpcRequirements",
+      "description": "Validates connectivity requirements for same-VPC scenarios by checking that both Amazon EC2 and Amazon Redshift subnets have proper local routing configuration and can communicate within the VPC boundaries.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "nextStep": "CheckSecurityGroups",
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "EC2SubnetType": "{{ AnalyzeEC2SubnetType.EC2SubnetType }}",
+          "RedshiftSubnetType": "{{ AnalyzeRedshiftSubnetType.RedshiftSubnetType }}",
+          "EC2RouteTableId": "{{ AnalyzeEC2SubnetType.EC2RouteTableId }}",
+          "RedshiftRoutetableId": "{{ AnalyzeRedshiftSubnetType.RedshiftRoutetableId }}"
+        },
+        "Handler": "validate_same_vpc_requirements.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "TroubleshootingPath",
+          "Selector": "$.Payload.TroubleshootingPath",
+          "Type": "String"
+        },
+        {
+          "Name": "Issues",
+          "Selector": "$.Payload.Issues",
+          "Type": "String"
+        },
+        {
+          "Name": "Recommendations",
+          "Selector": "$.Payload.Recommendations",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DetectCrossVpcConnectivity",
+      "description": "Detects and analyzes cross-VPC connectivity methods between the Amazon EC2 and Amazon Redshift VPCs. Searches for active VPC Peering connections and AWS Transit Gateway attachments to determine available connectivity options and their configuration status.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "EC2VpcId": "{{ CollectEC2Metadata.EC2VpcId }}",
+          "RedshiftVpcId": "{{ CollectRedshiftMetadata.RedshiftVpcId }}",
+          "EC2RouteTableId": "{{ AnalyzeEC2SubnetType.EC2RouteTableId }}",
+          "EC2HasInternetAccess": "{{ AnalyzeEC2SubnetType.EC2HasInternetAccess }}",
+          "RedshiftPublicAccess": "{{ CollectRedshiftMetadata.RedshiftPublicAccess }}"
+        },
+        "Handler": "detect_cross_vpc_connectivity.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "TroubleshootingPath",
+          "Selector": "$.Payload.TroubleshootingPath",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectivityMethod",
+          "Selector": "$.Payload.ConnectivityMethod",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectionDetails",
+          "Selector": "$.Payload.ConnectionDetails",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "Issues",
+          "Selector": "$.Payload.Issues",
+          "Type": "String"
+        },
+        {
+          "Name": "Recommendations",
+          "Selector": "$.Payload.Recommendations",
+          "Type": "String"
+        },
+        {
+          "Name": "DisconnectedVpcsWithInternet",
+          "Selector": "$.Payload.DisconnectedVpcsWithInternet",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnValidateCrossVpcRouting"
+    },
+    {
+      "name": "BranchOnValidateCrossVpcRouting",
+      "description": "Routes to the appropriate cross-VPC routing validation based on the detected connectivity method. Branches to VPC Peering validation, Transit Gateway validation, or critical issue reporting if no connectivity method is found.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ValidateVpcPeeringRouting",
+            "Variable": "{{ DetectCrossVpcConnectivity.ConnectivityMethod }}",
+            "StringEquals": "VPC_PEERING"
+          },
+          {
+            "NextStep": "ValidateTransitGatewayRouting",
+            "Variable": "{{ DetectCrossVpcConnectivity.ConnectivityMethod }}",
+            "StringEquals": "TRANSIT_GATEWAY"
+          },
+          {
+            "NextStep": "UpdateInstanceIPForPublicAccess",
+            "Variable": "{{ DetectCrossVpcConnectivity.DisconnectedVpcsWithInternet }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "ValidateDNSConfiguration"
+      },
+      "nextStep": "ValidateDNSConfiguration"
+    },
+    {
+      "name": "ValidateVpcPeeringRouting",
+      "description": "Validates Amazon VPC Peering route configuration by checking bidirectional routing between the Amazon EC2 and Amazon Redshift VPCs. Analyzes route tables in both VPCs to ensure proper routes exist for cross-VPC communication via the peering connection.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "nextStep": "CheckSecurityGroups",
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "EC2VpcId": "{{ CollectEC2Metadata.EC2VpcId }}",
+          "RedshiftVpcId": "{{ CollectRedshiftMetadata.RedshiftVpcId }}",
+          "ConnectionDetails": "{{ DetectCrossVpcConnectivity.ConnectionDetails }}"
+        },
+        "Handler": "validate_vpc_peering_routing.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "RoutingValidation",
+          "Selector": "$.Payload.RoutingValidation",
+          "Type": "String"
+        },
+        {
+          "Name": "Issues",
+          "Selector": "$.Payload.Issues",
+          "Type": "String"
+        },
+        {
+          "Name": "Recommendations",
+          "Selector": "$.Payload.Recommendations",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2VpcCidr",
+          "Selector": "$.Payload.EC2VpcCidr",
+          "Type": "String"
+        },
+        {
+          "Name": "RedshiftVpcCidr",
+          "Selector": "$.Payload.RedshiftVpcCidr",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ValidateTransitGatewayRouting",
+      "description": "Validates AWS Transit Gateway route configuration by analyzing route tables, associations, and propagations. Ensures both VPC attachments can communicate through the Transit Gateway with proper routing configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "nextStep": "CheckSecurityGroups",
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "EC2VpcId": "{{ CollectEC2Metadata.EC2VpcId }}",
+          "RedshiftVpcId": "{{ CollectRedshiftMetadata.RedshiftVpcId }}",
+          "ConnectionDetails": "{{ DetectCrossVpcConnectivity.ConnectionDetails }}",
+          "RedshiftRouteTableId": "{{ AnalyzeRedshiftSubnetType.RedshiftRoutetableId}}",
+          "EC2RouteTableId": "{{ AnalyzeEC2SubnetType.EC2RouteTableId }}"
+        },
+        "Handler": "validate_transit_gateway_routing.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "RoutingValidation",
+          "Selector": "$.Payload.RoutingValidation",
+          "Type": "String"
+        },
+        {
+          "Name": "Issues",
+          "Selector": "$.Payload.Issues",
+          "Type": "String"
+        },
+        {
+          "Name": "Recommendations",
+          "Selector": "$.Payload.Recommendations",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "UpdateInstanceIPForPublicAccess",
+      "description": "Updates the instanceIP variable with the correct source IP address (public IP or NAT Gateway IP) that will be used for security group validation in public access scenarios.",
+      "action": "aws:executeScript",
+      "nextStep": "SetInstanceIPVariable",
+      "timeoutSeconds": 180,
+      "maxAttempts": 1,
+      "inputs": {
+        "InputPayload": {
+          "EC2PublicIp": "{{ CollectEC2Metadata.EC2PublicIp }}",
+          "EC2SubnetType": "{{ AnalyzeEC2SubnetType.EC2SubnetType }}",
+          "EC2NATGatewayPublicIP": "{{ AnalyzeEC2SubnetType.EC2NATGatewayPublicIP }}"
+        },
+        "Handler": "update_instance_ip_for_public_access.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceIpToSet",
+          "Selector": "$.Payload.InstanceIpToSet",
+          "Type": "String"
+        },
+        {
+          "Name": "issues",
+          "Selector": "$.Payload.issues",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort"
+    },
+    {
+      "name": "SetInstanceIPVariable",
+      "description": "Sets the instanceIP variable with the determined IP address.",
+      "action": "aws:updateVariable",
+      "nextStep": "CheckSecurityGroups",
+      "inputs": {
+        "Name": "variable:instanceIP",
+        "Value": "{{ UpdateInstanceIPForPublicAccess.InstanceIpToSet }}"
+      },
+      "onFailure": "Abort",
+      "timeoutSeconds": 30,
+      "maxAttempts": 1
+    },
+    {
+      "name": "CheckSecurityGroups",
+      "description": "Validates security group rules for both Amazon EC2 instance and Amazon Redshift cluster using the dynamically determined instanceIP variable. Checks inbound rules on Redshift security groups and outbound rules on EC2 security groups to ensure proper connectivity permissions.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "InstanceIP": "{{ variable:instanceIP }}",
+          "RedshiftPort": "{{ CollectRedshiftMetadata.RedshiftPort }}",
+          "RedshiftSecurityGroups": "{{ CollectRedshiftMetadata.RedshiftSecurityGroups }}",
+          "EC2SecurityGroups": "{{ CollectEC2Metadata.EC2SecurityGroups }}"
+        },
+        "Handler": "check_security_groups.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "SecurityGroupIssues",
+          "Selector": "$.Payload.SecurityGroupIssues",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupRecommendations",
+          "Selector": "$.Payload.SecurityGroupRecommendations",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceIpChecked",
+          "Selector": "$.Payload.SourceIpChecked",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckNetworkACLs"
+    },
+    {
+      "name": "CheckNetworkACLs",
+      "description": "Validates Network ACL rules for connectivity between Amazon EC2 and Amazon Redshift subnets. Analyzes both inbound and outbound NACL rules including ephemeral port ranges for return traffic to ensure complete network-level connectivity.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "InstanceIP": "{{ variable:instanceIP }}",
+          "EC2SubnetId": "{{ CollectEC2Metadata.EC2SubnetId }}",
+          "RedshiftSubnets": "{{ CollectRedshiftSubnetInfo.RedshiftSubnets }}",
+          "RedshiftPort": "{{ CollectRedshiftMetadata.RedshiftPort }}"
+        },
+        "Handler": "check_network_ac_ls.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NaclIssues",
+          "Selector": "$.Payload.NaclIssues",
+          "Type": "String"
+        },
+        {
+          "Name": "NaclRecommendations",
+          "Selector": "$.Payload.NaclRecommendations",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceIpChecked",
+          "Selector": "$.Payload.SourceIpChecked",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ValidateDNSConfiguration"
+    },
+    {
+      "name": "ValidateDNSConfiguration",
+      "description": "Validates DNS configuration settings for both Amazon EC2 and Amazon Redshift VPCs including DNS support, DNS hostnames, and DHCP options sets. Identifies DNS resolution issues that could prevent connectivity even when network paths are correct.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 180,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "EC2VpcId": "{{ CollectEC2Metadata.EC2VpcId }}",
+          "RedshiftVpcId": "{{ CollectRedshiftMetadata.RedshiftVpcId }}"
+        },
+        "Handler": "validate_dns_configuration.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DnsIssues",
+          "Selector": "$.Payload.DnsIssues",
+          "Type": "String"
+        },
+        {
+          "Name": "DnsRecommendations",
+          "Selector": "$.Payload.DnsRecommendations",
+          "Type": "String"
+        },
+        {
+          "Name": "EC2VpcDnsSettings",
+          "Selector": "$.Payload.EC2VpcDnsSettings",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "RedshiftVpcDnsSettings",
+          "Selector": "$.Payload.RedshiftVpcDnsSettings",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "GenerateFinalReport"
+    },
+    {
+      "name": "GenerateFinalReport",
+      "description": "Generates a comprehensive diagnostic report consolidating all findings from the troubleshooting process. Creates categorized issue summaries, prioritized remediation steps, network topology analysis, and detailed recommendations with AWS console links and documentation references.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isEnd": true,
+      "timeoutSeconds": 180,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "SourceInstance": "{{ SourceInstance }}",
+          "ClusterIdentifier": "{{ ClusterIdentifier }}",
+          "InstanceIP": "{{ variable:instanceIP }}",
+          "EC2Metadata": {
+            "VpcId": "{{ CollectEC2Metadata.EC2VpcId }}",
+            "SubnetId": "{{ CollectEC2Metadata.EC2SubnetId }}",
+            "PrivateIp": "{{ CollectEC2Metadata.EC2PrivateIp }}",
+            "PublicIp": "{{ CollectEC2Metadata.EC2PublicIp }}",
+            "SecurityGroups": "{{ CollectEC2Metadata.EC2SecurityGroups }}",
+            "InstanceState": "{{ CollectEC2Metadata.EC2InstanceState }}",
+            "SubnetType": "{{ AnalyzeEC2SubnetType.EC2SubnetType }}",
+            "HasInternetAccess": "{{ AnalyzeEC2SubnetType.EC2HasInternetAccess }}"
+          },
+          "RedshiftMetadata": {
+            "VpcId": "{{ CollectRedshiftMetadata.RedshiftVpcId }}",
+            "Endpoint": "{{ CollectRedshiftMetadata.RedshiftEndpoint }}",
+            "Port": "{{ CollectRedshiftMetadata.RedshiftPort }}",
+            "PublicAccess": "{{ CollectRedshiftMetadata.RedshiftPublicAccess }}",
+            "SecurityGroups": "{{ CollectRedshiftMetadata.RedshiftSecurityGroups }}",
+            "ClusterStatus": "{{ CollectRedshiftMetadata.RedshiftClusterStatus }}",
+            "SubnetType": "{{ AnalyzeRedshiftSubnetType.RedshiftSubnetType }}",
+            "HasInternetAccess": "{{ AnalyzeRedshiftSubnetType.RedshiftHasInternetAccess }}"
+          },
+          "AllIssues": {
+            "SecurityGroupIssues": "{{ CheckSecurityGroups.SecurityGroupIssues }}",
+            "NaclIssues": "{{ CheckNetworkACLs.NaclIssues }}",
+            "DnsIssues": "{{ ValidateDNSConfiguration.DnsIssues }}"
+          },
+          "AllRecommendations": {
+            "SecurityGroupRecommendations": "{{ CheckSecurityGroups.SecurityGroupRecommendations }}",
+            "NaclRecommendations": "{{ CheckNetworkACLs.NaclRecommendations }}",
+            "DnsRecommendations": "{{ ValidateDNSConfiguration.DnsRecommendations }}"
+          },
+          "ReachabilityAnalysis": {
+            "Success": "{{ RunReachabilityAnalysis.ReachabilityAnalysisSuccess }}",
+            "Status": "{{ RunReachabilityAnalysis.AnalysisStatus }}",
+            "NetworkPathFound": "{{ RunReachabilityAnalysis.NetworkPathFound }}",
+            "ConnectivityMethod": "{{ RunReachabilityAnalysis.ConnectivityMethod }}",
+            "Issues": "{{ RunReachabilityAnalysis.Issues }}",
+            "Recommendations": "{{ RunReachabilityAnalysis.Recommendations }}"
+          },
+          "PathSpecificIssues": {
+            "ReachabilityIssues": "{{ RunReachabilityAnalysis.Issues }}",
+            "SameVpcIssues": "{{ ValidateSameVpcRequirements.Issues }}",
+            "PrivateCrossVpcIssues": "{{ DetectCrossVpcConnectivity.Issues }}",
+            "VpcPeeringIssues": "{{ ValidateVpcPeeringRouting.Issues }}",
+            "TransitGatewayIssues": "{{ ValidateTransitGatewayRouting.Issues }}",
+            "UpdateInstanceIPForPublicAccess": "{{ UpdateInstanceIPForPublicAccess.issues }}"
+          },
+          "CrossVpcConnectivity": {
+            "DisconnectedVpcsWithInternet": "{{ DetectCrossVpcConnectivity.DisconnectedVpcsWithInternet }}"
+          },
+          "PathSpecificRecommendations": {
+            "ReachabilityRecommendations": "{{ RunReachabilityAnalysis.Recommendations }}",
+            "SameVpcRecommendations": "{{ ValidateSameVpcRequirements.Recommendations }}",
+            "PrivateCrossVpcRecommendations": "{{ DetectCrossVpcConnectivity.Recommendations }}",
+            "VpcPeeringRecommendations": "{{ ValidateVpcPeeringRouting.Recommendations }}",
+            "TransitGatewayRecommendations": "{{ ValidateTransitGatewayRouting.Recommendations }}"
+          }
+        },
+        "Handler": "generate_final_report.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DiagnosticReport",
+          "Selector": "$.Payload.DiagnosticReport",
+          "Type": "String"
+        },
+        {
+          "Name": "OverallStatus",
+          "Selector": "$.Payload.OverallStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "IssuesSummary",
+          "Selector": "$.Payload.IssuesSummary",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "InstanceIPFinalValue",
+          "Selector": "$.Payload.InstanceIPFinalValue",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectivityMethod",
+          "Selector": "$.Payload.ConnectivityMethod",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateFinalReport.DiagnosticReport",
+    "GenerateFinalReport.OverallStatus",
+    "GenerateFinalReport.IssuesSummary",
+    "GenerateFinalReport.InstanceIPFinalValue",
+    "GenerateFinalReport.ConnectivityMethod"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "f80afa280f4399d35918826dea3f44a82f016ebc1cffe92fcf5055ae7d67a391"
+      }
+    }
+  }
+}

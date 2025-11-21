@@ -1,0 +1,614 @@
+{
+  "description": "The **AWSPremiumSupport-TroubleshootCloudWatchAlarm** runbook helps identify and troubleshoot issues with misconfigured or problematic CloudWatch Alarms.  \nIt leverages public APIs and known alarm evaluation logic to detect delayed or missing datapoints in the monitored metrics, which can lead to missed or delayed alarm actions.  \nThis runbook provides a structured approach to investigate and resolve CloudWatch Alarm-related problems.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "CloudWatchMetricAlarmName": {
+      "type": "String",
+      "description": "(Required) The name of the CloudWatch metric Alarm to troubleshoot.",
+      "allowedPattern": "^[a-zA-Z0-9.:;,\\-_&() ]{1,255}$"
+    },
+    "AlarmTriggerTimestamp": {
+      "type": "String",
+      "description": "(Required) The UTC timestamp when the Alarm issue occurred. This information is crucial for troubleshooting the issue and understanding the context in which it happened. The timestamp value should be a time within the last 30 days from today and in the format 'YYYY-MM-DDTHH:mm:ssZ'. Example: '2024-10-29T09:04:00Z'.",
+      "allowedPattern": "^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})Z$"
+    }
+  },
+  "variables": {
+    "SSMDocumentInputChecks": {
+      "type": "StringMap",
+      "default": {}
+    },
+    "InsufficientDataChecks": {
+      "type": "StringMap",
+      "default": {}
+    },
+    "MetricMismatchChecks": {
+      "type": "StringMap",
+      "default": {}
+    },
+    "MetricMissingDatapointsChecks": {
+      "type": "StringMap",
+      "default": {}
+    },
+    "AlarmHistoryChecks": {
+      "type": "StringMap",
+      "default": {}
+    },
+    "DelayedMetricChecks": {
+      "type": "StringMap",
+      "default": {}
+    },
+    "ActionDeliveredChecks": {
+      "type": "StringMap",
+      "default": {}
+    }
+  },
+  "outputs": [
+    "GenerateReport.Report"
+  ],
+  "mainSteps": [
+    {
+      "name": "VerifyRunbookInputs",
+      "description": "Verifies the CloudWatch alarm details in the `MetricAlarms` list from the output of DescribeAlarms, has only one item matching the provided alarm name and verifies the value of the `AlarmTriggerTimestamp` parameter to check if it's within 2,592,000 seconds (30 days).",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateSSMDocumentInputChecksVariable",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "CloudWatchMetricAlarmName": "{{ CloudWatchMetricAlarmName }}",
+          "AlarmTriggerTimestamp": "{{ AlarmTriggerTimestamp }}"
+        },
+        "Handler": "verify_runbook_inputs.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "SSMDocumentInputChecks",
+          "Selector": "$.Payload"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "MetricAlarmObject",
+          "Selector": "$.Payload.MetricAlarmObject"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "AlarmVerified",
+          "Selector": "$.Payload.AlarmVerified"
+        }
+      ]
+    },
+    {
+      "name": "UpdateSSMDocumentInputChecksVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `SSMDocumentInputChecks` with output `SSMDocumentInputChecks` from `VerifyRunbookInputs` step.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "nextStep": "BranchOnAlarmIsVerified",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:SSMDocumentInputChecks",
+        "Value": "{{ VerifyRunbookInputs.SSMDocumentInputChecks }}"
+      }
+    },
+    {
+      "name": "BranchOnAlarmIsVerified",
+      "action": "aws:branch",
+      "description": "Branches on Runbook's inputs verification `AlarmTriggerTimestamp` and `CloudWatchAlarmName`.",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "Variable": "{{ VerifyRunbookInputs.AlarmVerified }}",
+            "BooleanEquals": false
+          }
+        ],
+        "Default": "CheckMetricAlarmType"
+      }
+    },
+    {
+      "name": "CheckMetricAlarmType",
+      "action": "aws:executeScript",
+      "description": "Checks if an alarm is based on a Metric or Metric Math or is an Anomaly Detector Alarm.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "CheckAlarmInInsufficientDataState",
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "MetricAlarmObject": "{{ VerifyRunbookInputs.MetricAlarmObject }}"
+        },
+        "Handler": "check_metric_alarm_type.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "MetricAlarmType",
+          "Selector": "$.Payload.MetricAlarmType"
+        }
+      ]
+    },
+    {
+      "name": "CheckAlarmInInsufficientDataState",
+      "action": "aws:executeScript",
+      "description": "Checks if an alarm is in insufficient data state.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateInsufficientDataChecksVariable",
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "Timestamp": "{{ AlarmTriggerTimestamp }}",
+          "MetricAlarmObject": "{{ VerifyRunbookInputs.MetricAlarmObject }}"
+        },
+        "Handler": "check_alarm_insufficient_data_state.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload.Message"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "AlarmHasInsufficientData",
+          "Selector": "$.Payload.AlarmHasInsufficientData"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "InsufficientDataChecks",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "UpdateInsufficientDataChecksVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `InsufficientDataChecks` with output `InsufficientDataChecks` from `CheckAlarmInInsufficientDataState` step.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "nextStep": "BranchOnAlarmHasInsufficientData",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:InsufficientDataChecks",
+        "Value": "{{ CheckAlarmInInsufficientDataState.InsufficientDataChecks }}"
+      }
+    },
+    {
+      "name": "BranchOnAlarmHasInsufficientData",
+      "action": "aws:branch",
+      "description": "Branches on the `AlarmHasInsufficientData` from `CheckAlarmInInsufficientDataState` step, the default step is `GenerateReport`.",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "Variable": "{{ CheckAlarmInInsufficientDataState.AlarmHasInsufficientData }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "CheckMetricMismatch"
+      }
+    },
+    {
+      "name": "CheckMetricMismatch",
+      "action": "aws:executeScript",
+      "description": "Checks if the metric(s) used in the alarm matches with ListMetrics API output.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateMetricMismatchChecksVariable",
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "MetricAlarmObject": "{{ VerifyRunbookInputs.MetricAlarmObject }}"
+        },
+        "Handler": "check_metric_mismatch.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload.Message"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "MetricsMatched",
+          "Selector": "$.Payload.MetricsMatched"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "MetricMismatchChecks",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "UpdateMetricMismatchChecksVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `MetricMismatchChecks` with output `MetricMismatchChecks` from `CheckMetricMismatch` step.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "nextStep": "BranchOnMetricsMatched",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:MetricMismatchChecks",
+        "Value": "{{ CheckMetricMismatch.MetricMismatchChecks }}"
+      }
+    },
+    {
+      "name": "BranchOnMetricsMatched",
+      "action": "aws:branch",
+      "description": "Branches on the `MetricsMatched` value from `CheckMetricMismatch` step, the default step is `GenerateReport`.",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "Variable": "{{ CheckMetricMismatch.MetricsMatched }}",
+            "BooleanEquals": false
+          }
+        ],
+        "Default": "CheckMissingDatapoint"
+      }
+    },
+    {
+      "name": "CheckMissingDatapoint",
+      "action": "aws:executeScript",
+      "description": "Verifies if a metric was missing datapoint(s) at a given timestamp.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateMetricMissingDatapointsChecksVariable",
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "MetricAlarmType": "{{ CheckMetricAlarmType.MetricAlarmType }}",
+          "MetricAlarmObject": "{{ VerifyRunbookInputs.MetricAlarmObject }}",
+          "Timestamp": "{{ AlarmTriggerTimestamp }}"
+        },
+        "Handler": "check_missing_datapoint.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload.Message"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "MetricMissingDatapoint",
+          "Selector": "$.Payload.MetricMissingDatapoint"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "MetricDatapoints",
+          "Selector": "$.Payload.MetricDatapoints"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "MetricMissingDatapointsChecks",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "UpdateMetricMissingDatapointsChecksVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `MetricMissingDatapointsChecks` with output `MetricMissingDatapointsChecks` from `CheckMissingDatapoint` step.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "nextStep": "BranchOnMetricMissingDatapoint",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:MetricMissingDatapointsChecks",
+        "Value": "{{ CheckMissingDatapoint.MetricMissingDatapointsChecks }}"
+      }
+    },
+    {
+      "name": "BranchOnMetricMissingDatapoint",
+      "action": "aws:branch",
+      "description": "Branches on the `MetricMissingDatapoint` value from `CheckMissingDatapoint` step, the default step is `GenerateReport`.",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "Variable": "{{ CheckMissingDatapoint.MetricMissingDatapoint }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "GetAlarmHistoryDetails"
+      }
+    },
+    {
+      "name": "GetAlarmHistoryDetails",
+      "action": "aws:executeScript",
+      "description": "Gets the most recent history for a given timestamp.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateAlarmHistoryChecksVariable",
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "Timestamp": "{{ AlarmTriggerTimestamp }}",
+          "AlarmName": "{{ CloudWatchMetricAlarmName }}",
+          "AlarmType": "{{ CheckMetricAlarmType.MetricAlarmType }}"
+        },
+        "Handler": "describe_alarm_history.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload.Message"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "MostRecentHistoryItem",
+          "Selector": "$.Payload.MostRecentHistoryItem"
+        },
+        {
+          "Type": "MapList",
+          "Name": "AlarmHistoryItems",
+          "Selector": "$.Payload.AlarmHistoryItems"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "AlarmHistoryFound",
+          "Selector": "$.Payload.AlarmHistoryFound"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "AlarmHistoryChecks",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "UpdateAlarmHistoryChecksVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `AlarmHistoryChecks` with output `AlarmHistoryChecks` from `GetAlarmHistoryDetails` step.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "nextStep": "BranchOnAlarmHistoryFound",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:AlarmHistoryChecks",
+        "Value": "{{ GetAlarmHistoryDetails.AlarmHistoryChecks }}"
+      }
+    },
+    {
+      "name": "BranchOnAlarmHistoryFound",
+      "action": "aws:branch",
+      "description": "Branches on the `AlarmHistoryFound` value from `GetAlarmHistoryDetails` step, the default step is `GenerateReport`.",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "Variable": "{{ GetAlarmHistoryDetails.AlarmHistoryFound }}",
+            "BooleanEquals": false
+          }
+        ],
+        "Default": "CheckDelayedMetric"
+      }
+    },
+    {
+      "name": "CheckDelayedMetric",
+      "action": "aws:executeScript",
+      "description": "Checks if an alarm did not trigger due to a delayed or missed metric(s).",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateDelayedMetricChecksVariable",
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "Timestamp": "{{ AlarmTriggerTimestamp }}",
+          "MetricAlarmObject": "{{ VerifyRunbookInputs.MetricAlarmObject }}",
+          "MetricDatapoints": "{{ CheckMissingDatapoint.MetricDatapoints }}",
+          "MetricAlarmType": "{{ CheckMetricAlarmType.MetricAlarmType }}",
+          "MostRecentHistoryItem": "{{ GetAlarmHistoryDetails.MostRecentHistoryItem }}"
+        },
+        "Handler": "check_alarm_delayed_metric.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload.Message"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "MetricDelayed",
+          "Selector": "$.Payload.MetricDelayed"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "DatapointsMeetThreshold",
+          "Selector": "$.Payload.DatapointsMeetThreshold"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "DelayedMetricChecks",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "UpdateDelayedMetricChecksVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `DelayedMetricChecks` with output `DelayedMetricChecks` from `CheckDelayedMetric` step.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "nextStep": "BranchOnMetricDelayedAndDatapointsMeetThreshold",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:DelayedMetricChecks",
+        "Value": "{{ CheckDelayedMetric.DelayedMetricChecks }}"
+      }
+    },
+    {
+      "name": "BranchOnMetricDelayedAndDatapointsMeetThreshold",
+      "action": "aws:branch",
+      "description": "Branches on the `DatapointsMeetThreshold` and `MetricDelayed` values from `CheckDelayedMetric` step, the default step is `GenerateReport`.",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ CheckDelayedMetric.MetricDelayed }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ CheckDelayedMetric.DatapointsMeetThreshold }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "CheckActionDelivered"
+          }
+        ],
+        "Default": "GenerateReport"
+      }
+    },
+    {
+      "name": "CheckActionDelivered",
+      "action": "aws:executeScript",
+      "description": "Checks if an alarm's enabled action(s) was/were delivered.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateActionDeliveredChecksVariable",
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "AlarmTriggerTimestamp": "{{ AlarmTriggerTimestamp }}",
+          "MetricAlarmObject": "{{ VerifyRunbookInputs.MetricAlarmObject }}",
+          "AlarmHistoryItems": "{{ GetAlarmHistoryDetails.AlarmHistoryItems }}"
+        },
+        "Handler": "check_alarm_action_delivered.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Message",
+          "Selector": "$.Payload.Message"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "ActionsEnabled",
+          "Selector": "$.Payload.ActionsEnabled"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "ActionsDelivered",
+          "Selector": "$.Payload.ActionsDelivered"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "ActionDeliveredChecks",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "UpdateActionDeliveredChecksVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the variable `ActionDeliveredChecks` with output `ActionDeliveredChecks` from `CheckActionDelivered` step",
+      "maxAttempts": 3,
+      "timeoutSeconds": 180,
+      "nextStep": "GenerateReport",
+      "isCritical": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "Name": "variable:ActionDeliveredChecks",
+        "Value": "{{ CheckActionDelivered.ActionDeliveredChecks }}"
+      }
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "Compiles the output of the previous steps and outputs a report.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "isEnd": true,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "CloudWatchMetricAlarmName": "{{ CloudWatchMetricAlarmName }}",
+          "AlarmTriggerTimestamp": "{{ AlarmTriggerTimestamp }}",
+          "SSMDocumentInputChecks": "{{ variable:SSMDocumentInputChecks }}",
+          "ActionDeliveredChecks": "{{ variable:ActionDeliveredChecks }}",
+          "DelayedMetricChecks": "{{ variable:DelayedMetricChecks }}",
+          "AlarmHistoryChecks": "{{ variable:AlarmHistoryChecks }}",
+          "MetricMissingDatapointsChecks": "{{ variable:MetricMissingDatapointsChecks }}",
+          "MetricMismatchChecks": "{{ variable:MetricMismatchChecks }}",
+          "InsufficientDataChecks": "{{ variable:InsufficientDataChecks }}"
+        },
+        "Handler": "generate_report.handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "Report",
+          "Selector": "$.Payload"
+        }
+      ]
+    }
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "f16b26093f0c3c68e0e249c7b185518aab86821b678fdf46a92a53fc7cb90bfd"
+      }
+    }
+  }
+}

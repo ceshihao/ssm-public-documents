@@ -1,0 +1,541 @@
+{
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "description": "The **AWSSupport-TroubleshootDMSEndpointConnection** runbook helps diagnose and troubleshoot connectivity issues between AWS Database Migration Service (AWS DMS) replication instances and AWS DMS endpoints. The automation uses [Reachability Analyzer](https://docs.aws.amazon.com/vpc/latest/reachability/what-is-reachability-analyzer.html) to test network connectivity and analyzes the network configuration to identify potential connectivity problems that could prevent successful AWS DMS migrations.\n\n### What this runbook does:\n\n* **Validates AWS DMS Resources**: Verifies that the specified AWS DMS endpoint and replication instance exist and retrieves their configuration details.\n* **Network Connectivity Analysis**: Uses Amazon VPC Reachability Analyzer to test connectivity between the AWS DMS replication instance and the AWS DMS endpoint.\n* **Configuration Review**: Analyzes network settings including VPC configuration, security groups, network ACLs, and routing tables that could affect connectivity.\n\n### Supported Database Engines:\n\nThis runbook supports troubleshooting connectivity for the following AWS DMS endpoint database engines:\n* Amazon Aurora (aurora, aurora-postgresql, aurora-serverless)\n* Amazon DocumentDB (docdb, documentdb)\n* Amazon DynamoDB (dynamodb)\n* Amazon Neptune (neptune)\n* Amazon Redshift (redshift, redshift-serverless)\n* Amazon S3 (s3)\n* Azure Database (azuredb, azure-sql-managed-instance)\n* Babelfish (babelfish)\n* DB2 (db2, db2-zos)\n* Google Cloud MySQL (gcp-mysql)\n* MariaDB (mariadb)\n* MongoDB (mongodb)\n* MySQL (mysql)\n* Oracle (oracle)\n* PostgreSQL (postgres, postgres-serverless)\n* Redis (redis)\n* SQL Server (sqlserver)\n* Sybase (sybase)\n\n### Prerequisites:\n\n* **Test Connection**: You must have tested the connectivity between the DMS replication instance and endpoint using the DMS console or API before running this runbook. If you haven't tested the connection, please do so first, otherwise you may need to rerun this runbook.\n* Both the DMS replication instance and endpoint must be in an available state for accurate connectivity testing.\n\n### Important Notes:\n\n* **Charges Apply**: This runbook creates and invokes AWS Lambda functions, which will incur AWS Lambda charges. Each VPC Reachability Analyzer analysis run also incurs charges. For pricing details, see the [Amazon VPC Pricing](https://aws.amazon.com/vpc/pricing/) page under the **Network Analysis** tab and [AWS Lambda Pricing](https://aws.amazon.com/lambda/pricing/).",
+  "parameters": {
+    "DmsEndpointArn": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Database Migration Service (DMS) Endpoint.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):dms:[a-z0-9-]+:\\d{12}:endpoint:[A-Z0-9]{1,48}$"
+    },
+    "DmsReplicationInstanceArn": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Database Migration Service (DMS) Replication instance.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):dms:[a-z0-9-]+:\\d{12}:rep:[A-Z0-9]+$"
+    },
+    "PersistReachabilityAnalyzerResults": {
+      "type": "Boolean",
+      "description": "(Optional) Specifies whether to retain the Amazon VPC Network Insights Analysis results. Default: `false`.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows AWS Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "LambdaRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows the AWS Lambda function to access the required AWS services and resources. If no role is specified, this Systems Manager Automation will create one IAM role for the AWS Lambda function in your account with the name `AWSSupport-TroubleshootDMSEndpointConnection-<RandomID>` that includes the managed policies: `AWSLambdaBasicExecutionRole` and `AWSLambdaVPCAccessExecutionRole`.",
+      "default": ""
+    },
+    "Acknowledge": {
+      "type": "String",
+      "description": "(Required) Enter `yes` to acknowledge that this runbook will create an AWS Lambda function in your account and will create an IAM role if no LambdaRoleArn is provided.",
+      "allowedPattern": "^[Yy][Ee][Ss]$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "DescribeEndpointAndCheckEngine",
+      "description": "Retrieves the AWS Database Migration Service (AWS DMS) endpoint configuration and verifies database engine type support.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "BranchOnEndpointAndCheckEngineErrors",
+      "inputs": {
+        "InputPayload": {
+          "DmsEndpointArn": "{{ DmsEndpointArn }}"
+        },
+        "Handler": "describe_endpoint_and_check_engine.describe_endpoint_and_check_engine",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "serverName",
+          "Selector": "$.Payload.server_name",
+          "Type": "String"
+        },
+        {
+          "Name": "port",
+          "Selector": "$.Payload.port",
+          "Type": "Integer"
+        },
+        {
+          "Name": "errorMessage",
+          "Selector": "$.Payload.error_message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnEndpointAndCheckEngineErrors",
+      "description": "Branches the automation based on the error message. Continues troubleshooting if there are no errors or generates a report with error details.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "GenerateErrors",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ DescribeEndpointAndCheckEngine.errorMessage }}",
+            "StringEquals": "",
+            "NextStep": "GetTestConnectionStatus"
+          }
+        ],
+        "Default": "GenerateErrors"
+      }
+    },
+    {
+      "name": "GetTestConnectionStatus",
+      "description": "Retrieves the connection status and error message for the AWS DMS endpoint using the DescribeConnections API.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "BranchOnTestConnectionStatusErrors",
+      "inputs": {
+        "InputPayload": {
+          "DmsEndpointArn": "{{ DmsEndpointArn }}",
+          "DmsReplicationInstanceArn": "{{ DmsReplicationInstanceArn }}"
+        },
+        "Handler": "get_test_connection_status.get_test_connection_status",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "errorMessage",
+          "Selector": "$.Payload.error_message",
+          "Type": "String"
+        },
+        {
+          "Name": "failureMessage",
+          "Selector": "$.Payload.failure_message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnTestConnectionStatusErrors",
+      "description": "Branches the automation based on the error message. Continues troubleshooting if there are no errors or generates a report with error details.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "GenerateErrors",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ GetTestConnectionStatus.errorMessage }}",
+            "StringEquals": "",
+            "NextStep": "DescribeReplicationInstance"
+          }
+        ],
+        "Default": "GenerateErrors"
+      }
+    },
+    {
+      "name": "DescribeReplicationInstance",
+      "description": "Retrieves network configuration details for the AWS DMS replication instance and identifies the associated ENI.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "ValidateResourcePermissions",
+      "inputs": {
+        "InputPayload": {
+          "DmsReplicationInstanceArn": "{{ DmsReplicationInstanceArn }}"
+        },
+        "Handler": "describe_replication_instance.describe_replication_instance",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "vpcId",
+          "Selector": "$.Payload.vpc_id",
+          "Type": "String"
+        },
+        {
+          "Name": "subnetIds",
+          "Selector": "$.Payload.subnet_ids",
+          "Type": "String"
+        },
+        {
+          "Name": "securityGroupIds",
+          "Selector": "$.Payload.security_group_ids",
+          "Type": "String"
+        },
+        {
+          "Name": "eniId",
+          "Selector": "$.Payload.eni_id",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ValidateResourcePermissions",
+      "description": "Validates that the execution role has necessary permissions to clean up resources that will be created.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "CreateDNSResolverLambda",
+      "inputs": {
+        "InputPayload": {
+          "LambdaRoleArn": "{{ LambdaRoleArn }}"
+        },
+        "Handler": "validate_resource_permissions.validate_resource_permissions",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "validationPassed",
+          "Selector": "$.Payload.validation_passed",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "missingPermissions",
+          "Selector": "$.Payload.missing_permissions",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "CreateDNSResolverLambda",
+      "description": "Creates an AWS Lambda function in the Amazon Virtual Private Cloud (Amazon VPC) to resolve DNS names to private IP addresses.",
+      "action": "aws:createStack",
+      "onFailure": "step:CheckStackExists",
+      "isCritical": true,
+      "onCancel": "step:CheckStackExists",
+      "timeoutSeconds": 1200,
+      "maxAttempts": 1,
+      "nextStep": "GetDNSResolverLambdaNameAndRole",
+      "inputs": {
+        "Capabilities": [
+          "CAPABILITY_IAM",
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "StackName": "AWSSupport-TroubleshootDMSEndpointConnection-{{ automation:EXECUTION_ID }}",
+        "ClientRequestToken": "AWSSupport-TroubleshootDMSEndpointConnection-{{ automation:EXECUTION_ID }}",
+        "TimeoutInMinutes": 10,
+        "OnFailure": "DELETE",
+        "Parameters": [
+          {
+            "ParameterKey": "ExecID",
+            "ParameterValue": "{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "ParameterKey": "SubnetIds",
+            "ParameterValue": "{{ DescribeReplicationInstance.subnetIds }}"
+          },
+          {
+            "ParameterKey": "SecurityGroupIds",
+            "ParameterValue": "{{ DescribeReplicationInstance.securityGroupIds }}"
+          },
+          {
+            "ParameterKey": "InputLambdaRoleArn",
+            "ParameterValue": "{{ LambdaRoleArn }}"
+          }
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nDescription: Creates a Lambda function in the VPC to resolve DNS names to private\n  IP addresses\n\nParameters:\n  ExecID:\n    Type: String\n    Description: Execution ID for unique naming\n  SubnetIds:\n    Type: CommaDelimitedList\n    Description: Comma-delimited list of Subnet ID where the Lambda function will\n      be deployed\n  SecurityGroupIds:\n    Type: CommaDelimitedList\n    Description: Comma-delimited list of security group IDs attached to Lambda function\n  InputLambdaRoleArn:\n    Description: (Optional) ARN of the IAM role that needs to be attached to the Lambda\n      function.\n    Type: String\n    Default: ''\n\nConditions:\n  CreateLambdaRole: !Equals\n  - !Ref InputLambdaRoleArn\n  - ''\nResources:\n  LambdaExecutionRole:\n    Type: AWS::IAM::Role\n    Condition: CreateLambdaRole\n    Properties:\n      RoleName: !Sub\n      - AWSSupport-TroubleshootDMSEndpointConnection-${ShortExecID}\n      - ShortExecID: !Select [0, !Split ['-', !Ref ExecID]]\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n        - Effect: Allow\n          Principal:\n            Service: lambda.amazonaws.com\n          Action: sts:AssumeRole\n      ManagedPolicyArns:\n      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole\n      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole\n\n  DNSResolverFunction:\n    Type: AWS::Lambda::Function\n    Properties:\n      FunctionName: !Sub\n      - AWSSupport-TroubleshootDMSEndpointConnection-${ShortExecID}\n      - ShortExecID: !Select [0, !Split ['-', !Ref ExecID]]\n      Runtime: python3.11\n      Handler: index.lambda_handler\n      Role: !If\n      - CreateLambdaRole\n      - !GetAtt LambdaExecutionRole.Arn\n      - !Ref InputLambdaRoleArn\n      Timeout: 60\n      VpcConfig:\n        SubnetIds: !Ref SubnetIds\n        SecurityGroupIds: !Ref SecurityGroupIds\n      Code:\n        ZipFile: |+\n          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n\n          # SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n\n          # Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\n\n\n          import ipaddress\n\n          import logging\n\n          import socket\n\n          from typing import Any, Dict\n\n\n\n          logger = logging.getLogger()\n\n          logger.setLevel(logging.INFO)\n\n\n\n\n\n          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:\n\n              \"\"\"\n\n              Resolves hostname to IP address from within the VPC and checks if it's in the same VPC.\n\n\n\n              Args:\n\n                  event: Input event containing the hostname to resolve\n\n                  context: Lambda context object\n\n\n\n              Returns:\n\n                  Dict containing resolved IP address or error message\n\n              \"\"\"\n\n              try:\n\n                  hostname = event.get(\"hostname\")\n\n\n\n                  # Check if hostname is already an IP address\n\n                  try:\n\n                      ipaddress.ip_address(hostname)\n\n                      server_ip = hostname\n\n                      logger.info(f\"Hostname '{hostname}' is already an IP address\")\n\n                  except ValueError:\n\n                      # Resolve hostname to IP address from within VPC\n\n                      try:\n\n                          server_ip = socket.gethostbyname(hostname)\n\n                          logger.info(f\"Resolved {hostname} to {server_ip}\")\n\n                      except socket.gaierror as e:\n\n                          return _error_response(f\"Failed to resolve endpoint {hostname}: {e}\")\n\n\n\n                  if ipaddress.ip_address(server_ip).version == 6:\n\n                      return _error_response(\n\n                          f\"Endpoint {hostname} resolved to IPv6 address ({server_ip}). Reachability Analyzer does not support IPv6 addresses.\"\n\n                      )\n\n\n\n                  return {\"resolved_ip\": server_ip, \"error_message\": \"\"}\n\n\n\n              except Exception as e:\n\n                  logger.error(f\"Unexpected error: {e}\")\n\n                  raise RuntimeError(f\"Unexpected error: {e}\") from None\n\n\n\n\n\n          def _error_response(message: str) -> Dict[str, Any]:\n\n              \"\"\"Create standardized error response.\"\"\"\n\n              logger.error(message)\n\n              return {\"resolved_ip\": \"\", \"error_message\": message}\n\n\nOutputs:\n  LambdaFunctionName:\n    Description: Name of the DNS resolver Lambda function\n    Value: !Ref DNSResolverFunction\n  LambdaFunctionArn:\n    Description: ARN of the DNS resolver Lambda function\n    Value: !GetAtt DNSResolverFunction.Arn\n  LambdaRoleArn:\n    Description: Lambda Execution Role ARN\n    Value: !If [CreateLambdaRole, !GetAtt LambdaExecutionRole.Arn, !Ref InputLambdaRoleArn]\n",
+        "Tags": [
+          {
+            "Key": "AWSSupport-TroubleshootDMSEndpointConnection",
+            "Value": "true"
+          },
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootDMSEndpointConnection-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AutomationExecutionId",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CloudformationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetDNSResolverLambdaNameAndRole",
+      "description": "Retrieves the name of the DNS resolver AWS Lambda function from the CloudFormation stack.",
+      "action": "aws:executeAwsApi",
+      "onFailure": "step:CheckStackExists",
+      "onCancel": "step:CheckStackExists",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "ResolveDmsEndpoint",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ CreateDNSResolverLambda.CloudformationStackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "LambdaFunctionName",
+          "Selector": "$.Stacks[0].Outputs[0].OutputValue",
+          "Type": "String"
+        },
+        {
+          "Name": "LambdaRoleArn",
+          "Selector": "$.Stacks[0].Outputs[2].OutputValue",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ResolveDmsEndpoint",
+      "description": "Determines the endpoint IP address using AWS Lambda for DNS resolution.",
+      "action": "aws:invokeLambdaFunction",
+      "onFailure": "step:CheckStackExists",
+      "onCancel": "step:CheckStackExists",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "BranchOnResolveDmsEndpointErrors",
+      "inputs": {
+        "FunctionName": "{{ GetDNSResolverLambdaNameAndRole.LambdaFunctionName }}",
+        "InputPayload": {
+          "hostname": "{{ DescribeEndpointAndCheckEngine.serverName }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "resolvedIp",
+          "Selector": "$.resolved_ip",
+          "Type": "String"
+        },
+        {
+          "Name": "errorMessage",
+          "Selector": "$.error_message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnResolveDmsEndpointErrors",
+      "description": "Branches the automation based on the error message. Continues troubleshooting if there are no errors or generates a report with error details.",
+      "action": "aws:branch",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "GenerateErrors",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ ResolveDmsEndpoint.errorMessage }}",
+            "StringEquals": "",
+            "NextStep": "GetReachabilityAnalyzerTarget"
+          }
+        ],
+        "Default": "GenerateErrors"
+      }
+    },
+    {
+      "name": "GetReachabilityAnalyzerTarget",
+      "description": "Identifies the appropriate target for Amazon VPC Reachability Analyzer based on VPC configuration and endpoint location.",
+      "action": "aws:executeScript",
+      "onFailure": "step:CheckStackExists",
+      "onCancel": "step:CheckStackExists",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "GenerateReport",
+      "inputs": {
+        "InputPayload": {
+          "serverName": "{{ DescribeEndpointAndCheckEngine.serverName }}",
+          "resolvedIp": "{{ ResolveDmsEndpoint.resolvedIp}}",
+          "vpcId": "{{ DescribeReplicationInstance.vpcId }}"
+        },
+        "Handler": "get_reachability_analyzer_target.get_ra_target",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "targetId",
+          "Selector": "$.Payload.target_id",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GenerateErrors",
+      "description": "Creates a report of failures occurred in the previous steps.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "CheckStackExists",
+      "onFailure": "step:CheckStackExists",
+      "onCancel": "step:CheckStackExists",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "testConnectionErrorMessage": "{{ GetTestConnectionStatus.errorMessage }}",
+          "describeEndpointErrorMessage": "{{ DescribeEndpointAndCheckEngine.errorMessage }}",
+          "dnsResolutionErrorMessage": "{{ ResolveDmsEndpoint.errorMessage }}",
+          "endpointArn": "{{ DmsEndpointArn }}",
+          "replicationInstanceArn": "{{ DmsReplicationInstanceArn }}",
+          "hostname": "{{ DescribeEndpointAndCheckEngine.serverName }}"
+        },
+        "Handler": "generate_errors_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "report",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GenerateReport",
+      "description": "Creates a comprehensive troubleshooting report with connection status, network path analysis results, and recommended actions.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "CheckStackExists",
+      "onFailure": "step:CheckStackExists",
+      "onCancel": "step:CheckStackExists",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "connectionStatus": "{{ GetTestConnectionStatus.status }}",
+          "failureMessage": "{{ GetTestConnectionStatus.failureMessage }}",
+          "endpointArn": "{{ DmsEndpointArn }}",
+          "replicationInstanceArn": "{{ DmsReplicationInstanceArn }}",
+          "SourceNetworkInterface": "{{ DescribeReplicationInstance.eniId }}",
+          "TargetId": "{{ GetReachabilityAnalyzerTarget.targetId }}",
+          "Port": "{{ DescribeEndpointAndCheckEngine.port }}",
+          "Region": "{{ global:REGION }}",
+          "persistReachabilityAnalyzerResults": "{{ PersistReachabilityAnalyzerResults }}"
+        },
+        "Handler": "generate_final_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "report",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckStackExists",
+      "description": "Checks if CloudFormation stack was created and needs to be deleted.",
+      "action": "aws:branch",
+      "onFailure": "Continue",
+      "timeoutSeconds": 60,
+      "maxAttempts": 1,
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ CreateDNSResolverLambda.CloudformationStackId }}",
+            "StartsWith": "arn:",
+            "NextStep": "DeleteDNSResolverLambda"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DeleteDNSResolverLambda",
+      "description": "Deletes the AWS CloudFormation stack containing the DNS resolver AWS Lambda Function.",
+      "action": "aws:deleteStack",
+      "onCancel": "step:CleanupReport",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "timeoutSeconds": 3600,
+      "maxAttempts": 1,
+      "nextStep": "CleanupReport",
+      "inputs": {
+        "StackName": "{{ CreateDNSResolverLambda.CloudformationStackId }}"
+      }
+    },
+    {
+      "name": "CleanupReport",
+      "description": "Creates a report of cleanup activities.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "nextStep": "DescribeCloudFormationErrorFromStackEvents",
+      "inputs": {
+        "InputPayload": {
+          "LambdaFunctionName": "{{ GetDNSResolverLambdaNameAndRole.LambdaFunctionName }}",
+          "LambdaRoleArn": "{{ GetDNSResolverLambdaNameAndRole.LambdaRoleArn }}",
+          "MissingPermissions": "{{ ValidateResourcePermissions.missingPermissions }}"
+        },
+        "Handler": "generate_cleanup_report.cleanup_report",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "report",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DescribeCloudFormationErrorFromStackEvents",
+      "onFailure": "Abort",
+      "action": "aws:executeAwsApi",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "description": "Describes errors from the AWS CloudFormation stack.",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStackEvents",
+        "StackName": "{{ CreateDNSResolverLambda.CloudformationStackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "Events",
+          "Selector": "$.StackEvents..ResourceStatusReason",
+          "Type": "StringList"
+        }
+      ],
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "GetTestConnectionStatus.status",
+    "DescribeCloudFormationErrorFromStackEvents.Events",
+    "GenerateReport.report",
+    "GenerateErrors.report",
+    "CleanupReport.report"
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "fd8a9b3a75f6f9b6b9ee13279bcc2be4f19ebc43c4709cd3d90453e68b5a9856"
+      }
+    }
+  }
+}

@@ -1,0 +1,222 @@
+{
+  "schemaVersion": "1.0",
+  "templateBody": {
+    "Metadata": {
+      "Version": "1.0"
+    },
+    "Parameters": {
+      "QSType": {
+        "Type": "String",
+        "AllowedValues": [
+          "LA"
+        ],
+        "Description": "(Required) Specifies whether the Quick Setup applies to the local account or an AWS organization."
+      },
+      "QSConfigurationId": {
+        "Type": "String",
+        "Description": "(Required) Unique identifier of the deployed configuration."
+      },
+      "isInstall": {
+        "Type": "String",
+        "Description": "Whether to install the CloudWatch agent",
+        "AllowedValues": [
+          "true",
+          "false"
+        ],
+        "Default": "false"
+      },
+      "isConfigure": {
+        "Type": "String",
+        "Description": "Whether to configure the CloudWatch agent",
+        "AllowedValues": [
+          "true",
+          "false"
+        ],
+        "Default": "false"
+      },
+      "optionalConfigurationSource": {
+        "Type": "String",
+        "Description": "Configuration source for CloudWatch agent",
+        "AllowedValues": [
+          "ssm",
+          "default",
+          "all"
+        ],
+        "Default": "default"
+      },
+      "optionalConfigurationLocation": {
+        "Type": "String",
+        "Description": "Configuration location for CloudWatch agent",
+        "AllowedPattern": "^[a-zA-Z0-9-\"~:_@./^(*)!<>?=+,]*$",
+        "Default": ""
+      },
+      "RemediationSchedule": {
+        "Type": "String",
+        "Default": "rate(30 days)",
+        "AllowedValues": [
+          "rate(30 days)",
+          "rate(7 days)",
+          "rate(1 day)",
+          "none"
+        ],
+        "Description": "(Optional) The interval at which the configuration's drift remediation runs. This controls how often we upgrade CWAgent."
+      },
+      "TargetTagKey": {
+        "Type": "String",
+        "MinLength": 1,
+        "MaxLength": 128,
+        "AllowedPattern": "^[a-zA-Z0-9-\"~:_@./^(*)!<>?=+,]*$",
+        "Description": "Tag key used to target instances. This parameter is only used for the local Quick Setup type when Tags are the TargetType."
+      },
+      "TargetTagValue": {
+        "Type": "String",
+        "MaxLength": 256,
+        "AllowedPattern": "^[a-zA-Z0-9-\"~:_@./^(*) !<>?=+,]*$",
+        "Description": "(Optional) Tag value used to target instances. This parameter is only used for the local Quick Setup type when Tags are the TargetType."
+      },
+      "IsPolicyAttachAllowed": {
+        "Type": "String",
+        "Default": "false",
+        "AllowedValues": [
+          "true",
+          "false"
+        ],
+        "Description": "(Optional) Whether you want to allow Quick Setup to attach IAM policies to existing instance profiles."
+      }
+    },
+    "Conditions": {
+      "HasSchedule": {
+        "Fn::Not": [
+          {
+            "Fn::Equals": [
+              {
+                "Ref": "RemediationSchedule"
+              },
+              "none"
+            ]
+          }
+        ]
+      },
+      "IsPolicyAttachAllowed": {
+        "Fn::Equals": [
+          {
+            "Ref": "IsPolicyAttachAllowed"
+          },
+          "true"
+        ]
+      }
+    },
+    "Resources": {
+      "AmazonCWAgentManageInstanceProfileAssociation": {
+        "Type": "AWS::SSM::Association",
+        "Condition": "IsPolicyAttachAllowed",
+        "Properties": {
+          "Name": "AWSQuickSetupType-ManageInstanceProfile",
+          "AssociationName": {
+            "Fn::Join": [
+              "",
+              [
+                "AWS-QuickSetup-CWAAttachIAMToInstance-",
+                {
+                  "Ref": "QSConfigurationId"
+                }
+              ]
+            ]
+          },
+          "AutomationTargetParameterName": "InstanceId",
+          "Parameters": {
+            "AutomationAssumeRole": [
+              {
+                "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWS-QuickSetup-SetupCWAgentPermissions"
+              }
+            ],
+            "UpdateExistingProfiles": [
+              {
+                "Ref": "IsPolicyAttachAllowed"
+              }
+            ],
+            "ManagedPoliciesToAttach": [
+              {
+                "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy"
+              }
+            ]
+          },
+          "Targets": [
+            {
+              "Key": {
+                "Fn::Sub": "tag:${TargetTagKey}"
+              },
+              "Values": [
+                {
+                  "Ref": "TargetTagValue"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "AmazonCWAgentSetupAssociation": {
+        "Type": "AWS::SSM::Association",
+        "Properties": {
+          "Name": "AWSQuickSetupType-InstallAndManageCloudWatchAgent",
+          "AssociationName": {
+            "Fn::Join": [
+              "",
+              [
+                "AWS-QuickSetup-CWASetup-",
+                {
+                  "Ref": "QSConfigurationId"
+                }
+              ]
+            ]
+          },
+          "Parameters": {
+            "isInstall": [
+              {
+                "Ref": "isInstall"
+              }
+            ],
+            "isConfigure": [
+              {
+                "Ref": "isConfigure"
+              }
+            ],
+            "optionalConfigurationSource": [
+              {
+                "Ref": "optionalConfigurationSource"
+              }
+            ],
+            "optionalConfigurationLocation": [
+              {
+                "Ref": "optionalConfigurationLocation"
+              }
+            ]
+          },
+          "ScheduleExpression": {
+            "Fn::If": [
+              "HasSchedule",
+              {
+                "Ref": "RemediationSchedule"
+              },
+              {
+                "Ref": "AWS::NoValue"
+              }
+            ]
+          },
+          "Targets": [
+            {
+              "Key": {
+                "Fn::Sub": "tag:${TargetTagKey}"
+              },
+              "Values": [
+                {
+                  "Ref": "TargetTagValue"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

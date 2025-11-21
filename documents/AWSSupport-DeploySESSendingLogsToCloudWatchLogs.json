@@ -1,0 +1,363 @@
+{
+  "description": "The **AWSSupport-DeploySESSendingLogsToCloudWatchLogs** automation runbook helps configure the infrastructure required for Amazon Simple Email Service (Amazon SES) event publishing to Amazon CloudWatch Logs. This runbook sets up the components needed to capture email sending events and store them in CloudWatch Logs for monitoring and analysis. For more information about Amazon SES event publishing, see [Monitor email sending using Amazon SES event publishing](https://docs.aws.amazon.com/ses/latest/dg/monitor-using-event-publishing.html).\n\nThis runbook performs the following actions:\n\n> * Lists existing configuration sets that have event destinations configured for Amazon Simple Notification Service (Amazon SNS) topics or Amazon Data Firehose delivery streams.\n> * Creates the infrastructure required for Amazon SES event publishing to CloudWatch Logs when the **ApproveDeployAnalyticEnvironment** parameter is set to `approve`. This creates new AWS resources in your AWS account.\n\nWhen the **ApproveDeployAnalyticEnvironment** parameter is set to `approve`, the runbook creates the following resources:\n\n> * An AWS CloudFormation stack named **AWSSupport-SESSendingLogsToCloudWatchLogs** that includes:\n>     * Amazon SNS topic with AWS Key Management Service (AWS KMS) encryption\n>     * Amazon Simple Queue Service (Amazon SQS) queue\n>     * AWS Lambda function for processing email sending events\n>     * AWS Identity and Access Management (IAM) execution role with permissions for Amazon SQS and CloudWatch Logs\n>     * CloudWatch Logs log group\n>     * AWS KMS key for encryption\n>     * Amazon SES configuration set with event destinations\n> * The infrastructure processes email sending events in the following flow:\n>     * Amazon SES Email Sending Events → Amazon SES Configuration Set → Amazon SNS Topic → Amazon SQS Queue → AWS Lambda Function → CloudWatch Logs\n> * If the resource creation fails, the resources are deleted through AWS CloudFormation rollback.\n> * Associates the created configuration set as the default configuration set for a specified Amazon SES identity when the **SesIdentity** parameter is provided.\n\n**Note:**\n\n> * The AWS CloudFormation stack is deleted after the time specified in the **SleepTime** parameter. Set this parameter to `0` to prevent automatic deletion.\n> * The CloudWatch Logs log group is retained when the AWS CloudFormation stack is deleted by default. Set the **RetainCloudWatchLogsOnDeletion** parameter to `False` to delete the log group with the stack.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "variables": {
+    "StackName": {
+      "type": "String",
+      "default": "AWSSupport-SESSendingLogsToCloudWatchLogs"
+    },
+    "ConfigurationSetName": {
+      "type": "String",
+      "default": "AWSSupport-SendingEventLogs"
+    }
+  },
+  "outputs": [
+    "OutputExistingConfigurationSetsMessage.Message",
+    "OutputNewConfigurationSetMessage.Message"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ApproveDeployAnalyticEnvironment": {
+      "type": "String",
+      "description": "(Optional) Approval to deploy the Amazon SES event publishing infrastructure. Enter 'approve' to create the AWS CloudFormation stack and related resources. If left empty, the runbook only displays existing configuration sets with Amazon Data Firehose or Amazon SNS event destinations in the current region.",
+      "default": "",
+      "allowedPattern": "^$|^approve$"
+    },
+    "SesIdentity": {
+      "type": "String",
+      "description": "(Optional) Amazon SES identity (email address or domain) to associate with the newly created configuration set as the default configuration set. This will overwrite any existing default configuration set for the specified identity.",
+      "default": "",
+      "allowedPattern": "^$|^([a-zA-Z0-9._%+-]{1,64}@)?((?!-)[^\\.\\s]{0,62}(?<!-)\\.)+[^\\.\\s]{2,63}$"
+    },
+    "CloudWatchLogGroupName": {
+      "type": "String",
+      "description": "(Optional) Name of the CloudWatch Logs log group to create for storing Amazon SES email sending events.",
+      "default": "/ses/sending_event_logs",
+      "allowedPattern": "^[0-9a-zA-Z_.#/\\-]{1,512}$"
+    },
+    "MaskPIIData": {
+      "type": "String",
+      "description": "(Optional) Specify whether to mask personally identifiable information (PII) data such as destination email addresses and email subjects in CloudWatch Logs. Set to 'False' to include this information in the logs.",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "SleepTime": {
+      "type": "String",
+      "description": "(Optional) Number of minutes to wait before automatically deleting the AWS CloudFormation stack. The default is 24 hours (1,440 minutes), maximum is 7 days (10,080 minutes). Set to '0' to prevent automatic deletion.",
+      "allowedPattern": "^(?:[0-9]|[1-9]\\d{1,3}|100[0-7][0-9])$",
+      "default": "1440"
+    },
+    "RetainCloudWatchLogsOnDeletion": {
+      "type": "String",
+      "description": "(Optional) Specify whether to retain the CloudWatch Logs log group when the AWS CloudFormation stack is deleted. Set to 'False' to delete the log group along with the stack.",
+      "default": "True",
+      "allowedValues": [
+        "True",
+        "False"
+      ]
+    },
+    "UniqueId": {
+      "type": "String",
+      "description": "(Optional) A unique identifier for the workflow.",
+      "default": "{{ automation:EXECUTION_ID }}",
+      "allowedPattern": "\\{\\{ automation:EXECUTION_ID \\}\\}|[a-zA-Z0-9-]+",
+      "maxChars": 64
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "BranchOnValueOfParameterApproveDeployAnalyticEnvironment",
+      "action": "aws:branch",
+      "description": "Determines whether to deploy the Amazon SES event publishing infrastructure based on the ApproveDeployAnalyticEnvironment parameter value.",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckConcurrency",
+            "Variable": "{{ ApproveDeployAnalyticEnvironment }}",
+            "StringEquals": "approve"
+          }
+        ],
+        "Default": "GetEligibleConfigurationSets"
+      }
+    },
+    {
+      "name": "GetEligibleConfigurationSets",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport secrets\nimport sys\nimport time\n\nimport boto3\n\nsys.tracebacklimit = 0\n\nVALID_DESTINATION_TYPES = [\"SnsDestination\", \"KinesisFirehoseDestination\"]\n\n\ndef retry_with_backoff(max_retries=3, base_delay=1):\n    \"\"\"Retry decorator with exponential backoff and jitter.\"\"\"\n\n    def decorator(func):\n        def wrapper(*args, **kwargs):\n            for attempt in range(max_retries):\n                try:\n                    return func(*args, **kwargs)\n                except Exception as e:\n                    if attempt == max_retries - 1:\n                        raise RuntimeError(f\"Failed after {max_retries} attempts: {str(e)}\") from None\n                    delay = base_delay * (2**attempt) + secrets.SystemRandom().uniform(0, 1)\n                    time.sleep(delay)\n            return func(*args, **kwargs)\n\n        return wrapper\n\n    return decorator\n\n\ndef validate_configuration_set_name(name):\n    \"\"\"Validate configuration set name format.\"\"\"\n    if not name or not isinstance(name, str):\n        raise ValueError(f\"Invalid configuration set name: {name}\")\n    if len(name) > 64 or not name.replace(\"-\", \"\").replace(\"_\", \"\").isalnum():\n        raise ValueError(f\"Configuration set name format invalid: {name}\")\n\n\ndef is_valid_destination_type(event_destination):\n    return any(destination_type in event_destination for destination_type in VALID_DESTINATION_TYPES)\n\n\ndef has_valid_event_types(event_destination):\n    return \"BOUNCE\" in event_destination[\"MatchingEventTypes\"]\n\n\ndef is_event_destination_enabled(event_destination):\n    return event_destination[\"Enabled\"]\n\n\ndef has_valid_event_destinations(event_destinations):\n    return any(\n        [\n            all(\n                [\n                    is_event_destination_enabled(event_destination),\n                    has_valid_event_types(event_destination),\n                    is_valid_destination_type(event_destination),\n                ]\n            )\n            for event_destination in event_destinations\n        ]\n    )\n\n\n@retry_with_backoff()\ndef is_eligible_configuration_set(sesv2, configuration_set):\n    validate_configuration_set_name(configuration_set)\n    response = sesv2.get_configuration_set_event_destinations(ConfigurationSetName=configuration_set)\n    if \"EventDestinations\" not in response:\n        return False\n\n    return has_valid_event_destinations(response[\"EventDestinations\"])\n\n\ndef filter_eligible_configuration_sets(configuration_sets):\n    sesv2 = boto3.client(\"sesv2\")\n\n    return list(\n        filter(lambda configuration_set: is_eligible_configuration_set(sesv2, configuration_set), configuration_sets)\n    )\n\n\n@retry_with_backoff()\ndef get_configuration_set_names():\n    ses = boto3.client(\"ses\")\n\n    return (\n        [configuration_set[\"Name\"] for configuration_set in ses.list_configuration_sets()[\"ConfigurationSets\"]],\n        ses._client_config.region_name,\n    )\n\n\ndef script_handler(events, context):\n    configuration_set_names, region_name = get_configuration_set_names()\n    filtered_configuration_sets = filter_eligible_configuration_sets(configuration_set_names)\n    print(f\"region_name = {region_name}\")\n\n    return {\"configuration_sets\": filtered_configuration_sets, \"region_name\": region_name}\n"
+      },
+      "outputs": [
+        {
+          "Name": "ConfigurationSets",
+          "Selector": "$.Payload.configuration_sets",
+          "Type": "StringList"
+        },
+        {
+          "Name": "RegionName",
+          "Selector": "$.Payload.region_name",
+          "Type": "String"
+        }
+      ],
+      "description": "Retrieves existing Amazon SES configuration sets and identifies those with event destinations configured for Amazon Data Firehose delivery streams or Amazon SNS topics.",
+      "nextStep": "OutputExistingConfigurationSetsMessage",
+      "onFailure": "Abort"
+    },
+    {
+      "name": "OutputExistingConfigurationSetsMessage",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "description": "Displays information about existing Amazon SES configuration sets that can be used for email sending event publishing.",
+      "inputs": {
+        "InputPayload": {
+          "configurationSet": "{{ GetEligibleConfigurationSets.ConfigurationSets }}",
+          "regionName": "{{ GetEligibleConfigurationSets.RegionName }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\n\nsys.tracebacklimit = 0\n\nDOMAIN_URL_MAPPING = {\n    \"aws\": \"aws.amazon.com\",\n    \"aws-cn\": \"amazonaws.cn\",\n    \"aws-us-gov\": \"amazonaws-us-gov.com\",\n    \"aws-iso\": \"c2shome.ic.gov\",\n    \"aws-iso-b\": \"sc2shome.sgov.gov\",\n    \"aws-iso-e\": \"csphome.adc-e.uk\",\n    \"aws-iso-f\": \"csphome.hci.ic.gov\",\n}\n\nCONSOLE_URL_BASE_FOR_REGION = \"https://{region}.console.{domain}/ses/home?region={region}#/configuration-sets/\"\n\n\ndef get_console_domain(partition):\n    \"\"\"Get the console domain for the given partition.\"\"\"\n    return DOMAIN_URL_MAPPING.get(partition, \"aws.amazon.com\")\n\n\ndef generate_deeplink(configuration_set_name, region_name, partition):\n    domain = get_console_domain(partition)\n    return (\n        f\"[{configuration_set_name}](\"\n        + CONSOLE_URL_BASE_FOR_REGION.format(region=region_name, domain=domain)\n        + configuration_set_name\n        + \")\"\n    )\n\n\ndef script_handler(events, context):\n    try:\n        region_name = context[\"global:REGION\"]\n        partition = context[\"global:AWS_PARTITION\"]\n\n        message_prefix = \"\"\n\n        if \"configurationSet\" in events and events[\"configurationSet\"]:\n            configuration_sets = events[\"configurationSet\"]\n\n            configuration_sets_message = \"\\n\".join(\n                [\n                    generate_deeplink(configuration_set, region_name, partition)\n                    for configuration_set in configuration_sets\n                ]\n            )\n            message_prefix = (\n                \"You seem to have the below configuration sets \"\n                + \"which potentially can be utilized for SES sending event troubleshootings. \"\n                + \"Please check those configuration sets to see if they satisfy your requirements.\\n\\n\"\n                + configuration_sets_message\n            )\n        else:\n            message_prefix = \"You do not seem to have configuration sets with SES sending events stores.\"\n\n        message = (\n            message_prefix\n            + \"\\n\\nIn the case you would like to deploy a new SES sending events store with this document,\"\n            + ' please enter \"approve\" to the parameter ApproveDeployAnalyticEnvironment and run this document again.'\n        )\n\n        return {\"message\": message}\n\n    except Exception as e:\n        raise RuntimeError(f\"Unexpected error occurred when generating configuration sets message: {e}\") from None\n"
+      },
+      "isEnd": true,
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Selector": "$.Payload.message",
+          "Name": "Message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CheckConcurrency",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "description": "Verifies that no existing stack exists and that no other concurrent executions of this runbook are creating the same stack.",
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "StackName": "{{ variable:StackName }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nfrom datetime import datetime, timedelta, timezone\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\nssm_client = boto3.client(\"ssm\")\ncloudformation_client = boto3.client(\"cloudformation\")\n\n\ndef script_handler(events, context):\n    stack_name = events.get(\"StackName\", \"AWSSupport-SESSendingLogsToCloudWatchLogs\")\n\n    try:\n        # Get the current execution details\n        current_execution = ssm_client.get_automation_execution(\n            AutomationExecutionId=context[\"automation:EXECUTION_ID\"]\n        )[\"AutomationExecution\"]\n\n        current_execution_start_time = datetime.fromtimestamp(\n            current_execution[\"ExecutionStartTime\"].timestamp(), timezone.utc\n        )\n\n        # Add 5 seconds to 'StartTimeBefore' to capture executions that started exactly at the same time\n        current_execution_start_time += timedelta(seconds=5)\n\n        # Describe executions that are not in terminal status\n        document_executions = ssm_client.describe_automation_executions(\n            Filters=[\n                {\"Key\": \"DocumentNamePrefix\", \"Values\": [current_execution[\"DocumentName\"]]},\n                {\"Key\": \"ExecutionStatus\", \"Values\": [\"InProgress\", \"Pending\", \"Cancelling\", \"Waiting\"]},\n                {\"Key\": \"StartTimeBefore\", \"Values\": [current_execution_start_time.strftime(\"%Y-%m-%dT%H:%M:%SZ\")]},\n            ]\n        )[\"AutomationExecutionMetadataList\"]\n\n        # Check for other previous executions where ApproveDeployAnalyticEnvironment parameter is \"approve\". If any, return an error\n        for execution in document_executions:\n            execution_id = execution[\"AutomationExecutionId\"]\n            if execution_id != current_execution[\"AutomationExecutionId\"]:\n                approve_deploy_param_list = (\n                    ssm_client.get_automation_execution(AutomationExecutionId=execution_id)[\"AutomationExecution\"]\n                    .get(\"Parameters\", [])\n                    .get(\"ApproveDeployAnalyticEnvironment\", [])\n                )\n                approve_deploy_param = next(iter(approve_deploy_param_list), \"\")\n                if approve_deploy_param == \"approve\":\n                    raise RuntimeError(\n                        f\"There is another execution of this document already in progress with id {execution_id}\"\n                    ) from None\n\n        # Check if the CloudFormation stack already exists by directly querying CloudFormation\n        try:\n            response = cloudformation_client.describe_stacks(StackName=stack_name)\n            if response[\"Stacks\"]:\n                stack = response[\"Stacks\"][0]\n                stack_status = stack[\"StackStatus\"]\n                # Check if stack is in a non-terminal state or exists in a stable state\n                if stack_status not in [\"DELETE_COMPLETE\"]:\n                    raise RuntimeError(f\"Stack '{stack_name}' already exists with status: {stack_status}\") from None\n        except ClientError as e:\n            # If stack doesn't exist, CloudFormation returns ValidationError\n            if e.response[\"Error\"][\"Code\"] != \"ValidationError\":\n                raise RuntimeError(f\"An error occurred when checking stack existence: {str(e)}\") from None\n\n    except ClientError as e:\n        raise RuntimeError(f\"An error occurred when checking concurrency: {str(e)}\") from None\n\n    return {\n        \"Message\": \"There is no overlap between running the SAW runbook and creating the CloudFormation stack. We can go to the next step.\"\n    }\n"
+      },
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "DeploySesEventDestinations"
+    },
+    {
+      "name": "DeploySesEventDestinations",
+      "action": "aws:createStack",
+      "description": "Creates the AWS CloudFormation stack containing the Amazon SES event publishing infrastructure including Amazon SNS topic, Amazon SQS queue, AWS Lambda function, and CloudWatch Logs log group.",
+      "onFailure": "step:DescribeCloudFormationErrorFromStackEvents",
+      "onCancel": "step:DescribeCloudFormationErrorFromStackEvents",
+      "inputs": {
+        "StackName": "{{ variable:StackName }}",
+        "OnFailure": "DELETE",
+        "TimeoutInMinutes": 30,
+        "Capabilities": [
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nOutputs:\n  ConfigurationSetName:\n    Description: Configuration set to publish SES events to the deployed CloudWatch\n      Logs group.\n    Export:\n      Name: NewConfigurationSetName\n    Value:\n      Ref: ConfigurationSetName\n  LogGroup:\n    Description: CloudWatch Logs group to store SES events\n    Export:\n      Name: NewLogGroup\n    Value:\n      Ref: LogGroup\n  StackId:\n    Description: StackId\n    Export:\n      Name: StackId\n    Value:\n      Ref: AWS::StackId\nParameters:\n  ConfigurationSetName:\n    Default: SendingEventLogs\n    Description: ConfigurationSet name.\n    Type: String\n  LambdaFunctionName:\n    Default: SESEventsToCloudWatchLogs\n    Description: Name of the lambda function to upload SES events to CloudWatch log\n      grop\n    Type: String\n  CloudWatchLogGroupName:\n    Description: The name of CloudWatch log group created\n    Type: String\n  RetainCloudWatchLogsOnDeletion:\n    Type: String\n    Default: 'False'\n    AllowedValues:\n    - 'True'\n    - 'False'\n    Description: Specify if the CloudWatch log group should be retained after stack\n      deletion.\n  MaskPIIData:\n    Type: String\n    Default: 'True'\n    AllowedValues:\n    - 'True'\n    - 'False'\n    Description: Specify if PII data (destination email addresses and subject) should\n      be masked in the logs.\nConditions:\n  RetainLogGroup: !Equals\n  - !Ref RetainCloudWatchLogsOnDeletion\n  - 'True'\nResources:\n  ConfigurationSet:\n    Properties:\n      Name: !Sub \"AWSSupport-${ConfigurationSetName}\"\n      ReputationOptions:\n        ReputationMetricsEnabled: false\n    Type: AWS::SES::ConfigurationSet\n  ConfigurationSetDestination:\n    Properties:\n      ConfigurationSetName:\n        Ref: ConfigurationSet\n      EventDestination:\n        Enabled: true\n        MatchingEventTypes:\n        - send\n        - reject\n        - bounce\n        - complaint\n        - delivery\n        - deliveryDelay\n        Name: !Sub \"AWSSupport-${ConfigurationSetName}-SNS-destination\"\n        SnsDestination:\n          TopicARN:\n            Fn::GetAtt:\n            - SNSTopic\n            - TopicArn\n    Type: AWS::SES::ConfigurationSetEventDestination\n  LambdaExecutionRole:\n    Properties:\n      AssumeRolePolicyDocument:\n        Statement:\n        - Action: sts:AssumeRole\n          Effect: Allow\n          Principal:\n            Service: lambda.amazonaws.com\n        Version: '2012-10-17'\n      Policies:\n      - PolicyDocument:\n          Statement:\n          - Action: logs:CreateLogGroup\n            Effect: Allow\n            Resource:\n            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*\n          - Action:\n            - logs:CreateLogStream\n            - logs:PutLogEvents\n            Effect: Allow\n            Resource:\n            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/AWSSupport-${LambdaFunctionName}:*\n            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudWatchLogGroupName}:*\n          - Action:\n            - logs:DescribeLogGroups\n            - logs:DescribeLogStreams\n            Effect: Allow\n            Resource:\n            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*\n          - Action:\n            - sqs:ReceiveMessage\n            - sqs:DeleteMessage\n            - sqs:GetQueueAttributes\n            Effect: Allow\n            Resource:\n            - Fn::GetAtt:\n              - SQSQueue\n              - Arn\n          Version: '2012-10-17'\n        PolicyName: !Sub \"AWSSupport-${ConfigurationSetName}-LambdaExecutionRole-InlinePolicy\"\n      RoleName: !Sub \"AWSSupport-${ConfigurationSetName}-LambdaExecutionRole\"\n    Type: AWS::IAM::Role\n  LambdaFunction:\n    Properties:\n      Architectures:\n      - x86_64\n      Code:\n        ZipFile: \"# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\\n\\\n          \\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\\n\\n# Licensed\\\n          \\ under the Amazon Software License  http://aws.amazon.com/asl/\\n\\n\\n\\n\\\n          import datetime\\n\\nimport json\\n\\nimport os\\n\\nimport sys\\n\\nimport time\\n\\\n          \\nimport uuid\\n\\n\\n\\nimport boto3\\n\\n\\n\\nsys.tracebacklimit = 0\\n\\n\\n\\n\\\n          DEFAULT_LOG_GROUP_NAME = os.environ[\\\"LogGroupName\\\"]\\n\\nMASK_PII_DATA =\\\n          \\ os.environ[\\\"MaskPIIData\\\"] == \\\"True\\\"\\n\\nMAX_RETRY_COUNT = 3\\n\\n\\n\\n\\\n          logs_client = boto3.client(\\\"logs\\\")\\n\\n\\n\\n\\n\\nclass SESEventMasker:\\n\\n\\\n          \\    \\\"\\\"\\\"Class to handle masking of PII data in SES events.\\\"\\\"\\\"\\n\\n\\n\\\n          \\n    def _mask_local_part(self, local_part):\\n\\n        \\\"\\\"\\\"Mask the\\\n          \\ local part of an email address.\\\"\\\"\\\"\\n\\n        if len(local_part) <\\\n          \\ 3:\\n\\n            return \\\"*\\\" * len(local_part)\\n\\n        return local_part[0]\\\n          \\ + \\\"*\\\" * (len(local_part) - 2) + local_part[-1]\\n\\n\\n\\n    def _mask_email_address(self,\\\n          \\ email_address):\\n\\n        \\\"\\\"\\\"Mask an email address.\\\"\\\"\\\"\\n\\n    \\\n          \\    try:\\n\\n            local_part, domain_part = email_address.split(\\\"\\\n          @\\\")\\n\\n            return f\\\"{self._mask_local_part(local_part)}@{domain_part}\\\"\\\n          \\n\\n        except ValueError:\\n\\n            return self._mask_local_part(email_address)\\n\\\n          \\n\\n\\n    def _mask_subject(self, subject):\\n\\n        \\\"\\\"\\\"Completely\\\n          \\ mask email subject without revealing length.\\\"\\\"\\\"\\n\\n        return \\\"\\\n          [MASKED_SUBJECT]\\\"\\n\\n\\n\\n    def _mask_email_list(self, email_list):\\n\\n\\\n          \\        \\\"\\\"\\\"Mask a list of email addresses.\\\"\\\"\\\"\\n\\n        return [self._mask_email_address(email)\\\n          \\ for email in email_list]\\n\\n\\n\\n    def _mask_headers(self, headers):\\n\\\n          \\n        \\\"\\\"\\\"Mask sensitive headers (To, Cc, Bcc and Subject) - case\\\n          \\ insensitive.\\\"\\\"\\\"\\n\\n        masked_headers = []\\n\\n        for header\\\n          \\ in headers:\\n\\n            header_name = header.get(\\\"name\\\", \\\"\\\").lower()\\n\\\n          \\n            if header_name in [\\\"to\\\", \\\"cc\\\", \\\"bcc\\\"]:\\n\\n         \\\n          \\       header_copy = header.copy()\\n\\n                header_copy[\\\"value\\\"\\\n          ] = self._mask_email_address(header[\\\"value\\\"])\\n\\n                masked_headers.append(header_copy)\\n\\\n          \\n            elif header_name == \\\"subject\\\":\\n\\n                header_copy\\\n          \\ = header.copy()\\n\\n                header_copy[\\\"value\\\"] = self._mask_subject(header[\\\"\\\n          value\\\"])\\n\\n                masked_headers.append(header_copy)\\n\\n    \\\n          \\        else:\\n\\n                masked_headers.append(header)\\n\\n    \\\n          \\    return masked_headers\\n\\n\\n\\n    def _mask_common_headers(self, common_headers):\\n\\\n          \\n        \\\"\\\"\\\"Mask common headers (to, cc, bcc and subject) - case insensitive.\\\"\\\n          \\\"\\\"\\n\\n        masked_headers = common_headers.copy()\\n\\n\\n\\n        #\\\n          \\ Create a case-insensitive lookup for existing keys\\n\\n        key_mapping\\\n          \\ = {}\\n\\n        for key in masked_headers.keys():\\n\\n            key_mapping[key.lower()]\\\n          \\ = key\\n\\n\\n\\n        # Mask email fields (to, cc, bcc)\\n\\n        for\\\n          \\ field in [\\\"to\\\", \\\"cc\\\", \\\"bcc\\\"]:\\n\\n            if field in key_mapping:\\n\\\n          \\n                original_key = key_mapping[field]\\n\\n                masked_headers[original_key]\\\n          \\ = self._mask_email_list(masked_headers[original_key])\\n\\n\\n\\n        #\\\n          \\ Mask subject field\\n\\n        if \\\"subject\\\" in key_mapping:\\n\\n     \\\n          \\       original_key = key_mapping[\\\"subject\\\"]\\n\\n            masked_headers[original_key]\\\n          \\ = self._mask_subject(masked_headers[original_key])\\n\\n\\n\\n        return\\\n          \\ masked_headers\\n\\n\\n\\n    def _mask_bounced_recipients(self, bounced_recipients):\\n\\\n          \\n        \\\"\\\"\\\"Mask email addresses in bounced recipients.\\\"\\\"\\\"\\n\\n  \\\n          \\      masked_recipients = []\\n\\n        for recipient in bounced_recipients:\\n\\\n          \\n            if isinstance(recipient, dict) and \\\"emailAddress\\\" in recipient:\\n\\\n          \\n                recipient_copy = recipient.copy()\\n\\n                recipient_copy[\\\"\\\n          emailAddress\\\"] = self._mask_email_address(recipient[\\\"emailAddress\\\"])\\n\\\n          \\n                masked_recipients.append(recipient_copy)\\n\\n         \\\n          \\   else:\\n\\n                masked_recipients.append(recipient)\\n\\n   \\\n          \\     return masked_recipients\\n\\n\\n\\n    def _mask_complained_recipients(self,\\\n          \\ complained_recipients):\\n\\n        \\\"\\\"\\\"Mask email addresses in complained\\\n          \\ recipients.\\\"\\\"\\\"\\n\\n        masked_recipients = []\\n\\n        for recipient\\\n          \\ in complained_recipients:\\n\\n            if isinstance(recipient, dict)\\\n          \\ and \\\"emailAddress\\\" in recipient:\\n\\n                recipient_copy =\\\n          \\ recipient.copy()\\n\\n                recipient_copy[\\\"emailAddress\\\"] =\\\n          \\ self._mask_email_address(recipient[\\\"emailAddress\\\"])\\n\\n            \\\n          \\    masked_recipients.append(recipient_copy)\\n\\n            else:\\n\\n \\\n          \\               masked_recipients.append(recipient)\\n\\n        return masked_recipients\\n\\\n          \\n\\n\\n    def _mask_delayed_recipients(self, delayed_recipients):\\n\\n  \\\n          \\      \\\"\\\"\\\"Mask email addresses in delayed recipients.\\\"\\\"\\\"\\n\\n     \\\n          \\   masked_recipients = []\\n\\n        for recipient in delayed_recipients:\\n\\\n          \\n            if isinstance(recipient, dict) and \\\"emailAddress\\\" in recipient:\\n\\\n          \\n                recipient_copy = recipient.copy()\\n\\n                recipient_copy[\\\"\\\n          emailAddress\\\"] = self._mask_email_address(recipient[\\\"emailAddress\\\"])\\n\\\n          \\n                masked_recipients.append(recipient_copy)\\n\\n         \\\n          \\   else:\\n\\n                masked_recipients.append(recipient)\\n\\n   \\\n          \\     return masked_recipients\\n\\n\\n\\n    def _validate_masking_result(self,\\\n          \\ original_data, masked_data):\\n\\n        \\\"\\\"\\\"Validate that sensitive\\\n          \\ data was actually masked. Returns False if validation fails.\\\"\\\"\\\"\\n\\n\\\n          \\        try:\\n\\n            original_json = json.loads(original_data) if\\\n          \\ isinstance(original_data, str) else original_data\\n\\n            masked_json\\\n          \\ = json.loads(masked_data) if isinstance(masked_data, str) else masked_data\\n\\\n          \\n\\n\\n            # Check mail destinations\\n\\n            if \\\"mail\\\" in\\\n          \\ original_json and \\\"destination\\\" in original_json[\\\"mail\\\"]:\\n\\n    \\\n          \\            orig_destinations = original_json[\\\"mail\\\"][\\\"destination\\\"\\\n          ]\\n\\n                masked_destinations = masked_json.get(\\\"mail\\\", {}).get(\\\"\\\n          destination\\\", [])\\n\\n\\n\\n                for orig_email, masked_email in\\\n          \\ zip(orig_destinations, masked_destinations):\\n\\n                    if\\\n          \\ orig_email == masked_email and \\\"@\\\" in orig_email:\\n\\n              \\\n          \\          return False  # Masking failed, skip this item\\n\\n\\n\\n      \\\n          \\      # Check headers for email addresses\\n\\n            if \\\"mail\\\" in\\\n          \\ original_json and \\\"headers\\\" in original_json[\\\"mail\\\"]:\\n\\n        \\\n          \\        orig_headers = original_json[\\\"mail\\\"][\\\"headers\\\"]\\n\\n       \\\n          \\         masked_headers = masked_json.get(\\\"mail\\\", {}).get(\\\"headers\\\"\\\n          , [])\\n\\n\\n\\n                for orig_header, masked_header in zip(orig_headers,\\\n          \\ masked_headers):\\n\\n                    header_name = orig_header.get(\\\"\\\n          name\\\", \\\"\\\").lower()\\n\\n                    if header_name in [\\\"to\\\",\\\n          \\ \\\"cc\\\", \\\"bcc\\\"]:\\n\\n                        orig_value = orig_header.get(\\\"\\\n          value\\\", \\\"\\\")\\n\\n                        masked_value = masked_header.get(\\\"\\\n          value\\\", \\\"\\\")\\n\\n                        if orig_value == masked_value\\\n          \\ and \\\"@\\\" in orig_value:\\n\\n                            return False \\\n          \\ # Masking failed, skip this item\\n\\n\\n\\n            return True  # Masking\\\n          \\ validation passed\\n\\n\\n\\n        except Exception:\\n\\n            return\\\n          \\ False  # Validation failed, skip this item\\n\\n\\n\\n    def mask_ses_event(self,\\\n          \\ event_data):\\n\\n        \\\"\\\"\\\"Mask sensitive data in SES event based on\\\n          \\ event type.\\\"\\\"\\\"\\n\\n        original_data = event_data\\n\\n        try:\\n\\\n          \\n            # Parse JSON if it's a string\\n\\n            if isinstance(event_data,\\\n          \\ str):\\n\\n                event = json.loads(event_data)\\n\\n          \\\n          \\  else:\\n\\n                event = event_data.copy()\\n\\n\\n\\n          \\\n          \\  # Mask mail section (common to all event types)\\n\\n            if \\\"\\\n          mail\\\" in event:\\n\\n                mail = event[\\\"mail\\\"].copy()\\n\\n\\n\\n\\\n          \\                # Mask destination\\n\\n                if \\\"destination\\\"\\\n          \\ in mail:\\n\\n                    mail[\\\"destination\\\"] = self._mask_email_list(mail[\\\"\\\n          destination\\\"])\\n\\n\\n\\n                # Mask headers\\n\\n              \\\n          \\  if \\\"headers\\\" in mail:\\n\\n                    mail[\\\"headers\\\"] = self._mask_headers(mail[\\\"\\\n          headers\\\"])\\n\\n\\n\\n                # Mask common headers\\n\\n           \\\n          \\     if \\\"commonHeaders\\\" in mail:\\n\\n                    mail[\\\"commonHeaders\\\"\\\n          ] = self._mask_common_headers(mail[\\\"commonHeaders\\\"])\\n\\n\\n\\n         \\\n          \\       event[\\\"mail\\\"] = mail\\n\\n\\n\\n            # Mask event-specific\\\n          \\ sections\\n\\n            event_type = event.get(\\\"eventType\\\", \\\"\\\")\\n\\n\\\n          \\n\\n            if event_type == \\\"Delivery\\\" and \\\"delivery\\\" in event:\\n\\\n          \\n                delivery = event[\\\"delivery\\\"].copy()\\n\\n            \\\n          \\    if \\\"recipients\\\" in delivery:\\n\\n                    delivery[\\\"recipients\\\"\\\n          ] = self._mask_email_list(delivery[\\\"recipients\\\"])\\n\\n                event[\\\"\\\n          delivery\\\"] = delivery\\n\\n\\n\\n            elif event_type == \\\"Bounce\\\"\\\n          \\ and \\\"bounce\\\" in event:\\n\\n                bounce = event[\\\"bounce\\\"\\\n          ].copy()\\n\\n                if \\\"bouncedRecipients\\\" in bounce:\\n\\n    \\\n          \\                bounce[\\\"bouncedRecipients\\\"] = self._mask_bounced_recipients(bounce[\\\"\\\n          bouncedRecipients\\\"])\\n\\n                event[\\\"bounce\\\"] = bounce\\n\\n\\n\\\n          \\n            elif event_type == \\\"Complaint\\\" and \\\"complaint\\\" in event:\\n\\\n          \\n                complaint = event[\\\"complaint\\\"].copy()\\n\\n          \\\n          \\      if \\\"complainedRecipients\\\" in complaint:\\n\\n                   \\\n          \\ complaint[\\\"complainedRecipients\\\"] = self._mask_complained_recipients(\\n\\\n          \\n                        complaint[\\\"complainedRecipients\\\"]\\n\\n      \\\n          \\              )\\n\\n                event[\\\"complaint\\\"] = complaint\\n\\n\\\n          \\n\\n            elif event_type == \\\"DeliveryDelay\\\" and \\\"deliveryDelay\\\"\\\n          \\ in event:\\n\\n                delivery_delay = event[\\\"deliveryDelay\\\"\\\n          ].copy()\\n\\n                if \\\"delayedRecipients\\\" in delivery_delay:\\n\\\n          \\n                    delivery_delay[\\\"delayedRecipients\\\"] = self._mask_delayed_recipients(\\n\\\n          \\n                        delivery_delay[\\\"delayedRecipients\\\"]\\n\\n    \\\n          \\                )\\n\\n                event[\\\"deliveryDelay\\\"] = delivery_delay\\n\\\n          \\n\\n\\n            masked_result = json.dumps(event)\\n\\n\\n\\n            #\\\n          \\ Validate that masking was successful\\n\\n            if not self._validate_masking_result(original_data,\\\n          \\ masked_result):\\n\\n                return None  # Skip this item if masking\\\n          \\ validation failed\\n\\n\\n\\n            return masked_result\\n\\n\\n\\n    \\\n          \\    except (json.JSONDecodeError, KeyError, TypeError, ValueError):\\n\\n\\\n          \\            # If parsing fails, skip this item to prevent data leakage\\n\\\n          \\n            return None\\n\\n\\n\\n\\n\\n# Initialize masker instance\\n\\nses_masker\\\n          \\ = SESEventMasker()\\n\\n\\n\\n# Global sequence token storage\\n\\nsequence_tokens\\\n          \\ = {}\\n\\n\\n\\n\\n\\ndef get_log_stream_with_unique_suffix(log_group_name,\\\n          \\ retry_count=0):\\n\\n    \\\"\\\"\\\"Create log stream with unique suffix to avoid\\\n          \\ race conditions.\\\"\\\"\\\"\\n\\n    base_name = datetime.datetime.now(datetime.timezone.utc).strftime(\\\"\\\n          %Y-%m-%d\\\")\\n\\n    unique_suffix = str(uuid.uuid4())[:8]\\n\\n    log_stream_name\\\n          \\ = f\\\"{base_name}-{unique_suffix}\\\"\\n\\n\\n\\n    try:\\n\\n        logs_client.create_log_stream(logGroupName=log_group_name,\\\n          \\ logStreamName=log_stream_name)\\n\\n        return log_stream_name\\n\\n \\\n          \\   except logs_client.exceptions.ResourceAlreadyExistsException:\\n\\n  \\\n          \\      # Very rare with UUID suffix, but handle it\\n\\n        if retry_count\\\n          \\ < MAX_RETRY_COUNT:\\n\\n            return get_log_stream_with_unique_suffix(log_group_name,\\\n          \\ retry_count + 1)\\n\\n        raise RuntimeError(\\\"Failed to create unique\\\n          \\ log stream after maximum retries\\\") from None\\n\\n    except logs_client.exceptions.LimitExceededException\\\n          \\ as e:\\n\\n        if retry_count >= MAX_RETRY_COUNT:\\n\\n            raise\\\n          \\ e\\n\\n        time.sleep(1)\\n\\n        return get_log_stream_with_unique_suffix(log_group_name,\\\n          \\ retry_count + 1)\\n\\n    except Exception as e:\\n\\n        raise RuntimeError(f\\\"\\\n          Failed to create log stream: {e}\\\") from None\\n\\n\\n\\n\\n\\ndef put_log_events_with_sequence_token(log_group_name,\\\n          \\ log_stream_name, message, max_retries=3):\\n\\n    \\\"\\\"\\\"Put log events\\\n          \\ with proper sequence token handling.\\\"\\\"\\\"\\n\\n    for attempt in range(max_retries):\\n\\\n          \\n        try:\\n\\n            kwargs = {\\n\\n                \\\"logGroupName\\\"\\\n          : log_group_name,\\n\\n                \\\"logStreamName\\\": log_stream_name,\\n\\\n          \\n                \\\"logEvents\\\": [{\\\"timestamp\\\": int(time.time()) * 1000,\\\n          \\ \\\"message\\\": message}],\\n\\n            }\\n\\n\\n\\n            # Add sequence\\\n          \\ token if we have one\\n\\n            if log_stream_name in sequence_tokens:\\n\\\n          \\n                kwargs[\\\"sequenceToken\\\"] = sequence_tokens[log_stream_name]\\n\\\n          \\n\\n\\n            response = logs_client.put_log_events(**kwargs)\\n\\n\\n\\n\\\n          \\            # Store the next sequence token\\n\\n            if \\\"nextSequenceToken\\\"\\\n          \\ in response:\\n\\n                sequence_tokens[log_stream_name] = response[\\\"\\\n          nextSequenceToken\\\"]\\n\\n\\n\\n            return response\\n\\n\\n\\n        except\\\n          \\ logs_client.exceptions.InvalidSequenceTokenException as e:\\n\\n       \\\n          \\     # Extract expected sequence token from error and retry\\n\\n       \\\n          \\     error_message = str(e)\\n\\n            if \\\"expectedSequenceToken\\\"\\\n          \\ in error_message:\\n\\n                import re\\n\\n\\n\\n               \\\n          \\ match = re.search(r\\\"expectedSequenceToken: (\\\\S+)\\\", error_message)\\n\\\n          \\n                if match:\\n\\n                    sequence_tokens[log_stream_name]\\\n          \\ = match.group(1)\\n\\n                    continue\\n\\n\\n\\n            if\\\n          \\ attempt == max_retries - 1:\\n\\n                raise RuntimeError(f\\\"\\\n          Failed to put log events after {max_retries} attempts: {e}\\\") from None\\n\\\n          \\n\\n\\n        except Exception as e:\\n\\n            if attempt == max_retries\\\n          \\ - 1:\\n\\n                raise RuntimeError(f\\\"Failed to put log events:\\\n          \\ {e}\\\") from None\\n\\n            time.sleep(2**attempt)  # Exponential\\\n          \\ backoff\\n\\n\\n\\n\\n\\ndef put_log(message, log_group_name=DEFAULT_LOG_GROUP_NAME):\\n\\\n          \\n    log_stream_name = get_log_stream_with_unique_suffix(log_group_name)\\n\\\n          \\n    put_log_events_with_sequence_token(log_group_name, log_stream_name,\\\n          \\ message)\\n\\n\\n\\n\\n\\ndef lambda_handler(event, context):\\n\\n    \\\"\\\"\\\"\\n\\\n          \\n    Lambda handler to process SES events and send them to CloudWatch Logs.\\n\\\n          \\n\\n\\n    If MASK_PII_DATA environment variable is set to \\\"True\\\",\\n\\n\\\n          \\    email addresses and subjects will be masked before logging.\\n\\n   \\\n          \\ If masking fails, the event will be skipped to prevent data leakage.\\n\\\n          \\n    \\\"\\\"\\\"\\n\\n    for record in event[\\\"Records\\\"]:\\n\\n        payload\\\n          \\ = str(record[\\\"body\\\"])\\n\\n\\n\\n        # Apply masking if enabled\\n\\n\\\n          \\        if MASK_PII_DATA:\\n\\n            # Try to parse and mask the SES\\\n          \\ event\\n\\n            masked_payload = ses_masker.mask_ses_event(payload)\\n\\\n          \\n            if masked_payload is not None:  # Only log if masking succeeded\\n\\\n          \\n                put_log(masked_payload)\\n\\n            # Skip the record\\\n          \\ if masking failed (masked_payload is None)\\n\\n        else:\\n\\n      \\\n          \\      # No masking required\\n\\n            put_log(payload)\\n\\n\"\n      FunctionName: !Sub \"AWSSupport-${LambdaFunctionName}\"\n      Handler: index.lambda_handler\n      Role:\n        Fn::GetAtt:\n        - LambdaExecutionRole\n        - Arn\n      Runtime: python3.11\n      Timeout: 30\n      Environment:\n        Variables:\n          LogGroupName: !Ref CloudWatchLogGroupName\n          MaskPIIData: !Ref MaskPIIData\n    Type: AWS::Lambda::Function\n  LambdaFunctionLogGroup:\n    DeletionPolicy: Delete\n    UpdateReplacePolicy: Delete\n    Type: AWS::Logs::LogGroup\n    Properties:\n      LogGroupName: !Sub \"/aws/lambda/AWSSupport-${LambdaFunctionName}\"\n      RetentionInDays: 1827\n  LogGroup:\n    DeletionPolicy: !If [RetainLogGroup, Retain, Delete]\n    UpdateReplacePolicy: !If [RetainLogGroup, Retain, Delete]\n    Properties:\n      LogGroupName: !Ref CloudWatchLogGroupName\n      RetentionInDays: 1827\n    Type: AWS::Logs::LogGroup\n  KmsKey:\n    DeletionPolicy: Delete\n    UpdateReplacePolicy: Delete\n    Type: AWS::KMS::Key\n    Properties:\n      EnableKeyRotation: true\n      KeySpec: SYMMETRIC_DEFAULT\n      KeyPolicy:\n        Version: '2012-10-17'\n        Statement:\n        - Effect: Allow\n          Principal:\n            AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'\n          Action: kms:*\n          Resource: '*'\n        - Effect: Allow\n          Principal:\n            Service: ses.amazonaws.com\n          Action:\n          - kms:Decrypt\n          - kms:GenerateDataKey*\n          Resource: '*'\n  SNSSubscription:\n    DeletionPolicy: Delete\n    UpdateReplacePolicy: Delete\n    Properties:\n      Endpoint:\n        Fn::GetAtt:\n        - SQSQueue\n        - Arn\n      Protocol: sqs\n      RawMessageDelivery: true\n      TopicArn:\n        Ref: SNSTopic\n    Type: AWS::SNS::Subscription\n  SNSTopic:\n    Properties:\n      FifoTopic: false\n      KmsMasterKeyId: !Ref KmsKey\n      TopicName: !Sub \"AWSSupport-${ConfigurationSetName}-Topic\"\n    Type: AWS::SNS::Topic\n  SQSLambdaMapping:\n    DeletionPolicy: Delete\n    UpdateReplacePolicy: Delete\n    Properties:\n      BatchSize: 100\n      Enabled: true\n      EventSourceArn:\n        Fn::GetAtt:\n        - SQSQueue\n        - Arn\n      FunctionName:\n        Ref: LambdaFunction\n      MaximumBatchingWindowInSeconds: 10\n    Type: AWS::Lambda::EventSourceMapping\n  SQSQueue:\n    DeletionPolicy: Delete\n    UpdateReplacePolicy: Delete\n    Properties:\n      MessageRetentionPeriod: 600\n      QueueName: !Sub \"AWSSupport-Queue-${ConfigurationSetName}\"\n    Type: AWS::SQS::Queue\n  SQSQueuePolicy:\n    Properties:\n      PolicyDocument:\n        Id: __default_policy_ID\n        Statement:\n        - Action: sqs:SendMessage\n          Condition:\n            ArnEquals:\n              aws:SourceArn:\n                Ref: SNSTopic\n          Effect: Allow\n          Principal:\n            Service: sns.amazonaws.com\n          Resource:\n            Fn::GetAtt:\n            - SQSQueue\n            - Arn\n        Version: '2012-10-17'\n      Queues:\n      - Fn::GetAtt:\n        - SQSQueue\n        - QueueUrl\n    Type: AWS::SQS::QueuePolicy\n",
+        "ClientRequestToken": "AWSSupport-DeploySESSendingLogsToCloudWatchLogs-{{ UniqueId }}",
+        "Parameters": [
+          {
+            "ParameterKey": "RetainCloudWatchLogsOnDeletion",
+            "ParameterValue": "{{ RetainCloudWatchLogsOnDeletion }}"
+          },
+          {
+            "ParameterKey": "CloudWatchLogGroupName",
+            "ParameterValue": "{{ CloudWatchLogGroupName }}"
+          },
+          {
+            "ParameterKey": "MaskPIIData",
+            "ParameterValue": "{{ MaskPIIData }}"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "SAW-Runbook",
+            "Value": "AWSSupport-DeploySESSendingLogsToCloudWatchLogs"
+          },
+          {
+            "Key": "AWSSupport-DeploySESSendingLogsToCloudWatchLogs-AutomationExecution",
+            "Value": "{{ UniqueId }}"
+          }
+        ]
+      },
+      "nextStep": "BranchOnPresenceOfSesIdentityParameter"
+    },
+    {
+      "name": "BranchOnPresenceOfSesIdentityParameter",
+      "action": "aws:branch",
+      "description": "Determines whether to associate the newly created configuration set with a specific Amazon SES identity based on the SesIdentity parameter.",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "OutputNewConfigurationSetMessage",
+            "Variable": "{{ SesIdentity }}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "RelateConfigurationSetAsDefaultConfigurationSet"
+      }
+    },
+    {
+      "name": "RelateConfigurationSetAsDefaultConfigurationSet",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "description": "Associates the newly created Amazon SES configuration set as the default configuration set for the specified Amazon SES identity.",
+      "inputs": {
+        "Service": "sesv2",
+        "Api": "PutEmailIdentityConfigurationSetAttributes",
+        "EmailIdentity": "{{ SesIdentity }}",
+        "ConfigurationSetName": "{{ variable:ConfigurationSetName }}"
+      },
+      "nextStep": "OutputNewConfigurationSetMessage",
+      "onFailure": "Abort"
+    },
+    {
+      "name": "OutputNewConfigurationSetMessage",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "description": "Displays information about the newly created Amazon SES configuration set and CloudWatch Logs log group.",
+      "inputs": {
+        "InputPayload": {
+          "sesIdentity": "{{ SesIdentity }}",
+          "logGroupName": "{{ CloudWatchLogGroupName }}",
+          "configurationSetName": "{{ variable:ConfigurationSetName }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\nimport sys\nimport urllib.parse\n\nsys.tracebacklimit = 0\n\nDOMAIN_URL_MAPPING = {\n    \"aws\": \"aws.amazon.com\",\n    \"aws-cn\": \"amazonaws.cn\",\n    \"aws-us-gov\": \"amazonaws-us-gov.com\",\n    \"aws-iso\": \"c2shome.ic.gov\",\n    \"aws-iso-b\": \"sc2shome.sgov.gov\",\n    \"aws-iso-e\": \"csphome.adc-e.uk\",\n    \"aws-iso-f\": \"csphome.hci.ic.gov\",\n}\n\nMANAGEMENT_CONSOLE_URL_BASE = \"https://{region}.console.{domain}/{service}/home?region={region}#\"\nCONFIGURATION_SET_DEEPLINK_URL_BASE = MANAGEMENT_CONSOLE_URL_BASE + \"/configuration-sets/\"\nLOG_GROUP_DEEPLINK_URL_BASE = MANAGEMENT_CONSOLE_URL_BASE + \"logsV2:log-groups/log-group/\"\n\n\ndef get_console_domain(partition):\n    \"\"\"Get the console domain for the given partition.\"\"\"\n    return DOMAIN_URL_MAPPING.get(partition, \"aws.amazon.com\")\n\n\ndef generate_configuration_set_deeplink(configuration_set_name, region_name, partition):\n    domain = get_console_domain(partition)\n    return (\n        f\"[{configuration_set_name}](\"\n        + CONFIGURATION_SET_DEEPLINK_URL_BASE.format(service=\"ses\", region=region_name, domain=domain)\n        + configuration_set_name\n        + \")\"\n    )\n\n\ndef encode_log_group_name(log_group_name):\n    return urllib.parse.quote_plus(urllib.parse.quote_plus(log_group_name)).replace(\"%\", \"$\")\n\n\ndef generate_log_group_deeplink(log_group_name, region_name, partition):\n    domain = get_console_domain(partition)\n    return (\n        f\"[{log_group_name}](\"\n        + LOG_GROUP_DEEPLINK_URL_BASE.format(service=\"cloudwatch\", region=region_name, domain=domain)\n        + encode_log_group_name(log_group_name)\n        + \")\"\n    )\n\n\ndef create_usage_message(ses_identity):\n    message = \"\"\n    if ses_identity != \"\":\n        message = f'This runbook related the configuration set to the SES identity \"{ses_identity}\" as the default configuration set. Please note that SES events will not be stored in the log group if you explicitly specify other configuration sets on SendEmail API calls which prevent you from using the default configuration set.'\n    else:\n        message = (\n            \"Please utilize the configuration set explicitly on each SendEmail API calls \"\n            + \"or relate it to your SES email identities as default configuration sets. \"\n        )\n\n    return message\n\n\ndef script_handler(events, context):\n    try:\n        region_name = context[\"global:REGION\"]\n        partition = context[\"global:AWS_PARTITION\"]\n\n        configuration_set_name = events.get(\"configurationSetName\", \"AWSSupport-SendingEventLogs\")\n        log_group_name = events[\"logGroupName\"]\n\n        message = (\n            f\"We created a new configuration set {generate_configuration_set_deeplink(configuration_set_name, region_name, partition)} \"\n            + f\"to store SES sending events to a CloudWatch Logs group {generate_log_group_deeplink(log_group_name, region_name, partition)}. \\n\\n\"\n            + create_usage_message(events[\"sesIdentity\"])\n            + \"\\n\\n\"\n            + \"More information about SES configuration sets can be found on https://docs.aws.amazon.com/ses/latest/dg/using-configuration-sets.html\"\n        )\n\n        return {\"message\": message}\n\n    except Exception as e:\n        raise RuntimeError(f\"Unexpected error occurred when generating new configuration set message: {e}\") from None\n"
+      },
+      "nextStep": "BranchOnSleepTime",
+      "onFailure": "Abort",
+      "outputs": [
+        {
+          "Selector": "$.Payload.message",
+          "Name": "Message",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnSleepTime",
+      "description": "Determines whether to automatically delete the AWS CloudFormation stack based on the SleepTime parameter value. If SleepTime is set to '0', the stack is not automatically deleted.",
+      "action": "aws:branch",
+      "onFailure": "step:DeleteCloudFormationStack",
+      "inputs": {
+        "Choices": [
+          {
+            "Not": {
+              "Variable": "{{ SleepTime }}",
+              "StringEquals": "0"
+            },
+            "NextStep": "SleepBeforeDeleteCloudFormationStack"
+          }
+        ]
+      },
+      "isCritical": true,
+      "isEnd": true
+    },
+    {
+      "name": "SleepBeforeDeleteCloudFormationStack",
+      "action": "aws:sleep",
+      "onFailure": "Continue",
+      "onCancel": "step:DeleteCloudFormationStack",
+      "description": "Waits for the specified duration in the SleepTime parameter before proceeding to delete the AWS CloudFormation stack.",
+      "inputs": {
+        "Duration": "PT{{SleepTime}}M"
+      },
+      "nextStep": "DeleteCloudFormationStack"
+    },
+    {
+      "name": "DescribeCloudFormationErrorFromStackEvents",
+      "description": "Retrieves AWS CloudFormation stack events to provide detailed error information if stack creation or update fails.",
+      "onCancel": "step:WaitCloudFormationStackRollback",
+      "onFailure": "step:WaitCloudFormationStackRollback",
+      "nextStep": "WaitCloudFormationStackRollback",
+      "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStackEvents",
+        "StackName": "{{ DeploySesEventDestinations.StackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "Events",
+          "Selector": "$.StackEvents..ResourceStatusReason",
+          "Type": "StringList"
+        }
+      ],
+      "isCritical": false
+    },
+    {
+      "name": "WaitCloudFormationStackRollback",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the AWS CloudFormation stack to reach a terminal status before attempting deletion.",
+      "nextStep": "DeleteCloudFormationStack",
+      "onFailure": "step:DeleteCloudFormationStack",
+      "onCancel": "step:DeleteCloudFormationStack",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ DeploySesEventDestinations.StackId }}",
+        "PropertySelector": "$.Stacks[0].StackStatus",
+        "DesiredValues": [
+          "UPDATE_COMPLETE",
+          "CREATE_COMPLETE",
+          "ROLLBACK_FAILED",
+          "ROLLBACK_COMPLETE",
+          "DELETE_COMPLETE",
+          "CREATE_FAILED",
+          "DELETE_FAILED",
+          "UPDATE_ROLLBACK_FAILED",
+          "UPDATE_ROLLBACK_COMPLETE"
+        ]
+      },
+      "isCritical": false
+    },
+    {
+      "name": "DeleteCloudFormationStack",
+      "action": "aws:executeAwsApi",
+      "description": "Deletes the AWS CloudFormation stack.",
+      "maxAttempts": 5,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DeleteStack",
+        "StackName": "{{ DeploySesEventDestinations.StackId }}"
+      },
+      "isCritical": true,
+      "isEnd": true,
+      "onFailure": "Abort"
+    }
+  ]
+}
