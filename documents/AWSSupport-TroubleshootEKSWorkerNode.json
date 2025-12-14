@@ -10,68 +10,889 @@
     },
     "ClusterName": {
       "type": "String",
-      "description": "(Required) The name of the Amazon EKS cluster.",
+      "description": "(Required) The name of the Amazon Elastic Kubernetes Service (Amazon EKS).",
       "allowedPattern": "^[a-zA-Z0-9][a-zA-Z0-9-\\_]{0,99}$"
     },
     "WorkerID": {
       "type": "AWS::EC2::Instance::Id",
-      "description": "(Required) The EC2 instance ID for the worker node which failed to join the Amazon EKS cluster."
+      "description": "(Required) The Amazon Elastic Compute Cloud (Amazon EC2) instance ID for the worker node which failed to join the Amazon EKS cluster."
     }
   },
   "mainSteps": [
     {
-      "name": "validateIfClusterExistsAndActive",
-      "description": "Confirms that the Amazon EKS cluster you specify in the `ClusterName` parameter exists and it is in `ACTIVE` state.",
-      "action": "aws:assertAwsResourceProperty",
-      "isCritical": true,
-      "timeoutSeconds": 30,
-      "maxAttempts": 3,
-      "onFailure": "Abort",
-      "inputs": {
-        "Service": "eks",
-        "Api": "DescribeCluster",
-        "name": "{{ ClusterName }}",
-        "PropertySelector": "$.cluster.status",
-        "DesiredValues": [
-          "ACTIVE"
-        ]
-      },
-      "nextStep": "validateIfInstanceExistsAndRunning"
-    },
-    {
-      "name": "validateIfInstanceExistsAndRunning",
-      "description": "Confirms that the Amazon EC2 worker node you specify in the `WorkerID` parameter exists and it is in `running` state.",
-      "action": "aws:assertAwsResourceProperty",
-      "isCritical": true,
-      "onFailure": "Abort",
-      "timeoutSeconds": 30,
-      "maxAttempts": 3,
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DescribeInstanceStatus",
-        "InstanceIds": [
-          "{{ WorkerID }}"
-        ],
-        "PropertySelector": "$.InstanceStatuses[0].InstanceState.Name",
-        "DesiredValues": [
-          "running"
-        ]
-      },
-      "nextStep": "TroubleshootWorkerNode"
-    },
-    {
-      "name": "TroubleshootWorkerNode",
-      "description": "Runs a Python script that helps identify possible causes for the worker node failing to join the cluster.",
+      "name": "GatherClusterNodeData",
+      "description": "Gathers all cluster and node data.",
       "action": "aws:executeScript",
       "onFailure": "Abort",
       "isCritical": true,
-      "isEnd": true,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
       "inputs": {
         "InputPayload": {
           "ClusterName": "{{ ClusterName }}",
           "WorkerID": "{{ WorkerID }}"
         },
-        "Handler": "main.script_handler",
+        "Handler": "gather_cluster_node_data.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ClusterData",
+          "Selector": "$.Payload.ClusterData",
+          "Type": "String"
+        },
+        {
+          "Name": "NodeData",
+          "Selector": "$.Payload.NodeData",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterStatus",
+          "Selector": "$.Payload.ClusterStatus",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "NodeStatus",
+          "Selector": "$.Payload.NodeStatus",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "NodeConnectivity",
+          "Selector": "$.Payload.NodeConnectivity",
+          "Type": "String"
+        },
+        {
+          "Name": "ClusterPublicOnly",
+          "Selector": "$.Payload.ClusterPublicOnly",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnClusterInActive"
+    },
+    {
+      "name": "BranchOnClusterInActive",
+      "description": "Checks if the cluster is active and aborts if so.",
+      "action": "aws:branch",
+      "nextStep": "BranchOnNodeTerminated",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ GatherClusterNodeData.ClusterStatus }}",
+            "BooleanEquals": false,
+            "NextStep": "GenerateFinalReport"
+          }
+        ],
+        "Default": "BranchOnNodeTerminated"
+      }
+    },
+    {
+      "name": "BranchOnNodeTerminated",
+      "description": "Checks if the worker node is terminated and aborts if so.",
+      "action": "aws:branch",
+      "nextStep": "CheckClusterSecurityGroup",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ GatherClusterNodeData.NodeStatus }}",
+            "BooleanEquals": true,
+            "NextStep": "GenerateFinalReport"
+          }
+        ],
+        "Default": "CheckClusterSecurityGroup"
+      }
+    },
+    {
+      "name": "CheckClusterSecurityGroup",
+      "description": "Validates cluster security group configuration for worker node communication.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}",
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "ClusterSec_check.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckDHCPOptions"
+    },
+    {
+      "name": "CheckDHCPOptions",
+      "description": "Validates VPC DHCP options configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "dhcp_options.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckClusterIAMRole"
+    },
+    {
+      "name": "CheckClusterIAMRole",
+      "description": "Validates cluster IAM role and policies configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "cp_iam_role.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckManagedAddons"
+    },
+    {
+      "name": "CheckManagedAddons",
+      "description": "Validates EKS managed addons configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "eks_addon_check.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckClusterENIs"
+    },
+    {
+      "name": "CheckClusterENIs",
+      "description": "Validates cluster ENI configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "cluster_enis.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckVPCDNS"
+    },
+    {
+      "name": "CheckVPCDNS",
+      "description": "Validates VPC DNS attributes configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "vpc_dns.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckEnhancedInstanceHealth"
+    },
+    {
+      "name": "CheckEnhancedInstanceHealth",
+      "description": "Validates enhanced instance health status.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "enhanced_instance_health.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckInstanceType"
+    },
+    {
+      "name": "CheckInstanceType",
+      "description": "Validates worker node instance type compatibility.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "instancetype.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnNetworkConfiguration"
+    },
+    {
+      "name": "BranchOnNetworkConfiguration",
+      "description": "Determines the network configuration type (private, public, or VPC endpoints) to branch to appropriate checks.",
+      "action": "aws:branch",
+      "nextStep": "CheckInstanceProfile",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ GatherClusterNodeData.NodeConnectivity }}",
+            "StringEquals": "private",
+            "NextStep": "CheckPrivateNodeConnectivity"
+          },
+          {
+            "Variable": "{{ GatherClusterNodeData.NodeConnectivity }}",
+            "StringEquals": "public",
+            "NextStep": "CheckPublicNodeConnectivity"
+          },
+          {
+            "Variable": "{{ GatherClusterNodeData.NodeConnectivity }}",
+            "StringEquals": "vpc_endpoints",
+            "NextStep": "CheckVPCEndpointConnectivity"
+          }
+        ],
+        "Default": "CheckInstanceProfile"
+      }
+    },
+    {
+      "name": "CheckPrivateNodeConnectivity",
+      "description": "Validates private node connectivity through NAT gateway.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}",
+          "ClusterPublicOnly": "{{ GatherClusterNodeData.ClusterPublicOnly }}"
+        },
+        "Handler": "private_node_connectivity.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckInstanceProfile"
+    },
+    {
+      "name": "CheckPublicNodeConnectivity",
+      "description": "Validates public node connectivity through internet gateway.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}",
+          "ClusterPublicOnly": "{{ GatherClusterNodeData.ClusterPublicOnly }}"
+        },
+        "Handler": "public_node_connectivity.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckInstanceProfile"
+    },
+    {
+      "name": "CheckVPCEndpointConnectivity",
+      "description": "Validates VPC endpoint connectivity for private clusters.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "vpc_endpoint_check.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckInstanceProfile"
+    },
+    {
+      "name": "CheckInstanceProfile",
+      "description": "Validates worker node IAM instance profile and role configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "node_iam_role.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckAccessEntries"
+    },
+    {
+      "name": "CheckAccessEntries",
+      "description": "Validates node IAM role in cluster access entries.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}",
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "access_entry_check.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckUserData"
+    },
+    {
+      "name": "CheckUserData",
+      "description": "Validates worker node user data configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "userdata.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckNodeTags"
+    },
+    {
+      "name": "CheckNodeTags",
+      "description": "Validates required node tags configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "node_tags.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckNodeAMI"
+    },
+    {
+      "name": "CheckNodeAMI",
+      "description": "Validates worker node AMI version compatibility.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "node_ami.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckNodeCNI"
+    },
+    {
+      "name": "CheckNodeCNI",
+      "description": "Validates worker node CNI configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "node_cni.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckNodeSecurityGroups"
+    },
+    {
+      "name": "CheckNodeSecurityGroups",
+      "description": "Validates worker node security group outbound rules.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "node_sg_outbound.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckAWSOutposts"
+    },
+    {
+      "name": "CheckAWSOutposts",
+      "description": "Validates AWS Outposts configuration if applicable.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "outposts_check.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckNACLs"
+    },
+    {
+      "name": "CheckNACLs",
+      "description": "Validates Network ACL basic rules for worker node communication.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "nacls_basic_rules.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckSTSEndpoint"
+    },
+    {
+      "name": "CheckSTSEndpoint",
+      "description": "Validates STS endpoint configuration for the region.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "sts_endpoint.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckIMDSEndpoint"
+    },
+    {
+      "name": "CheckIMDSEndpoint",
+      "description": "Validates Instance Metadata Service (IMDS) endpoint configuration.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}"
+        },
+        "Handler": "imds_check.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "CheckSystemDaemons"
+    },
+    {
+      "name": "CheckSystemDaemons",
+      "description": "Validates kubelet, containerd, and docker daemon status.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "sw_daemons.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateFinalReport"
+    },
+    {
+      "name": "GenerateFinalReport",
+      "description": "Generates a comprehensive troubleshooting report from all check results.",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "ClusterName": "{{ ClusterName }}",
+          "WorkerID": "{{ WorkerID }}",
+          "ClusterStatus": "{{ GatherClusterNodeData.ClusterStatus }}",
+          "NodeStatus": "{{ GatherClusterNodeData.NodeStatus }}",
+          "ClusterSecurityGroupReport": "{{ CheckClusterSecurityGroup.Report }}",
+          "ClusterSecurityGroupStatus": "{{ CheckClusterSecurityGroup.Status }}",
+          "DHCPOptionsReport": "{{ CheckDHCPOptions.Report }}",
+          "DHCPOptionsStatus": "{{ CheckDHCPOptions.Status }}",
+          "ClusterIAMRoleReport": "{{ CheckClusterIAMRole.Report }}",
+          "ClusterIAMRoleStatus": "{{ CheckClusterIAMRole.Status }}",
+          "ManagedAddonsReport": "{{ CheckManagedAddons.Report }}",
+          "ManagedAddonsStatus": "{{ CheckManagedAddons.Status }}",
+          "ClusterENIsReport": "{{ CheckClusterENIs.Report }}",
+          "ClusterENIsStatus": "{{ CheckClusterENIs.Status }}",
+          "VPCDNSReport": "{{ CheckVPCDNS.Report }}",
+          "VPCDNSStatus": "{{ CheckVPCDNS.Status }}",
+          "EnhancedInstanceHealthReport": "{{ CheckEnhancedInstanceHealth.Report }}",
+          "EnhancedInstanceHealthStatus": "{{ CheckEnhancedInstanceHealth.Status }}",
+          "InstanceTypeReport": "{{ CheckInstanceType.Report }}",
+          "InstanceTypeStatus": "{{ CheckInstanceType.Status }}",
+          "CheckPrivateNodeConnectivityReport": "{{ CheckPrivateNodeConnectivity.Report }}",
+          "CheckPrivateNodeConnectivityStatus": "{{ CheckPrivateNodeConnectivity.Status }}",
+          "CheckPublicNodeConnectivityReport": "{{ CheckPublicNodeConnectivity.Report }}",
+          "CheckPublicNodeConnectivityStatus": "{{ CheckPublicNodeConnectivity.Status }}",
+          "CheckVPCEndpointConnectivityReport": "{{ CheckVPCEndpointConnectivity.Report }}",
+          "CheckVPCEndpointConnectivityStatus": "{{ CheckVPCEndpointConnectivity.Status }}",
+          "InstanceProfileReport": "{{ CheckInstanceProfile.Report }}",
+          "InstanceProfileStatus": "{{ CheckInstanceProfile.Status }}",
+          "AccessEntriesReport": "{{ CheckAccessEntries.Report }}",
+          "AccessEntriesStatus": "{{ CheckAccessEntries.Status }}",
+          "UserDataReport": "{{ CheckUserData.Report }}",
+          "UserDataStatus": "{{ CheckUserData.Status }}",
+          "NodeTagsReport": "{{ CheckNodeTags.Report }}",
+          "NodeTagsStatus": "{{ CheckNodeTags.Status }}",
+          "NodeAMIReport": "{{ CheckNodeAMI.Report }}",
+          "NodeAMIStatus": "{{ CheckNodeAMI.Status }}",
+          "NodeCNIReport": "{{ CheckNodeCNI.Report }}",
+          "NodeCNIStatus": "{{ CheckNodeCNI.Status }}",
+          "NodeSecurityGroupsReport": "{{ CheckNodeSecurityGroups.Report }}",
+          "NodeSecurityGroupsStatus": "{{ CheckNodeSecurityGroups.Status }}",
+          "AWSOutpostsReport": "{{ CheckAWSOutposts.Report }}",
+          "AWSOutpostsStatus": "{{ CheckAWSOutposts.Status }}",
+          "NACLsReport": "{{ CheckNACLs.Report }}",
+          "NACLsStatus": "{{ CheckNACLs.Status }}",
+          "STSEndpointReport": "{{ CheckSTSEndpoint.Report }}",
+          "STSEndpointStatus": "{{ CheckSTSEndpoint.Status }}",
+          "IMDSEndpointReport": "{{ CheckIMDSEndpoint.Report }}",
+          "IMDSEndpointStatus": "{{ CheckIMDSEndpoint.Status }}",
+          "SystemDaemonsReport": "{{ CheckSystemDaemons.Report }}",
+          "SystemDaemonsStatus": "{{ CheckSystemDaemons.Status }}"
+        },
+        "Handler": "generate_final_report.lambda_handler",
         "Runtime": "python3.11",
         "Attachment": "artifact.zip"
       },
@@ -85,12 +906,12 @@
     }
   ],
   "outputs": [
-    "TroubleshootWorkerNode.Message"
+    "GenerateFinalReport.Message"
   ],
   "files": {
     "artifact.zip": {
       "checksums": {
-        "SHA256": "21b53a0ad02e14c71d621db1fcbeaa244da47576e70636daefd50dbecb26f54e"
+        "SHA256": "12068165a61b7eb1b475f3918fd4f3e8761f62a9cb68f6b3dcf39ad904c531b0"
       }
     }
   }

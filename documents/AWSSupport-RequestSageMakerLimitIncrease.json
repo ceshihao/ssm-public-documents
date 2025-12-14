@@ -1,0 +1,254 @@
+{
+  "description": "The **AWSSupport-RequestSageMakerLimitIncrease** automation runbook enables bulk submission of multiple Amazon SageMaker quota increase requests in a single operation, streamlining the quota management process for customers managing large-scale machine learning workloads. This automation provides efficient validation and processing while maintaining AWS service standards.\n\nIt processes valid quota increase requests through automated approval workflows. \n- When requests fall within defined auto-approval thresholds, they are processed immediately. \n- For requests exceeding these thresholds, the automation creates AWS Support cases, enabling customers to provide additional justification for manual review and approval.\n\nThe automation includes comprehensive validation to verify request integrity. It gracefully handles scenarios where requested limits are lower than current values or contain invalid inputs, providing clear feedback to help customers correct their requests.\n\n### Important: \n- This automation does not support quota increase requests for specialized compute instances including P4, P5, and Trainium instances. For these instance types, please submit individual quota increase requests through the AWS Service Quotas console or AWS Support.\n- The limit increases are applied in the same region where the document is executed.\n\n### Note: \nThe automation pauses for up to 1 hour in between as an approval is requested from the designated principals via Amazon Simple Notification Service (Amazon SNS) notification. Once approval is provided it proceeds with the quota increase requests.\n\n#### **Disclaimer**: Before providing approval, please verify the mapping for the requested quotas along with the new desired values are correct as once increased the values can't be decreased again.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ResourcesMapping": {
+      "type": "StringList",
+      "description": "(Required) Specify the Amazon SageMaker service quotas you want to increase using colon-separated values in one of these formats: Category:Resource:NewValue when both category and resource names are available (Example: spot-training-job:ml.c4.xlarge:25), Resource:NewValue when only the resource name is available (Example: max_number_of_experiment_trial_associations:501), or QuotaCode:NewValue if none available use the direct quota code (Example: L-9xAxx23x:25).You can mix different formats in the same request as needed separated by comma. Sample Inputs:- studio:CodeEditor-ml.r6id.large:787,spot-training-job:ml.c4.xlarge:34,L-99AEC235:2.",
+      "allowedPattern": "^([a-zA-Z0-9_-]{1,100}) {0,2}: {0,2}([a-zA-Z0-9._-]{0,100}) {0,2}:? {0,2}(\\d{1,10})$",
+      "maxItems": 50
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) Provide the ARN of the Amazon Simple Notification Service (Amazon SNS) Topic for Approval notification. This Amazon SNS topic is used to send approval notifications required during the automation execution.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):sns:(us(-gov|-isob?)?|ap|ca|af|me|cn|eu|sa)-(central|(north|south)?(east|west)?)-\\d:\\d{12}:[a-zA-Z0-9_.-]{1,256}$"
+    },
+    "ApproverIAM": {
+      "type": "StringList",
+      "description": "(Required) Provide a list of AWS authenticated principals who are able to either approve or reject the action for confirmation. The maximum number of approvers is 10. You can specify principals by using any of these formats, 1) An AWS Identity and Access Management (IAM) user name, 2) An IAM user ARN, 3) An IAM role ARN, or 4) An IAM assume role user ARN.",
+      "allowedPattern": "^[a-zA-Z0-9_+=,.@\\-\\/]{1,128}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):(sts|iam)::[0-9]{12}:[a-zA-Z0-9_+=,.@\\-\\/]{1,256}$"
+    },
+    "MinimumRequiredApprovals": {
+      "type": "Integer",
+      "description": "(Optional) The minimum number of approvals required to resume the automation. If you don't specify a value, the system defaults to one. The value for this parameter must be a positive number. The value for this parameter can't exceed the number of approvers defined by the ApproverIAM parameter.",
+      "default": 1,
+      "allowedValues": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "VerifyCategoriesAndResources",
+      "action": "aws:executeScript",
+      "description": "Validation of all specified categories and resources against the adjustable Amazon SageMaker service quotas to verify they exist and can be modified. This step retrieves the most current quota information directly from the AWS Service Quotas API. It validates that each category specified in the input exists in the list of valid Amazon SageMaker categories, confirms that each resource name exists within its specified category, and identifies resources where the requested new limit is less than the current value to prevent accidental limit decreases.",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ResourcesMapping": "{{ ResourcesMapping }}"
+        },
+        "Handler": "verify_categories_and_resources.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ValidationResults",
+          "Selector": "$.Payload.ValidationResults",
+          "Type": "MapList"
+        },
+        {
+          "Name": "ValidMappingFound",
+          "Selector": "$.Payload.ValidMappingFound",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnValidCategoriesFound"
+    },
+    {
+      "name": "BranchOnValidCategoriesFound",
+      "action": "aws:branch",
+      "description": "Determines whether to proceed with quota increase requests based on the presence of valid categories and resources.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ApproveQuotaCodeLimitMapping",
+            "Variable": "{{ VerifyCategoriesAndResources.ValidMappingFound }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "GenerateSummaryReport"
+      },
+      "nextStep": "ApproveQuotaCodeLimitMapping"
+    },
+    {
+      "name": "ApproveQuotaCodeLimitMapping",
+      "action": "aws:executeScript",
+      "description": "Prepares a detailed approval message that provides you with a complete breakdown of your quota increase requests. This step output shows you which requests are valid and ready for processing, which requests are invalid and require your attention along with explanations for why those requests cannot be processed (such as requesting limits lower than current values, invalid resource names, or unsupported quota codes). Review this information carefully before providing approval, as it helps verify only valid requests proceed to the quota increase process.",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ValidationResults": "{{ VerifyCategoriesAndResources.ValidationResults }}"
+        },
+        "Handler": "build_approval_message.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ApprovalMessage",
+          "Selector": "$.Payload.ApprovalMessage",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "WaitingForApproval"
+    },
+    {
+      "name": "WaitingForApproval",
+      "action": "aws:approve",
+      "description": "Automation wait for human approval checkpoint where designated approvers can review and authorize the quota code mapping before proceeding with actual limit increase requests.",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "inputs": {
+        "NotificationArn": "{{ SNSTopicArn }}",
+        "Message": "The automation process has been paused and requires your approval to proceed with the quota code and limit mapping changes. To review the detailed approval message that provides you with a complete breakdown of your quota increase requests submitted you have two options:  First option: Using the AWS Console - Navigate to AWS Systems Manager, go to Change Management > Automation > Executions, and locate below execution details. Review the details in the 'ApproveQuotaCodeLimitMapping' step output.  Second option: If you prefer using AWS CLI/SDK, you can use the DescribeAutomationStepExecutions API to review the changes for Step:ApproveQuotaCodeLimitMapping. API documentation is available at https://docs.aws.amazon.com/systems-manager/latest/APIReference/API_DescribeAutomationStepExecutions.html .Please note: Your approval is required to proceed with the limit increase. If rejected, the automation stops with a Failed status. This approval step automatically times out after 3600 seconds (1 hour) if no action is taken.",
+        "MinRequiredApprovals": "{{ MinimumRequiredApprovals }}",
+        "Approvers": "{{ ApproverIAM }}"
+      },
+      "nextStep": "RequestQuotaIncreases"
+    },
+    {
+      "name": "RequestQuotaIncreases",
+      "action": "aws:executeScript",
+      "description": "Submits quota increase requests for each resource. This step submits individual quota increase requests for each resource, implements pacing of 1 request per second between requests to prevent API throttling. This script handles API exceptions gracefully with appropriate error messages and exponential retry.",
+      "onFailure": "Abort",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ValidationResults": "{{ VerifyCategoriesAndResources.ValidationResults }}"
+        },
+        "Handler": "request_quota_increases.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "RequestIDs",
+          "Selector": "$.Payload.RequestIDs",
+          "Type": "StringList"
+        },
+        {
+          "Name": "UnsuccessfulRequests",
+          "Selector": "$.Payload.UnsuccessfulRequests",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "WaitForRequestQuotaIncreaseResults"
+    },
+    {
+      "name": "WaitForRequestQuotaIncreaseResults",
+      "action": "aws:loop",
+      "description": "Continuously polls the status of all submitted quota increase requests until none are in PENDING state, ensuring all requests have been processed before proceeding to final status collection.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Iterators": "{{ RequestQuotaIncreases.RequestIDs }}",
+        "IteratorDataType": "String",
+        "Steps": [
+          {
+            "description": "Waits until the current status of all quota increase requests isn't PENDING",
+            "name": "WaitForRequestToBeProcessed",
+            "action": "aws:waitForAwsResourceProperty",
+            "maxAttempts": 2,
+            "timeoutSeconds": 300,
+            "isCritical": false,
+            "onFailure": "Continue",
+            "inputs": {
+              "Service": "service-quotas",
+              "Api": "GetRequestedServiceQuotaChange",
+              "PropertySelector": "$.RequestedQuota.Status",
+              "DesiredValues": [
+                "CASE_OPENED",
+                "APPROVED",
+                "DENIED",
+                "NOT_APPROVED",
+                "CASE_CLOSED",
+                "INVALID_REQUEST"
+              ],
+              "RequestId": "{{ WaitForRequestQuotaIncreaseResults.CurrentIteratorValue }}"
+            }
+          }
+        ]
+      },
+      "nextStep": "GetRequestQuotaIncreaseResults"
+    },
+    {
+      "name": "GetRequestQuotaIncreaseResults",
+      "action": "aws:executeScript",
+      "description": "Retrieves and processes the current status of all submitted quota increase requests to provide accurate reporting on outcomes. This step queries the AWS Service Quotas API for the current status of each submitted request, captures detailed status information using standardized status codes, maps case IDs to their corresponding resources and request IDs for comprehensive tracking, and organizes status information in a structured format for the final summary report.",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "RequestIDs": "{{ RequestQuotaIncreases.RequestIDs }}"
+        },
+        "Handler": "get_request_quota_increase_results.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "RequestStatusResults",
+          "Selector": "$.Payload.RequestStatusResults",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateSummaryReport"
+    },
+    {
+      "name": "GenerateSummaryReport",
+      "action": "aws:executeScript",
+      "description": "Compiles and presents a comprehensive summary of all quota increase requests and their outcomes, providing clear visibility into the results. This step provides the total number of requests, number of successful and failed requests, details for each request, support case IDs for manual review requests, warning messages for any problematic requests, and actionable next steps based on the results.",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ValidationResults": "{{ VerifyCategoriesAndResources.ValidationResults }}",
+          "UnsuccessfulRequests": "{{ RequestQuotaIncreases.UnsuccessfulRequests }}",
+          "RequestStatusResults": "{{ GetRequestQuotaIncreaseResults.RequestStatusResults }}"
+        },
+        "Handler": "generate_summary_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "SummaryReport",
+          "Selector": "$.Payload.SummaryReport",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateSummaryReport.SummaryReport"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "fc31557556c2451668c5051896111cbcad83708917a52d35ba56398115b0e194"
+      }
+    }
+  }
+}

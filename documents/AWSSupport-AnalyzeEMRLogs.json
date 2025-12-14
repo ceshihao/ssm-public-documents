@@ -1,5 +1,5 @@
 {
-  "description": " The **AWSSupport-AnalyzeEMRLogs** automation runbook detects specific predefined errors while running a job on an Amazon EMR Cluster. It provides you 3 options: To run the automation once; schedule an automation to run at a specific time interval; or remove and existing schedule. The remove schedule option allows you to remove any previously configured scheduled automation. When a scheduled automation is removed, log analysis runbook will not be automatically triggered.\nWhen executed once, or on a schedule, the runbook performs the following steps:\n - The runbook retrieves Amazon EMR cluster details. \n - Lists running instances in the provided Amazon EMR cluster. \n - Verifies nodes are Systems Manager managed instances. \n - Creates Amazon CloudWatch log group, metric filters and dashboard if selected in the inputs to the runbook. \n - Installs required packages on nodes.  \n - Detects and reports identified errors found in logs and outputs the findings.\n\n Important: This runbook will create resources in your account. To review the possible charges you may incur once you exceed the free tier, please review the following:\n - https://aws.amazon.com/cloudwatch/pricing/\n -  https://aws.amazon.com/eventbridge/pricing/",
+  "description": " The **AWSSupport-AnalyzeEMRLogs** automation runbook detects specific predefined errors while running a job on an Amazon EMR Cluster. It provides you 3 options: To run the automation once; schedule an automation to run at a specific time interval; or remove and existing schedule. The remove schedule option allows you to remove any previously configured scheduled automation. When a scheduled automation is removed, log analysis runbook will not be automatically triggered.\nWhen executed once, or on a schedule, the runbook performs the following steps:\n - The runbook retrieves Amazon EMR cluster details. \n - Lists running instances in the provided Amazon EMR cluster. \n - Verifies nodes are Systems Manager managed instances. \n - Creates Amazon CloudWatch log group, metric filters and dashboard if selected in the inputs to the runbook. \n - Installs required packages on nodes.  \n - Detects and reports identified errors found in logs and outputs the findings.\n\n **Note**: For scheduling operations, either `AutomationAssumeRole` or `EventBridgeRole` must be provided. If `EventBridgeRole` is not specified, `AutomationAssumeRole` will be used to create an EventBridge role automatically.\n\n Important: This runbook will create resources in your account. To review the possible charges you may incur once you exceed the free tier, please review the following:\n - https://aws.amazon.com/cloudwatch/pricing/\n -  https://aws.amazon.com/eventbridge/pricing/",
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
@@ -82,9 +82,34 @@
         "Yes",
         "No"
       ]
+    },
+    "EventBridgeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of an IAM role that EventBridge will use to trigger the scheduled automation. This role must have permissions to start this automation and pass the AutomationAssumeRole to SSM. If not provided, a role will be created automatically (requires AutomationAssumeRole to be specified).",
+      "default": ""
     }
   },
   "mainSteps": [
+    {
+      "name": "validateExecutionParameters",
+      "action": "aws:executeScript",
+      "description": "Validates that required roles are provided for scheduling. If EventBridgeRole is not provided, AutomationAssumeRole must be specified so a role can be created automatically.",
+      "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 60,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "Operation": "{{ Operation }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "EventBridgeRole": "{{ EventBridgeRole }}"
+        },
+        "Handler": "validate_execution_parameters.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "nextStep": "branchOnAllowResourceCreation"
+    },
     {
       "name": "branchOnAllowResourceCreation",
       "action": "aws:branch",
@@ -333,7 +358,11 @@
           },
           {
             "ParameterKey": "AutomationAssumeRole",
-            "ParameterValue": "{{AutomationAssumeRole}}"
+            "ParameterValue": "{{ AutomationAssumeRole }}"
+          },
+          {
+            "ParameterKey": "EventBridgeRole",
+            "ParameterValue": "{{ EventBridgeRole }}"
           },
           {
             "ParameterKey": "LogToCloudWatchLogs",
@@ -356,7 +385,7 @@
             "ParameterValue": "{{CloudWatchLogGroup}}"
           }
         ],
-        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nParameters:\n  IntervalTime:\n    Type: String\n    Default: ''\n  ClusterId:\n    Type: String\n    Default: ''\n  AutomationAssumeRole:\n    Type: String\n    Default: ''\n  LogToCloudWatchLogs:\n    Type: String\n    Default: ''\n  CreateLogInsightsDashboard:\n    Type: String\n    Default: ''\n  CreateMetricFilters:\n    Type: String\n    Default: ''\n  CloudWatchLogGroup:\n    Type: String\n    Default: ''\nResources:\n  EMRSchedulingRuleCreatedbySSM: \n    Type: AWS::Events::Rule\n    Properties: \n      Description: \"Scheduling rule for AWSSupport-AnalyzeEMRLogs\"\n      ScheduleExpression: !Sub 'rate(${IntervalTime})'\n      Targets: \n        - Arn: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::automation-definition/AWSSupport-AnalyzeEMRLogs:$DEFAULT'\n          Id: !Sub \"AWSSupport-AnalyzeEMRLogs-${ClusterId}-Rule\"\n          RoleArn: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RoletoTriggerAWSSupportAnalyzeEMRLogs}'\n          Input: !Sub \"{\\\"ClusterID\\\":[\\\"${ClusterId}\\\"],\\\"AutomationAssumeRole\\\":[\\\"${AutomationAssumeRole}\\\"],\\\"Operation\\\":[\\\"Run Once\\\"],\\\"IntervalTime\\\":[\\\"${IntervalTime}\\\"],\\\"LogToCloudWatchLogs\\\":[\\\"${LogToCloudWatchLogs}\\\"],\\\"CreateLogInsightsDashboard\\\":[\\\"${CreateLogInsightsDashboard}\\\"],\\\"CreateMetricFilters\\\":[\\\"${CreateMetricFilters}\\\"],\\\"CloudWatchLogGroup\\\":[\\\"${CloudWatchLogGroup}\\\"]}\"\n  RoletoTriggerAWSSupportAnalyzeEMRLogs:\n   Type: AWS::IAM::Role\n   Properties:\n     AssumeRolePolicyDocument:\n       Version: 2012-10-17\n       Statement:\n         - Effect: Allow\n           Principal:\n             Service:\n               - events.amazonaws.com\n           Action:\n             - sts:AssumeRole\n     Path: /\n     Policies:\n       - PolicyName: \"StartAutomationAndPassRole\"\n         PolicyDocument:\n           Version: '2012-10-17'\n           Statement:\n             - Effect: Allow\n               Action: ssm:StartAutomationExecution\n               Resource:\n                 - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::automation-definition/AWSSupport-AnalyzeEMRLogs:$DEFAULT'\n             - Effect: Allow\n               Action: \n                 - iam:PassRole\n               Resource: !Sub '${AutomationAssumeRole}'\n               Condition:\n                 StringLikeIfExists: \n                   iam:PassedToService: 'ssm.amazonaws.com'\n",
+        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nParameters:\n  IntervalTime:\n    Type: String\n    Default: ''\n  ClusterId:\n    Type: String\n    Default: ''\n  AutomationAssumeRole:\n    Type: String\n    Default: ''\n  EventBridgeRole:\n    Type: String\n    Default: ''\n  LogToCloudWatchLogs:\n    Type: String\n    Default: ''\n  CreateLogInsightsDashboard:\n    Type: String\n    Default: ''\n  CreateMetricFilters:\n    Type: String\n    Default: ''\n  CloudWatchLogGroup:\n    Type: String\n    Default: ''\n\nConditions:\n  CreateEventBridgeRole: !Equals [!Ref EventBridgeRole, '']\n\nResources:\n  EMRSchedulingRuleCreatedbySSM: \n    Type: AWS::Events::Rule\n    Properties: \n      Description: \"Scheduling rule for AWSSupport-AnalyzeEMRLogs\"\n      ScheduleExpression: !Sub 'rate(${IntervalTime})'\n      Targets: \n        - Arn: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::automation-definition/AWSSupport-AnalyzeEMRLogs:$DEFAULT'\n          Id: !Sub \"AWSSupport-AnalyzeEMRLogs-${ClusterId}-Rule\"\n          RoleArn: !If\n            - CreateEventBridgeRole\n            - !GetAtt RoletoTriggerAWSSupportAnalyzeEMRLogs.Arn\n            - !Ref EventBridgeRole\n          Input: !Sub \"{\\\"ClusterID\\\":[\\\"${ClusterId}\\\"],\\\"AutomationAssumeRole\\\":[\\\"${AutomationAssumeRole}\\\"],\\\"Operation\\\":[\\\"Run Once\\\"],\\\"IntervalTime\\\":[\\\"${IntervalTime}\\\"],\\\"LogToCloudWatchLogs\\\":[\\\"${LogToCloudWatchLogs}\\\"],\\\"CreateLogInsightsDashboard\\\":[\\\"${CreateLogInsightsDashboard}\\\"],\\\"CreateMetricFilters\\\":[\\\"${CreateMetricFilters}\\\"],\\\"CloudWatchLogGroup\\\":[\\\"${CloudWatchLogGroup}\\\"],\\\"AllowResourceCreation\\\":[\\\"Yes\\\"]}\"\n\n  RoletoTriggerAWSSupportAnalyzeEMRLogs:\n    Type: AWS::IAM::Role\n    Condition: CreateEventBridgeRole\n    Properties:\n      AssumeRolePolicyDocument:\n        Version: 2012-10-17\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service:\n                - events.amazonaws.com\n            Action:\n              - sts:AssumeRole\n            Condition:\n              ArnLike:\n                aws:SourceArn: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/AWSSupport-AnalyzeEMRLogs-${ClusterId}*'\n      Path: /\n      Policies:\n        - PolicyName: \"StartAutomationAndPassRole\"\n          PolicyDocument:\n            Version: '2012-10-17'\n            Statement:\n              - Effect: Allow\n                Action: ssm:StartAutomationExecution\n                Resource:\n                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::automation-definition/AWSSupport-AnalyzeEMRLogs:$DEFAULT'\n              - Effect: Allow\n                Action: \n                  - iam:PassRole\n                Resource: !Ref AutomationAssumeRole\n                Condition:\n                  StringLikeIfExists: \n                    iam:PassedToService: 'ssm.amazonaws.com'\n",
         "Tags": [
           {
             "Key": "Name",
@@ -1006,7 +1035,7 @@
   "files": {
     "attachments.zip": {
       "checksums": {
-        "SHA256": "0e11412e5eddf857e77754453b63b4398f7c7363144b9e539e87a3dea3926b24"
+        "SHA256": "b747ff59de5088f1b3fdf64e7b13f0f7ec7637ac44a28a35fff579307f32d6f4"
       }
     }
   }

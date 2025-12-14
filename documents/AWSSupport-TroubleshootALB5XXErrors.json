@@ -1,0 +1,421 @@
+{
+  "description": "The **AWSSupport-TroubleshootALB5XXErrors** runbook provides comprehensive diagnosis and troubleshooting for Application Load Balancer (ALB) HTTP 5XX errors by analyzing CloudWatch metrics and access logs to identify root causes and provide actionable recommendations.\n\n### Capabilities\n\n1. **Traffic Pattern Analysis**: Identifies hotspotting and single AZ anomalies using CloudWatch metrics to detect uneven traffic distribution across Availability Zones.\n\n2. **Access Log Diagnosis**: Processes ALB access logs by retrieving log files from the configured S3 bucket to extract specific error patterns, error reasons, and detailed diagnostic information for granular troubleshooting.\n\n3. **Error-Specific Analysis**: Provides targeted diagnosis for each HTTP 5XX error type:\n\t- **HTTP 500**: Authentication failures, WAF connectivity issues, and IDP endpoint problems\n\t- **HTTP 502**: Target connection issues, Lambda function errors, TLS negotiation failures, and target deregistration scenarios\n\t- **HTTP 503**: Empty target groups and target registration issues\n\t- **HTTP 504**: Connection timeouts, target response time anomalies with historical baseline comparison, and comprehensive network connectivity evaluation\n\t- **Other 5XX Errors**: Comprehensive analysis of uncommon 5XX status codes and edge cases not covered by standard error categories\n\n4. **Network Connectivity Deep Dive**: For HTTP 504 errors, evaluates security group rules, network ACLs, and route table configurations between ALB and targets (same-region, same-account only).\n\n5. **Adaptive Data Source Selection**: Prioritizes access log analysis when available for detailed error diagnosis, with automatic fallback to CloudWatch metrics when logs are unavailable or incomplete.\n\n### Important Notes\n\n1. **Connectivity Check Limitations**: Network connectivity evaluations are only performed for targets in the same AWS region and account as the ALB. Cross-account or on-premises targets receive general connectivity guidance.\n\n2. **Access Log Processing Time Limits**: Access log analysis is limited to a 9-minute processing window. If exceeded, analysis stops and provides results based on processed logs. Reduce time frame for complete log analysis.\n\n3. **S3 Bucket Security and Location Requirements**: Access log processing requires the S3 bucket to meet security and location criteria. Processing will be skipped if the S3 bucket is publicly accessible (determined by bucket policy status or public access block configuration) or if the S3 bucket is not in the same AWS account and region as the ALB. When these checks fail, the runbook automatically falls back to CloudWatch metrics-based analysis.\n\n4. **Metrics as Fallback**: When access logs are not enabled or log processing fails/is incomplete, the runbook automatically falls back to CloudWatch metrics-based analysis with less granular diagnostic information. Lack of access logs may affect root-cause detection accuracy.\n\n5. **Historical Data Dependency**: HTTP 504 response time anomaly detection requires 7 days of historical data for baseline comparison. Limited historical data may affect detection accuracy.\n\n### AutomationAssumeRole Permissions Required:\n```\n[\n\t\"s3:ListBucket\",\n\t\"s3:GetObject\",\n\t\"s3:GetBucketPolicyStatus\",\n\t\"s3:GetBucketPublicAccessBlock\",\n\t\"s3:ListAllMyBuckets\",\n\t\"elasticloadbalancing:DescribeTargetGroups\",\n\t\"elasticloadbalancing:DescribeTargetHealth\",\n\t\"elasticloadbalancing:DescribeLoadBalancers\",\n\t\"elasticloadbalancing:DescribeTargetGroupAttributes\",\n\t\"elasticloadbalancing:DescribeLoadBalancerAttributes\",\n\t\"elasticloadbalancing:DescribeListeners\",\n\t\"elasticloadbalancing:DescribeRules\",\n\t\"ec2:DescribeSubnets\",\n\t\"ec2:DescribeInstances\",\n\t\"ec2:DescribeNetworkInterfaces\",\n\t\"ec2:DescribeSecurityGroups\",\n\t\"ec2:DescribeNetworkAcls\",\n\t\"ec2:DescribeRouteTables\",\n\t\"cloudwatch:GetMetricData\",\n\t\"cloudtrail:LookupEvents\",\n\t\"wafv2:ListWebACLs\",\n\t\"wafv2:ListResourcesForWebACL\",\n\t\"lambda:GetFunctionConfiguration\"\n]\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "ALBArn": {
+      "type": "String",
+      "description": "(Required) The ARN of the AWS ALB to be investigated.",
+      "allowedPattern": "^arn:(?:aws|aws-cn|aws-us-gov):elasticloadbalancing:([a-z0-9-]+):(\\d{12}):loadbalancer/app/([a-zA-Z0-9-]+)/([a-z0-9]+)$"
+    },
+    "IssueStartTime": {
+      "type": "String",
+      "description": "(Required) Start time of the issue in UTC. Use ISO 8601 format timestamps (YYYY-MM-DDTHH:MM:SSZ).",
+      "allowedPattern": "^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "IssueEndTime": {
+      "type": "String",
+      "description": "(Required) End time of the issue in UTC. Use ISO 8601 format timestamps (YYYY-MM-DDTHH:MM:SSZ).",
+      "allowedPattern": "^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "RunInitialChecks",
+      "action": "aws:executeScript",
+      "nextStep": "ProcessAccessLogs",
+      "description": "Runs initial checks on the ALB. Initial checks include checking the existence of ALB, hotspotting, single AZ errors, HTTP error details and access logs configuration.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 30,
+      "maxAttempts": 3,
+      "inputs": {
+        "Handler": "alb_initial_checks.initial_checks",
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "start_time": "{{ IssueStartTime }}",
+          "end_time": "{{ IssueEndTime }}"
+        },
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ALBExists",
+          "Selector": "$.Payload.ALBExists",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ALBGeneratedError",
+          "Selector": "$.Payload.ALBErrorDetails.ELBErrorType",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "TargetGeneratedError",
+          "Selector": "$.Payload.ALBErrorDetails.TargetErrorType",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ErrorCodes",
+          "Selector": "$.Payload.ALBErrorDetails.ErrorCodes",
+          "Type": "StringList"
+        },
+        {
+          "Name": "AdjustedStartTime",
+          "Selector": "$.Payload.ALBErrorDetails.AdjustedStartTime",
+          "Type": "String"
+        },
+        {
+          "Name": "AdjustedEndTime",
+          "Selector": "$.Payload.ALBErrorDetails.AdjustedEndTime",
+          "Type": "String"
+        },
+        {
+          "Name": "SelectedTimestamps",
+          "Selector": "$.Payload.ALBErrorDetails.SelectedTimestamps",
+          "Type": "StringList"
+        },
+        {
+          "Name": "Period",
+          "Selector": "$.Payload.ALBErrorDetails.Period",
+          "Type": "Integer"
+        },
+        {
+          "Name": "ALBErrorDetails",
+          "Selector": "$.Payload.ALBErrorDetails",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "HotspottingStatus",
+          "Selector": "$.Payload.Hotspotting.Status",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "HotspottedAZs",
+          "Selector": "$.Payload.Hotspotting.AZs",
+          "Type": "StringList"
+        },
+        {
+          "Name": "SingleAZErrorsStatus",
+          "Selector": "$.Payload.SingleAZErrors.Status",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "SingleAZErrorsAZ",
+          "Selector": "$.Payload.SingleAZErrors.AZs",
+          "Type": "StringList"
+        },
+        {
+          "Name": "AccessLogsEnabled",
+          "Selector": "$.Payload.ALBAttributeInfo.access_logs_enabled",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AccessLogS3BucketName",
+          "Selector": "$.Payload.ALBAttributeInfo.bucket_name",
+          "Type": "String"
+        },
+        {
+          "Name": "AccessLogsS3BucketPrefix",
+          "Selector": "$.Payload.ALBAttributeInfo.bucket_prefix",
+          "Type": "String"
+        },
+        {
+          "Name": "ALBIdleTimeout",
+          "Selector": "$.Payload.ALBAttributeInfo.idle_timeout",
+          "Type": "String"
+        },
+        {
+          "Name": "S3PublicAccess",
+          "Selector": "$.Payload.ALBAttributeInfo.s3_public_status.is_public",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "S3AccountRegionCheck",
+          "Selector": "$.Payload.ALBAttributeInfo.s3_account_region_check.same_account_region",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "HealthyHostDiscrepancy",
+          "Selector": "$.Payload.HealthyHostDiscrepancy.Anomalous",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "HealthyHostDiscrepancyDetails",
+          "Selector": "$.Payload.HealthyHostDiscrepancy",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "ProcessAccessLogs",
+      "action": "aws:executeScript",
+      "nextStep": "HTTP500ErrorIdentification",
+      "description": "Retrieves relevant ALB access log files from the S3 bucket and processes them to identify unique error reasons and codes. \nNote: Only a subset of access logs files are processed identified time-ranges. If processing time exceeds the 9 minute mark, remaining logs are not processed.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "access_log_enabled": "{{ RunInitialChecks.AccessLogsEnabled }}",
+          "bucket": "{{ RunInitialChecks.AccessLogS3BucketName }}",
+          "prefix": "{{ RunInitialChecks.AccessLogsS3BucketPrefix }}",
+          "period": "{{ RunInitialChecks.Period }}",
+          "idle_timeout": "{{ RunInitialChecks.ALBIdleTimeout }}",
+          "selected_timestamps": "{{ RunInitialChecks.SelectedTimestamps }}",
+          "error_codes": "{{ RunInitialChecks.ErrorCodes }}",
+          "s3_public_access": "{{ RunInitialChecks.S3PublicAccess }}",
+          "s3_account_region_check": "{{ RunInitialChecks.S3AccountRegionCheck }}"
+        },
+        "Handler": "alb_access_log_processor.main",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "LogParserOutput",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "onFailure": "Continue"
+    },
+    {
+      "name": "HTTP500ErrorIdentification",
+      "action": "aws:executeScript",
+      "nextStep": "HTTP502ErrorIdentification",
+      "description": "Identifies error reason for ALB generated HTTP500 errors using either metrics or access logs if available.",
+      "timeoutSeconds": 30,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "period": "{{ RunInitialChecks.Period }}",
+          "start_time": "{{ RunInitialChecks.AdjustedStartTime }}",
+          "end_time": "{{ RunInitialChecks.AdjustedEndTime }}",
+          "access_log_enabled": "{{ RunInitialChecks.AccessLogsEnabled }}",
+          "log_parser_output": "{{ ProcessAccessLogs.LogParserOutput }}",
+          "error_codes": "{{ RunInitialChecks.ErrorCodes }}"
+        },
+        "Handler": "alb_http500_error_identification.main",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "HTTP500DiagStatus",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "HTTP500DiagOutput",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "onFailure": "Continue"
+    },
+    {
+      "name": "HTTP502ErrorIdentification",
+      "action": "aws:executeScript",
+      "nextStep": "HTTP503ErrorIdentification",
+      "description": "Identifies error reason for ALB generated HTTP502 errors using either metrics or access logs if available.",
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "period": "{{ RunInitialChecks.Period }}",
+          "start_time": "{{ RunInitialChecks.AdjustedStartTime }}",
+          "end_time": "{{ RunInitialChecks.AdjustedEndTime }}",
+          "access_log_enabled": "{{ RunInitialChecks.AccessLogsEnabled }}",
+          "log_parser_output": "{{ ProcessAccessLogs.LogParserOutput }}",
+          "error_codes": "{{ RunInitialChecks.ErrorCodes }}"
+        },
+        "Handler": "alb_http502_error_identification.main",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "HTTP502DiagStatus",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "HTTP502DiagOutput",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "onFailure": "Continue"
+    },
+    {
+      "name": "HTTP503ErrorIdentification",
+      "action": "aws:executeScript",
+      "nextStep": "HTTP504ErrorIdentification",
+      "description": "Identifies error reason for ALB generated HTTP503 errors using metrics.",
+      "timeoutSeconds": 30,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "period": "{{ RunInitialChecks.Period }}",
+          "start_time": "{{ RunInitialChecks.AdjustedStartTime }}",
+          "end_time": "{{ RunInitialChecks.AdjustedEndTime }}",
+          "error_codes": "{{ RunInitialChecks.ErrorCodes }}"
+        },
+        "Handler": "alb_http503_error_identification.main",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "HTTP503DiagStatus",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "HTTP503DiagOutput",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "onFailure": "Continue"
+    },
+    {
+      "name": "HTTP504ErrorIdentification",
+      "action": "aws:executeScript",
+      "nextStep": "OtherHTTPErrorIdentification",
+      "description": "Identifies error reason for ALB generated HTTP504 errors using either metrics or access logs if available.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "period": "{{ RunInitialChecks.Period }}",
+          "start_time": "{{ RunInitialChecks.AdjustedStartTime }}",
+          "end_time": "{{ RunInitialChecks.AdjustedEndTime }}",
+          "access_log_enabled": "{{ RunInitialChecks.AccessLogsEnabled }}",
+          "log_parser_output": "{{ ProcessAccessLogs.LogParserOutput }}",
+          "error_codes": "{{ RunInitialChecks.ErrorCodes }}"
+        },
+        "Handler": "alb_http504_error_identification.main",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "HTTP504DiagStatus",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "HTTP504DiagOutput",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "onFailure": "Continue"
+    },
+    {
+      "name": "OtherHTTPErrorIdentification",
+      "action": "aws:executeScript",
+      "nextStep": "GenerateReport",
+      "description": "Identifies error reason for unclassified HTTP errors generated by ALB using either metrics or access logs if available.",
+      "timeoutSeconds": 30,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "period": "{{ RunInitialChecks.Period }}",
+          "start_time": "{{ RunInitialChecks.AdjustedStartTime }}",
+          "end_time": "{{ RunInitialChecks.AdjustedEndTime }}",
+          "access_log_enabled": "{{ RunInitialChecks.AccessLogsEnabled }}",
+          "log_parser_output": "{{ ProcessAccessLogs.LogParserOutput }}",
+          "error_codes": "{{ RunInitialChecks.ErrorCodes }}"
+        },
+        "Handler": "alb_other_http_error_identification.main",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "OtherHTTPErrorsDiagStatus",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "OtherHTTPErrorsDiagOutput",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ],
+      "onFailure": "Continue"
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "Generate a report by consolidating the findings from the steps.",
+      "timeoutSeconds": 30,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "alb_arn": "{{ ALBArn }}",
+          "alb_generated_errors": "{{ RunInitialChecks.ALBGeneratedError }}",
+          "target_generated_errors": "{{ RunInitialChecks.TargetGeneratedError }}",
+          "alb_generated_error_codes": "{{ RunInitialChecks.ErrorCodes }}",
+          "selected_timestamps": "{{ RunInitialChecks.SelectedTimestamps }}",
+          "adjusted_start_time": "{{ RunInitialChecks.AdjustedStartTime }}",
+          "adjusted_end_time": "{{ RunInitialChecks.AdjustedEndTime }}",
+          "error_details": "{{ RunInitialChecks.ALBErrorDetails }}",
+          "access_logs_enabled": "{{ RunInitialChecks.AccessLogsEnabled }}",
+          "idle_timeout": "{{ RunInitialChecks.ALBIdleTimeout }}",
+          "hotspotting_status": "{{ RunInitialChecks.HotspottingStatus }}",
+          "hotspotted_azs": "{{ RunInitialChecks.HotspottedAZs }}",
+          "single_az_errors_status": "{{ RunInitialChecks.SingleAZErrorsStatus }}",
+          "single_az_errors_azs": "{{ RunInitialChecks.SingleAZErrorsAZ }}",
+          "healthy_host_discrepancy": "{{ RunInitialChecks.HealthyHostDiscrepancyDetails }}",
+          "s3_public_access": "{{ RunInitialChecks.S3PublicAccess }}",
+          "s3_account_region_check": "{{ RunInitialChecks.S3AccountRegionCheck }}",
+          "access_log_error_details": "{{ ProcessAccessLogs.LogParserOutput }}",
+          "http500_diagnosis": "{{ HTTP500ErrorIdentification.HTTP500DiagOutput }}",
+          "http502_diagnosis": "{{ HTTP502ErrorIdentification.HTTP502DiagOutput }}",
+          "http503_diagnosis": "{{ HTTP503ErrorIdentification.HTTP503DiagOutput }}",
+          "http504_diagnosis": "{{ HTTP504ErrorIdentification.HTTP504DiagOutput }}",
+          "other_http_diagnosis": "{{ OtherHTTPErrorIdentification.OtherHTTPErrorsDiagOutput }}"
+        },
+        "Handler": "generate_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "report",
+          "Selector": "$.Payload.report"
+        },
+        {
+          "Type": "String",
+          "Name": "errors",
+          "Selector": "$.Payload.errors"
+        }
+      ],
+      "isEnd": true,
+      "onFailure": "Continue"
+    }
+  ],
+  "outputs": [
+    "GenerateReport.report"
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "bc428c193352216cf6f84ed85e7f0433411b16d7c77ed1036218c6eb4730ffeb"
+      }
+    }
+  }
+}
