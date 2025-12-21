@@ -1,0 +1,275 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-MigrateIncidentManagerEventBridgeRules\n\n## What does this document do?\nThis runbook automates the migration of EventBridge rules from AWS Systems Manager Incident Manager to \nOpsCenter with comprehensive safety features and monitoring capabilities. It provides the following features:\n\n* Discovery and batching: The runbook discovers all EventBridge rules configured with Incident Manager \n  response plan targets and organizes them into configurable batches for processing.\n* S3 backup and review: All rule configurations are backed up to S3 before migration, and the complete \n  list of rules to be migrated is stored for manual review and approval.\n* Manual approval workflow: The runbook requires explicit approval via SNS notification before proceeding \n  with the migration, with a 24-hour timeout for safety.\n* Batch processing: Rules are migrated in configurable batches to prevent API throttling and allow for \n  better error handling and progress tracking.\n* Comprehensive logging: All migration activities are logged to CloudWatch Logs with detailed progress \n  tracking, error reporting, and audit trails.\n* Error handling and retry: The runbook includes exponential backoff retry mechanisms for API calls and \n  comprehensive error handling with detailed failure reporting.\n* Progress tracking: Global counters track successfully migrated, failed, and skipped rules throughout \n  the execution with real-time updates.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The IAM role ARN for the automation execution. Expected format: \n  arn:aws:iam::{AccountId}:role/IM-Migration-Automation-Role. This role should be created by deploying \n  the provided CloudFormation stack.\n* ApproverArn: (Required) The IAM role or user ARN who can review and approve the migration. Expected \n  format: arn:aws:iam::{AccountId}:(role|user)/{name}. Default: arn:aws:iam::{AccountId}:role/Admin.\n* S3BucketName: (Required) The S3 bucket name for storing backups and review files. Expected format: \n  im-migration-logs-{AccountId}-{region}. This bucket should be created by deploying the provided \n  CloudFormation stack.\n* SNSTopicArn: (Required) The SNS topic ARN for approval notifications. Expected format: \n  arn:aws:sns:{region}:{AccountId}:Automation-IM-Migration-Approvals. This topic should be created by deploying \n  the provided CloudFormation stack.\n* MaxNumberOfRulesToMigrate: (Optional) The maximum number of rules to migrate in a single execution. \n  Valid values: 1, 5, 10, 50, 100, 500, 5000, 10000, 25000, 50000. Default: 10000. For migrations \n  exceeding 10000 rules, consider adjusting the batch size accordingly.\n* BatchSize: (Optional) The number of rules to process in each batch. Valid values: 25, 50, 100, 200, \n  250, 300, 350, 400, 450, 500. Default: 100. Use smaller values if encountering issues. The runbook \n  supports 100 × BatchSize rules per execution.\n\n## Output Parameters\n* MigrationSummary: A comprehensive summary report containing:\n  * Total number of rules found with Incident Manager targets\n  * Count of successfully migrated rules\n  * Count of failed migrations with error details\n  * Count of skipped rules (those without Incident Manager targets)\n  * Overall migration status (Success or Completed with errors)",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) IM-Migration-Automation-Role is expected to be created by user by deploying cfn stack",
+      "default": "arn:aws:iam::{AccountId}:role/IM-Migration-Automation-Role",
+      "allowedPattern": "^arn:aws:iam::[0-9]{12}:role/IM-Migration-Automation-Role$"
+    },
+    "ApproverArn": {
+      "type": "String",
+      "description": "(Required) IAM role/user ARN who can review and approve the migration",
+      "default": "arn:aws:iam::{AccountId}:role/Admin",
+      "allowedPattern": "^arn:aws:iam::[0-9]{12}:(role|user)/[a-zA-Z0-9+=,.@_/-]+$"
+    },
+    "S3BucketName": {
+      "type": "String",
+      "description": "(Required) S3 bucket is expected to be created by user by deploying cfn stack",
+      "default": "im-migration-logs-{AccountId}-{region, ex:us-east-2}",
+      "allowedPattern": "^im-migration-logs-[0-9]{12}-[a-z]{2}-[a-z]+-[0-9]{1}$"
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) SNS topic ARN for approval notifications is expected to be created by user by deploying cfn stack",
+      "default": "arn:aws:sns:{region, ex:us-east-2}:{AccountId}:Automation-IM-Migration-Approvals",
+      "allowedPattern": "^arn:aws[a-z0-9\\\\-]*:sns:[a-z]{2}-[a-z]+-[0-9]{1}:[0-9]{12}:Automation-IM-Migration-Approvals$"
+    },
+    "MaxNumberOfRulesToMigrate": {
+      "type": "Integer",
+      "description": "(Optional) You can choose to set the number of rules you can migrate in a single execution. For more than 10000 rule migration, update the batch size as well.",
+      "default": 10000,
+      "allowedValues": [
+        1,
+        5,
+        10,
+        50,
+        100,
+        500,
+        5000,
+        10000,
+        25000,
+        50000
+      ]
+    },
+    "BatchSize": {
+      "type": "Integer",
+      "description": "(Optional) Use smaller numbers if encountered with issue. Current runbook support 100 X BatchSize number of rules migration in single execution. If you increase batch size above 100, update Max No. Of Rules as well as per your need.",
+      "default": 100,
+      "allowedValues": [
+        25,
+        50,
+        100,
+        200,
+        250,
+        300,
+        350,
+        400,
+        450,
+        500
+      ]
+    }
+  },
+  "variables": {
+    "MigratedRuleCount": {
+      "type": "Integer",
+      "default": 0,
+      "description": "Initializing a global counter variable to help with Progress tracking "
+    },
+    "FailedRuleCount": {
+      "type": "Integer",
+      "description": "Initializing a global counter variable to help with Failure tracking ",
+      "default": 0
+    },
+    "SkippedRuleCount": {
+      "type": "Integer",
+      "default": 0,
+      "description": "Initializing a global counter variable to help with skipped rule count tracking "
+    }
+  },
+  "mainSteps": [
+    {
+      "description": "Discover EventBridge rules with Incident Manager targets, organize into batches, and store list to S3 for review",
+      "name": "getEventBridgeRules",
+      "action": "aws:executeScript",
+      "maxAttempts": 100,
+      "nextStep": "CheckIfRulesExists",
+      "isEnd": false,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "get_rule_handler",
+        "InputPayload": {
+          "S3BucketName": "{{ S3BucketName }}",
+          "MaxNumberOfRulesToMigrate": "{{MaxNumberOfRulesToMigrate}}",
+          "BatchSize": "{{ BatchSize }}"
+        },
+        "Script": "import boto3\nimport json\nimport re\nimport time\nfrom botocore.exceptions import ClientError\n\n\ndef retry_with_backoff(func, max_retries=3, base_delay=1, max_delay=60):\n    \"\"\"Generic retry function with exponential backoff\"\"\"\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except ClientError as e:\n            error_code = e.response['Error']['Code']\n            if error_code in ['Throttling', 'ThrottlingException', 'RequestLimitExceeded', 'ServiceUnavailable']:\n                if attempt < max_retries - 1:\n                    delay = min(base_delay * (2 ** attempt), max_delay)\n                    print(f\"Throttling detected, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})\")\n                    time.sleep(delay)\n                    continue\n            raise\n        except Exception as e:\n            if attempt < max_retries - 1:\n                delay = min(base_delay * (2 ** attempt), max_delay)\n                print(f\"Error occurred, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries}): {str(e)}\")\n                time.sleep(delay)\n                continue\n            raise\n\n\ndef get_rule_handler(events, context):\n    try:\n        # Get current account ID and region with retry\n        def get_account_info():\n            sts_client = boto3.client('sts')\n            return sts_client.get_caller_identity()['Account']\n        \n        account_id = retry_with_backoff(get_account_info)\n        region = boto3.session.Session().region_name\n        \n        # Create clients\n        events_client = boto3.client('events')\n        s3_client = boto3.client('s3')\n\n        # Get parameters from input payload and ensure integers are properly converted\n        s3_bucket = events['S3BucketName']\n        max_rules = int(events['MaxNumberOfRulesToMigrate'])\n        \n        # Get rules with IM targets using paginator with retry\n        rules_with_im = []\n        ssm_incidents_pattern = re.compile(r'arn:aws:ssm-incidents::[0-9]{12}:response-plan/.*')\n\n        def get_rules_page(page_iterator):\n            results = []\n            for page in page_iterator:\n                for rule in page['Rules']:\n                    if len(results) + len(rules_with_im) >= max_rules:\n                        break\n                    \n                    # Get targets for this rule with retry\n                    def get_targets():\n                        return events_client.list_targets_by_rule(Rule=rule['Name'])\n                    \n                    targets_response = retry_with_backoff(get_targets, max_retries=5)\n                    targets = targets_response.get('Targets', [])\n                    \n                    if any(ssm_incidents_pattern.match(target.get('Arn', '')) for target in targets):\n                        results.append(rule['Name'])\n                if len(results) + len(rules_with_im) >= max_rules:\n                    break\n            return results\n\n        def paginate_rules():\n            paginator = events_client.get_paginator('list_rules')\n            return get_rules_page(paginator.paginate())\n\n        rules_with_im = retry_with_backoff(paginate_rules, max_retries=5)\n\n        # Write the rules in batches to S3 with retry\n        batch_size = int(events['BatchSize'])\n        if batch_size is None:\n            raise ValueError(\"BatchSize parameter is required\")\n        print(f\"Processing up to {max_rules} rules in batches of {batch_size}\")\n        batches = {}\n\n        for i in range(0, len(rules_with_im), batch_size):\n            batch = rules_with_im[i:i + batch_size]\n            batch_key = f\"batch_{i//batch_size}\"\n            batches[batch_key] = batch\n        \n        # Write to S3 with retry\n        def write_to_s3():\n            return s3_client.put_object(\n                Bucket=s3_bucket,\n                Key=f\"review/EventBridge/review_EB_rules_to_migrate_{account_id}_{region}.json\",\n                Body=json.dumps(batches, indent=2)\n            )\n\n        retry_with_backoff(write_to_s3, max_retries=5)\n        \n        return {\n          'RuleCount': len(rules_with_im),\n          'TotalNumberOfBatches': len(batches),\n          'RuleCountString': str(len(rules_with_im)),\n          'FileName': f\"review_EB_rules_to_migrate_{account_id}_{region}.json\"\n        }\n    except Exception as e:\n        print(f\"Retrieving list of EventBridge Rules with incident manager usage failed: {str(e)}\")\n        raise"
+      },
+      "outputs": [
+        {
+          "Type": "Integer",
+          "Name": "RuleCount",
+          "Selector": "$.Payload.RuleCount"
+        },
+        {
+          "Type": "Integer",
+          "Name": "TotalNumberOfBatches",
+          "Selector": "$.Payload.TotalNumberOfBatches"
+        },
+        {
+          "Type": "String",
+          "Name": "RuleCountString",
+          "Selector": "$.Payload.RuleCountString"
+        },
+        {
+          "Type": "String",
+          "Name": "FileName",
+          "Selector": "$.Payload.FileName"
+        }
+      ]
+    },
+    {
+      "description": "Check if any rules were found for migration, proceed to approval if rules exist, otherwise end execution",
+      "name": "CheckIfRulesExists",
+      "action": "aws:branch",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ApprovalStep",
+            "Variable": "{{ getEventBridgeRules.RuleCount }}",
+            "NumericGreater": 0
+          }
+        ]
+      }
+    },
+    {
+      "description": "Send SNS notification and wait for manual approval to proceed with migration. Times out after 24 hours if no approval received.",
+      "name": "ApprovalStep",
+      "action": "aws:approve",
+      "timeoutSeconds": 86400,
+      "nextStep": "ProcessRuleBatches",
+      "isEnd": false,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "NotificationArn": "{{ SNSTopicArn }}",
+        "Approvers": [
+          "{{ ApproverArn }}"
+        ],
+        "Message": "Please review the EventBridge rules to be migrated from Incident Manager to OpsCenter. Number of rules to migrate: {{ getEventBridgeRules.RuleCountString}}. The complete list can be found in S3: s3://{{ S3BucketName }}/review/EventBridge/{{ getEventBridgeRules.FileName }}",
+        "MinRequiredApprovals": 1
+      }
+    },
+    {
+      "description": "Process rule migration in batches with comprehensive logging, backup, and error handling",
+      "name": "ProcessRuleBatches",
+      "action": "aws:loop",
+      "nextStep": "GenerateSummary",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": "{{ getEventBridgeRules.TotalNumberOfBatches }}",
+        "LoopCondition": {
+          "Variable": "{{ getEventBridgeRules.RuleCount }}",
+          "NumericGreater": 0
+        },
+        "Steps": [
+          {
+            "description": "Migrate current batch of rules from Incident Manager to OpsCenter with S3 backup and comprehensive logging",
+            "name": "ProcessMigration",
+            "action": "aws:executeScript",
+            "maxAttempts": 3,
+            "nextStep": "UpdateSucceededRuleCount",
+            "isEnd": false,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "migrate_handler",
+              "Script": "import boto3\nimport json\nimport time\nimport re\nfrom botocore.exceptions import ClientError\n\ndef retry_with_backoff(func, max_retries=3, base_delay=1, max_delay=60):\n    \"\"\"Generic retry function with exponential backoff\"\"\"\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except ClientError as e:\n            error_code = e.response['Error']['Code']\n            if error_code in ['Throttling', 'ThrottlingException', 'RequestLimitExceeded', 'ServiceUnavailable']:\n                if attempt < max_retries - 1:\n                    delay = min(base_delay * (2 ** attempt), max_delay)\n                    print(f\"Throttling detected, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})\")\n                    time.sleep(delay)\n                    continue\n            raise\n        except Exception as e:\n            if attempt < max_retries - 1:\n                delay = min(base_delay * (2 ** attempt), max_delay)\n                print(f\"Error occurred, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries}): {str(e)}\")\n                time.sleep(delay)\n                continue\n            raise\ndef migrate_handler(events, context):\n    # Create CloudWatch logs client\n    logs_client = boto3.client('logs')\n    log_group = '/aws/ssm/incidentmanager/ebmigration'\n    log_stream = f\"EventBridgeMigration-{int(time.time())}\"\n\n    # Create log group if it doesn't exist with retry\n    def create_log_group():\n        try:\n            logs_client.create_log_group(logGroupName=log_group)\n        except logs_client.exceptions.ResourceAlreadyExistsException:\n            pass\n\n    retry_with_backoff(create_log_group)\n\n    # Create log stream with retry\n    def create_log_stream():\n        try:\n            logs_client.create_log_stream(\n                logGroupName=log_group,\n                logStreamName=log_stream\n            )\n        except Exception as e:\n            print(f\"ERROR: Failed to create log stream {log_stream}: {str(e)}\")\n            raise  # Re-raise the exception as logging setup is critical\n\n    retry_with_backoff(create_log_stream)\n\n    def log_message(message):\n        def put_log():\n            return logs_client.put_log_events(\n                logGroupName=log_group,\n                logStreamName=log_stream,\n                logEvents=[{\n                    'timestamp': int(time.time() * 1000),\n                    'message': message\n                }]\n            )\n        try:\n            retry_with_backoff(put_log, max_retries=2)\n        except Exception as e:\n            print(f\"Failed to log message: {message}. Error: {str(e)}\")\n\n\n    try:\n         # ADD: Log loop-related information\n        log_message(f\"=== LOOP ITERATION DEBUG ===\")\n        log_message(f\"Current iteration: {events.get('CurrentIteration', 'NOT_SET')}\")\n        log_message(f\"Max iterations expected: {events.get('MaxIterations', 'NOT_SET')}\")\n        # ADD: Log function start and input parameters\n        log_message(f\"=== MIGRATION HANDLER STARTED ===\")\n        \n        # Create clients\n        events_client = boto3.client('events')\n        s3_client = boto3.client('s3')\n\n        # Get current account ID and region with retry\n        def get_account_info():\n            sts_client = boto3.client('sts')\n            return sts_client.get_caller_identity()['Account']\n\n        current_account = retry_with_backoff(get_account_info)\n        current_region = boto3.session.Session().region_name\n        \n        # ADD: Log account and region info\n        log_message(f\"Current account: {current_account}, region: {current_region}\")\n        \n        # Get current batch of rules list from S3 with retry\n        def get_s3_object():\n            return s3_client.get_object(\n                Bucket=events['s3BucketName'],\n                Key=f\"review/EventBridge/review_EB_rules_to_migrate_{current_account}_{current_region}.json\"\n            )\n\n        response = retry_with_backoff(get_s3_object, max_retries=5)\n        approved_rules = json.loads(response['Body'].read().decode('utf-8'))\n        batchNumber = events['CurrentIteration']-1\n        \n        # ADD: Enhanced batch logging\n        log_message(f\"Current iteration: {events['CurrentIteration']}\")\n        log_message(f\"Processing batch number: {batchNumber}\")\n        log_message(f\"Total batches in approved_rules: {list(approved_rules.keys())}\")\n        \n        approved_rule_names = approved_rules.get(f'batch_{batchNumber}', [])\n        \n        # ADD: Log batch details\n        log_message(f\"Rules in batch_{batchNumber}: {len(approved_rule_names)}\")\n        log_message(f\"Rule names in current batch: {approved_rule_names}\")\n\n        migrated_rules = []\n        failed_rules = []\n        skipped_rules = []  # ADD: Track skipped rules\n\n        ssm_incidents_pattern = re.compile(r'arn:aws:ssm-incidents::[0-9]{12}:response-plan/(.*)')\n\n        # ADD: Check if batch is empty\n        if not approved_rule_names:\n            log_message(f\"WARNING: No rules found in batch_{batchNumber}\")\n            return {\n                'SuccessCount': events['MigratedRuleCount'],\n                'FailureCount': events['FailedRuleCount'],\n                'SkippedCount': events['SkippedRuleCount'],\n                'Status': 'No rules in batch'\n            }\n\n        # Process each rule in the batch\n        for rule_name in approved_rule_names:\n            log_message(f\"=== Processing rule: {rule_name} ===\")\n            \n            try:\n                # Get current targets with retry\n                def get_targets():\n                    return events_client.list_targets_by_rule(Rule=rule_name)\n                \n                targets_response = retry_with_backoff(get_targets, max_retries=5)\n                targets = targets_response.get('Targets', [])\n                \n                # ADD: Log current rule targets\n                log_message(f\"Current rule targets: {json.dumps(targets, default=str)}\")\n                \n                # Check if rule still uses ssm-incidents\n                still_use_IM = 0\n                updated_targets = []\n                \n                for target in targets:\n                    log_message(f\"Evaluating target: {target.get('Arn', 'NO_ARN')}\")\n                    target_arn = target.get('Arn', '')\n                    if 'ssm-incidents::' in target_arn:\n                        log_message(f\"Found SSM Incidents target: {target_arn}\")\n                        new_arn = f\"arn:aws:ssm:{current_region}:{current_account}:opsitem\"\n                        log_message(f\"Converting target from {target_arn} to {new_arn}\")\n                        target['Arn'] = new_arn\n                        still_use_IM += 1\n                    else:\n                        log_message(f\"Target does not match SSM Incidents pattern, keeping as-is: {target_arn}\")\n                    updated_targets.append(target)\n                \n                # ADD: Log decision logic\n                log_message(f\"Found {still_use_IM} SSM Incidents targets to convert\")\n                \n                if still_use_IM > 0:\n                    log_message(f\"Proceeding with migration for rule: {rule_name}\")\n                    \n                    # Backup current configuration with retry\n                    backup_config = {\n                        'RuleName': rule_name,\n                        'Targets': targets\n                    }\n                    backup_key = f\"backups/EventBridge/{current_account}/{current_region}/{rule_name}_backup.json\"\n\n                    def backup_to_s3():\n                        return s3_client.put_object(\n                            Bucket=events['s3BucketName'],\n                            Key=backup_key,\n                            Body=json.dumps(backup_config, indent=2, default=str)\n                        )\n\n                    # ADD: Log backup attempt\n                    log_message(f\"Attempting to backup rule to S3: {backup_key}\")\n                    retry_with_backoff(backup_to_s3, max_retries=5)\n                    log_message(f\"Successfully backed up rule configuration to {backup_key}\")\n\n                    # Update rule targets with retry\n                    def update_targets():\n                        return events_client.put_targets(\n                            Rule=rule_name,\n                            Targets=updated_targets\n                        )\n\n                    log_message(f\"Attempting to update rule targets in EventBridge: {rule_name}\")\n                    retry_with_backoff(update_targets, max_retries=5)\n                    log_message(f\"Successfully migrated rule: {rule_name}\")\n                    migrated_rules.append(rule_name)\n                else:\n                    log_message(f\"Skipping rule {rule_name} - no SSM Incidents targets found\")\n                    skipped_rules.append(rule_name)\n                    \n            except Exception as e:\n                log_message(f\"ERROR: Failed to process rule {rule_name}: {str(e)}\")\n                failed_rules.append({\n                    'RuleName': rule_name,\n                    'Error': str(e)\n                })\n\n        # ADD: Enhanced final logging\n        log_message(f\"=== BATCH PROCESSING COMPLETE ===\")\n        log_message(f\"Batch {batchNumber} results:\")\n        log_message(f\"  - Total rules in batch: {len(approved_rule_names)}\")\n        log_message(f\"  - Successfully migrated: {len(migrated_rules)} - {migrated_rules}\")\n        log_message(f\"  - Failed migrations: {len(failed_rules)} - {[f['RuleName'] for f in failed_rules]}\")\n        log_message(f\"  - Skipped (no IM targets): {len(skipped_rules)} - {skipped_rules}\")\n        \n        if failed_rules:\n            log_message(f\"Failed to migrate {len(failed_rules)} rules - see individual rule logs for details\")\n        log_message(f\"=== ITERATION {events['CurrentIteration']} SUMMARY ===\")\n        log_message(f\"This iteration processed batch_{batchNumber}\")\n        log_message(f\"Remaining iterations: {int(events.get('MaxIterations', 0)) - int(events.get('CurrentIteration', 0))}\")\n        return {\n            'SuccessCount': events['MigratedRuleCount']+len(migrated_rules),\n            'FailureCount': events['FailedRuleCount']+len(failed_rules),\n            'SkippedCount': events['SkippedRuleCount']+len(skipped_rules),  # ADD: Include skipped count\n            'Status': 'Success' if not failed_rules else 'Partial Success'\n        }\n    except Exception as e:\n        log_message(f\"CRITICAL ERROR: Migration failed with exception: {str(e)}\")\n        log_message(f\"Exception type: {type(e).__name__}\")\n        import traceback\n        log_message(f\"Full traceback: {traceback.format_exc()}\")\n        raise",
+              "InputPayload": {
+                "s3BucketName": "{{ S3BucketName }}",
+                "CurrentIteration": "{{ ProcessRuleBatches.CurrentIteration }}",
+                "MigratedRuleCount": "{{ variable:MigratedRuleCount }}",
+                "FailedRuleCount": "{{ variable:FailedRuleCount }}",
+                "SkippedRuleCount": "{{ variable:SkippedRuleCount }}"
+              }
+            },
+            "outputs": [
+              {
+                "Type": "Integer",
+                "Name": "MigratedRuleCount",
+                "Selector": "$.Payload.SuccessCount"
+              },
+              {
+                "Type": "Integer",
+                "Name": "FailedRuleCount",
+                "Selector": "$.Payload.FailureCount"
+              },
+              {
+                "Type": "String",
+                "Name": "Status",
+                "Selector": "$.Payload.Status"
+              },
+              {
+                "Type": "Integer",
+                "Name": "SkippedRuleCount",
+                "Selector": "$.Payload.SkippedCount"
+              }
+            ]
+          },
+          {
+            "description": "Update global counter with successfully migrated rules from current batch",
+            "name": "UpdateSucceededRuleCount",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateFailedRuleCount",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:MigratedRuleCount",
+              "Value": "{{ ProcessMigration.MigratedRuleCount }}"
+            }
+          },
+          {
+            "description": "Update global counter with failed rule migrations from current batch",
+            "name": "UpdateFailedRuleCount",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateSkippedRuleCount",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:FailedRuleCount",
+              "Value": "{{ ProcessMigration.FailedRuleCount }}"
+            }
+          },
+          {
+            "description": "Update global counter with skipped rules from current batch",
+            "name": "UpdateSkippedRuleCount",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:SkippedRuleCount",
+              "Value": "{{ ProcessMigration.SkippedRuleCount }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Generate comprehensive migration summary report with total counts and overall status",
+      "name": "GenerateSummary",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "summary_handler",
+        "Script": "def summary_handler(events, context):\n  # Get the input values\n  migrated = events.get('MigratedRuleCount', 0)\n  failed = events.get('FailedRuleCount', 0)\n  skipped = events.get('SkippedRuleCount', 0)\n  total = events.get('TotalRules', 0)\n\n  # Determine status\n  status = 'Success' if int(failed) == 0 else 'Completed with errors'\n\n  # Create single consolidated summary string\n  Summary = f\"\"\"EventBridge Rules Migration Results:\n            Total Rules Found: {total}\n            Successfully Migrated: {migrated}\n            Failed: {failed}\n            Skipped: {skipped}\n            Status: {status}\"\"\"\n\n  return {'message': Summary}",
+        "InputPayload": {
+          "MigratedRuleCount": "{{ variable:MigratedRuleCount }}",
+          "FailedRuleCount": "{{ variable:FailedRuleCount }}",
+          "SkippedRuleCount": "{{ variable:SkippedRuleCount }}",
+          "TotalRules": "{{ getEventBridgeRules.RuleCountString }}"
+        }
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "message",
+          "Selector": "$.Payload.message"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateSummary.message"
+  ]
+}

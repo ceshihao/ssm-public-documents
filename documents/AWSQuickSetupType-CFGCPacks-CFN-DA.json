@@ -4895,166 +4895,10 @@
           }
         }
       },
-      "DeployCPackDocument": {
-        "Type": "AWS::SSM::Document",
-        "Condition": "CreateResources",
-        "Properties": {
-          "UpdateMethod": "NewVersion",
-          "Content": {
-            "description": "## AWS-DeployConformancePack\n\n### What does this document do?\n\nThe **AWS-DeployConformancePack** automation document creates new or updates existing conformance packs in your current account or across member accounts in your AWS Organization.\n\n### Inputs\n\n- **ConformancePackName**: (Required) Name of the conformance pack you want to create.\n- **TemplateSource**: \"(Required) Location of the conformance pack template body. Format {\\\"Type\\\": \\\"S3|GitHub|TemplateBody\\\", \\\"Value\\\": \\\"URL|TemplateContent\\\"}.\"\n- **ConformancePackInputParameters**: (Optional) A list of ConformancePackInputParameter objects.\n- **DeployToOrganization**: (Optional) Identifies whether the specified conformance pack should be applied organization-wide.\n- **ExcludedAccounts**: (Optional) A list of AWS accounts to be excluded from an organization conformance pack while deploying a conformance pack.\n- **AutomationAssumeRole**: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n### Outputs\n\n- **ConformancePackArn**: ARN of the created/updated conformance pack.\n",
-            "schemaVersion": "0.3",
-            "assumeRole": "{{ AutomationAssumeRole }}",
-            "parameters": {
-              "ConformancePackName": {
-                "allowedPattern": "^[a-zA-Z][-a-zA-Z0-9]*$",
-                "description": "(Required) Name of the conformance pack you want to create.",
-                "maxChars": 256,
-                "minChars": 1,
-                "type": "String"
-              },
-              "TemplateSource": {
-                "description": "(Required) Location of the conformance pack template body. Format {\"Type\": \"S3|GitHub|TemplateBody\", \"Value\": \"URL|TemplateContent\"}.",
-                "type": "StringMap"
-              },
-              "ConformancePackInputParameters": {
-                "default": [],
-                "description": "(Optional) A list of ConformancePackInputParameter objects.",
-                "maxItems": 60,
-                "type": "MapList"
-              },
-              "DeployToOrganization": {
-                "default": false,
-                "description": "(Optional) Identifies whether the specified conformance pack should be applied organization-wide.",
-                "type": "Boolean"
-              },
-              "ExcludedAccounts": {
-                "default": [],
-                "description": "(Optional) A list of AWS accounts to be excluded from an organization conformance pack while deploying a conformance pack.",
-                "maxItems": 1000,
-                "type": "StringList"
-              },
-              "AutomationAssumeRole": {
-                "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
-                "type": "String"
-              }
-            },
-            "mainSteps": [
-              {
-                "action": "aws:executeScript",
-                "inputs": {
-                  "Handler": "put_conformance_pack_handler",
-                  "InputPayload": {
-                    "ConformancePackInputParameters": "{{ ConformancePackInputParameters }}",
-                    "ConformancePackName": "{{ ConformancePackName }}",
-                    "DeployToOrganization": "{{ DeployToOrganization }}",
-                    "ExcludedAccounts": "{{ ExcludedAccounts }}",
-                    "TemplateSource": "{{ TemplateSource }}"
-                  },
-                  "Runtime": "python3.11",
-                  "Script": "import boto3\nimport time\nimport urllib.request\n\nTEMPLATE_SOURCE_S3 = 'S3'\nTEMPLATE_SOURCE_GITHUB = 'GitHub'\nTEMPLATE_SOURCE_BODY = 'TemplateBody'\n\n\ndef validate_github_url(url):\n    if not url.startswith('https://'):\n        raise Exception('GitHub source type only supports downloads via HTTPS')\n    if not url.startswith('https://github.com/') and not url.startswith('https://raw.githubusercontent.com/'):\n        raise Exception(\n            'Provide a URL that corresponds to a path within a GitHub repository')\n\n\ndef download_from_https(url):\n    with urllib.request.urlopen(url) as resp:\n        template_content = resp.read().decode('utf-8')\n    return template_content\n\n\ndef put_organization_conformance_pack_with_retry(config_client, cpack_params, retries=5, delay=30):\n    try:\n        return {\n            'ConformancePackArn': config_client.put_organization_conformance_pack(**cpack_params)['OrganizationConformancePackArn']\n        }\n    except config_client.exceptions.ResourceInUseException as error:\n        if retries > 0:\n            time.sleep(delay)\n            return put_organization_conformance_pack_with_retry(config_client, cpack_params, retries - 1)\n        else:\n            raise error\n\n\ndef put_conformance_pack_handler(events, context):\n    # get required parameters\n    deploy_to_organization = events['DeployToOrganization']\n    conformance_pack_name = events['ConformancePackName']\n    template_source = events['TemplateSource']\n    conformance_pack_input_parameters = events['ConformancePackInputParameters']\n    excluded_accounts = events['ExcludedAccounts']\n\n    # verify that accounts to exclude are used only when deploying organization CPacks\n    if excluded_accounts and not deploy_to_organization:\n        raise Exception(\n            'You can\\'t specify ExcludedAccounts when deploying a local conformance pack.')\n\n    # default conformance pack parameters\n    cpack_params = {\n        'ConformancePackInputParameters': conformance_pack_input_parameters\n    }\n\n    # add conformance pack definition\n    template_source_type = template_source['Type']\n    template_source_value = template_source['Value']\n\n    if template_source_type == TEMPLATE_SOURCE_S3:\n        cpack_params['TemplateS3Uri'] = template_source_value\n    elif template_source_type == TEMPLATE_SOURCE_BODY:\n        cpack_params['TemplateBody'] = template_source_value\n    elif template_source_type == TEMPLATE_SOURCE_GITHUB:\n        validate_github_url(template_source_value)\n        cpack_params['TemplateBody'] = download_from_https(\n            template_source_value)\n    else:\n        raise Exception(\n            f'The conformance pack template source must be one of {TEMPLATE_SOURCE_S3}, {TEMPLATE_SOURCE_BODY}, {TEMPLATE_SOURCE_GITHUB}')\n\n    # deploy conformance pack\n    config_client = boto3.client('config')\n    if deploy_to_organization:\n        cpack_params['OrganizationConformancePackName'] = conformance_pack_name\n        cpack_params['ExcludedAccounts'] = excluded_accounts\n        return put_organization_conformance_pack_with_retry(config_client, cpack_params)\n    else:\n        cpack_params['ConformancePackName'] = conformance_pack_name\n        return {\n            'ConformancePackArn': config_client.put_conformance_pack(**cpack_params)['ConformancePackArn']\n        }\n"
-                },
-                "maxAttempts": 3,
-                "name": "PutConformancePack",
-                "outputs": [
-                  {
-                    "Name": "ConformancePackArn",
-                    "Selector": "$.ConformancePackArn",
-                    "Type": "StringMap"
-                  }
-                ]
-              },
-              {
-                "name": "checkIfOrgDeployment",
-                "action": "aws:branch",
-                "inputs": {
-                  "Choices": [
-                    {
-                      "NextStep": "waitForOrgCPackDeployment",
-                      "Variable": "{{ DeployToOrganization }}",
-                      "BooleanEquals": true
-                    }
-                  ],
-                  "Default": "waitForLocalCPackDeployment"
-                }
-              },
-              {
-                "name": "waitForOrgCPackDeployment",
-                "action": "aws:waitForAwsResourceProperty",
-                "timeoutSeconds": 36000,
-                "inputs": {
-                  "Service": "config",
-                  "Api": "DescribeOrganizationConformancePackStatuses",
-                  "OrganizationConformancePackNames": [
-                    "{{ ConformancePackName }}"
-                  ],
-                  "PropertySelector": "$.OrganizationConformancePackStatuses[0].Status",
-                  "DesiredValues": [
-                    "CREATE_SUCCESSFUL",
-                    "CREATE_FAILED",
-                    "UPDATE_SUCCESSFUL"
-                  ]
-                },
-                "nextStep": "VerifyConformancePackStatus"
-              },
-              {
-                "name": "waitForLocalCPackDeployment",
-                "action": "aws:waitForAwsResourceProperty",
-                "timeoutSeconds": 36000,
-                "inputs": {
-                  "Service": "config",
-                  "Api": "DescribeConformancePackStatus",
-                  "ConformancePackNames": [
-                    "{{ ConformancePackName }}"
-                  ],
-                  "PropertySelector": "$.ConformancePackStatusDetails[0].ConformancePackState",
-                  "DesiredValues": [
-                    "CREATE_COMPLETE",
-                    "CREATE_FAILED"
-                  ]
-                },
-                "nextStep": "VerifyConformancePackStatus"
-              },
-              {
-                "name": "VerifyConformancePackStatus",
-                "action": "aws:executeScript",
-                "inputs": {
-                  "Handler": "describe_conformance_pack_status_handler",
-                  "InputPayload": {
-                    "ConformancePackName": "{{ ConformancePackName }}",
-                    "DeployToOrganization": "{{ DeployToOrganization }}",
-                    "ExcludedAccounts": "{{ ExcludedAccounts }}"
-                  },
-                  "Runtime": "python3.11",
-                  "Script": "import boto3\n\n\ndef describe_conformance_pack_status_handler(events, context):\n    deploy_to_organization = events['DeployToOrganization']\n    config_client = boto3.client('config')\n    conformance_pack_name = events['ConformancePackName']\n    if deploy_to_organization:\n        status = config_client.describe_organization_conformance_pack_statuses(OrganizationConformancePackNames=[conformance_pack_name])['OrganizationConformancePackStatuses'][0]\n        if status['Status'] != \"CREATE_SUCCESSFUL\" and status['Status'] != \"UPDATE_SUCCESSFUL\":\n            raise Exception(status['ErrorMessage'])\n    else:\n        status = config_client.describe_conformance_pack_status(ConformancePackNames=[conformance_pack_name])['ConformancePackStatusDetails'][0]\n        if status['ConformancePackState'] != \"CREATE_COMPLETE\":\n            raise Exception(status['ConformancePackStatusReason'])\n"
-                },
-                "maxAttempts": 3,
-                "isEnd": true
-              }
-            ],
-            "outputs": [
-              "PutConformancePack.ConformancePackArn"
-            ]
-          },
-          "DocumentType": "Automation",
-          "Name": {
-            "Fn::Join": [
-              "",
-              [
-                "AWSQuickSetup-DeployCPackV2-",
-                {
-                  "Ref": "QSConfigurationId"
-                }
-              ]
-            ]
-          }
-        }
-      },
       "DeployAWSControlTowerDetectiveGuardrailsPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5096,12 +4940,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5129,9 +4973,7 @@
       "DeployABSCCIGv2MaterialPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5173,12 +5015,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5206,9 +5048,7 @@
       "DeployABSCCIGv2StandardPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5250,12 +5090,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5283,9 +5123,7 @@
       "DeployACSCEssential8PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5327,12 +5165,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5360,9 +5198,7 @@
       "DeployACSCISMPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5404,12 +5240,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5437,9 +5273,7 @@
       "DeployAIandMLPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5481,12 +5315,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5514,9 +5348,7 @@
       "DeployAPRACPG234PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5558,12 +5390,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5591,9 +5423,7 @@
       "DeployIAMPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5635,12 +5465,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5668,9 +5498,7 @@
       "DeployWellArchitectedReliabilityPillarPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5712,12 +5540,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5745,9 +5573,7 @@
       "DeployWellArchitectedSecurityPillarPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5789,12 +5615,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5822,9 +5648,7 @@
       "DeployDynamoDBPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5866,12 +5690,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5899,9 +5723,7 @@
       "DeployS3PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -5943,12 +5765,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -5976,9 +5798,7 @@
       "DeployAssetManagementPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6020,12 +5840,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6053,9 +5873,7 @@
       "DeployBCPandDRPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6097,12 +5915,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6130,9 +5948,7 @@
       "DeployBNMRMiTPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6174,12 +5990,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6207,9 +6023,7 @@
       "DeployCCNENSLowPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6251,12 +6065,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6284,9 +6098,7 @@
       "DeployCCNENSMediumPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6328,12 +6140,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6361,9 +6173,7 @@
       "DeployCISPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6405,12 +6215,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6438,9 +6248,7 @@
       "DeployCISAWSFBv13Level1PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6482,12 +6290,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6515,9 +6323,7 @@
       "DeployCISAWSFBv13Level2PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6559,12 +6365,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6592,9 +6398,7 @@
       "DeployCISTop20PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6636,12 +6440,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6669,9 +6473,7 @@
       "DeployCMMCLevel1PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6713,12 +6515,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6746,9 +6548,7 @@
       "DeployCMMCLevel2PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6790,12 +6590,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6823,9 +6623,7 @@
       "DeployCMMCLevel3PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6867,12 +6665,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6900,9 +6698,7 @@
       "DeployCMMCLevel4PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -6944,12 +6740,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -6977,9 +6773,7 @@
       "DeployCMMCLevel5PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7021,12 +6815,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7054,9 +6848,7 @@
       "DeployComputeServicesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7098,12 +6890,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7131,9 +6923,7 @@
       "DeployDataResiliencyPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7175,12 +6965,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7208,9 +6998,7 @@
       "DeployDatabaseServicesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7252,12 +7040,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7285,9 +7073,7 @@
       "DeployDatalakesandAnalyticsServicesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7329,12 +7115,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7362,9 +7148,7 @@
       "DeployEC2PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7406,12 +7190,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7439,9 +7223,7 @@
       "DeployEncryptionandKeysPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7483,12 +7265,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7516,9 +7298,7 @@
       "DeployFDA21CFRPart11PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7560,12 +7340,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7593,9 +7373,7 @@
       "DeployFFIECPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7637,12 +7415,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7670,9 +7448,7 @@
       "DeployFedRAMPPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7714,12 +7490,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7747,9 +7523,7 @@
       "DeployFedRAMPLowPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7791,12 +7565,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7824,9 +7598,7 @@
       "DeployHIPAASecurityPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7868,12 +7640,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7901,9 +7673,7 @@
       "DeployKISMSPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -7945,12 +7715,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -7978,9 +7748,7 @@
       "DeployLoadBalancingPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8022,12 +7790,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8055,9 +7823,7 @@
       "DeployLoggingPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8099,12 +7865,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8132,9 +7898,7 @@
       "DeployMASNotice655PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8176,12 +7940,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8209,9 +7973,7 @@
       "DeployMASTRMGPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8253,12 +8015,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8286,9 +8048,7 @@
       "DeployManagementGovernanceServicesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8330,12 +8090,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8363,9 +8123,7 @@
       "DeployMonitoringPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8407,12 +8165,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8440,9 +8198,7 @@
       "DeployNBCTRMGPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8484,12 +8240,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8517,9 +8273,7 @@
       "DeployNCSCCAFPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8561,12 +8315,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8594,9 +8348,7 @@
       "DeployNCSCCloudSecPrinciplesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8638,12 +8390,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8671,9 +8423,7 @@
       "DeployNERCCIPPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8715,12 +8465,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8748,9 +8498,7 @@
       "DeployNIST800171PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8792,12 +8540,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8825,9 +8573,7 @@
       "DeployNIST80053rev4PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8869,12 +8615,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8902,9 +8648,7 @@
       "DeployNISTCSFPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -8946,12 +8690,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -8979,9 +8723,7 @@
       "DeployNYDFS23NYCRR500PackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9023,12 +8765,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9056,9 +8798,7 @@
       "DeployNetworkingServicesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9100,12 +8840,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9133,9 +8873,7 @@
       "DeployPCIDSSPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9177,12 +8915,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9210,9 +8948,7 @@
       "DeployPubliclyAccessibleResourcesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9254,12 +8990,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9287,9 +9023,7 @@
       "DeployRBIBasicCyberSecurityFrameworkPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9331,12 +9065,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9364,9 +9098,7 @@
       "DeployRBIMasterDirectionPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9408,12 +9140,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9441,9 +9173,7 @@
       "DeploySecurityServicesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9485,12 +9215,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9518,9 +9248,7 @@
       "DeployServerlessPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9562,12 +9290,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]
@@ -9595,9 +9323,7 @@
       "DeployStorageServicesPackAssociation": {
         "Type": "AWS::SSM::Association",
         "Properties": {
-          "Name": {
-            "Ref": "DeployCPackDocument"
-          },
+          "Name": "AWSQuickSetupType-DeployConformancePack",
           "AssociationName": {
             "Fn::Join": [
               "",
@@ -9639,12 +9365,12 @@
                 ]
               }
             ],
-            "DeployToOrganization": [
+            "DeploymentType": [
               {
                 "Fn::If": [
                   "DeployOrgCPacks",
-                  "true",
-                  "false"
+                  "ORGANIZATIONAL",
+                  "LOCAL"
                 ]
               }
             ]

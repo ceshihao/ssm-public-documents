@@ -1,0 +1,45 @@
+{
+  "description": "## AWS-ConfigureDevOpsGuru\n\n### What does this document do?\n\nThe **AWS-ConfigureDevOpsGuru** automation runbook configures DevOps Guru for all CloudFormation stacks in your current AWS account..\n\n### Inputs\n\n- **AnalyzeAllResources**: (Optional) Determines whether DevOps Guru analyzes all CloudFormation stacks in the account.\n- **EnableSnsNotifications**: (Optional) Determines whether DevOps Guru sends SNS notifications when an insight is generated.\n- **EnableSsmOpsItems**: (Optional) Determines whether DevOps Guru creates AWS Systems Manager OpsItems for each insight.\n- **AutomationAssumeRole**: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AnalyzeAllResources": {
+      "default": false,
+      "description": "(Optional) Determines whether DevOps Guru analyzes all CloudFormation stacks in the account.",
+      "type": "Boolean"
+    },
+    "EnableSnsNotifications": {
+      "default": false,
+      "description": "(Optional) Determines whether DevOps Guru sends SNS notifications when an insight is generated.",
+      "type": "Boolean"
+    },
+    "EnableSsmOpsItems": {
+      "default": false,
+      "description": "(Optional) Determines whether DevOps Guru creates AWS Systems Manager OpsItems for each insight.",
+      "type": "Boolean"
+    },
+    "AutomationAssumeRole": {
+      "default": "",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "type": "AWS::IAM::Role::Arn"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "inputs": {
+        "Handler": "configure_devops_guru_handler",
+        "InputPayload": {
+          "AnalyzeAllResources": "{{ AnalyzeAllResources }}",
+          "EnableSnsNotifications": "{{ EnableSnsNotifications }}",
+          "EnableSsmOpsItems": "{{ EnableSsmOpsItems }}",
+          "AutomationAssumeRoleArn": "{{ AutomationAssumeRole }}"
+        },
+        "Runtime": "python3.11",
+        "Script": "import boto3\nimport time\n\nSNS_TOPIC_NAME = \"DevOpsGuru-Default-Topic\"\n\n\ndef ensure_sns_topic_exists():\n    sns_client = boto3.resource('sns')\n\n    existing_topics = dict(map(lambda topic: [topic.arn.rsplit(':', 1)[1], topic.arn], sns_client.topics.all()))\n\n    if SNS_TOPIC_NAME not in existing_topics:\n        topic = sns_client.create_topic(\n            Name=SNS_TOPIC_NAME,\n            Attributes={\n                'DisplayName': SNS_TOPIC_NAME\n            }\n        )\n        return topic.arn\n    else:\n        return existing_topics[SNS_TOPIC_NAME]\n\ndef configure_devops_guru_handler(events, context):\n    # get required parameters\n    analyse_all_resources = events['AnalyzeAllResources'] or False\n    cfn_stack_names = []\n    enable_sns_notifications = events['EnableSnsNotifications'] or False\n    enable_ssm_ops_items = events['EnableSsmOpsItems'] or False\n    devops_guru_client = boto3.client('devops-guru')\n\n    # Enable SNS notifications for each generated insight\n    if enable_sns_notifications:\n        notifications_topic_arn = ensure_sns_topic_exists()\n\n        # Create a notification channel for the specified/created SNS topic ARN\n        devops_guru_client.add_notification_channel(Config={\n            'Sns': {\n                'TopicArn': notifications_topic_arn\n            }\n        })\n\n    # Get all CloudFormation stack names and override the provided stack names\n    if analyse_all_resources:\n        cfn_client = boto3.resource('cloudformation')\n        cfn_stack_names = list(map(lambda stack: stack.stack_name, cfn_client.stacks.all()))\n\n    # Enable DevOps Guru analysis for the provided/all CloudFormation stacks\n    if len(cfn_stack_names) > 0:\n        chunk_size = 100\n        for i in range(0, len(cfn_stack_names), chunk_size):\n            devops_guru_client.update_resource_collection(\n                Action='ADD',\n                ResourceCollection={\n                    'CloudFormation': {\n                        'StackNames': cfn_stack_names[i:i + chunk_size]\n                    }\n                }\n            )\n            time.sleep(1)\n\n    # Toggle creation of OpsItems for each generated insight\n    devops_guru_client.update_service_integration(ServiceIntegration={\n        'OpsCenter': {\n            'OptInStatus': 'ENABLED' if enable_ssm_ops_items else 'DISABLED'\n        }\n    })"
+      },
+      "name": "ConfigureDevOpsGuru"
+    }
+  ]
+}

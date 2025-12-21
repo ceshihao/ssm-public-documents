@@ -1,0 +1,274 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-MigrateIncidentManagerCloudWatchAlarms\n\n## What does this document do?\nThis runbook automates the migration of CloudWatch alarms from AWS Systems Manager Incident Manager to \nOpsCenter with comprehensive safety features and monitoring capabilities. It provides the following features:\n\n* Discovery and batching: The runbook discovers all CloudWatch alarms configured with Incident Manager \n  response plan actions and organizes them into configurable batches for processing.\n* S3 backup and review: All alarm configurations are backed up to S3 before migration, and the complete \n  list of alarms to be migrated is stored for manual review and approval.\n* Manual approval workflow: The runbook requires explicit approval via SNS notification before proceeding \n  with the migration, with a 24-hour timeout for safety.\n* Batch processing: Alarms are migrated in configurable batches to prevent API throttling and allow for \n  better error handling and progress tracking.\n* Comprehensive logging: All migration activities are logged to CloudWatch Logs with detailed progress \n  tracking, error reporting, and audit trails.\n* Error handling and retry: The runbook includes exponential backoff retry mechanisms for API calls and \n  comprehensive error handling with detailed failure reporting.\n* Progress tracking: Global counters track successfully migrated, failed, and skipped alarms throughout \n  the execution with real-time updates.\n* Impact mapping: The runbook automatically maps Incident Manager response plan impact levels to \n  appropriate OpsCenter severity levels during migration.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The IAM role ARN for the automation execution. Expected format: \n  arn:aws:iam::{AccountId}:role/IM-Migration-Automation-Role. This role should be created by deploying \n  the provided CloudFormation stack.\n* ApproverArn: (Required) The IAM role or user ARN who can review and approve the migration. Expected \n  format: arn:aws:iam::{AccountId}:(role|user)/{name}. Default: arn:aws:iam::{AccountId}:role/Admin.\n* S3BucketName: (Required) The S3 bucket name for storing backups and review files. Expected format: \n  im-migration-logs-{AccountId}-{region}. This bucket should be created by deploying the provided \n  CloudFormation stack.\n* SNSTopicArn: (Required) The SNS topic ARN for approval notifications. Expected format: \n  arn:aws:sns:{region}:{AccountId}:Automation-IM-Migration-Approvals. This topic should be created by deploying \n  the provided CloudFormation stack.\n* MaxNumberOfAlarmsToMigrate: (Optional) The maximum number of alarms to migrate in a single execution. \n  Valid values: 1, 5, 10, 50, 100, 500, 5000, 10000, 25000, 50000. Default: 10000. For migrations \n  exceeding 10000 alarms, consider adjusting the batch size accordingly.\n* BatchSize: (Optional) The number of alarms to process in each batch. Valid values: 25, 50, 100, 200, \n  250, 300, 350, 400, 450, 500. Default: 100. Use smaller values if encountering issues. The runbook \n  supports 100 × BatchSize alarms per execution.\n\n## Output Parameters\n* MigrationSummary: A comprehensive summary report containing:\n  * Total number of alarms found with Incident Manager actions\n  * Count of successfully migrated alarms\n  * Count of failed migrations with error details\n  * Count of skipped alarms (those without Incident Manager actions)\n  * Overall migration status (Success or Completed with errors)",
+  "assumeRole": "{{AutomationAssumeRole}}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Required) IM-Migration-Automation-Role is expected to be created by user by deploying cfn stack",
+      "default": "arn:aws:iam::{AccountId}:role/IM-Migration-Automation-Role",
+      "allowedPattern": "^arn:aws:iam::[0-9]{12}:role/IM-Migration-Automation-Role$"
+    },
+    "ApproverArn": {
+      "type": "String",
+      "description": "(Required) IAM role/user ARN who can review and approve the migration",
+      "default": "arn:aws:iam::{AccountId}:role/Admin",
+      "allowedPattern": "^arn:aws:iam::[0-9]{12}:(role|user)/[a-zA-Z0-9+=,.@_/-]+$"
+    },
+    "S3BucketName": {
+      "type": "String",
+      "description": "(Required) S3 bucket is expected to be created by user by deploying cfn stack",
+      "default": "im-migration-logs-{AccountId}-{region, ex:us-east-2}",
+      "allowedPattern": "^im-migration-logs-[0-9]{12}-[a-z]{2}-[a-z]+-[0-9]{1}$"
+    },
+    "SNSTopicArn": {
+      "type": "String",
+      "description": "(Required) SNS topic ARN for approval notifications is expected to be created by user by deploying cfn stack",
+      "default": "arn:aws:sns:{region, ex:us-east-2}:{AccountId}:Automation-IM-Migration-Approvals",
+      "allowedPattern": "^arn:aws[a-z0-9\\\\-]*:sns:[a-z]{2}-[a-z]+-[0-9]{1}:[0-9]{12}:Automation-IM-Migration-Approvals$"
+    },
+    "MaxNumberOfAlarmsToMigrate": {
+      "type": "Integer",
+      "description": "(Optional) You can choose to set the number of alarms you can migrate in a single execution. For more than 10000 alarm migration, update the batch size as well.",
+      "default": 10000,
+      "allowedValues": [
+        1,
+        5,
+        10,
+        50,
+        100,
+        500,
+        5000,
+        10000,
+        25000,
+        50000
+      ]
+    },
+    "BatchSize": {
+      "type": "Integer",
+      "description": "(Optional) Use smaller numbers if encountered with issue. Current runbook support 100 X BatchSize number of alarms migration in single execution. If you increase batch size above 100, update Max No. Of Alarms as well as per your need.",
+      "default": 100,
+      "allowedValues": [
+        25,
+        50,
+        100,
+        200,
+        250,
+        300,
+        350,
+        400,
+        450,
+        500
+      ]
+    }
+  },
+  "variables": {
+    "MigratedAlarmCount": {
+      "type": "Integer",
+      "default": 0,
+      "description": "Initializing a global counter variable to help with Progress tracking "
+    },
+    "FailedAlarmCount": {
+      "type": "Integer",
+      "description": "Initializing a global counter variable to help with Failure tracking ",
+      "default": 0
+    },
+    "SkippedAlarmCount": {
+      "type": "Integer",
+      "default": 0,
+      "description": "Initializing a global counter variable to help with skipped alarm count tracking "
+    }
+  },
+  "mainSteps": [
+    {
+      "description": "Discover CloudWatch alarms with Incident Manager actions, organize into batches, and store list to S3 for review",
+      "name": "getCloudWatchAlarms",
+      "action": "aws:executeScript",
+      "maxAttempts": 100,
+      "nextStep": "CheckIfAlarmsExists",
+      "isEnd": false,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "get_alarm_handler",
+        "InputPayload": {
+          "S3BucketName": "{{ S3BucketName }}",
+          "MaxNumberOfAlarmsToMigrate": "{{MaxNumberOfAlarmsToMigrate}}",
+          "BatchSize": "{{ BatchSize }}"
+        },
+        "Script": "import boto3\nimport json\nimport re\nimport time\nfrom botocore.exceptions import ClientError\n\n\ndef retry_with_backoff(func, max_retries=3, base_delay=1, max_delay=60):\n    \"\"\"Generic retry function with exponential backoff\"\"\"\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except ClientError as e:\n            error_code = e.response['Error']['Code']\n            if error_code in ['Throttling', 'ThrottlingException', 'RequestLimitExceeded', 'ServiceUnavailable']:\n                if attempt < max_retries - 1:\n                    delay = min(base_delay * (2 ** attempt), max_delay)\n                    print(f\"Throttling detected, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})\")\n                    time.sleep(delay)\n                    continue\n            raise\n        except Exception as e:\n            if attempt < max_retries - 1:\n                delay = min(base_delay * (2 ** attempt), max_delay)\n                print(f\"Error occurred, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries}): {str(e)}\")\n                time.sleep(delay)\n                continue\n            raise\n\n\ndef get_alarm_handler(events, context):\n    try:\n        # Get current account ID and region with retry\n        def get_account_info():\n            sts_client = boto3.client('sts')\n            return sts_client.get_caller_identity()['Account']\n        \n        account_id = retry_with_backoff(get_account_info)\n        region = boto3.session.Session().region_name\n        \n        # Create clients\n        cloudwatch_client = boto3.client('cloudwatch')\n        s3_client = boto3.client('s3')\n\n        # Get parameters from input payload and ensure integers are properly converted\n        s3_bucket = events['S3BucketName']\n        max_alarms = int(events['MaxNumberOfAlarmsToMigrate'])\n        \n        # Get alarms with IM actions using paginator with retry\n        alarms_with_im = []\n        ssm_incidents_pattern = re.compile(r'arn:aws:ssm-incidents::[0-9]{12}:response-plan/.*')\n\n        def get_alarms_page(page_iterator):\n            results = []\n            for page in page_iterator:\n                for alarm in page['MetricAlarms']:\n                    if len(results) + len(alarms_with_im) >= max_alarms:\n                        break\n                    if any(ssm_incidents_pattern.match(action) for action in alarm.get('AlarmActions', [])):\n                        results.append(alarm['AlarmName'])\n                if len(results) + len(alarms_with_im) >= max_alarms:\n                    break\n            return results\n\n        def paginate_alarms():\n            paginator = cloudwatch_client.get_paginator('describe_alarms')\n            return get_alarms_page(paginator.paginate())\n\n        alarms_with_im = retry_with_backoff(paginate_alarms, max_retries=5)\n\n        # Write the alarms in batches to S3 with retry\n        batch_size = int(events['BatchSize'])\n        if batch_size is None:\n            raise ValueError(\"BatchSize parameter is required\")\n        print(f\"Processing up to {max_alarms} alarms in batches of {batch_size}\")\n        batches = {}\n\n        for i in range(0, len(alarms_with_im), batch_size):\n            batch = alarms_with_im[i:i + batch_size]\n            batch_key = f\"batch_{i//batch_size}\"\n            batches[batch_key] = batch\n        \n        # Write to S3 with retry\n        def write_to_s3():\n            return s3_client.put_object(\n                Bucket=s3_bucket,\n                Key=f\"review/CloudWatch/review_CW_alarms_to_migrate_{account_id}_{region}.json\",\n                Body=json.dumps(batches, indent=2)\n            )\n\n        retry_with_backoff(write_to_s3, max_retries=5)\n        \n        return {\n          'AlarmCount': len(alarms_with_im),\n          'TotalNumberOfBatches': len(batches),\n          'AlarmCountString': str(len(alarms_with_im)),\n          'FileName': f\"review_CW_alarms_to_migrate_{account_id}_{region}.json\"\n        }\n    except Exception as e:\n        print(f\"Retrieving list of CloudWatch Alarms with incident manager usage failed: {str(e)}\")\n        raise"
+      },
+      "outputs": [
+        {
+          "Type": "Integer",
+          "Name": "AlarmCount",
+          "Selector": "$.Payload.AlarmCount"
+        },
+        {
+          "Type": "Integer",
+          "Name": "TotalNumberOfBatches",
+          "Selector": "$.Payload.TotalNumberOfBatches"
+        },
+        {
+          "Type": "String",
+          "Name": "AlarmCountString",
+          "Selector": "$.Payload.AlarmCountString"
+        },
+        {
+          "Type": "String",
+          "Name": "FileName",
+          "Selector": "$.Payload.FileName"
+        }
+      ]
+    },
+    {
+      "description": "Check if any alarms were found for migration, proceed to approval if alarms exist, otherwise end execution",
+      "name": "CheckIfAlarmsExists",
+      "action": "aws:branch",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ApprovalStep",
+            "Variable": "{{ getCloudWatchAlarms.AlarmCount }}",
+            "NumericGreater": 0
+          }
+        ]
+      }
+    },
+    {
+      "description": "Send SNS notification and wait for manual approval to proceed with migration. Times out after 24 hours if no approval received.",
+      "name": "ApprovalStep",
+      "action": "aws:approve",
+      "timeoutSeconds": 86400,
+      "nextStep": "ProcessAlarmBatches",
+      "isEnd": false,
+      "onCancel": "Abort",
+      "onFailure": "Abort",
+      "inputs": {
+        "NotificationArn": "{{ SNSTopicArn }}",
+        "Approvers": [
+          "{{ ApproverArn }}"
+        ],
+        "Message": "Please review the CloudWatch alarms to be migrated from Incident Manager to OpsCenter. Number of alarms to migrate: {{ getCloudWatchAlarms.AlarmCountString}}. The complete list can be found in S3: s3://{{ S3BucketName }}/review/CloudWatch/{{ getCloudWatchAlarms.FileName}}",
+        "MinRequiredApprovals": 1
+      }
+    },
+    {
+      "name": "ProcessAlarmBatches",
+      "action": "aws:loop",
+      "nextStep": "GenerateSummary",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": "{{ getCloudWatchAlarms.TotalNumberOfBatches }}",
+        "LoopCondition": {
+          "Variable": "{{ getCloudWatchAlarms.AlarmCount }}",
+          "NumericGreater": 0
+        },
+        "Steps": [
+          {
+            "description": "Migrate current batch of alarms from Incident Manager to OpsCenter with S3 backup and comprehensive logging",
+            "name": "ProcessMigration",
+            "action": "aws:executeScript",
+            "maxAttempts": 3,
+            "nextStep": "UpdateSucceededAlarmCount",
+            "isEnd": false,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "migrate_handler",
+              "Script": "import boto3\nimport json\nimport time\nimport re\nfrom botocore.exceptions import ClientError\n\nNON_CONFIGURABLE_PARAMETERS = [\n    'AlarmArn', 'StateValue', 'StateReason', 'StateReasonData',\n    'StateUpdatedTimestamp', 'AlarmConfigurationUpdatedTimestamp',\n    'StateTransitionedTimestamp'\n]\n\ndef retry_with_backoff(func, max_retries=3, base_delay=1, max_delay=60):\n    \"\"\"Generic retry function with exponential backoff\"\"\"\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except ClientError as e:\n            error_code = e.response['Error']['Code']\n            if error_code in ['Throttling', 'ThrottlingException', 'RequestLimitExceeded', 'ServiceUnavailable']:\n                if attempt < max_retries - 1:\n                    delay = min(base_delay * (2 ** attempt), max_delay)\n                    print(f\"Throttling detected, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})\")\n                    time.sleep(delay)\n                    continue\n            raise\n        except Exception as e:\n            if attempt < max_retries - 1:\n                delay = min(base_delay * (2 ** attempt), max_delay)\n                print(f\"Error occurred, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries}): {str(e)}\")\n                time.sleep(delay)\n                continue\n            raise\ndef migrate_handler(events, context):\n    # Create CloudWatch logs client\n    logs_client = boto3.client('logs')\n    log_group = '/aws/ssm/incidentmanager/cwmigration'\n    log_stream = f\"CloudWatchMigration-{int(time.time())}\"\n\n    # Create log group if it doesn't exist with retry\n    def create_log_group():\n        try:\n            logs_client.create_log_group(logGroupName=log_group)\n        except logs_client.exceptions.ResourceAlreadyExistsException:\n            pass\n\n    retry_with_backoff(create_log_group)\n\n    # Create log stream with retry\n    def create_log_stream():\n        try:\n            logs_client.create_log_stream(\n                logGroupName=log_group,\n                logStreamName=log_stream\n            )\n        except Exception as e:\n            print(f\"ERROR: Failed to create log stream {log_stream}: {str(e)}\")\n            raise  # Re-raise the exception as logging setup is critical\n\n    retry_with_backoff(create_log_stream)\n\n    def log_message(message):\n        def put_log():\n            return logs_client.put_log_events(\n                logGroupName=log_group,\n                logStreamName=log_stream,\n                logEvents=[{\n                    'timestamp': int(time.time() * 1000),\n                    'message': message\n                }]\n            )\n        try:\n            retry_with_backoff(put_log, max_retries=2)\n        except Exception as e:\n            print(f\"Failed to log message: {message}. Error: {str(e)}\")\n\n    # Get actual impact from response plan and map it to severity\n    def get_impact_from_response_plan(arn, response_plan_name):\n        try:\n            if response_plan_name:\n                log_message(f\"Response plan name associated with alarm action: {response_plan_name}\")\n\n                # Get Incident manager client\n                ssm_incidents = boto3.client('ssm-incidents')\n\n                # Get impact associated with response plan with retry\n                def get_response_plan():\n                    return ssm_incidents.get_response_plan(arn=arn)\n\n                response = retry_with_backoff(get_response_plan, max_retries=5)\n                impact = response['incidentTemplate']['impact']\n                log_message(f\"Impact associated with {response_plan_name} response plan is: {impact}\")\n\n                return 4 if impact == 5 else impact\n\n            return 3  # Default medium\n        except Exception as e:\n            log_message(f\"Error fetching impact from response plan: {str(e)}\")\n            raise   \n\n    try:\n         # ADD: Log loop-related information\n        log_message(f\"=== LOOP ITERATION DEBUG ===\")\n        log_message(f\"Current iteration: {events.get('CurrentIteration', 'NOT_SET')}\")\n        log_message(f\"Max iterations expected: {events.get('MaxIterations', 'NOT_SET')}\")\n        # ADD: Log function start and input parameters\n        log_message(f\"=== MIGRATION HANDLER STARTED ===\")\n        \n        # Create clients\n        cloudwatch_client = boto3.client('cloudwatch')\n        s3_client = boto3.client('s3')\n\n        # Get current account ID and region with retry\n        def get_account_info():\n            sts_client = boto3.client('sts')\n            return sts_client.get_caller_identity()['Account']\n\n        current_account = retry_with_backoff(get_account_info)\n        current_region = boto3.session.Session().region_name\n        \n        # ADD: Log account and region info\n        log_message(f\"Current account: {current_account}, region: {current_region}\")\n        \n        # Get current batch of alarms list from S3 with retry\n        def get_s3_object():\n            return s3_client.get_object(\n                Bucket=events['s3BucketName'],\n                Key=f\"review/CloudWatch/review_CW_alarms_to_migrate_{current_account}_{current_region}.json\"\n            )\n\n        response = retry_with_backoff(get_s3_object, max_retries=5)\n        approved_alarms = json.loads(response['Body'].read().decode('utf-8'))\n        batchNumber = events['CurrentIteration']-1\n        \n        # ADD: Enhanced batch logging\n        log_message(f\"Current iteration: {events['CurrentIteration']}\")\n        log_message(f\"Processing batch number: {batchNumber}\")\n        log_message(f\"Total batches in approved_alarms: {list(approved_alarms.keys())}\")\n        \n        approved_alarm_names = approved_alarms.get(f'batch_{batchNumber}', [])\n        \n        # ADD: Log batch details\n        log_message(f\"Alarms in batch_{batchNumber}: {len(approved_alarm_names)}\")\n        log_message(f\"Alarm names in current batch: {approved_alarm_names}\")\n\n        migrated_alarms = []\n        failed_alarms = []\n        skipped_alarms = []  # ADD: Track skipped alarms\n\n        ssm_incidents_pattern = re.compile(r'arn:aws:ssm-incidents::[0-9]{12}:response-plan/(.*)')\n\n        # ADD: Check if batch is empty\n        if not approved_alarm_names:\n            log_message(f\"WARNING: No alarms found in batch_{batchNumber}\")\n            return {\n                'SuccessCount': events['MigratedAlarmCount'],\n                'FailureCount': events['FailedAlarmCount'],\n                'SkippedCount': events['SkippedAlarmCount'],\n                'Status': 'No alarms in batch'\n            }\n\n        # Describe alarms with retry\n        def describe_alarms():\n              all_alarms = []\n              chunk_size=50\n              # Split alarm names into chunks of 50 or less\n              for i in range(0, len(approved_alarm_names), chunk_size):\n                  chunk = approved_alarm_names[i:i + chunk_size]\n                  \n                  try:\n                      response = cloudwatch_client.describe_alarms(AlarmNames=chunk)\n                      all_alarms.extend(response.get('MetricAlarms', []))\n                  except Exception as e:\n                      log_message(f\"Error describing alarms chunk {i//chunk_size + 1}: {e}\")\n                      \n              return {'MetricAlarms': all_alarms}\n\n        # ADD: Log before describing alarms\n        log_message(f\"Describing {len(approved_alarm_names)} alarms from CloudWatch\")\n        \n        alarm_batch = retry_with_backoff(describe_alarms, max_retries=5)\n        \n        # ADD: Log alarm retrieval results\n        log_message(f\"Retrieved {len(alarm_batch['MetricAlarms'])} alarms from CloudWatch API\")\n        \n        # ADD: Check for missing alarms\n        retrieved_alarm_names = [alarm['AlarmName'] for alarm in alarm_batch['MetricAlarms']]\n        missing_alarms = set(approved_alarm_names) - set(retrieved_alarm_names)\n        if missing_alarms:\n            log_message(f\"WARNING: {len(missing_alarms)} alarms not found in CloudWatch: {list(missing_alarms)}\")\n        \n        for alarm in alarm_batch['MetricAlarms']:\n            still_use_IM = 0\n            log_message(f\"=== Processing alarm: {alarm['AlarmName']} ===\")\n            \n            # ADD: Log current alarm actions\n            current_actions = alarm.get('AlarmActions', [])\n            log_message(f\"Current alarm actions: {current_actions}\")\n            \n            # Update alarms actions\n            updated_actions = []\n            for action in current_actions:\n                log_message(f\"Evaluating action: {action}\")\n                match = ssm_incidents_pattern.match(action)\n                if match:\n                    response_plan_name = match.group(1)\n                    log_message(f\"Found SSM Incidents action with response plan: {response_plan_name}\")\n                    severity = get_impact_from_response_plan(action, response_plan_name)\n                    new_action = f\"arn:aws:ssm:{current_region}:{current_account}:opsitem:{severity}\"\n                    log_message(f\"Converting action from {action} to {new_action}\")\n                    action = new_action\n                    still_use_IM += 1\n                else:\n                    log_message(f\"Action does not match SSM Incidents pattern, keeping as-is: {action}\")\n                updated_actions.append(action)\n            \n            # ADD: Log decision logic\n            log_message(f\"Found {still_use_IM} SSM Incidents actions to convert\")\n            \n            if still_use_IM > 0:\n                log_message(f\"Proceeding with migration for alarm: {alarm['AlarmName']}\")\n                \n                # ADD: Log alarm parameters before cleanup\n                log_message(f\"Alarm parameters before cleanup: {list(alarm.keys())}\")\n                \n                for param in NON_CONFIGURABLE_PARAMETERS:\n                    if param in alarm:\n                        log_message(f\"Removing non-configurable parameter: {param}\")\n                    alarm.pop(param, None)\n\n                # Backup current configuration with retry\n                backup_key = f\"backups/CloudWatch/{current_account}/{current_region}/{alarm['AlarmName']}_backup.json\"\n\n                def backup_to_s3():\n                    return s3_client.put_object(\n                        Bucket=events['s3BucketName'],\n                        Key=backup_key,\n                        Body=json.dumps(alarm, indent=2)\n                    )\n\n                # ADD: Log backup attempt\n                log_message(f\"Attempting to backup alarm to S3: {backup_key}\")\n                retry_with_backoff(backup_to_s3, max_retries=5)\n                log_message(f\"Successfully backed up alarm configuration to {backup_key}\")\n\n                alarm['AlarmActions'] = updated_actions\n\n                # Update alarm with retry\n                def update_alarm():\n                    return cloudwatch_client.put_metric_alarm(**alarm)\n\n                try:\n                    log_message(f\"Attempting to update alarm in CloudWatch: {alarm['AlarmName']}\")\n                    retry_with_backoff(update_alarm, max_retries=5)\n                    log_message(f\"Successfully migrated alarm: {alarm['AlarmName']}\")\n                    migrated_alarms.append(alarm['AlarmName'])\n                except Exception as e:\n                    log_message(f\"ERROR: Failed to update alarm {alarm['AlarmName']}: {str(e)}\")\n                    failed_alarms.append({\n                        'AlarmName': alarm['AlarmName'],\n                        'Error': str(e)\n                    })\n            else:\n                log_message(f\"Skipping alarm {alarm['AlarmName']} - no SSM Incidents actions found\")\n                skipped_alarms.append(alarm['AlarmName'])\n\n        # ADD: Enhanced final logging\n        log_message(f\"=== BATCH PROCESSING COMPLETE ===\")\n        log_message(f\"Batch {batchNumber} results:\")\n        log_message(f\"  - Total alarms in batch: {len(approved_alarm_names)}\")\n        log_message(f\"  - Alarms retrieved from CloudWatch: {len(alarm_batch['MetricAlarms'])}\")\n        log_message(f\"  - Successfully migrated: {len(migrated_alarms)} - {migrated_alarms}\")\n        log_message(f\"  - Failed migrations: {len(failed_alarms)} - {[f['AlarmName'] for f in failed_alarms]}\")\n        log_message(f\"  - Skipped (no IM actions): {len(skipped_alarms)} - {skipped_alarms}\")\n        \n        if failed_alarms:\n            log_message(f\"Failed to migrate {len(failed_alarms)} alarms - see individual alarm logs for details\")\n        log_message(f\"=== ITERATION {events['CurrentIteration']} SUMMARY ===\")\n        log_message(f\"This iteration processed batch_{batchNumber}\")\n        log_message(f\"Remaining iterations: {int(events.get('MaxIterations', 0)) - int(events.get('CurrentIteration', 0))}\")\n        return {\n            'SuccessCount': events['MigratedAlarmCount']+len(migrated_alarms),\n            'FailureCount': events['FailedAlarmCount']+len(failed_alarms),\n            'SkippedCount': events['SkippedAlarmCount']+len(skipped_alarms),  # ADD: Include skipped count\n            'Status': 'Success' if not failed_alarms else 'Partial Success'\n        }\n    except Exception as e:\n        log_message(f\"CRITICAL ERROR: Migration failed with exception: {str(e)}\")\n        log_message(f\"Exception type: {type(e).__name__}\")\n        import traceback\n        log_message(f\"Full traceback: {traceback.format_exc()}\")\n        raise",
+              "InputPayload": {
+                "s3BucketName": "{{ S3BucketName }}",
+                "CurrentIteration": "{{ ProcessAlarmBatches.CurrentIteration }}",
+                "MigratedAlarmCount": "{{ variable:MigratedAlarmCount }}",
+                "FailedAlarmCount": "{{ variable:FailedAlarmCount }}",
+                "SkippedAlarmCount": "{{ variable:SkippedAlarmCount }}"
+              }
+            },
+            "outputs": [
+              {
+                "Type": "Integer",
+                "Name": "MigratedAlarmCount",
+                "Selector": "$.Payload.SuccessCount"
+              },
+              {
+                "Type": "Integer",
+                "Name": "FailedAlarmCount",
+                "Selector": "$.Payload.FailureCount"
+              },
+              {
+                "Type": "String",
+                "Name": "Status",
+                "Selector": "$.Payload.Status"
+              },
+              {
+                "Type": "Integer",
+                "Name": "SkippedAlarmCount",
+                "Selector": "$.Payload.SkippedCount"
+              }
+            ]
+          },
+          {
+            "description": "Update global counter with successfully migrated alarms from current batch",
+            "name": "UpdateSucceededAlarmCount",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateFailedAlarmCount",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:MigratedAlarmCount",
+              "Value": "{{ ProcessMigration.MigratedAlarmCount }}"
+            }
+          },
+          {
+            "description": "Update global counter with failed alarm migrations from current batch",
+            "name": "UpdateFailedAlarmCount",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateSkippedAlarmCount",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:FailedAlarmCount",
+              "Value": "{{ ProcessMigration.FailedAlarmCount }}"
+            }
+          },
+          {
+            "description": "Update global counter with skipped alarms from current batch",
+            "name": "UpdateSkippedAlarmCount",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:SkippedAlarmCount",
+              "Value": "{{ ProcessMigration.SkippedAlarmCount }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Generate comprehensive migration summary report with total counts and overall status",
+      "name": "GenerateSummary",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "summary_handler",
+        "Script": "def summary_handler(events, context):\n  # Get the input values\n  migrated = events.get('MigratedAlarmCount', 0)\n  failed = events.get('FailedAlarmCount', 0)\n  skipped = events.get('SkippedAlarmCount', 0)\n  total = events.get('TotalAlarms', 0)\n\n  # Determine status\n  status = 'Success' if int(failed) == 0 else 'Completed with errors'\n\n  # Create single consolidated summary string\n  Summary = f\"\"\"CloudWatch Alarm Migration Results:\n            Total Alarms Found: {total}\n            Successfully Migrated: {migrated}\n            Failed: {failed}\n            Skipped: {skipped}\n            Status: {status}\"\"\"\n\n  return {'message': Summary}",
+        "InputPayload": {
+          "MigratedAlarmCount": "{{ variable:MigratedAlarmCount }}",
+          "FailedAlarmCount": "{{ variable:FailedAlarmCount }}",
+          "SkippedAlarmCount": "{{ variable:SkippedAlarmCount }}",
+          "TotalAlarms": "{{ getCloudWatchAlarms.AlarmCountString }}"
+        }
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "message",
+          "Selector": "$.Payload.message"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateSummary.message"
+  ]
+}

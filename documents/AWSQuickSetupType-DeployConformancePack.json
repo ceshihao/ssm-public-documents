@@ -1,0 +1,145 @@
+{
+  "description": "## AWSQuickSetupType-DeployConformancePack\n\n### What does this document do?\n\nThe **AWSQuickSetupType-DeployConformancePack** automation document creates new or updates existing conformance packs in your current account or across member accounts in your AWS Organization.\n\n### Inputs\n\n- **ConformancePackName**: (Required) Name of the conformance pack you want to create.\n- **TemplateSource**: \"(Required) Location of the conformance pack template body. Format {\\\"Type\\\": \\\"S3|GitHub|TemplateBody\\\", \\\"Value\\\": \\\"URL|TemplateContent\\\"}.\"\n- **ConformancePackInputParameters**: (Optional) A list of ConformancePackInputParameter objects.\n- **DeploymentType**: (Optional) Identifies whether the specified conformance pack should be applied organization-wide.\n- **ExcludedAccounts**: (Optional) A list of AWS accounts to be excluded from an organization conformance pack while deploying a conformance pack.\n- **AutomationAssumeRole**: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.\n\n### Outputs\n\n- **ConformancePackArn**: ARN of the created/updated conformance pack.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "ConformancePackName": {
+      "allowedPattern": "^[a-zA-Z][-a-zA-Z0-9]*$",
+      "description": "(Required) Name of the conformance pack you want to create.",
+      "maxChars": 256,
+      "minChars": 1,
+      "type": "String"
+    },
+    "TemplateSource": {
+      "description": "(Required) Location of the conformance pack template body. Format {\"Type\": \"S3|GitHub|TemplateBody\", \"Value\": \"URL|TemplateContent\"}.",
+      "type": "StringMap",
+      "allowedPattern": "^\\{\\s*\"Type\"\\s*:\\s*\"(S3|GitHub|TemplateBody)\"\\s*,\\s*\"Value\"\\s*:\\s*\"([^\"\\\\]|\\\\.)*\"\\s*\\}$"
+    },
+    "ConformancePackInputParameters": {
+      "default": [],
+      "description": "(Optional) A list of ConformancePackInputParameter objects.",
+      "maxItems": 60,
+      "type": "MapList",
+      "allowedPattern": "^\\{\\s*\"ParameterName\"\\s*:\\s*\"[a-zA-Z][a-zA-Z0-9_-]*\"\\s*,\\s*\"ParameterValue\"\\s*:\\s*\"[^\"]*\"\\s*\\}$"
+    },
+    "DeploymentType": {
+      "default": "LOCAL",
+      "description": "(Optional) Identifies whether the specified conformance pack should be deployed organization-wide or locally in the account.",
+      "type": "String",
+      "allowedValues": [
+        "LOCAL",
+        "ORGANIZATIONAL"
+      ]
+    },
+    "ExcludedAccounts": {
+      "default": [],
+      "description": "(Optional) A list of AWS accounts to be excluded from an organization conformance pack while deploying a conformance pack.",
+      "maxItems": 1000,
+      "type": "StringList",
+      "allowedPattern": "^[0-9]{12}(,[0-9]{12})*$"
+    },
+    "AutomationAssumeRole": {
+      "description": "(Required) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "type": "AWS::IAM::Role::Arn"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:executeScript",
+      "inputs": {
+        "Handler": "put_conformance_pack_handler",
+        "InputPayload": {
+          "ConformancePackInputParameters": "{{ ConformancePackInputParameters }}",
+          "ConformancePackName": "{{ ConformancePackName }}",
+          "DeploymentType": "{{ DeploymentType }}",
+          "ExcludedAccounts": "{{ ExcludedAccounts }}",
+          "TemplateSource": "{{ TemplateSource }}"
+        },
+        "Runtime": "python3.11",
+        "Script": "import boto3\nimport time\nimport urllib.request\n\nTEMPLATE_SOURCE_S3 = 'S3'\nTEMPLATE_SOURCE_GITHUB = 'GitHub'\nTEMPLATE_SOURCE_BODY = 'TemplateBody'\n\n\ndef validate_github_url(url):\n    if not url.startswith('https://'):\n        raise Exception('GitHub source type only supports downloads via HTTPS')\n    if not url.startswith('https://github.com/') and not url.startswith('https://raw.githubusercontent.com/'):\n        raise Exception(\n            'Provide a URL that corresponds to a path within a GitHub repository')\n\n\ndef download_from_https(url):\n    with urllib.request.urlopen(url) as resp:\n        template_content = resp.read().decode('utf-8')\n    return template_content\n\n\ndef put_organization_conformance_pack_with_retry(config_client, cpack_params, retries=5, delay=30):\n    try:\n        return {\n            'ConformancePackArn': config_client.put_organization_conformance_pack(**cpack_params)['OrganizationConformancePackArn']\n        }\n    except config_client.exceptions.ResourceInUseException as error:\n        if retries > 0:\n            time.sleep(delay)\n            return put_organization_conformance_pack_with_retry(config_client, cpack_params, retries - 1)\n        else:\n            raise error\n\n\ndef put_conformance_pack_handler(events, context):\n    # get required parameters\n    deploy_to_organization = events['DeploymentType'] == 'ORGANIZATIONAL'\n    conformance_pack_name = events['ConformancePackName']\n    template_source = events['TemplateSource']\n    conformance_pack_input_parameters = events['ConformancePackInputParameters']\n    excluded_accounts = events['ExcludedAccounts']\n\n    # verify that accounts to exclude are used only when deploying organization CPacks\n    if excluded_accounts and not deploy_to_organization:\n        raise Exception(\n            'You can\\'t specify ExcludedAccounts when deploying a local conformance pack.')\n\n    # default conformance pack parameters\n    cpack_params = {\n        'ConformancePackInputParameters': conformance_pack_input_parameters\n    }\n\n    # add conformance pack definition\n    template_source_type = template_source['Type']\n    template_source_value = template_source['Value']\n\n    if template_source_type == TEMPLATE_SOURCE_S3:\n        cpack_params['TemplateS3Uri'] = template_source_value\n    elif template_source_type == TEMPLATE_SOURCE_BODY:\n        cpack_params['TemplateBody'] = template_source_value\n    elif template_source_type == TEMPLATE_SOURCE_GITHUB:\n        validate_github_url(template_source_value)\n        cpack_params['TemplateBody'] = download_from_https(\n            template_source_value)\n    else:\n        raise Exception(\n            f'The conformance pack template source must be one of {TEMPLATE_SOURCE_S3}, {TEMPLATE_SOURCE_BODY}, {TEMPLATE_SOURCE_GITHUB}')\n\n    # deploy conformance pack\n    config_client = boto3.client('config')\n    if deploy_to_organization:\n        cpack_params['OrganizationConformancePackName'] = conformance_pack_name\n        cpack_params['ExcludedAccounts'] = excluded_accounts\n        return put_organization_conformance_pack_with_retry(config_client, cpack_params)\n    else:\n        cpack_params['ConformancePackName'] = conformance_pack_name\n        return {\n            'ConformancePackArn': config_client.put_conformance_pack(**cpack_params)['ConformancePackArn']\n        }\n"
+      },
+      "maxAttempts": 3,
+      "name": "PutConformancePack",
+      "outputs": [
+        {
+          "Name": "ConformancePackArn",
+          "Selector": "$.Payload.ConformancePackArn",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "checkIfOrgDeployment",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "waitForOrgCPackDeployment",
+            "Variable": "{{ DeploymentType }}",
+            "StringEquals": "ORGANIZATIONAL"
+          }
+        ],
+        "Default": "waitForLocalCPackDeployment"
+      }
+    },
+    {
+      "name": "waitForOrgCPackDeployment",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 36000,
+      "inputs": {
+        "Service": "config",
+        "Api": "DescribeOrganizationConformancePackStatuses",
+        "OrganizationConformancePackNames": [
+          "{{ ConformancePackName }}"
+        ],
+        "PropertySelector": "$.OrganizationConformancePackStatuses[0].Status",
+        "DesiredValues": [
+          "CREATE_SUCCESSFUL",
+          "CREATE_FAILED",
+          "UPDATE_SUCCESSFUL",
+          "UPDATE_FAILED"
+        ]
+      },
+      "nextStep": "VerifyConformancePackStatus"
+    },
+    {
+      "name": "waitForLocalCPackDeployment",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 36000,
+      "inputs": {
+        "Service": "config",
+        "Api": "DescribeConformancePackStatus",
+        "ConformancePackNames": [
+          "{{ ConformancePackName }}"
+        ],
+        "PropertySelector": "$.ConformancePackStatusDetails[0].ConformancePackState",
+        "DesiredValues": [
+          "CREATE_COMPLETE",
+          "CREATE_FAILED",
+          "UPDATE_SUCCESSFUL",
+          "UPDATE_FAILED"
+        ]
+      },
+      "nextStep": "VerifyConformancePackStatus"
+    },
+    {
+      "name": "VerifyConformancePackStatus",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Handler": "describe_conformance_pack_status_handler",
+        "InputPayload": {
+          "ConformancePackName": "{{ ConformancePackName }}",
+          "DeploymentType": "{{ DeploymentType }}",
+          "ExcludedAccounts": "{{ ExcludedAccounts }}"
+        },
+        "Runtime": "python3.11",
+        "Script": "import boto3\n\n\ndef describe_conformance_pack_status_handler(events, context):\n    deploy_to_organization = events['DeploymentType'] == 'ORGANIZATIONAL'\n    config_client = boto3.client('config')\n    conformance_pack_name = events['ConformancePackName']\n    if deploy_to_organization:\n        status = config_client.describe_organization_conformance_pack_statuses(OrganizationConformancePackNames=[conformance_pack_name])['OrganizationConformancePackStatuses'][0]\n        if status['Status'] != \"CREATE_SUCCESSFUL\" and status['Status'] != \"UPDATE_SUCCESSFUL\":\n            raise Exception(status['ErrorMessage'])\n    else:\n        status = config_client.describe_conformance_pack_status(ConformancePackNames=[conformance_pack_name])['ConformancePackStatusDetails'][0]\n        if status['ConformancePackState'] != \"CREATE_COMPLETE\":\n            raise Exception(status['ConformancePackStatusReason'])\n"
+      },
+      "maxAttempts": 3,
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "PutConformancePack.ConformancePackArn"
+  ]
+}
