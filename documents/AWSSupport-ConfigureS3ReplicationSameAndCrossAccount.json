@@ -1,0 +1,396 @@
+{
+  "description": "The **AWSSupport-ConfigureS3ReplicationSameAndCrossAccount** automation runbook helps you configure Amazon Simple Storage Service (Amazon S3) bucket replication between a source and destination bucket. This automation runbook performs the following actions:\n\n> * Validates input parameters and bucket configurations for compatibility\n> * Checks encryption settings on both source and destination buckets\n> * Creates a new AWS Identity and Access Management (IAM) role with appropriate permissions for replication\n> * Configures replication rules based on your specified parameters (prefix, tags, or entire bucket)\n> * Enables bucket versioning if not already enabled\n> * Sets up replication configuration with optional features like Replication Time Control (RTC) and delete marker replication\n\n### Supported Features:\n\n> * Same-account and cross-account replication\n> * Server-Side Encryption with Amazon S3 managed keys (SSE-S3) and Server-Side Encryption with AWS Key Management Service (SSE-KMS) encrypted buckets\n> * Prefix and tag-based selective replication\n> * Amazon S3 Replication Time Control (RTC) with 15-minute SLA\n> * Delete marker replication\n> * Replica modifications synchronization for metadata changes made to replicated objects\n\n### Important:\n\n> * **Existing replication rules:** This runbook does not support buckets with existing replication rules. The source bucket must not have any existing replication configuration.\n> * **IAM role creation:** This runbook creates a new IAM role with appropriate permissions for replication.\n> * **Existing objects:** This runbook does not replicate existing objects. Amazon S3 replication only applies to objects uploaded or created after you enable the replication configuration.\n> **Cross-account replication:** You must provide an IAM role in the destination account with appropriate permissions for Amazon S3 operations and AWS KMS operations (if you use SSE-KMS).\n> * **Prerequisites:** Source and destination buckets must exist before you run this runbook.\n> * **Approval requirement:** This runbook uses the `aws:approve` action, which temporarily pauses execution until designated principals approve the configuration changes. See [Running an automation with approvers](https://docs.aws.amazon.com/systems-manager/latest/userguide/running-automations-require-approvals.html) for more information.\n\n### For Existing Objects:\n\nTo replicate existing objects, use one of these AWS services:\n\n> * **AWS DataSync** - For one-time bulk data transfer between Amazon S3 buckets\n> * **Amazon S3 Batch Operations** - For large-scale object operations\n> * **AWS Command Line Interface (AWS CLI) sync command** - For programmatic sync with resume capability",
+  "schemaVersion": "0.3",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "allowedPattern": "^$|^arn:aws[a-zA-Z\\-]*:iam::\\d{12}:role/[\\w+=,.@\\-/]+$"
+    },
+    "SourceBucket": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the source Amazon S3 bucket where you want to create or update replication rules.",
+      "allowedPattern": "(?!^(\\d{1,3}\\.){3}\\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\\.[a-z0-9])?)*$(?<!\\-))",
+      "minChars": 3,
+      "maxChars": 63
+    },
+    "DestinationBucket": {
+      "type": "String",
+      "description": "(Required) The name of the destination Amazon S3 bucket where you want to replicate objects.",
+      "allowedPattern": "(?!^(\\d{1,3}\\.){3}\\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\\.[a-z0-9])?)*$(?<!\\-))",
+      "minChars": 3,
+      "maxChars": 63
+    },
+    "SourceAccountId": {
+      "type": "String",
+      "description": "(Required) The AWS Account ID where the source bucket is located.",
+      "allowedPattern": "^[0-9]{12,13}$"
+    },
+    "DestinationAccountId": {
+      "type": "String",
+      "description": "(Required) The AWS Account ID where the destination bucket is located.",
+      "allowedPattern": "^[0-9]{12,13}$"
+    },
+    "S3ReplicationRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of an existing AWS Identity and Access Management (IAM) role to use for Amazon S3 replication operations. This role must have permissions to read from the source bucket and write to the destination bucket, including AWS KMS permissions if the buckets use SSE-KMS encryption. If you don't provide a role, the runbook creates a new role with appropriate permissions.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::\\d{12}:role/[\\w+=,.@\\-/]+$"
+    },
+    "CrossAccountReplicationRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of an AWS Identity and Access Management (IAM) role in the destination account that the runbook can assume. This parameter is required for cross-account replication. For same-account replication, leave this parameter empty.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::\\d{12}:role/[\\w+=,.@\\-/]+$"
+    },
+    "ReplicateEntireBucket": {
+      "type": "Boolean",
+      "description": "(Optional) Specify whether to replicate the entire bucket. If you set this parameter to `true`, the runbook replicates the entire bucket and both Prefix and Tags must be empty. If `false`, replication is based on your specified prefix or tags.",
+      "default": true,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "ReplicationRuleStatus": {
+      "type": "Boolean",
+      "description": "(Optional) Specify whether to enable the replication rules. If you set this parameter to `true`, the runbook enables the replication rules it creates. If you set this to `false`, the runbook sets the rules to **Disabled**.",
+      "default": true,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "DeleteMarkerReplicationStatus": {
+      "type": "Boolean",
+      "description": "(Optional) Specify whether to enable delete marker replication. If you set this parameter to `true`, the runbook enables [delete marker replication](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "ReplicationTimeControl": {
+      "type": "Boolean",
+      "description": "(Optional) Specify whether to enable Amazon S3 Replication Time Control. If you set this parameter to `true`, the runbook enables [Amazon S3 Replication Time Control](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-time-control.html) (Amazon S3 RTC), which provides a 15-minute SLA for predictable replication times.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "ReplicaModifications": {
+      "type": "Boolean",
+      "description": "(Optional) Specify whether to enable replication of metadata changes. If you set this parameter to `true`, the runbook enables replication of [metadata changes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-for-metadata-changes.html) made to replica objects. This allows modifications to replicated objects to synchronize back to the source.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    },
+    "Prefix": {
+      "type": "String",
+      "description": "(Optional) The prefix filter for selective replication of objects with specific key prefixes. The prefix must end with a trailing slash (/) for proper Amazon S3 prefix filtering.",
+      "default": "",
+      "allowedPattern": "^$|^[a-zA-Z0-9!_'()\\-]*/+$"
+    },
+    "Tags": {
+      "type": "String",
+      "description": "(Optional) A JSON array of tags for filtering objects to replicate. Format for a single tag: [{\"Key\":\"TagKey\",\"Value\":\"TagValue\"}]. Format for multiple tags: [{\"Key\":\"TagKey1\",\"Value\":\"TagValue1\"},{\"Key\":\"TagKey2\",\"Value\":\"TagValue2\"}]. Note: S3 objects can have a maximum of 10 tags. Specifying more than 10 tags in this filter will result in no objects being replicated since no object can match all the specified tags.",
+      "default": "[]",
+      "allowedPattern": "^\\[((\\{\"Key\":\"[a-zA-Z0-9+\\-=.:/ @\\s]{1,128}\",\"Value\":\"[a-zA-Z0-9+\\-=.:/@\\s]{0,256}\"\\})(,\\{\"Key\":\"[a-zA-Z0-9+\\-=.:/ @\\s]{1,128}\",\"Value\":\"[a-zA-Z0-9+\\-=.:/@\\s]{0,256}\"\\})*)?\\]$"
+    },
+    "SnsNotificationArn": {
+      "type": "String",
+      "description": "(Required) The ARN of an Amazon Simple Notification Service (Amazon SNS) topic for runbook execution approvals.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):sns:[a-z]{2}(-gov)?(-iso[a-z]?)?-[a-z]{2,10}-[0-9]{1,2}:\\d{12}:[0-9a-zA-Z-_]{1,256}(.fifo)?$"
+    },
+    "Approvers": {
+      "type": "StringList",
+      "description": "(Required) A list of AWS Identity and Access Management (IAM) user or role ARNs authorized to approve the runbook execution.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::\\d{12}:(user|role)/[\\w+=,.@\\-/]+$"
+    }
+  },
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "mainSteps": [
+    {
+      "description": "Validates all input parameters for correctness and compatibility to ensure a proper replication configuration.",
+      "name": "ValidateInputParameters",
+      "action": "aws:executeScript",
+      "nextStep": "PrepareApprovalMessage",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "SourceBucket": "{{ SourceBucket }}",
+          "DestinationBucket": "{{ DestinationBucket }}",
+          "sourceAccountId": "{{ SourceAccountId }}",
+          "destinationAccountId": "{{ DestinationAccountId }}",
+          "CrossAccountReplicationRole": "{{ CrossAccountReplicationRole }}",
+          "S3ReplicationRole": "{{ S3ReplicationRole }}",
+          "replicationParameters": {
+            "replicateEntireBucket": "{{ ReplicateEntireBucket }}",
+            "prefix": "{{ Prefix }}",
+            "tags": "{{ Tags }}"
+          }
+        },
+        "Handler": "validate_input_parameters.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ValidationStatus",
+          "Selector": "$.Payload.ValidationStatus",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ValidationMessage",
+          "Selector": "$.Payload.ValidationMessage",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Prepares an approval message with all replication configuration parameters for your review.",
+      "name": "PrepareApprovalMessage",
+      "action": "aws:executeScript",
+      "nextStep": "RequestApproval",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "SourceBucket": "{{ SourceBucket }}",
+          "DestinationBucket": "{{ DestinationBucket }}",
+          "SourceAccountId": "{{ SourceAccountId }}",
+          "DestinationAccountId": "{{ DestinationAccountId }}",
+          "ReplicateEntireBucket": "{{ ReplicateEntireBucket }}",
+          "ReplicationRuleStatus": "{{ ReplicationRuleStatus }}",
+          "DeleteMarkerReplicationStatus": "{{ DeleteMarkerReplicationStatus }}",
+          "ReplicationTimeControl": "{{ ReplicationTimeControl }}",
+          "ReplicaModifications": "{{ ReplicaModifications }}",
+          "Prefix": "{{ Prefix }}",
+          "Tags": "{{ Tags }}",
+          "S3ReplicationRole": "{{ S3ReplicationRole }}",
+          "CrossAccountReplicationRole": "{{ CrossAccountReplicationRole }}"
+        },
+        "Handler": "prepare_approval_message.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ApprovalMessage",
+          "Selector": "$.Payload.ApprovalMessage",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Requests approval from authorized users before it proceeds with Amazon S3 replication configuration changes.",
+      "name": "RequestApproval",
+      "action": "aws:approve",
+      "maxAttempts": 1,
+      "timeoutSeconds": 3600,
+      "nextStep": "CheckBucketEncryption",
+      "onFailure": "Abort",
+      "inputs": {
+        "NotificationArn": "{{ SnsNotificationArn }}",
+        "Message": "{{ PrepareApprovalMessage.ApprovalMessage }}",
+        "MinRequiredApprovals": 1,
+        "Approvers": "{{ Approvers }}"
+      }
+    },
+    {
+      "description": "Checks the encryption configuration for both source and destination Amazon S3 buckets to determine compatible replication settings.",
+      "name": "CheckBucketEncryption",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnEncryptionType",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "SourceBucket": "{{ SourceBucket }}",
+          "DestinationBucket": "{{ DestinationBucket }}",
+          "SourceAccountId": "{{ SourceAccountId }}",
+          "DestinationAccountId": "{{ DestinationAccountId }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "CrossAccountReplicationRole": "{{ CrossAccountReplicationRole }}"
+        },
+        "Handler": "CheckBucketEncryption.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EncryptionType",
+          "Selector": "$.Payload.EncryptionType",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceEncryption",
+          "Selector": "$.Payload.SourceEncryption",
+          "Type": "String"
+        },
+        {
+          "Name": "DestinationEncryption",
+          "Selector": "$.Payload.DestinationEncryption",
+          "Type": "String"
+        },
+        {
+          "Name": "IsMatching",
+          "Selector": "$.Payload.IsMatching",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnEncryptionType",
+      "action": "aws:branch",
+      "description": "Branches execution based on the Amazon S3 bucket encryption type to apply the appropriate replication configuration for SSE-S3 or SSE-KMS encrypted buckets.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ConfigureSSES3Replication",
+            "Variable": "{{ CheckBucketEncryption.EncryptionType }}",
+            "StringEquals": "AES256"
+          },
+          {
+            "NextStep": "ConfigureSSEKMSReplication",
+            "Variable": "{{ CheckBucketEncryption.EncryptionType }}",
+            "StringEquals": "aws:kms"
+          }
+        ]
+      },
+      "onFailure": "Abort",
+      "isEnd": true
+    },
+    {
+      "description": "Configures Amazon S3 replication for buckets encrypted with Server-Side Encryption with Amazon S3-Managed Keys (SSE-S3), including IAM roles and replication rules.",
+      "name": "ConfigureSSES3Replication",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "onFailure": "step:CleanupResources",
+      "inputs": {
+        "InputPayload": {
+          "sourceBucket": "{{ SourceBucket }}",
+          "destinationBucket": "{{ DestinationBucket }}",
+          "sourceAccountId": "{{ SourceAccountId }}",
+          "destinationAccountId": "{{ DestinationAccountId }}",
+          "CrossAccountReplicationRole": "{{ CrossAccountReplicationRole }}",
+          "S3ReplicationRole": "{{ S3ReplicationRole }}",
+          "replicationConfig": {
+            "replicateEntireBucket": "{{ ReplicateEntireBucket }}",
+            "replicationRuleStatus": "{{ ReplicationRuleStatus }}",
+            "deleteMarkerReplication": "{{ DeleteMarkerReplicationStatus }}",
+            "replicationTimeControl": "{{ ReplicationTimeControl }}",
+            "replicaModifications": "{{ ReplicaModifications }}",
+            "prefix": "{{ Prefix }}",
+            "tags": "{{ Tags }}"
+          }
+        },
+        "Handler": "configure_sse_s3_replication.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ReplicationRoleArn",
+          "Selector": "$.Payload.ReplicationRoleArn",
+          "Type": "String"
+        },
+        {
+          "Name": "ConfigurationStatus",
+          "Selector": "$.Payload.ConfigurationStatus",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Configures Amazon S3 replication for buckets encrypted with Server-Side Encryption with AWS Key Management Service (SSE-KMS), including IAM roles, KMS key permissions, and replication rules.",
+      "name": "ConfigureSSEKMSReplication",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "onFailure": "step:CleanupResources",
+      "inputs": {
+        "InputPayload": {
+          "sourceBucket": "{{ SourceBucket }}",
+          "destinationBucket": "{{ DestinationBucket }}",
+          "sourceAccountId": "{{ SourceAccountId }}",
+          "destinationAccountId": "{{ DestinationAccountId }}",
+          "CrossAccountReplicationRole": "{{ CrossAccountReplicationRole }}",
+          "S3ReplicationRole": "{{ S3ReplicationRole }}",
+          "replicationConfig": {
+            "replicateEntireBucket": "{{ ReplicateEntireBucket }}",
+            "replicationRuleStatus": "{{ ReplicationRuleStatus }}",
+            "deleteMarkerReplication": "{{ DeleteMarkerReplicationStatus }}",
+            "replicationTimeControl": "{{ ReplicationTimeControl }}",
+            "replicaModifications": "{{ ReplicaModifications }}",
+            "prefix": "{{ Prefix }}",
+            "tags": "{{ Tags }}"
+          }
+        },
+        "Handler": "configure_sse_kms_replication.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ReplicationRoleArn",
+          "Selector": "$.Payload.ReplicationRoleArn",
+          "Type": "String"
+        },
+        {
+          "Name": "ConfigurationStatus",
+          "Selector": "$.Payload.ConfigurationStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "KMSKeyConfiguration",
+          "Selector": "$.Payload.KMSKeyConfiguration",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "description": "Cleans up IAM roles that the runbook created during failed replication configuration when you didn't provide an S3ReplicationRole.",
+      "name": "CleanupResources",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "S3ReplicationRole": "{{ S3ReplicationRole }}"
+        },
+        "Handler": "cleanup_resources.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachment.zip"
+      },
+      "outputs": [
+        {
+          "Name": "CleanupStatus",
+          "Selector": "$.Payload.CleanupStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "CleanupMessage",
+          "Selector": "$.Payload.CleanupMessage",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "ConfigureSSES3Replication.ReplicationRoleArn",
+    "ConfigureSSES3Replication.ConfigurationStatus",
+    "ConfigureSSEKMSReplication.ReplicationRoleArn",
+    "ConfigureSSEKMSReplication.ConfigurationStatus",
+    "ConfigureSSEKMSReplication.KMSKeyConfiguration",
+    "CleanupResources.CleanupStatus",
+    "CleanupResources.CleanupMessage"
+  ],
+  "files": {
+    "attachment.zip": {
+      "checksums": {
+        "SHA256": "aba63a82d8a0c199e4f1fa8ffd7b59d7d19c13016bd37f2d7c29380eddd88395"
+      }
+    }
+  }
+}

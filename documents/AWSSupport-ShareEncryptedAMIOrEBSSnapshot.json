@@ -1,0 +1,314 @@
+{
+  "description": "# AWSSupport-ShareEncryptedAMIOrEBSSnapshot\nThis runbook automates the process of sharing encrypted Amazon Machine Images (AMIs) or Amazon Elastic Block Store (EBS) snapshots with other AWS accounts. This runbook handles the complex requirements for cross-account sharing of encrypted resources, including AWS Key Management Service (KMS) key policy modifications and resource permission updates.\n\nThis automation performs the steps outlined in the AWS Security Blog article [How to share encrypted AMIs across accounts to launch encrypted EC2 instances](https://aws.amazon.com/blogs/security/how-to-share-encrypted-amis-across-accounts-to-launch-encrypted-ec2-instances/).\n\n## Important Considerations:\n\n1. **This runbook will modify your resources**:\n\n    The runbook will add cross-account permissions to your KMS Customer Managed Key (CMK) policy and grant AMI launch permissions or EBS snapshot create volume permissions to the destination account.\n\n2. **Additional costs may apply**: \n\n    When copying resources (different region or AWS managed key encryption), additional costs will be incurred for the new AMI or EBS snapshot and any cross-region data transfer.\n\n3. **Please verify the destination account ID**: \n\n    Double-check the destination account ID as this runbook cannot validate account existence.\n\n4. **Automatic rollback with manual verification**: \n\n    This runbook attempts to automatically roll back changes if it fails. However, if the rollback itself fails, please verify that:\n   - No extra AMI/Snapshot copies were left in your account\n   - Resource LaunchPermission/CreateVolumePermission attributes do not include unintended accounts\n   - KMS key policy is in its original state\n\n## Required AWS Identity and Access Management (IAM) Policy for Destination Account:\n\nThe IAM role or user in the destination account must configure the following IAM permissions to launch encrypted Amazon Elastic Compute Cloud (EC2) instances from the shared encrypted AMI or to create volumes from the shared encrypted EBS snapshot:\n\n```json\n{\n    \"Version\": \"2012-10-17\",\n    \"Statement\": [\n        {\n            \"Effect\": \"Allow\",\n            \"Action\": [\n                \"kms:DescribeKey\",\n                \"kms:ReEncrypt*\",\n                \"kms:CreateGrant\",\n                \"kms:Decrypt\"\n            ],\n            \"Resource\": [\n                \"arn:aws:kms:<region>:<account-id>:key/<key-id>\"\n            ]\n        }\n    ]\n}\n```\n\nFor more information, see [Share a KMS key](https://docs.aws.amazon.com/ebs/latest/userguide/share-kms-key.html) in the Amazon EBS User Guide.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "Approvers": {
+      "type": "StringList",
+      "description": "(Required) The list of AWS authenticated principals who are able to either approve or reject the action. The maximum number of approvers is 10. You can specify principals by using any of the following formats: user name, user ARN, IAM role ARN, or IAM assume role ARN.",
+      "allowedPattern": "^[a-z0-9A-Z+=,.@_-]{1,64}$|^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):(iam|sts)::[0-9]{12,14}:(role/|user/|assumed-role/)[a-z0-9A-Z+=,.@_-]{1,64}(/[a-z0-9A-Z+=,.@_-]{1,64})?$"
+    },
+    "ResourceId": {
+      "type": "String",
+      "description": "(Required) Amazon AMI or Amazon EBS Snapshot ID to be shared (e.g., ami-123456789012 or snap-123456789012).",
+      "allowedPattern": "^(ami|snap)-[a-z0-9]{17}$"
+    },
+    "DestinationAccountId": {
+      "type": "String",
+      "description": "(Required) The 12-digit AWS account ID where the resource will be shared.",
+      "allowedPattern": "^[0-9]{12,13}$"
+    },
+    "CustomerManagedKeyId": {
+      "type": "String",
+      "description": "(Optional) AWS KMS CMK ID to re-encrypt the resource. Required if the resource is encrypted with AWS managed key or when DestinationRegion is specified for cross-region copying. For cross-region copying, this key must exist in the destination region.",
+      "default": "",
+      "allowedPattern": "^$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "DestinationRegion": {
+      "type": "String",
+      "description": "(Optional) The AWS region where the resource will be copied (for example, us-east-1). The default value '{{ global:REGION }}' is the current region. If a different region is specified, the resource will be copied to the destination region using the AWS KMS CMK specified in the CustomerManagedKeyId parameter.",
+      "default": "{{ global:REGION }}",
+      "allowedPattern": "^\\{\\{ global:REGION \\}\\}$|^[a-z]{2}(-gov)?(-iso[a-z]?)?-[a-z]{2,10}-[0-9]{1,2}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateResources",
+      "action": "aws:executeScript",
+      "nextStep": "BranchOnResourcePermission",
+      "description": "Validates input resource existence, state, encryption configuration, and determines required changes for sharing.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 180,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ResourceId": "{{ ResourceId }}",
+          "DestinationAccountId": "{{ DestinationAccountId }}",
+          "CustomerManagedKeyId": "{{ CustomerManagedKeyId }}",
+          "DestinationRegion": "{{ DestinationRegion }}"
+        },
+        "Handler": "validate_resources.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EncryptionKeyId",
+          "Selector": "$.Payload.encryptionKeyId",
+          "Type": "String"
+        },
+        {
+          "Name": "EncryptionKey",
+          "Selector": "$.Payload.encryptionKey",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "ShouldCopyResource",
+          "Selector": "$.Payload.shouldCopyResource",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnResourcePermission",
+      "action": "aws:branch",
+      "description": "Branches the workflow based on whether resource sharing permissions need to be checked.",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "Or": [
+              {
+                "Variable": "{{ ValidateResources.ShouldCopyResource }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ DestinationAccountId }}",
+                "StringEquals": "{{ global:ACCOUNT_ID }}"
+              }
+            ],
+            "NextStep": "AnalyzeChanges"
+          }
+        ],
+        "Default": "CheckResourcePermission"
+      }
+    },
+    {
+      "name": "CheckResourcePermission",
+      "action": "aws:executeScript",
+      "description": "Checks if the target account has required sharing permission for the resource.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 180,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ResourceId": "{{ ResourceId }}",
+          "DestinationAccountId": "{{ DestinationAccountId }}"
+        },
+        "Handler": "check_resource_permission.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ShouldAddPermission",
+          "Selector": "$.Payload.shouldAddPermission",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "AnalyzeChanges"
+    },
+    {
+      "name": "AnalyzeChanges",
+      "action": "aws:executeScript",
+      "description": "Analyzes the KMS key policy and creates a comprehensive preview of all the required changes.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 180,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ResourceId": "{{ ResourceId }}",
+          "DestinationAccountId": "{{ DestinationAccountId }}",
+          "CustomerManagedKeyId": "{{ CustomerManagedKeyId }}",
+          "DestinationRegion": "{{ DestinationRegion }}",
+          "ShouldCopyResource": "{{ ValidateResources.ShouldCopyResource }}",
+          "ShouldAddPermission": "{{ CheckResourcePermission.ShouldAddPermission }}",
+          "EncryptionKeyId": "{{ ValidateResources.EncryptionKeyId }}"
+        },
+        "Handler": "analyze_changes.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ShouldUpdateKeyPolicy",
+          "Selector": "$.Payload.shouldUpdateKeyPolicy",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "OriginalKeyPolicy",
+          "Selector": "$.Payload.originalKeyPolicy",
+          "Type": "String"
+        },
+        {
+          "Name": "NewKeyPolicy",
+          "Selector": "$.Payload.newKeyPolicy",
+          "Type": "String"
+        },
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.report",
+          "Type": "String"
+        },
+        {
+          "Name": "Summary",
+          "Selector": "$.Payload.summary",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnChanges"
+    },
+    {
+      "name": "BranchOnChanges",
+      "action": "aws:branch",
+      "isEnd": false,
+      "description": "Branches the workflow based on what updates need to be made to a resource.",
+      "inputs": {
+        "Choices": [
+          {
+            "Or": [
+              {
+                "Variable": "{{ ValidateResources.ShouldCopyResource }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ CheckResourcePermission.ShouldAddPermission }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ AnalyzeChanges.ShouldUpdateKeyPolicy }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "GetApproval"
+          }
+        ],
+        "Default": "Results"
+      }
+    },
+    {
+      "name": "GetApproval",
+      "action": "aws:approve",
+      "description": "Waits for the approval of designated AWS IAM principals to make the required changes allow the sharing of encrypted AMI or snapshots with other AWS accounts.",
+      "timeoutSeconds": 900,
+      "onFailure": "Abort",
+      "inputs": {
+        "Message": "{{ AnalyzeChanges.Summary }}",
+        "Approvers": [
+          "{{ Approvers }}"
+        ],
+        "MinRequiredApprovals": 1
+      },
+      "nextStep": "ExecuteChanges"
+    },
+    {
+      "name": "ExecuteChanges",
+      "action": "aws:executeScript",
+      "description": "Executes approved changes with rollback on failure.",
+      "onFailure": "Abort",
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "ResourceId": "{{ ResourceId }}",
+          "DestinationAccountId": "{{ DestinationAccountId }}",
+          "DestinationRegion": "{{ DestinationRegion }}",
+          "ApprovalStatus": "{{ GetApproval.ApprovalStatus }}",
+          "ShouldCopyResource": "{{ ValidateResources.ShouldCopyResource }}",
+          "ShouldAddPermission": "{{ CheckResourcePermission.ShouldAddPermission }}",
+          "ShouldUpdateKeyPolicy": "{{ AnalyzeChanges.ShouldUpdateKeyPolicy }}",
+          "OriginalKeyPolicy": "{{ AnalyzeChanges.OriginalKeyPolicy }}",
+          "NewKeyPolicy": "{{ AnalyzeChanges.NewKeyPolicy }}",
+          "EncryptionKeyId": "{{ ValidateResources.EncryptionKeyId }}",
+          "CustomerManagedKeyId": "{{ CustomerManagedKeyId }}"
+        },
+        "Handler": "execute_changes.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "CopiedResourceId",
+          "Selector": "$.Payload.copiedResourceId",
+          "Type": "String"
+        },
+        {
+          "Name": "CopiedResource",
+          "Selector": "$.Payload.changesApplied.copied_resource",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AddedPermission",
+          "Selector": "$.Payload.changesApplied.added_permission",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "UpdatedPolicy",
+          "Selector": "$.Payload.changesApplied.updated_policy",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "Results"
+    },
+    {
+      "name": "Results",
+      "description": "Generates a comprehensive execution report summarizing all actions taken during the encrypted AMI or snapshot sharing process, including resource copying, permission updates, and KMS key policy modifications with their current status and any rollback information.",
+      "action": "aws:executeScript",
+      "inputs": {
+        "InputPayload": {
+          "ResourceId": "{{ ResourceId }}",
+          "DestinationAccountId": "{{ DestinationAccountId }}",
+          "DestinationRegion": "{{ DestinationRegion }}",
+          "CustomerManagedKeyId": "{{ CustomerManagedKeyId }}",
+          "CopiedResourceId": "{{ ExecuteChanges.CopiedResourceId }}",
+          "CopiedResource": "{{ ExecuteChanges.CopiedResource }}",
+          "AddedPermission": "{{ ExecuteChanges.AddedPermission }}",
+          "UpdatedPolicy": "{{ ExecuteChanges.UpdatedPolicy }}",
+          "EncryptionKeyId": "{{ ValidateResources.EncryptionKeyId }}",
+          "EncryptionKey": "{{ ValidateResources.EncryptionKey }}",
+          "OriginalKeyPolicy": "{{ AnalyzeChanges.OriginalKeyPolicy }}",
+          "NewKeyPolicy": "{{ AnalyzeChanges.NewKeyPolicy }}"
+        },
+        "Handler": "results.function_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.message",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true,
+      "onFailure": "Abort",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3
+    }
+  ],
+  "outputs": [
+    "Results.Message"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "fc413cb68c87595fe7d5f12022d7ad1dddd3e3cd5e184b47450bf81a60b41c0e"
+      }
+    }
+  }
+}
