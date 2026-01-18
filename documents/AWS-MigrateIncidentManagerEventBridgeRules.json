@@ -1,6 +1,6 @@
 {
   "schemaVersion": "0.3",
-  "description": "# AWS-MigrateIncidentManagerEventBridgeRules\n\n## What does this document do?\nThis runbook automates the migration of EventBridge rules from AWS Systems Manager Incident Manager to \nOpsCenter with comprehensive safety features and monitoring capabilities. It provides the following features:\n\n* Discovery and batching: The runbook discovers all EventBridge rules configured with Incident Manager \n  response plan targets and organizes them into configurable batches for processing.\n* S3 backup and review: All rule configurations are backed up to S3 before migration, and the complete \n  list of rules to be migrated is stored for manual review and approval.\n* Manual approval workflow: The runbook requires explicit approval via SNS notification before proceeding \n  with the migration, with a 24-hour timeout for safety.\n* Batch processing: Rules are migrated in configurable batches to prevent API throttling and allow for \n  better error handling and progress tracking.\n* Comprehensive logging: All migration activities are logged to CloudWatch Logs with detailed progress \n  tracking, error reporting, and audit trails.\n* Error handling and retry: The runbook includes exponential backoff retry mechanisms for API calls and \n  comprehensive error handling with detailed failure reporting.\n* Progress tracking: Global counters track successfully migrated, failed, and skipped rules throughout \n  the execution with real-time updates.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The IAM role ARN for the automation execution. Expected format: \n  arn:aws:iam::{AccountId}:role/IM-Migration-Automation-Role. This role should be created by deploying \n  the provided CloudFormation stack.\n* ApproverArn: (Required) The IAM role or user ARN who can review and approve the migration. Expected \n  format: arn:aws:iam::{AccountId}:(role|user)/{name}. Default: arn:aws:iam::{AccountId}:role/Admin.\n* S3BucketName: (Required) The S3 bucket name for storing backups and review files. Expected format: \n  im-migration-logs-{AccountId}-{region}. This bucket should be created by deploying the provided \n  CloudFormation stack.\n* SNSTopicArn: (Required) The SNS topic ARN for approval notifications. Expected format: \n  arn:aws:sns:{region}:{AccountId}:Automation-IM-Migration-Approvals. This topic should be created by deploying \n  the provided CloudFormation stack.\n* MaxNumberOfRulesToMigrate: (Optional) The maximum number of rules to migrate in a single execution. \n  Valid values: 1, 5, 10, 50, 100, 500, 5000, 10000, 25000, 50000. Default: 10000. For migrations \n  exceeding 10000 rules, consider adjusting the batch size accordingly.\n* BatchSize: (Optional) The number of rules to process in each batch. Valid values: 25, 50, 100, 200, \n  250, 300, 350, 400, 450, 500. Default: 100. Use smaller values if encountering issues. The runbook \n  supports 100 × BatchSize rules per execution.\n\n## Output Parameters\n* MigrationSummary: A comprehensive summary report containing:\n  * Total number of rules found with Incident Manager targets\n  * Count of successfully migrated rules\n  * Count of failed migrations with error details\n  * Count of skipped rules (those without Incident Manager targets)\n  * Overall migration status (Success or Completed with errors)",
+  "description": "# AWS-MigrateIncidentManagerEventBridgeRules\n\n## What does this document do?\nThis runbook automates the migration of EventBridge rules from AWS Systems Manager Incident Manager to \nOpsCenter with comprehensive safety features and monitoring capabilities. It provides the following features:\n\n* Discovery and batching: The runbook discovers all EventBridge rules configured with Incident Manager \n  response plan targets and organizes them into configurable batches for processing.\n* S3 backup and review: All rule configurations are backed up to S3 before migration, and the complete \n  list of rules to be migrated is stored for manual review and approval.\n* Manual approval workflow: The runbook requires explicit approval via SNS notification before proceeding \n  with the migration, with a 24-hour timeout for safety.\n* Batch processing: Rules are migrated in configurable batches to prevent API throttling and allow for \n  better error handling and progress tracking.\n* Comprehensive logging: All migration activities are logged to CloudWatch Logs with detailed progress \n  tracking, error reporting, and audit trails.\n* Error handling and retry: The runbook includes exponential backoff retry mechanisms for API calls and \n  comprehensive error handling with detailed failure reporting.\n* Progress tracking: Global counters track successfully migrated, failed, and skipped rules throughout \n  the execution with real-time updates.\n\n## Input Parameters\n* AutomationAssumeRole: (Required) The IAM role ARN for the automation execution. Expected format: \n  arn:aws:iam::{AccountId}:role/IM-Migration-Automation-Role. This role should be created by deploying \n  the provided CloudFormation stack.\n* ApproverArn: (Required) The IAM role or user ARN who can review and approve the migration. Expected \n  format: arn:aws:iam::{AccountId}:(role|user)/{name}. Default: arn:aws:iam::{AccountId}:role/Admin.\n* S3BucketName: (Required) The S3 bucket name for storing backups and review files. Expected format: \n  im-migration-logs-{AccountId}-{region}. This bucket should be created by deploying the provided \n  CloudFormation stack.\n* SNSTopicArn: (Required) The SNS topic ARN for approval notifications. Expected format: \n  arn:aws:sns:{region}:{AccountId}:Automation-IM-Migration-Approvals. This topic should be created by deploying \n  the provided CloudFormation stack.\n* MaxNumberOfRulesToMigrate: (Optional) The maximum number of rules to migrate in a single execution. \n  Valid values: 1, 5, 10, 50, 100, 500, 5000, 10000, 25000, 50000. Default: 10000. For migrations \n  exceeding 10000 rules, consider adjusting the batch size accordingly.\n* BatchSize: (Optional) The number of rules to process in each batch. Valid values: 25, 50, 100, 200, \n  250, 300, 350, 400, 450, 500. Default: 100. Use smaller values if encountering issues. The runbook \n  supports 100 × BatchSize rules per execution.\n* RequireManualApproval: (Optional) Whether to require manual approval before proceeding with the migration. \n  Set to false to skip the approval step and proceed automatically. Default: true for safety.\n\n## Output Parameters\n* MigrationSummary: A comprehensive summary report containing:\n  * Total number of rules found with Incident Manager targets\n  * Count of successfully migrated rules\n  * Count of failed migrations with error details\n  * Count of skipped rules (those without Incident Manager targets)\n  * Overall migration status (Success or Completed with errors)",
   "assumeRole": "{{AutomationAssumeRole}}",
   "parameters": {
     "AutomationAssumeRole": {
@@ -59,6 +59,15 @@
         400,
         450,
         500
+      ]
+    },
+    "RequireManualApproval": {
+      "type": "String",
+      "description": "(Optional) Whether to require manual approval before proceeding with the migration. Set to false to skip the approval step and proceed automatically. Default is true for safety.",
+      "default": "true",
+      "allowedValues": [
+        "true",
+        "false"
       ]
     }
   },
@@ -122,16 +131,36 @@
       ]
     },
     {
-      "description": "Check if any rules were found for migration, proceed to approval if rules exist, otherwise end execution",
+      "description": "Check if any rules were found for migration, proceed to conditional approval if rules exist, otherwise end execution",
       "name": "CheckIfRulesExists",
       "action": "aws:branch",
       "isEnd": true,
       "inputs": {
         "Choices": [
           {
-            "NextStep": "ApprovalStep",
+            "NextStep": "CheckApprovalRequirement",
             "Variable": "{{ getEventBridgeRules.RuleCount }}",
             "NumericGreater": 0
+          }
+        ]
+      }
+    },
+    {
+      "description": "Check if manual approval is required based on the RequireManualApproval parameter",
+      "name": "CheckApprovalRequirement",
+      "action": "aws:branch",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ApprovalStep",
+            "Variable": "{{ RequireManualApproval }}",
+            "StringEquals": "true"
+          },
+          {
+            "NextStep": "ProcessRuleBatches",
+            "Variable": "{{ RequireManualApproval }}",
+            "StringEquals": "false"
           }
         ]
       }
