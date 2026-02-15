@@ -177,48 +177,10 @@
       "description": "Pauses the execution of the automation document for 24 hours and 5 minutes to account for the cooldown period.",
       "name": "Sleep",
       "action": "aws:sleep",
-      "nextStep": "CancelExecutionIfNecessary",
+      "nextStep": "PromoteIndexRetry",
       "isEnd": false,
       "inputs": {
         "Duration": "PT24H5M"
-      }
-    },
-    {
-      "description": "Cancel automation execution if the region is no longer the selected aggregator region.",
-      "name": "CancelExecutionIfNecessary",
-      "action": "aws:executeScript",
-      "maxAttempts": 2,
-      "nextStep": "EndIfExecutionCanceled",
-      "isEnd": false,
-      "inputs": {
-        "Runtime": "python3.11",
-        "Handler": "script_handler",
-        "InputPayload": {
-          "automationExecutionId": "{{ automation:EXECUTION_ID }}",
-          "aggregatorRegion": "{{ AggregatorIndexRegion }}"
-        },
-        "Script": "import boto3\nfrom botocore.exceptions import ClientError\n\nssm_client = boto3.client('ssm')\n\ncanceled = {\n    'isCanceled': True\n}\n\nnotCanceled = {\n    'isCanceled': False\n}\n\ndef get_document_name_and_version(automation_execution_id):\n    print('Getting document name and version from the current automation execution...')\n    automation_execution = ssm_client.get_automation_execution(\n        AutomationExecutionId=automation_execution_id\n    )\n    document_name = automation_execution['AutomationExecution']['DocumentName']\n    document_version = automation_execution['AutomationExecution']['DocumentVersion']\n    print(f'Document name and version: {document_name}, {document_version}')\n    return document_name, document_version\n\n\ndef get_current_document_version_and_parameters(document_name):\n    print(\n        f'Getting the current document version and parameters for the document: {document_name}...')\n    document = ssm_client.describe_document(\n        Name=document_name\n    )\n    current_document_version = document['Document']['DocumentVersion']\n    current_document_parameters = document['Document']['Parameters']\n    print(\n        f'Current document version and parameters: {current_document_version}, {current_document_parameters}')\n    return current_document_version, current_document_parameters\n\n\ndef get_current_selected_aggregator_region(current_document_parameters):\n    for param in current_document_parameters:\n        if param['Name'] == 'aggregatorRegion':\n            return param['DefaultValue']\n\n\ndef script_handler(events, context):\n    try:\n        automation_execution_id = events['automationExecutionId']\n        selected_aggregator_region = events['aggregatorRegion']\n\n        document_name, document_version = get_document_name_and_version(\n            automation_execution_id)\n\n        current_document_version, current_document_parameters = get_current_document_version_and_parameters(\n            document_name)\n\n        if document_version == current_document_version:\n            print(\n                'No-op; the document versions match, indicating there was no change to the document')\n            return notCanceled\n\n        current_selected_aggregator_region = get_current_selected_aggregator_region(\n            current_document_parameters)\n\n        if selected_aggregator_region == current_selected_aggregator_region:\n            print(\n                'No-op; the selected Aggregator Index Region has not changed')\n            return notCanceled\n\n        print('The selected Aggregator Index Region has changed')\n        return canceled\n    except ClientError as error:\n        print(\n            f'Failed to determine if the automation document needs to be cancelled: {error}')\n        raise error\n"
-      },
-      "outputs": [
-        {
-          "Name": "isCanceled",
-          "Selector": "$.Payload.isCanceled",
-          "Type": "Boolean"
-        }
-      ]
-    },
-    {
-      "name": "EndIfExecutionCanceled",
-      "action": "aws:branch",
-      "isEnd": true,
-      "inputs": {
-        "Choices": [
-          {
-            "NextStep": "PromoteIndexRetry",
-            "Variable": "{{ CancelExecutionIfNecessary.isCanceled }}",
-            "BooleanEquals": false
-          }
-        ]
       }
     },
     {
