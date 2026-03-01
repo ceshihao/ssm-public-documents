@@ -1,6 +1,6 @@
 {
   "schemaVersion": "0.3",
-  "description": "The **AWSSupport-StartEC2RescueWorkflow** runbook creates a temporary Amazon Elastic Compute Cloud (Amazon EC2) instance (also known as the helper instance) to perform offline remediation of issues on your Amazon EC2 instance. After the helper instance is created, your instance is stopped, and the Amazon Elastic Block Store (Amazon EBS) root volume of your instance is attached and mounted to the helper instance. The Amazon EC2 [Rescue for Linux (ec2rl)](https://github.com/awslabs/aws-ec2rescue-linux) or [Rescue for Windows Server](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/Windows-Server-EC2Rescue.html) tool is then installed on the helper instance and the `base64` encoded script (Bash or PowerShell) provided in the `OfflineScript` parameter is executed. If your instance is Windows, provide a PowerShell script, otherwise, use Bash. The Amazon EC2 Rescue tool sets some [environment variables](https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-startec2rescueworkflow.html) which you can use in your script. The environment variables contain information about the offline EBS root volume and EC2 instance. For example, you can save a Desired State Configuration file to an offline Windows root volume, or chroot to an offline Linux root volume and perform an offline remediation.",
+  "description": "The **AWSSupport-StartEC2RescueWorkflow** runbook creates a temporary Amazon Elastic Compute Cloud (Amazon EC2) helper instance to perform offline remediation of issues on your Amazon EC2 instance. After the helper instance is created, your instance is stopped, and the Amazon Elastic Block Store (Amazon EBS) root volume of your instance is attached and mounted to the helper instance. The Amazon EC2 [Rescue for Linux (ec2rl)](https://github.com/awslabs/aws-ec2rescue-linux) or [Rescue for Windows Server](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/Windows-Server-EC2Rescue.html) tool is then installed on the helper instance and the `base64` encoded script (Bash or PowerShell) provided in the `OfflineScript` parameter is executed. If your instance is Windows, provide a PowerShell script, otherwise, use Bash. The Amazon EC2 Rescue tool sets some [environment variables](https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-startec2rescueworkflow.html) which you can use in your script. The environment variables contain information about the offline EBS root volume and EC2 instance. For example, you can save a Desired State Configuration file to an offline Windows root volume, or chroot to an offline Linux root volume and perform an offline remediation.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "AutomationAssumeRole": {
@@ -32,9 +32,20 @@
         "i3.large"
       ]
     },
+    "WindowsAMIName": {
+      "type": "String",
+      "description": "(Optional) The Windows Server version for the EC2Rescue helper instance.",
+      "default": "Windows_Server-2019-English-Full-Base",
+      "allowedValues": [
+        "Windows_Server-2016-English-Full-Base",
+        "Windows_Server-2019-English-Full-Base",
+        "Windows_Server-2022-English-Full-Base",
+        "Windows_Server-2025-English-Full-Base"
+      ]
+    },
     "SubnetId": {
       "type": "String",
-      "description": "(Optional) The subnet ID for the EC2Rescue instance. By default, the same subnet where the provided instance resides is used. This parameter support the following values: `SelectedInstanceSubnet`, `CreateNewVPC`, or a specific subnet ID. IMPORTANT: If you provide a custom subnet, it must be in the same Availability Zone as InstanceId, and it must allow access to the AWS Systems Manager and Amazon S3 endpoints.",
+      "description": "(Optional) The subnet ID for the EC2Rescue instance. By default, the same subnet where the provided instance resides is used. Accepted values: `SelectedInstanceSubnet`, `CreateNewVPC`, or a specific subnet ID. IMPORTANT: If you provide a custom subnet, it must be in the same Availability Zone as InstanceId, and it must allow access to the AWS Systems Manager and Amazon S3 endpoints.",
       "default": "SelectedInstanceSubnet",
       "allowedPattern": "^SelectedInstanceSubnet$|^CreateNewVPC$|^subnet-[a-z0-9]{8,17}$"
     },
@@ -97,7 +108,7 @@
     },
     "AssociatePublicIpAddress": {
       "type": "String",
-      "description": "(Optional) Set it to `False` to indicate that the runbook does not need to assign a public IP address to the helper instance.",
+      "description": "(Optional) Set it to `False` to indicate that the runbook does not need to assign a public IP address to the helper EC2 instance.",
       "default": "True",
       "allowedValues": [
         "True",
@@ -106,7 +117,7 @@
     },
     "HelperInstanceSecurityGroupId": {
       "type": "String",
-      "description": "(Optional) The security group ID that will be associated to the temporary EC2 instance. If not provided, the default VPC security group is used. NOTE: The helper instance security group must allow HTTPS (port 443) outbound traffic to the Amazon S3 and AWS Systems Manager endpoints.",
+      "description": "(Optional) The security group ID for the helper EC2 instance. If not provided, the default VPC security group is used. NOTE: The helper instance security group must allow HTTPS (port 443) outbound traffic to the Amazon S3 and AWS Systems Manager endpoints.",
       "allowedPattern": "^$|sg-[a-z0-9]{8,17}$",
       "default": ""
     }
@@ -351,7 +362,7 @@
       "onFailure": "Abort",
       "nextStep": "branchOnSubnetId",
       "isCritical": true,
-      "description": "Ensures the provided instance is not part of an Amazon EC2 Auto Scaling group by calling the 'DescribeAutoScalingInstances' API. If the instance is part of an Amazon EC2 Auto Scaling group, ensures the EC2 instance is in 'Standby' lifecycle state.",
+      "description": "Ensures the instance is not part of an Auto Scaling group by calling 'DescribeAutoScalingInstances'. If it is, ensures the instance is in 'Standby' lifecycle state.",
       "timeoutSeconds": 600,
       "inputs": {
         "InputPayload": {
@@ -407,7 +418,7 @@
     {
       "name": "ensureNoConcurrentExecutionsForTheInstance",
       "action": "aws:executeScript",
-      "description": "Ensures there is only one execution of this runbook targeting the provided EC2 instance. If the runbook finds another in progress execution targeting the same instance ID, it returns an error and ends.",
+      "description": "Ensures only one execution of this runbook targets the provided EC2 instance. If another in-progress execution targets the same instance, it returns an error.",
       "onFailure": "Abort",
       "nextStep": "stageEC2RescueAutomation",
       "maxAttempts": 3,
@@ -431,7 +442,7 @@
       "inputs": {
         "StackName": "AWSSupport-EC2Rescue-{{ UniqueId }}",
         "OnFailure": "DELETE",
-        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nDescription: Creates the EC2 Rescue instance\nParameters:\n  AZ:\n    Type: String\n    Default: ''\n  Architecture:\n    Type: String\n    AllowedValues:\n      - arm64\n      - x86_64\n  CurrentSubnetId:\n    Type: AWS::EC2::Subnet::Id\n  SubnetId:\n    Type: String\n    Default: ''\n  Platform:\n    Type: String\n    Default: ''\n  InstanceProfileName:\n    Type: String\n    Default: ''\n  S3BucketName:\n    Type: String\n    Default: ''\n  S3Prefix:\n    Type: String\n    Default: ''\n  ExecutionId:\n    Type: String\n    Default: ''\n  WindowsAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base\n  LinuxAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64\n  ARMLinuxAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2\n  InstanceType:\n    Type: String\n    Default: t3.small\n    ConstraintDescription: Must be a valid EC2 instance type.\n  AddPublicIp:\n    Type: String\n    Default: 'True'\n    AllowedValues:\n      - 'True'\n      - 'False'\n  CustomSecurityGroupId:\n    Type: String\n    Default: ''\nConditions:\n  ArchitectureIsARM: !Equals\n    - !Ref Architecture\n    - arm64\n  UseWindowsAMI: !Equals\n    - !Ref Platform\n    - windows\n  UseS3: !Not\n    - !Equals\n      - !Ref S3BucketName\n      - ''\n  CreateInstProfile: !Equals\n      - !Ref InstanceProfileName\n      - ''\n  NeedVPC: !Equals\n    - !Ref SubnetId\n    - 'CreateNewVPC'\n  UseInstanceSubnet: !Equals\n    - !Ref SubnetId\n    - 'SelectedInstanceSubnet'\n  AddPublicIp: !Equals\n    - !Ref AddPublicIp\n    - 'True'\n  UseCustomSecurityGroup: !Not\n    - !Equals\n      - !Ref CustomSecurityGroupId\n      - ''\nResources:\n  EC2RescueEC2Role:\n    Condition: CreateInstProfile\n    Type: 'AWS::IAM::Role'\n    Properties:\n      RoleName: !Sub 'AWSSupport-EC2Rescue-EC2Role${ExecutionId}'\n      AssumeRolePolicyDocument:\n        Version: 2012-10-17\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: ec2.amazonaws.com\n            Action: 'sts:AssumeRole'\n      Policies:\n        - PolicyName: AWSSupport-EC2Rescue-EC2Role_Permissions\n          PolicyDocument:\n            Version: 2012-10-17\n            Statement:\n              - Sid: LinuxOfflineSSHKeyResetPermissions\n                Action:\n                  - 'ssm:PutParameter'\n                  - 'kms:Encrypt'\n                Resource: '*'\n                Effect: Allow\n        - PolicyName: AWSSupport-EC2Rescue-EC2Role_Read_S3_Permissions\n          PolicyDocument:\n            Version: 2012-10-17\n            Statement:\n              - Sid: S3ReadPermissions\n                Action:\n                  - 's3:GetBucketLocation'\n                  - 's3:GetObject'\n                  - 's3:GetEncryptionConfiguration'\n                  - 's3:ListMultipartUploadParts'\n                  - 's3:ListBucket'\n                  - 's3:ListBucketMultipartUploads'\n                Resource: '*'\n                Effect: Allow\n        - !If\n          - UseS3\n          - PolicyName: AWSSupport-EC2Rescue-EC2Role_Write_S3_Permissions\n            PolicyDocument:\n              Version: 2012-10-17\n              Statement:\n                - Sid: S3WritePermissions\n                  Action:\n                    - 's3:PutObject'\n                    - 's3:AbortMultipartUpload'\n                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/${S3Prefix}/*'\n                  Effect: Allow\n          - !Ref 'AWS::NoValue'\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMPatchAssociation'\n  EC2RescueInstanceProfile:\n    Condition: CreateInstProfile\n    Type: 'AWS::IAM::InstanceProfile'\n    Properties:\n      Roles:\n        - !Ref EC2RescueEC2Role\n      InstanceProfileName: !Sub 'AWSSupport-EC2Rescue-EC2Role${ExecutionId}'\n  LaunchTemplate:\n    Type: AWS::EC2::LaunchTemplate\n    Properties:\n      LaunchTemplateData:\n        MetadataOptions:\n          HttpEndpoint: enabled\n          HttpTokens: required\n          HttpPutResponseHopLimit: 1\n  HelperInstance:\n    Type: 'AWS::EC2::Instance'\n    Properties:\n      ImageId: !If\n        - UseWindowsAMI\n        - !Ref WindowsAMI\n        - !If\n          - ArchitectureIsARM\n          - !Ref ARMLinuxAMI\n          - !Ref LinuxAMI\n      LaunchTemplate:\n        LaunchTemplateId: !Ref LaunchTemplate\n        Version: !GetAtt LaunchTemplate.LatestVersionNumber\n      InstanceType: !Ref InstanceType\n      PropagateTagsToVolumeOnCreation: true\n      NetworkInterfaces:\n        - AssociatePublicIpAddress: !If\n            - AddPublicIp\n            - true\n            - false\n          DeleteOnTermination: true\n          DeviceIndex: '0'\n          GroupSet:\n            - !If\n              - UseCustomSecurityGroup\n              - !Ref CustomSecurityGroupId\n              - Ref: AWS::NoValue\n          SubnetId: !If\n            - NeedVPC\n            - !Ref Subnet\n            - !If\n              - UseInstanceSubnet\n              - !Ref CurrentSubnetId\n              - !Ref SubnetId\n      IamInstanceProfile: !If\n      - CreateInstProfile\n      - !Ref EC2RescueInstanceProfile\n      - !Ref InstanceProfileName\n  EC2RescueVPC:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::VPC'\n    Properties:\n      CidrBlock: 172.31.0.0/16\n      InstanceTenancy: default\n      EnableDnsSupport: true\n      EnableDnsHostnames: true\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-VPC\n  Subnet:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::Subnet'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      CidrBlock: 172.31.0.0/24\n      AvailabilityZone: !Ref AZ\n      MapPublicIpOnLaunch: true\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-Subnet\n  InternetGateway:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::InternetGateway'\n    Properties:\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-IGW\n  GatewayToInternet:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::VPCGatewayAttachment'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      InternetGatewayId: !Ref InternetGateway\n  PublicRouteTable:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::RouteTable'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-RT\n        - Key: Network\n          Value: Public\n  PublicRoute:\n    Condition: NeedVPC\n    DependsOn: GatewayToInternet\n    Type: 'AWS::EC2::Route'\n    Properties:\n      RouteTableId: !Ref PublicRouteTable\n      DestinationCidrBlock: 0.0.0.0/0\n      GatewayId: !Ref InternetGateway\n  PublicSubnetRouteTableAssociation:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::SubnetRouteTableAssociation'\n    Properties:\n      SubnetId: !Ref Subnet\n      RouteTableId: !Ref PublicRouteTable\nOutputs:\n  HelperInstanceId:\n    Value: !Ref HelperInstance\n",
+        "TemplateBody": "AWSTemplateFormatVersion: 2010-09-09\nDescription: Creates the EC2 Rescue instance\nParameters:\n  AZ:\n    Type: String\n    Default: ''\n  Architecture:\n    Type: String\n    AllowedValues:\n      - arm64\n      - x86_64\n  CurrentSubnetId:\n    Type: AWS::EC2::Subnet::Id\n  SubnetId:\n    Type: String\n    Default: ''\n  Platform:\n    Type: String\n    Default: ''\n  InstanceProfileName:\n    Type: String\n    Default: ''\n  S3BucketName:\n    Type: String\n    Default: ''\n  S3Prefix:\n    Type: String\n    Default: ''\n  ExecutionId:\n    Type: String\n    Default: ''\n  WindowsAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base\n  LinuxAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64\n  ARMLinuxAMI:\n    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'\n    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2\n  InstanceType:\n    Type: String\n    Default: t3.small\n  AddPublicIp:\n    Type: String\n    Default: 'True'\n    AllowedValues:\n      - 'True'\n      - 'False'\n  CustomSecurityGroupId:\n    Type: String\n    Default: ''\nConditions:\n  ArchitectureIsARM: !Equals\n    - !Ref Architecture\n    - arm64\n  UseWindowsAMI: !Equals\n    - !Ref Platform\n    - windows\n  UseS3: !Not\n    - !Equals\n      - !Ref S3BucketName\n      - ''\n  CreateInstProfile: !Equals\n      - !Ref InstanceProfileName\n      - ''\n  NeedVPC: !Equals\n    - !Ref SubnetId\n    - 'CreateNewVPC'\n  UseInstanceSubnet: !Equals\n    - !Ref SubnetId\n    - 'SelectedInstanceSubnet'\n  AddPublicIp: !Equals\n    - !Ref AddPublicIp\n    - 'True'\n  UseCustomSecurityGroup: !Not\n    - !Equals\n      - !Ref CustomSecurityGroupId\n      - ''\nResources:\n  EC2RescueEC2Role:\n    Condition: CreateInstProfile\n    Type: 'AWS::IAM::Role'\n    Properties:\n      RoleName: !Sub 'AWSSupport-EC2Rescue-EC2Role${ExecutionId}'\n      AssumeRolePolicyDocument:\n        Version: 2012-10-17\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: ec2.amazonaws.com\n            Action: 'sts:AssumeRole'\n      Policies:\n        - PolicyName: AWSSupport-EC2Rescue-EC2Role_Permissions\n          PolicyDocument:\n            Version: 2012-10-17\n            Statement:\n              - Sid: LinuxOfflineSSHKeyResetPermissions\n                Action:\n                  - 'ssm:PutParameter'\n                  - 'kms:Encrypt'\n                Resource: '*'\n                Effect: Allow\n        - PolicyName: AWSSupport-EC2Rescue-EC2Role_Read_S3_Permissions\n          PolicyDocument:\n            Version: 2012-10-17\n            Statement:\n              - Sid: S3ReadPermissions\n                Action:\n                  - 's3:GetBucketLocation'\n                  - 's3:GetObject'\n                  - 's3:GetEncryptionConfiguration'\n                  - 's3:ListMultipartUploadParts'\n                  - 's3:ListBucket'\n                  - 's3:ListBucketMultipartUploads'\n                Resource: '*'\n                Effect: Allow\n        - !If\n          - UseS3\n          - PolicyName: AWSSupport-EC2Rescue-EC2Role_Write_S3_Permissions\n            PolicyDocument:\n              Version: 2012-10-17\n              Statement:\n                - Sid: S3WritePermissions\n                  Action:\n                    - 's3:PutObject'\n                    - 's3:AbortMultipartUpload'\n                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/${S3Prefix}/*'\n                  Effect: Allow\n          - !Ref 'AWS::NoValue'\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMPatchAssociation'\n  EC2RescueInstanceProfile:\n    Condition: CreateInstProfile\n    Type: 'AWS::IAM::InstanceProfile'\n    Properties:\n      Roles:\n        - !Ref EC2RescueEC2Role\n      InstanceProfileName: !Sub 'AWSSupport-EC2Rescue-EC2Role${ExecutionId}'\n  LaunchTemplate:\n    Type: AWS::EC2::LaunchTemplate\n    Properties:\n      LaunchTemplateData:\n        MetadataOptions:\n          HttpEndpoint: enabled\n          HttpTokens: required\n          HttpPutResponseHopLimit: 1\n  HelperInstance:\n    Type: 'AWS::EC2::Instance'\n    Properties:\n      ImageId: !If\n        - UseWindowsAMI\n        - !Ref WindowsAMI\n        - !If\n          - ArchitectureIsARM\n          - !Ref ARMLinuxAMI\n          - !Ref LinuxAMI\n      LaunchTemplate:\n        LaunchTemplateId: !Ref LaunchTemplate\n        Version: !GetAtt LaunchTemplate.LatestVersionNumber\n      InstanceType: !Ref InstanceType\n      PropagateTagsToVolumeOnCreation: true\n      NetworkInterfaces:\n        - AssociatePublicIpAddress: !If\n            - AddPublicIp\n            - true\n            - false\n          DeleteOnTermination: true\n          DeviceIndex: '0'\n          GroupSet:\n            - !If\n              - UseCustomSecurityGroup\n              - !Ref CustomSecurityGroupId\n              - Ref: AWS::NoValue\n          SubnetId: !If\n            - NeedVPC\n            - !Ref Subnet\n            - !If\n              - UseInstanceSubnet\n              - !Ref CurrentSubnetId\n              - !Ref SubnetId\n      IamInstanceProfile: !If\n      - CreateInstProfile\n      - !Ref EC2RescueInstanceProfile\n      - !Ref InstanceProfileName\n  EC2RescueVPC:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::VPC'\n    Properties:\n      CidrBlock: 172.31.0.0/16\n      InstanceTenancy: default\n      EnableDnsSupport: true\n      EnableDnsHostnames: true\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-VPC\n  Subnet:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::Subnet'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      CidrBlock: 172.31.0.0/24\n      AvailabilityZone: !Ref AZ\n      MapPublicIpOnLaunch: true\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-Subnet\n  InternetGateway:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::InternetGateway'\n    Properties:\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-IGW\n  GatewayToInternet:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::VPCGatewayAttachment'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      InternetGatewayId: !Ref InternetGateway\n  PublicRouteTable:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::RouteTable'\n    Properties:\n      VpcId: !Ref EC2RescueVPC\n      Tags:\n        - Key: Name\n          Value: AWSSupport-EC2Rescue-RT\n        - Key: Network\n          Value: Public\n  PublicRoute:\n    Condition: NeedVPC\n    DependsOn: GatewayToInternet\n    Type: 'AWS::EC2::Route'\n    Properties:\n      RouteTableId: !Ref PublicRouteTable\n      DestinationCidrBlock: 0.0.0.0/0\n      GatewayId: !Ref InternetGateway\n  PublicSubnetRouteTableAssociation:\n    Condition: NeedVPC\n    Type: 'AWS::EC2::SubnetRouteTableAssociation'\n    Properties:\n      SubnetId: !Ref Subnet\n      RouteTableId: !Ref PublicRouteTable\nOutputs:\n  HelperInstanceId:\n    Value: !Ref HelperInstance\n",
         "TimeoutInMinutes": 30,
         "Capabilities": [
           "CAPABILITY_NAMED_IAM"
@@ -485,6 +496,10 @@
           {
             "ParameterKey": "CustomSecurityGroupId",
             "ParameterValue": "{{ HelperInstanceSecurityGroupId }}"
+          },
+          {
+            "ParameterKey": "WindowsAMI",
+            "ParameterValue": "/aws/service/ami-windows-latest/{{ WindowsAMIName }}"
           }
         ],
         "Tags": [
@@ -1037,16 +1052,13 @@
             "def contains_root_fs(device_name):",
             "    if not os.path.isdir(MOUNT_POINT):",
             "        os.makedirs(MOUNT_POINT)",
-            "    # TODO find a more native way to obtain the filesystem type",
             "    try:",
             "        fs_type = subprocess.check_output(shlex.split('blkid {} -s TYPE -o value'.format(device_name)),",
             "                                          universal_newlines=True).strip()",
             "    except Exception:",
             "        return False",
             "    try:",
-            "        # Python does not have a builtin for mount so use libc to do it",
-            "        # Ref: https://www.gnu.org/software/libc/manual/html_node/Mount_002dUnmount_002dRemount.html",
-            "        # ctypes does not automatically convert unicode/byte strings so it is necessary to encode them in Python 3",
+            "        # Use libc mount since Python has no builtin; encode strings for Python 3 compatibility",
             "        if fs_type == 'xfs':",
             "            mount_option = 'ro,nouuid'",
             "            ret = LIBC.mount(device_name.encode('ascii'), MOUNT_POINT.encode('ascii'), fs_type.encode('ascii'), 0, mount_option.encode('ascii'))",
@@ -1065,8 +1077,7 @@
             "",
             "",
             "def run():",
-            "    # This detection method relies on udev's standard storage naming rules",
-            "    # https://cgit.freedesktop.org/systemd/systemd/tree/rules/60-persistent-storage.rules",
+            "    # Detection relies on udev standard storage naming rules",
             "    partitions = list()",
             "    device_mapping = dict()",
             "    root_fs_dev = ''",
@@ -1165,8 +1176,7 @@
             "    rm -v \"${EC2RL_NAME}\"",
             "fi",
             "",
-            "# Copy ec2rl from the rescue host to the rescue volume",
-            "# This may \"upgrade\" the version on the rescue volume if it was already installed",
+            "# Copy ec2rl from rescue host to rescue volume (may upgrade existing version)",
             "EC2RL_DIR=\"$(dirname \"$(readlink /usr/bin/ec2rl)\")\"",
             "mkdir -vp \"$(dirname \"${CHROOT}\"\"${EC2RL_DIR}\")\" || error_trap",
             "cp -r \"${EC2RL_DIR}\" \"${CHROOT}\"\"$(dirname ${EC2RL_DIR})\" || error_trap \"Failed to copy ec2rl to rescue volume\"",

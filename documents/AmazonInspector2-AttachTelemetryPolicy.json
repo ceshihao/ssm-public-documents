@@ -1,0 +1,115 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Attach Inspector Telemetry policy to roles associated with instance profiles",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "BatchSize": {
+      "type": "Integer",
+      "default": 200,
+      "description": "Number of instance profiles per batch"
+    },
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "IAM role ARN assumed by SSM Automation",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov):iam::[0-9]{12}:role/[\\w+=,.@/-]+$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ListAndSplitProfiles",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "batchSize": "{{ BatchSize }}"
+        },
+        "Script": "import boto3\nimport json\n\ndef get_partition():\n    sts = boto3.client('sts')\n    identity = sts.get_caller_identity()\n    arn = identity['Arn']\n    partition = arn.split(':')[1]\n    return partition\n\ndef handler(event, context):\n    iam = boto3.client('iam')\n    ssm = boto3.client('ssm')\n    batch_size = int(event['batchSize'])\n    \n    partition = get_partition()\n    policy_arn = f\"arn:{partition}:iam::aws:policy/AmazonInspector2ManagedTelemetryPolicy\"\n\n    # First, check and process DHMC role\n    dhmc_info = {'checked': False, 'found': False, 'roleName': None, 'processed': False, 'alreadyHad': False}\n    dhmc_role_name = None\n    try:\n        dhmc_info['checked'] = True\n        resp = ssm.get_service_setting(\n            SettingId='/ssm/managed-instance/default-ec2-instance-management-role'\n        )\n        value = resp['ServiceSetting']['SettingValue']\n        if value and value not in ['$None', '']:\n            dhmc_role_name = value.split('/')[-1] if value.startswith('arn:') else value\n            iam.get_role(RoleName=dhmc_role_name)\n            dhmc_info['found'] = True\n            dhmc_info['roleName'] = dhmc_role_name\n\n            # Check and attach policy to DHMC role immediately\n            current = iam.list_attached_role_policies(RoleName=dhmc_role_name)\n            policy_arns = [p['PolicyArn'] for p in current['AttachedPolicies']]\n            if policy_arn in policy_arns:\n                dhmc_info['alreadyHad'] = True\n            else:\n                iam.attach_role_policy(RoleName=dhmc_role_name, PolicyArn=policy_arn)\n                dhmc_info['processed'] = True\n    except Exception as e:\n        # Record any error but continue execution\n        dhmc_info['error'] = str(e)\n\n    # Get all profiles and extract role names\n    role_names = []\n    paginator = iam.get_paginator('list_instance_profiles')\n    for page in paginator.paginate():\n        for profile in page.get('InstanceProfiles', []):\n            for role in profile.get('Roles', []):\n                role_names.append(role['RoleName'])\n\n    unique_roles = list(set(role_names))\n\n    # Split into batches\n    batches = []\n    for i in range(0, len(unique_roles), batch_size):\n        batch_data = unique_roles[i:i+batch_size]\n        batches.append(json.dumps(batch_data))\n\n    if not batches:\n        batches.append(json.dumps([]))\n\n    return {\n        'batches': batches, \n        'batchCount': len(batches),\n        'totalProfiles': len(role_names),\n        'uniqueRoles': len(unique_roles),\n        'dhmc': dhmc_info\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "Batches",
+          "Selector": "$.Payload.batches",
+          "Type": "StringList"
+        },
+        {
+          "Name": "BatchCount",
+          "Selector": "$.Payload.batchCount",
+          "Type": "Integer"
+        },
+        {
+          "Name": "UniqueRoles",
+          "Selector": "$.Payload.uniqueRoles",
+          "Type": "Integer"
+        },
+        {
+          "Name": "DHMC",
+          "Selector": "$.Payload.dhmc",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "ProcessBatches",
+      "action": "aws:loop",
+      "inputs": {
+        "Iterators": "{{ ListAndSplitProfiles.Batches }}",
+        "MaxIterations": 100,
+        "Steps": [
+          {
+            "name": "HandleBatch",
+            "action": "aws:executeScript",
+            "timeoutSeconds": 600,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "InputPayload": {
+                "batchJson": "{{ ProcessBatches.CurrentIteratorValue }}"
+              },
+              "Script": "import boto3\nimport json\nimport time\n\ndef get_partition():\n    sts = boto3.client('sts')\n    identity = sts.get_caller_identity()\n    arn = identity['Arn']\n    partition = arn.split(':')[1]\n    return partition\n\ndef handler(event, context):\n    iam = boto3.client('iam')\n    role_names = json.loads(event['batchJson'])\n    \n    partition = get_partition()\n    policy_arn = f\"arn:{partition}:iam::aws:policy/AmazonInspector2ManagedTelemetryPolicy\"\n    attached = 0\n    skipped = 0\n    errors = []\n    for role_name in role_names:\n        try:\n            current = iam.list_attached_role_policies(RoleName=role_name)\n            policy_arns = [p['PolicyArn'] for p in current['AttachedPolicies']]\n            if policy_arn in policy_arns:\n                skipped += 1\n                continue\n            iam.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)\n            attached += 1\n            time.sleep(0.05)\n        except Exception as e:\n            err = str(e)\n            errors.append(role_name + ': ' + err)\n    return {'attached': attached, 'skipped': skipped, 'errors': errors}\n"
+            },
+            "outputs": [
+              {
+                "Name": "Attached",
+                "Selector": "$.Payload.attached",
+                "Type": "Integer"
+              },
+              {
+                "Name": "Skipped",
+                "Selector": "$.Payload.skipped",
+                "Type": "Integer"
+              },
+              {
+                "Name": "Errors",
+                "Selector": "$.Payload.errors",
+                "Type": "StringList"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "automationExecutionId": "{{ automation:EXECUTION_ID }}",
+          "dhmcInfo": "{{ ListAndSplitProfiles.DHMC }}",
+          "batchCount": "{{ ListAndSplitProfiles.BatchCount }}"
+        },
+        "Script": "import boto3\nimport json\ndef handler(event, context):\n    ssm = boto3.client('ssm')\n    execution_id = event['automationExecutionId']\n    dhmc_info = event.get('dhmcInfo', {})\n    \n    # Get automation execution details\n    response = ssm.get_automation_execution(AutomationExecutionId=execution_id)\n    step_executions = response['AutomationExecution'].get('StepExecutions', [])\n    \n    total_attached = 0\n    total_skipped = 0\n    total_errors = 0\n    error_details = []\n    \n    # Find all HandleBatch step executions\n    for step in step_executions:\n        step_name = step.get('StepName', '')\n        # Match any step that contains HandleBatch\n        if 'HandleBatch' in step_name:\n            outputs = step.get('Outputs', {})\n            \n            # Extract Attached count\n            if 'Attached' in outputs:\n                attached_val = outputs['Attached']\n                if isinstance(attached_val, list) and len(attached_val) > 0:\n                    total_attached += int(attached_val[0])\n                elif attached_val:\n                    total_attached += int(attached_val)\n            \n            # Extract Skipped count\n            if 'Skipped' in outputs:\n                skipped_val = outputs['Skipped']\n                if isinstance(skipped_val, list) and len(skipped_val) > 0:\n                    total_skipped += int(skipped_val[0])\n                elif skipped_val:\n                    total_skipped += int(skipped_val)\n            \n            # Extract Errors\n            if 'Errors' in outputs:\n                errors = outputs['Errors']\n                if isinstance(errors, list):\n                    # Filter out empty strings\n                    valid_errors = [e for e in errors if e and e.strip()]\n                    if valid_errors:\n                        total_errors += len(valid_errors)\n                        error_details.extend(valid_errors)\n    \n    # Log summary\n    print()\n    print(\"Execution Report\")\n    print(\"=\" * 60)\n    print(f\"Successfully Attached: {total_attached}\")\n    print(f\"Skipped: {total_skipped}\")\n    print(f\"Failed: {total_errors}\")\n    if error_details:\n        print(\"-\" * 60)\n        print(f\"Sample Errors ({len(error_details)} total):\")\n        for i, err in enumerate(error_details[:3], 1):\n            print(f\"  {i}. {err}\")\n    print(\"-\" * 60)\n    if dhmc_info and dhmc_info.get('checked'):\n        print(\"DHMC Role Information:\")\n        \n        if not dhmc_info.get('found'):\n            print(f\"  - Status: Not Configured\")\n        elif 'error' in dhmc_info:\n            print(f\"  - Status: Failed\")\n            print(f\"  - Role Name: {dhmc_info.get('roleName', 'N/A')}\")\n            print(f\"  - Error: {dhmc_info['error']}\")\n        elif dhmc_info.get('alreadyHad'):\n            print(f\"  - Status: Already Had Policy (Skipped)\")\n            print(f\"  - Role Name: {dhmc_info.get('roleName', 'N/A')}\")\n        elif dhmc_info.get('processed'):\n            print(f\"  - Status: Successfully Attached\")\n            print(f\"  - Role Name: {dhmc_info.get('roleName', 'N/A')}\")\n        else:\n            print(f\"  - Status: Unknown\")\n            print(f\"  - Role Name: {dhmc_info.get('roleName', 'N/A')}\")\n    print(\"=\" * 60)\n\n    return {'status': 'Report generated successfully'}\n"
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        }
+      ]
+    }
+  ]
+}
