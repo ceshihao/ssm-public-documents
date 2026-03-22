@@ -1,10 +1,9 @@
 {
   "schemaVersion": "0.3",
-  "description": "**This Document is not intended to run by itself, but to be invoked from the main document AWSEC2-CloneInstanceAndUpgradeWindows**  Given a running Instance with SSM Agent installed, upgrade to Windows Server 2016, 2019 or 2022. This document will create an AMI from the running instance and launch a new instance from the Image and will upgrade the new instance. Note that if the running instance does not have SSM installed, we will attempt to install SSM in the new instance before it is upgraded. The running instance remains untouched.",
   "parameters": {
     "InstanceId": {
       "type": "String",
-      "description": "(Required) The Instance running Windows Server 2012 R2 with the SSM agent installed.",
+      "description": "(Required) The Instance running Windows Server 2012 R2, 2016, 2019 or 2022 with the SSM agent installed.",
       "allowedPattern": "^[a-zA-Z0-9]*i-[a-z0-9]{8,17}$"
     },
     "IamInstanceProfile": {
@@ -24,7 +23,8 @@
       "allowedValues": [
         "2016",
         "2019",
-        "2022"
+        "2022",
+        "2025"
       ]
     },
     "amiName": {
@@ -75,6 +75,8 @@
       "name": "describeOriginalInstanceDetails",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
+      "nextStep": "branchOnImdsV2Required",
+      "isEnd": false,
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstances",
@@ -118,8 +120,7 @@
           "Selector": "$.Reservations[0].Instances[0].MetadataOptions.HttpTokens",
           "Type": "String"
         }
-      ],
-      "nextStep": "branchOnImdsV2Required"
+      ]
     },
     {
       "name": "branchOnImdsV2Required",
@@ -148,6 +149,9 @@
     {
       "name": "assertRootVolumeIsEbs",
       "action": "aws:assertAwsResourceProperty",
+      "nextStep": "branchOnRebootInstanceBeforeTakingImage",
+      "isCritical": "true",
+      "isEnd": false,
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstances",
@@ -158,13 +162,12 @@
         "DesiredValues": [
           "ebs"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "branchOnRebootInstanceBeforeTakingImage"
+      }
     },
     {
       "name": "branchOnRebootInstanceBeforeTakingImage",
       "action": "aws:branch",
+      "isCritical": "true",
       "inputs": {
         "Choices": [
           {
@@ -174,13 +177,14 @@
           }
         ],
         "Default": "createImageWithNoReboot"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "createImageWithReboot",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
+      "nextStep": "describeOriginalInstanceImage",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
@@ -195,13 +199,14 @@
           "Selector": "$.ImageId",
           "Type": "String"
         }
-      ],
-      "nextStep": "describeOriginalInstanceImage"
+      ]
     },
     {
       "name": "createImageWithNoReboot",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
+      "nextStep": "describeOriginalInstanceImage",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
@@ -216,13 +221,14 @@
           "Selector": "$.ImageId",
           "Type": "String"
         }
-      ],
-      "nextStep": "describeOriginalInstanceImage"
+      ]
     },
     {
       "name": "describeOriginalInstanceImage",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
+      "nextStep": "waitTillOriginalInstanceImageImageReady",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
@@ -242,14 +248,15 @@
           "Selector": "$.Images[0].ImageId",
           "Type": "String"
         }
-      ],
-      "nextStep": "waitTillOriginalInstanceImageImageReady"
+      ]
     },
     {
       "name": "waitTillOriginalInstanceImageImageReady",
       "action": "aws:waitForAwsResourceProperty",
-      "onFailure": "step:deleteServerUpgradeInstance",
       "maxAttempts": 2,
+      "nextStep": "branchUseAlternativeKeyPair",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeImages",
@@ -260,12 +267,12 @@
         "DesiredValues": [
           "available"
         ]
-      },
-      "nextStep": "branchUseAlternativeKeyPair"
+      }
     },
     {
       "name": "branchUseAlternativeKeyPair",
       "action": "aws:branch",
+      "isCritical": "true",
       "inputs": {
         "Choices": [
           {
@@ -282,14 +289,16 @@
           }
         ],
         "Default": "serverUpgradeInstanceWithOriginalKeyPair"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "serverUpgradeInstanceWithoutKeyPair",
       "action": "aws:runInstances",
-      "timeoutSeconds": 7200,
       "maxAttempts": 3,
+      "timeoutSeconds": 7200,
+      "nextStep": "getServerUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
       "inputs": {
         "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
         "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
@@ -315,15 +324,16 @@
           }
         ],
         "UserData": "PHBvd2Vyc2hlbGw+CiRzZXJ2aWNlTmFtZSA9ICJBbWF6b25TU01BZ2VudCIKJHNlcnZpY2VEb3dubG9hZFBhdGggPSAiQzpcdGVtcFxBbWF6b25TU01BZ2VudFNldHVwLmV4ZSIKCklmIChHZXQtU2VydmljZSAkc2VydmljZU5hbWUgLUVycm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUgLVdhcm5pbmdBY3Rpb24gU2lsZW50bHlDb250aW51ZSkgewogICAgSWYgKChHZXQtU2VydmljZSAkc2VydmljZU5hbWUpLlN0YXR1cyAtbmUgIlJ1bm5pbmciKSB7CiAgICAgICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgICAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgZm91bmQsIGJ1dCBpdCBpcyBub3QgcnVubmluZywgc28gc3RhcnRlZCBpdC4iCiAgICB9Cn0gRWxzZSB7CiAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgbm90IGZvdW5kLCB0cnlpbmcgdG8gaW5zdGFsbC4iCiAgICAgTmV3LUl0ZW0gLUl0ZW1UeXBlIERpcmVjdG9yeSAtRm9yY2UgLVBhdGggIkM6XHRlbXAiCiAgICAgW1N5c3RlbS5OZXQuU2VydmljZVBvaW50TWFuYWdlcl06OlNlY3VyaXR5UHJvdG9jb2wgPSBbU3lzdGVtLk5ldC5TZWN1cml0eVByb3RvY29sVHlwZV06OlRsczEyOyAgCiAgICAoTmV3LU9iamVjdCBTeXN0ZW0uTmV0LldlYkNsaWVudCkuRG93bmxvYWRGaWxlKCJodHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC93aW5kb3dzX2FtZDY0L0FtYXpvblNTTUFnZW50U2V0dXAuZXhlIiwgIiRzZXJ2aWNlRG93bmxvYWRQYXRoIikKICAgIFN0YXJ0LVByb2Nlc3MgLUZpbGVQYXRoICIkc2VydmljZURvd25sb2FkUGF0aCIgIC1Bcmd1bWVudExpc3QgQCgiL3F1aWV0IiwgIi9ub3Jlc3RhcnQiLCAiL2xvZyIsICJzc20taW5zdGFsbC5sb2ciLCAiQUxMT1dFQzJJTlNUQUxMPVlFUyIpIC1XYWl0CiAgICBTdGFydC1TbGVlcCAtcyAxMAogICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgIFdyaXRlLUhvc3QgIiRzZXJ2aWNlTmFtZSBpbnN0YWxsZWQgYW5kIHN0YXJ0ZWQuIgp9CjwvcG93ZXJzaGVsbD4KPHBlcnNpc3Q+dHJ1ZTwvcGVyc2lzdD4="
-      },
-      "isCritical": "true",
-      "nextStep": "getServerUpgradeInstance"
+      }
     },
     {
       "name": "serverUpgradeInstanceWithAlternativeKeyPair",
       "action": "aws:runInstances",
-      "timeoutSeconds": 7200,
       "maxAttempts": 3,
+      "timeoutSeconds": 7200,
+      "nextStep": "getServerUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
       "inputs": {
         "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
         "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
@@ -350,15 +360,16 @@
           }
         ],
         "UserData": "PHBvd2Vyc2hlbGw+CiRzZXJ2aWNlTmFtZSA9ICJBbWF6b25TU01BZ2VudCIKJHNlcnZpY2VEb3dubG9hZFBhdGggPSAiQzpcdGVtcFxBbWF6b25TU01BZ2VudFNldHVwLmV4ZSIKCklmIChHZXQtU2VydmljZSAkc2VydmljZU5hbWUgLUVycm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUgLVdhcm5pbmdBY3Rpb24gU2lsZW50bHlDb250aW51ZSkgewogICAgSWYgKChHZXQtU2VydmljZSAkc2VydmljZU5hbWUpLlN0YXR1cyAtbmUgIlJ1bm5pbmciKSB7CiAgICAgICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgICAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgZm91bmQsIGJ1dCBpdCBpcyBub3QgcnVubmluZywgc28gc3RhcnRlZCBpdC4iCiAgICB9Cn0gRWxzZSB7CiAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgbm90IGZvdW5kLCB0cnlpbmcgdG8gaW5zdGFsbC4iCiAgICAgTmV3LUl0ZW0gLUl0ZW1UeXBlIERpcmVjdG9yeSAtRm9yY2UgLVBhdGggIkM6XHRlbXAiCiAgICAgW1N5c3RlbS5OZXQuU2VydmljZVBvaW50TWFuYWdlcl06OlNlY3VyaXR5UHJvdG9jb2wgPSBbU3lzdGVtLk5ldC5TZWN1cml0eVByb3RvY29sVHlwZV06OlRsczEyOyAgCiAgICAoTmV3LU9iamVjdCBTeXN0ZW0uTmV0LldlYkNsaWVudCkuRG93bmxvYWRGaWxlKCJodHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC93aW5kb3dzX2FtZDY0L0FtYXpvblNTTUFnZW50U2V0dXAuZXhlIiwgIiRzZXJ2aWNlRG93bmxvYWRQYXRoIikKICAgIFN0YXJ0LVByb2Nlc3MgLUZpbGVQYXRoICIkc2VydmljZURvd25sb2FkUGF0aCIgIC1Bcmd1bWVudExpc3QgQCgiL3F1aWV0IiwgIi9ub3Jlc3RhcnQiLCAiL2xvZyIsICJzc20taW5zdGFsbC5sb2ciLCAiQUxMT1dFQzJJTlNUQUxMPVlFUyIpIC1XYWl0CiAgICBTdGFydC1TbGVlcCAtcyAxMAogICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgIFdyaXRlLUhvc3QgIiRzZXJ2aWNlTmFtZSBpbnN0YWxsZWQgYW5kIHN0YXJ0ZWQuIgp9CjwvcG93ZXJzaGVsbD4KPHBlcnNpc3Q+dHJ1ZTwvcGVyc2lzdD4="
-      },
-      "isCritical": "true",
-      "nextStep": "getServerUpgradeInstance"
+      }
     },
     {
       "name": "serverUpgradeInstanceWithOriginalKeyPair",
       "action": "aws:runInstances",
-      "timeoutSeconds": 7200,
       "maxAttempts": 3,
+      "timeoutSeconds": 7200,
+      "nextStep": "getServerUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
       "inputs": {
         "ImageId": "{{ describeOriginalInstanceImage.ImageId }}",
         "InstanceType": "{{ describeOriginalInstanceDetails.InstanceType }}",
@@ -385,13 +396,14 @@
           }
         ],
         "UserData": "PHBvd2Vyc2hlbGw+CiRzZXJ2aWNlTmFtZSA9ICJBbWF6b25TU01BZ2VudCIKJHNlcnZpY2VEb3dubG9hZFBhdGggPSAiQzpcdGVtcFxBbWF6b25TU01BZ2VudFNldHVwLmV4ZSIKCklmIChHZXQtU2VydmljZSAkc2VydmljZU5hbWUgLUVycm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUgLVdhcm5pbmdBY3Rpb24gU2lsZW50bHlDb250aW51ZSkgewogICAgSWYgKChHZXQtU2VydmljZSAkc2VydmljZU5hbWUpLlN0YXR1cyAtbmUgIlJ1bm5pbmciKSB7CiAgICAgICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgICAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgZm91bmQsIGJ1dCBpdCBpcyBub3QgcnVubmluZywgc28gc3RhcnRlZCBpdC4iCiAgICB9Cn0gRWxzZSB7CiAgICBXcml0ZS1Ib3N0ICIkc2VydmljZU5hbWUgbm90IGZvdW5kLCB0cnlpbmcgdG8gaW5zdGFsbC4iCiAgICAgTmV3LUl0ZW0gLUl0ZW1UeXBlIERpcmVjdG9yeSAtRm9yY2UgLVBhdGggIkM6XHRlbXAiCiAgICAgW1N5c3RlbS5OZXQuU2VydmljZVBvaW50TWFuYWdlcl06OlNlY3VyaXR5UHJvdG9jb2wgPSBbU3lzdGVtLk5ldC5TZWN1cml0eVByb3RvY29sVHlwZV06OlRsczEyOyAgCiAgICAoTmV3LU9iamVjdCBTeXN0ZW0uTmV0LldlYkNsaWVudCkuRG93bmxvYWRGaWxlKCJodHRwczovL3MzLmFtYXpvbmF3cy5jb20vZWMyLWRvd25sb2Fkcy13aW5kb3dzL1NTTUFnZW50L2xhdGVzdC93aW5kb3dzX2FtZDY0L0FtYXpvblNTTUFnZW50U2V0dXAuZXhlIiwgIiRzZXJ2aWNlRG93bmxvYWRQYXRoIikKICAgIFN0YXJ0LVByb2Nlc3MgLUZpbGVQYXRoICIkc2VydmljZURvd25sb2FkUGF0aCIgIC1Bcmd1bWVudExpc3QgQCgiL3F1aWV0IiwgIi9ub3Jlc3RhcnQiLCAiL2xvZyIsICJzc20taW5zdGFsbC5sb2ciLCAiQUxMT1dFQzJJTlNUQUxMPVlFUyIpIC1XYWl0CiAgICBTdGFydC1TbGVlcCAtcyAxMAogICAgU3RhcnQtU2VydmljZSAkc2VydmljZU5hbWUKICAgIFdyaXRlLUhvc3QgIiRzZXJ2aWNlTmFtZSBpbnN0YWxsZWQgYW5kIHN0YXJ0ZWQuIgp9CjwvcG93ZXJzaGVsbD4KPHBlcnNpc3Q+dHJ1ZTwvcGVyc2lzdD4="
-      },
-      "isCritical": "true",
-      "nextStep": "getServerUpgradeInstance"
+      }
     },
     {
       "name": "getServerUpgradeInstance",
       "action": "aws:executeAwsApi",
+      "nextStep": "waitForInstanceToReady",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
@@ -411,16 +423,17 @@
           "Selector": "$.Reservations[0].Instances[0].InstanceId",
           "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "waitForInstanceToReady"
+      ]
     },
     {
       "name": "waitForInstanceToReady",
       "action": "aws:waitForAwsResourceProperty",
-      "onFailure": "step:rebootToMakeItReady",
-      "timeoutSeconds": 600,
       "maxAttempts": 2,
+      "timeoutSeconds": 600,
+      "nextStep": "checkForSSMAgent",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "step:rebootToMakeItReady",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstanceStatus",
@@ -431,13 +444,14 @@
         "DesiredValues": [
           "passed"
         ]
-      },
-      "isCritical": "false",
-      "nextStep": "checkForSSMAgent"
+      }
     },
     {
       "name": "rebootToMakeItReady",
       "action": "aws:executeAwsApi",
+      "nextStep": "waitForInstanceToBeReadyAfterReboot",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "step:waitForInstanceToBeReadyAfterReboot",
       "inputs": {
         "Service": "ec2",
@@ -445,16 +459,17 @@
         "InstanceIds": [
           "{{ getServerUpgradeInstance.InstanceId }}"
         ]
-      },
-      "isCritical": "false",
-      "nextStep": "waitForInstanceToBeReadyAfterReboot"
+      }
     },
     {
       "name": "waitForInstanceToBeReadyAfterReboot",
       "action": "aws:waitForAwsResourceProperty",
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "timeoutSeconds": 600,
       "maxAttempts": 2,
+      "timeoutSeconds": 600,
+      "nextStep": "checkForSSMAgent",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstanceStatus",
@@ -465,15 +480,16 @@
         "DesiredValues": [
           "passed"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "checkForSSMAgent"
+      }
     },
     {
       "name": "checkForSSMAgent",
       "action": "aws:waitForAwsResourceProperty",
-      "timeoutSeconds": 120,
       "maxAttempts": 5,
+      "timeoutSeconds": 120,
+      "nextStep": "getUpgradeServerInstanceDetails",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:prepareServerInstanceForSSMInstall",
       "inputs": {
         "Service": "ssm",
@@ -490,15 +506,16 @@
         "DesiredValues": [
           "Online"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "getUpgradeServerInstanceDetails"
+      }
     },
     {
       "name": "prepareServerInstanceForSSMInstall",
       "action": "aws:executeAutomation",
       "maxAttempts": 3,
       "timeoutSeconds": 3600,
+      "nextStep": "startServerInstanceWithSSMInstall",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "DocumentName": "AWSSupport-StartEC2RescueWorkflow",
@@ -510,15 +527,16 @@
             "JEVDMlNldHRpbmdzRmlsZT0iJHtlbnY6RUMyUkVTQ1VFX09GRkxJTkVfUFJPR1JBTV9GSUxFU19ESVJ9XEFtYXpvblxFYzJDb25maWdTZXJ2aWNlXFNldHRpbmdzXENvbmZpZy54bWwiCndyaXRlLWhvc3QgIkZvdW5kIEVDMiBTZXR0aW5ncyBmaWxlIGluICQoJEVDMlNldHRpbmdzRmlsZSkiCiR4bWwgPSBbeG1sXShnZXQtY29udGVudCAkRUMyU2V0dGluZ3NGaWxlKQokeG1sRWxlbWVudCA9ICR4bWwuZ2V0X0RvY3VtZW50RWxlbWVudCgpCiR4bWxFbGVtZW50VG9Nb2RpZnkgPSAkeG1sRWxlbWVudC5QbHVnaW5zCndyaXRlLWhvc3QgIlNldHRpbmcgQ29uZmlnLnhtbCIKZm9yZWFjaCAoJGVsZW1lbnQgaW4gJHhtbEVsZW1lbnRUb01vZGlmeS5QbHVnaW4pCnsKCXdyaXRlLWhvc3QgIiAkKCRlbGVtZW50Lm5hbWUpIgoJaWYgKCRlbGVtZW50Lm5hbWUgLWVxICJFYzJIYW5kbGVVc2VyRGF0YSIpCgl7CgkJd3JpdGUtaG9zdCAiYWJvdXQgdG8gdXBkYXRlICQoJGVsZW1lbnQubmFtZSkiCgkJJGVsZW1lbnQuU3RhdGU9IkVuYWJsZWQiCgl9CgkJCgl3cml0ZS1ob3N0ICIgICQoJGVsZW1lbnQuU3RhdGUpIgp9CiR4bWwuU2F2ZSgkRUMyU2V0dGluZ3NGaWxlKQ=="
           ]
         }
-      },
-      "isCritical": "true",
-      "nextStep": "startServerInstanceWithSSMInstall"
+      }
     },
     {
       "name": "startServerInstanceWithSSMInstall",
       "action": "aws:changeInstanceState",
       "maxAttempts": 3,
       "timeoutSeconds": 600,
+      "nextStep": "waitSSMAgentOnlineOnServerUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "InstanceIds": [
@@ -526,15 +544,16 @@
         ],
         "CheckStateOnly": false,
         "DesiredState": "running"
-      },
-      "isCritical": "true",
-      "nextStep": "waitSSMAgentOnlineOnServerUpgradeInstance"
+      }
     },
     {
       "name": "waitSSMAgentOnlineOnServerUpgradeInstance",
       "action": "aws:waitForAwsResourceProperty",
-      "timeoutSeconds": 120,
       "maxAttempts": 5,
+      "timeoutSeconds": 120,
+      "nextStep": "getUpgradeServerInstanceDetails",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ssm",
@@ -551,14 +570,15 @@
         "DesiredValues": [
           "Online"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "getUpgradeServerInstanceDetails"
+      }
     },
     {
       "name": "getUpgradeServerInstanceDetails",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
+      "nextStep": "assertSupportedWindowsVersion2019",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
@@ -578,18 +598,17 @@
           "Selector": "$.Reservations[0].Instances[0].NetworkInterfaces[0].SubnetId",
           "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "assertSupportedWindowsVersion2019"
+      ]
     },
     {
       "name": "assertSupportedWindowsVersion2019",
       "action": "aws:runCommand",
       "maxAttempts": 3,
-      "onFailure": "step:deleteServerUpgradeInstance",
       "timeoutSeconds": 600,
-      "isCritical": "true",
       "nextStep": "runScriptBeforeWindowServerUpgrade2019",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
         "InstanceIds": [
@@ -692,6 +711,9 @@
       "name": "runScriptBeforeWindowServerUpgrade2019",
       "action": "aws:runCommand",
       "maxAttempts": 3,
+      "nextStep": "getAmazonOwnedWindowsServerSnapShotId",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
@@ -763,16 +785,17 @@
             "GetSnapshot-ForCulture"
           ]
         }
-      },
-      "isCritical": "true",
-      "nextStep": "getAmazonOwnedWindowsServerSnapShotId"
+      }
     },
     {
       "name": "getAmazonOwnedWindowsServerSnapShotId",
       "action": "aws:executeAwsApi",
       "maxAttempts": 3,
-      "onFailure": "step:deleteServerUpgradeInstance",
       "timeoutSeconds": 600,
+      "nextStep": "branchOnLicensingToGetWindowMediaSnapshot",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeSnapshots",
@@ -794,17 +817,16 @@
           "Selector": "$.Snapshots[0].SnapshotId",
           "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "nextStep": "branchOnLicensingToGetWindowMediaSnapshot"
+      ]
     },
     {
       "name": "branchOnLicensingToGetWindowMediaSnapshot",
       "action": "aws:branch",
-      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
       "inputs": {
         "Choices": [
           {
+            "NextStep": "assertFailBecauseSameSnapshotOwnedByAmazon",
             "And": [
               {
                 "Variable": "{{ assertSupportedWindowsVersion2019.Output }}",
@@ -814,22 +836,23 @@
                 "Variable": "{{ BYOLWindowsMediaSnapshotId }}",
                 "StringEquals": "{{ getAmazonOwnedWindowsServerSnapShotId.SnapShotId }}"
               }
-            ],
-            "NextStep": "assertFailBecauseSameSnapshotOwnedByAmazon"
+            ]
           },
           {
+            "NextStep": "useCustomerWindowMediaSnapshotToCreateVolume",
             "Variable": "{{ assertSupportedWindowsVersion2019.Output }}",
-            "Contains": "BYOL",
-            "NextStep": "useCustomerWindowMediaSnapshotToCreateVolume"
+            "Contains": "BYOL"
           }
         ],
         "Default": "useAmazonProvidedWindowMediaSnapshotToCreateVolume"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "assertFailBecauseSameSnapshotOwnedByAmazon",
       "action": "aws:assertAwsResourceProperty",
+      "nextStep": "deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
@@ -841,15 +864,17 @@
         "DesiredValues": [
           "{{ automation:EXECUTION_ID }}"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "deleteServerUpgradeInstance"
+      }
     },
     {
       "name": "useCustomerWindowMediaSnapshotToCreateVolume",
       "action": "aws:executeAwsApi",
       "maxAttempts": 3,
       "timeoutSeconds": 600,
+      "nextStep": "describeWindowMediaSnapshotVolume",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "CreateVolume",
@@ -867,16 +892,17 @@
             ]
           }
         ]
-      },
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "isCritical": "true",
-      "nextStep": "describeWindowMediaSnapshotVolume"
+      }
     },
     {
       "name": "useAmazonProvidedWindowMediaSnapshotToCreateVolume",
       "action": "aws:executeAwsApi",
       "maxAttempts": 3,
       "timeoutSeconds": 600,
+      "nextStep": "sleepForVolumetoBeCreated",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "CreateVolume",
@@ -894,26 +920,27 @@
             ]
           }
         ]
-      },
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "isCritical": "true",
-      "nextStep": "sleepForVolumetoBeCreated"
+      }
     },
     {
       "name": "sleepForVolumetoBeCreated",
       "action": "aws:sleep",
+      "nextStep": "tryToGetWindowMediaSnapshotVolume",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Duration": "PT2M"
-      },
-      "isCritical": "false",
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "nextStep": "tryToGetWindowMediaSnapshotVolume"
+      }
     },
     {
       "name": "tryToGetWindowMediaSnapshotVolume",
       "action": "aws:executeAwsApi",
       "maxAttempts": 3,
       "timeoutSeconds": 600,
+      "nextStep": "describeWindowMediaSnapshotVolume",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
@@ -939,15 +966,16 @@
           "Selector": "$.Volumes[0].VolumeId",
           "Type": "String"
         }
-      ],
-      "isCritical": "false",
-      "nextStep": "describeWindowMediaSnapshotVolume"
+      ]
     },
     {
       "name": "describeWindowMediaSnapshotVolume",
       "action": "aws:executeAwsApi",
       "maxAttempts": 3,
       "timeoutSeconds": 600,
+      "nextStep": "waitUntilWindowMediaSnapshotVolumeIsAvailable",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
@@ -973,15 +1001,16 @@
           "Selector": "$.Volumes[0].VolumeId",
           "Type": "String"
         }
-      ],
-      "isCritical": "false",
-      "nextStep": "waitUntilWindowMediaSnapshotVolumeIsAvailable"
+      ]
     },
     {
       "name": "waitUntilWindowMediaSnapshotVolumeIsAvailable",
       "action": "aws:waitForAwsResourceProperty",
-      "onFailure": "step:deleteServerUpgradeInstance",
       "timeoutSeconds": 600,
+      "nextStep": "findAvailableDeviceMapping2019",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeVolumes",
@@ -997,13 +1026,13 @@
         "DesiredValues": [
           "available"
         ]
-      },
-      "isCritical": "true",
-      "nextStep": "findAvailableDeviceMapping2019"
+      }
     },
     {
       "name": "findAvailableDeviceMapping2019",
       "action": "aws:executeScript",
+      "nextStep": "attachInstallationMediaToUpgradeInstance",
+      "isEnd": false,
       "inputs": {
         "Runtime": "PowerShell 7.4",
         "Script": "$inputPayload = $env:InputPayload | ConvertFrom-Json\n$instanceMappings = $inputPayload.mappedDevices\n\nfunction Get-DeviceList {\nforeach ($letterMapping in 98..122) {\nif (-not ($instanceMappings -match \"sd$([char]$letterMapping)\" -or $instanceMappings -match \"xvd$([char]$letterMapping)\")) {\nreturn \"xvd$([char]$letterMapping)\"\n}\n}\n}\n$availableDevice = Get-DeviceList\n\nif (-not $availableDevice) {\nWrite-Host \"ERROR: No free device available.\"\nExit 1\n}\nelse {\nreturn @{availableDevice = \"$availableDevice\" }\nExit 0\n}",
@@ -1017,28 +1046,32 @@
           "Selector": "$.Payload.availableDevice",
           "Type": "String"
         }
-      ],
-      "nextStep": "attachInstallationMediaToUpgradeInstance"
+      ]
     },
     {
       "name": "attachInstallationMediaToUpgradeInstance",
       "action": "aws:executeAwsApi",
       "timeoutSeconds": 600,
+      "nextStep": "waitTillAttachedInstallationMediaToUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "AttachVolume",
         "Device": "{{ findAvailableDeviceMapping2019.availableDevice }}",
         "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
         "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
-      },
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "isCritical": "true",
-      "nextStep": "waitTillAttachedInstallationMediaToUpgradeInstance"
+      }
     },
     {
       "name": "waitTillAttachedInstallationMediaToUpgradeInstance",
       "action": "aws:waitForAwsResourceProperty",
       "timeoutSeconds": 1800,
+      "nextStep": "sleepBeforeWindowUpgradeAndStart",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeVolumes",
@@ -1060,26 +1093,28 @@
         "DesiredValues": [
           "in-use"
         ]
-      },
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "isCritical": "true",
-      "nextStep": "sleepBeforeWindowUpgradeAndStart"
+      }
     },
     {
       "name": "sleepBeforeWindowUpgradeAndStart",
       "action": "aws:sleep",
+      "nextStep": "runWindowsServerUpgrade2019",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Duration": "PT1M"
-      },
-      "isCritical": "false",
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "nextStep": "runWindowsServerUpgrade2019"
+      }
     },
     {
       "name": "runWindowsServerUpgrade2019",
       "action": "aws:runCommand",
-      "timeoutSeconds": 43200,
       "maxAttempts": 1,
+      "timeoutSeconds": 43200,
+      "nextStep": "branchUpgradeSleep",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:getTheErrorDetails",
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
         "InstanceIds": [
@@ -1233,17 +1268,17 @@
             "Upgrade-Server"
           ]
         }
-      },
-      "onFailure": "step:getTheErrorDetails",
-      "isCritical": "true",
-      "nextStep": "branchUpgradeSleep"
+      }
     },
     {
       "name": "getTheErrorDetails",
       "action": "aws:runCommand",
       "maxAttempts": 3,
-      "onFailure": "step:deleteServerUpgradeInstance",
       "timeoutSeconds": 300,
+      "nextStep": "deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
         "InstanceIds": [
@@ -1257,50 +1292,69 @@
             "get-content \"C:\\$WINDOWS.~BT\\Sources\\Rollback\\setuperr.log\" -Raw"
           ]
         }
-      },
-      "isCritical": "true",
-      "nextStep": "deleteServerUpgradeInstance"
+      }
     },
     {
       "name": "branchUpgradeSleep",
       "action": "aws:branch",
+      "isCritical": "true",
       "inputs": {
         "Choices": [
           {
             "NextStep": "sleepForWindowUpgradeAndStart2022",
             "Variable": "{{ TargetWindowVersion }}",
             "StringEquals": "2022"
+          },
+          {
+            "NextStep": "sleepForWindowUpgradeAndStart2025",
+            "Variable": "{{ TargetWindowVersion }}",
+            "StringEquals": "2025"
           }
         ],
         "Default": "sleepForWindowUpgradeAndStart"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "sleepForWindowUpgradeAndStart",
       "action": "aws:sleep",
+      "nextStep": "checkAfterWindowsUpgrade2019",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Duration": "PT10M"
-      },
-      "isCritical": "false",
-      "nextStep": "checkAfterWindowsUpgrade2019"
+      }
     },
     {
       "name": "sleepForWindowUpgradeAndStart2022",
       "action": "aws:sleep",
+      "nextStep": "checkAfterWindowsUpgrade2019",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Duration": "PT20M"
-      },
+      }
+    },
+    {
+      "name": "sleepForWindowUpgradeAndStart2025",
+      "action": "aws:sleep",
+      "nextStep": "checkAfterWindowsUpgrade2019",
       "isCritical": "false",
-      "nextStep": "checkAfterWindowsUpgrade2019"
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "Duration": "PT20M"
+      }
     },
     {
       "name": "checkAfterWindowsUpgrade2019",
       "action": "aws:runCommand",
-      "onFailure": "step:deleteServerUpgradeInstance",
       "maxAttempts": 10,
+      "nextStep": "branchOnWindowsUpgradeSuccess",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
         "InstanceIds": [
@@ -1399,31 +1453,28 @@
             ""
           ]
         }
-      },
-      "isCritical": "true",
-      "nextStep": "branchOnWindowsUpgradeSuccess"
+      }
     },
     {
       "name": "branchOnWindowsUpgradeSuccess",
       "action": "aws:branch",
       "maxAttempts": 3,
-      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
       "inputs": {
         "Choices": [
           {
+            "NextStep": "deleteServerUpgradeInstance",
             "Variable": "{{ checkAfterWindowsUpgrade2019.Output }}",
-            "Contains": "Error: Upgrade failed",
-            "NextStep": "deleteServerUpgradeInstance"
+            "Contains": "Error: Upgrade failed"
           }
         ],
         "Default": "branchOnLicensingTypeToActivateLicense"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "branchOnLicensingTypeToActivateLicense",
       "action": "aws:branch",
-      "onFailure": "step:deleteServerUpgradeInstance",
+      "isCritical": "true",
       "inputs": {
         "Choices": [
           {
@@ -1433,14 +1484,16 @@
           }
         ],
         "Default": "activateWindowsWithAmazonLicense"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "activateWindowsWithAmazonLicense",
       "action": "aws:executeAutomation",
       "maxAttempts": 3,
       "timeoutSeconds": 3600,
+      "nextStep": "DetachVolume",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWSSupport-ActivateWindowsWithAmazonLicense",
@@ -1452,29 +1505,34 @@
             "True"
           ]
         }
-      },
-      "isCritical": "false",
-      "nextStep": "DetachVolume"
+      }
     },
     {
       "name": "DetachVolume",
       "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 1800,
+      "nextStep": "waitUntilInstallationMediaIsDetached",
       "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DetachVolume",
         "InstanceId": "{{ getServerUpgradeInstance.InstanceId }}",
         "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}",
         "Force": true
-      },
-      "maxAttempts": 3,
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "timeoutSeconds": 1800,
-      "nextStep": "waitUntilInstallationMediaIsDetached"
+      }
     },
     {
       "name": "waitUntilInstallationMediaIsDetached",
       "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 3,
+      "timeoutSeconds": 1800,
+      "nextStep": "DeleteVolume",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeVolumes",
@@ -1490,33 +1548,32 @@
         "DesiredValues": [
           "available"
         ]
-      },
-      "maxAttempts": 3,
-      "isCritical": "true",
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "timeoutSeconds": 1800,
-      "nextStep": "DeleteVolume"
+      }
     },
     {
       "name": "DeleteVolume",
       "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "nextStep": "UpdateSSMAgent",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DeleteVolume",
         "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
-      },
-      "maxAttempts": 3,
-      "isCritical": "true",
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "timeoutSeconds": 300,
-      "nextStep": "UpdateSSMAgent"
+      }
     },
     {
       "name": "UpdateSSMAgent",
       "action": "aws:runCommand",
       "maxAttempts": 3,
-      "onFailure": "Continue",
       "timeoutSeconds": 600,
+      "nextStep": "UpgradeIntel82599VF2019",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWS-UpdateSSMAgent",
         "InstanceIds": [
@@ -1525,16 +1582,17 @@
         "Parameters": {
           "allowDowngrade": "false"
         }
-      },
-      "isCritical": "false",
-      "nextStep": "UpgradeIntel82599VF2019"
+      }
     },
     {
       "name": "UpgradeIntel82599VF2019",
       "action": "aws:runCommand",
       "maxAttempts": 3,
-      "onFailure": "Continue",
       "timeoutSeconds": 300,
+      "nextStep": "MigrateEC2LaunchV2",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWS-RunPowerShellScript",
         "InstanceIds": [
@@ -1640,29 +1698,31 @@
             "Remove-Item -Path $targetFolder -Recurse -Force:$True | Out-Null"
           ]
         }
-      },
-      "isCritical": "false",
-      "nextStep": "MigrateEC2LaunchV2"
+      }
     },
     {
       "name": "MigrateEC2LaunchV2",
       "action": "aws:runCommand",
       "maxAttempts": 3,
-      "onFailure": "Continue",
       "timeoutSeconds": 7200,
+      "nextStep": "upgradeWindowsAWSDrivers",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWSEC2Launch-RunMigration",
         "InstanceIds": [
           "{{ getServerUpgradeInstance.InstanceId }}"
         ]
-      },
-      "isCritical": "false",
-      "nextStep": "upgradeWindowsAWSDrivers"
+      }
     },
     {
       "name": "upgradeWindowsAWSDrivers",
       "action": "aws:executeAutomation",
       "timeoutSeconds": 3600,
+      "nextStep": "getPreBackUpAMIFromDriverUpgrade",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWSSupport-UpgradeWindowsAWSDrivers",
@@ -1671,13 +1731,14 @@
             "{{ getServerUpgradeInstance.InstanceId }}"
           ]
         }
-      },
-      "isCritical": "false",
-      "nextStep": "getPreBackUpAMIFromDriverUpgrade"
+      }
     },
     {
       "name": "getPreBackUpAMIFromDriverUpgrade",
       "action": "aws:executeAwsApi",
+      "nextStep": "deletePreBackupAMIFromDriverUpgrade",
+      "isCritical": "false",
+      "isEnd": false,
       "onFailure": "Continue",
       "inputs": {
         "Service": "ssm",
@@ -1690,28 +1751,30 @@
           "Selector": "$.AutomationExecution.Outputs.'preUpgradeBackup.BackupImageId'[0]",
           "Type": "String"
         }
-      ],
-      "isCritical": "false",
-      "nextStep": "deletePreBackupAMIFromDriverUpgrade"
+      ]
     },
     {
       "name": "deletePreBackupAMIFromDriverUpgrade",
       "action": "aws:deleteImage",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "installWindowUpdates",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "ImageId": "{{ getPreBackUpAMIFromDriverUpgrade.ImageId }}"
-      },
-      "maxAttempts": 3,
-      "isCritical": "false",
-      "onFailure": "Continue",
-      "timeoutSeconds": 600,
-      "nextStep": "installWindowUpdates"
+      }
     },
     {
       "name": "installWindowUpdates",
       "action": "aws:runCommand",
       "maxAttempts": 3,
-      "onFailure": "Continue",
       "timeoutSeconds": 3600,
+      "nextStep": "amiName",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "DocumentName": "AWS-InstallWindowsUpdates",
         "InstanceIds": [
@@ -1722,13 +1785,13 @@
           "Categories": "CriticalUpdates,SecurityUpdates",
           "SeverityLevels": "Critical,Important"
         }
-      },
-      "isCritical": "false",
-      "nextStep": "amiName"
+      }
     },
     {
       "name": "amiName",
       "action": "aws:executeScript",
+      "nextStep": "createImageServerUpgradeInstance",
+      "isEnd": false,
       "inputs": {
         "Runtime": "PowerShell 7.4",
         "Script": "$inputPayload = $env:InputPayload | ConvertFrom-Json\n$amiName = $inputPayload.amiName\n$targetVersion = $inputPayload.TargetVersion\n$instanceId = $inputPayload.InstanceId\n$executionId = $inputPayload.executionId\nif ([string]::IsNullOrWhitespace($amiName)) {\nreturn @{message = \"AWSEC2_UPGRADED_AMI_TO_{0}_FOR_INSTANCE_{1}_{2}\" -f $targetVersion, $instanceId, $executionId }\n}\nelse {\nreturn @{message = \"$amiName\" }\n}",
@@ -1745,12 +1808,17 @@
           "Selector": "$.Payload.message",
           "Type": "String"
         }
-      ],
-      "nextStep": "createImageServerUpgradeInstance"
+      ]
     },
     {
       "name": "createImageServerUpgradeInstance",
       "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "waitTillImageReadyForInterim",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "CreateImage",
@@ -1764,16 +1832,16 @@
           "Selector": "$.ImageId",
           "Type": "String"
         }
-      ],
-      "maxAttempts": 3,
-      "isCritical": "true",
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "timeoutSeconds": 600,
-      "nextStep": "waitTillImageReadyForInterim"
+      ]
     },
     {
       "name": "waitTillImageReadyForInterim",
       "action": "aws:waitForAwsResourceProperty",
+      "maxAttempts": 3,
+      "nextStep": "deleteServerUpgradeInstance",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "step:deleteServerUpgradeInstance",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeImages",
@@ -1784,33 +1852,33 @@
         "DesiredValues": [
           "available"
         ]
-      },
-      "maxAttempts": 3,
-      "isCritical": "true",
-      "onFailure": "step:deleteServerUpgradeInstance",
-      "nextStep": "deleteServerUpgradeInstance"
+      }
     },
     {
       "name": "deleteServerUpgradeInstance",
       "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 1800,
+      "nextStep": "waitForServerUpgradeInstanceDelete",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
         "Api": "TerminateInstances",
         "InstanceIds": [
           "{{ getServerUpgradeInstance.InstanceId }}"
         ]
-      },
-      "maxAttempts": 3,
-      "isCritical": "true",
-      "onFailure": "Continue",
-      "timeoutSeconds": 1800,
-      "nextStep": "waitForServerUpgradeInstanceDelete"
+      }
     },
     {
       "name": "waitForServerUpgradeInstanceDelete",
       "action": "aws:waitForAwsResourceProperty",
-      "onFailure": "Continue",
       "maxAttempts": 2,
+      "timeoutSeconds": 600,
+      "nextStep": "branchOnDeletingImageFromOriginalInstance",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeInstances",
@@ -1821,14 +1889,12 @@
         "DesiredValues": [
           "terminated"
         ]
-      },
-      "timeoutSeconds": 600,
-      "nextStep": "branchOnDeletingImageFromOriginalInstance"
+      }
     },
     {
       "name": "branchOnDeletingImageFromOriginalInstance",
       "action": "aws:branch",
-      "onFailure": "step:describeInstallationMediaVolume",
+      "isCritical": "true",
       "inputs": {
         "Choices": [
           {
@@ -1838,24 +1904,30 @@
           }
         ],
         "Default": "describeInstallationMediaVolume"
-      },
-      "isCritical": "true"
+      }
     },
     {
       "name": "deleteImageFromOriginalInstance",
       "action": "aws:deleteImage",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "describeInstallationMediaVolume",
+      "isCritical": "true",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "ImageId": "{{ describeOriginalInstanceImage.ImageId }}"
-      },
-      "maxAttempts": 3,
-      "isCritical": "true",
-      "onFailure": "Continue",
-      "timeoutSeconds": 600,
-      "nextStep": "describeInstallationMediaVolume"
+      }
     },
     {
       "name": "describeInstallationMediaVolume",
       "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300,
+      "nextStep": "branchOnInstallationMediaVolumeStatus",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "Continue",
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeVolumes",
@@ -1874,17 +1946,12 @@
           "Selector": "$.Volumes[0].State",
           "Type": "String"
         }
-      ],
-      "maxAttempts": 3,
-      "isCritical": "false",
-      "onFailure": "Continue",
-      "timeoutSeconds": 300,
-      "nextStep": "branchOnInstallationMediaVolumeStatus"
+      ]
     },
     {
       "name": "branchOnInstallationMediaVolumeStatus",
       "action": "aws:branch",
-      "onFailure": "step:getUpgradedImageDetails",
+      "isCritical": "false",
       "inputs": {
         "Choices": [
           {
@@ -1902,27 +1969,29 @@
           }
         ],
         "Default": "getUpgradedImageDetails"
-      },
-      "isCritical": "false"
+      }
     },
     {
       "name": "retryDeletingInstallationMediaVolume",
       "action": "aws:executeAwsApi",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600,
+      "nextStep": "getUpgradedImageDetails",
+      "isCritical": "false",
+      "isEnd": false,
+      "onFailure": "step:getUpgradedImageDetails",
       "inputs": {
         "Service": "ec2",
         "Api": "DeleteVolume",
         "VolumeId": "{{ describeWindowMediaSnapshotVolume.VolumeId }}"
-      },
-      "maxAttempts": 3,
-      "isCritical": "false",
-      "onFailure": "step:getUpgradedImageDetails",
-      "timeoutSeconds": 600,
-      "nextStep": "getUpgradedImageDetails"
+      }
     },
     {
       "name": "getUpgradedImageDetails",
       "action": "aws:executeAwsApi",
       "maxAttempts": 2,
+      "isCritical": "true",
+      "isEnd": true,
       "inputs": {
         "Service": "ec2",
         "Api": "DescribeImages",
@@ -1941,9 +2010,7 @@
           "Selector": "$.Images[0].Name",
           "Type": "String"
         }
-      ],
-      "isCritical": "true",
-      "isEnd": "true"
+      ]
     }
   ],
   "outputs": [
