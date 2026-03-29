@@ -1,0 +1,1263 @@
+{
+  "description": "The **AWSSupport-TroubleshootEKSDNSFailure** automation runbook helps troubleshoot issues with CoreDNS pods and configuration in Amazon Elastic Kubernetes Service (Amazon EKS) when applications/pods are encountering DNS resolution issues. The EKS cluster's authentication mode must be `API` or `API_AND_CONFIG_MAP`.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "GenerateReport.EvalReport"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "EksClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the target Amazon Elastic Kubernetes Service (EKS) cluster.",
+      "allowedPattern": "^[a-zA-Z0-9][a-zA-Z0-9-_]{0,99}$"
+    },
+    "DnsName": {
+      "type": "String",
+      "description": "(Optional) The stub domain suffix for the domain names that the application or pod fails to resolve. The default is amazon.com.",
+      "allowedPattern": "^$|^[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$",
+      "default": "amazon.com"
+    },
+    "ProblematicNodeInstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Optional) The instance ID of worker node where application is experiencing DNS resolution errors is running. A value for this parameter means that an EC2 instance will be created in your account and used to perform DNS resolution checks instead of this being done on the worker node. Consider providing a value for this parameter if the worker node is not in a public subnet (or does not have internet access) and do not want or cannot have bind-utils installed on the worker node due to security policies.",
+      "default": ""
+    },
+    "CoreDnsNamespace": {
+      "type": "String",
+      "description": "(Optional) The Kubernetes (K8s) namespace for CoreDNS pods. The default value is `kube-system`.",
+      "allowedPattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
+      "default": "kube-system"
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Optional) The target Amazon S3 bucket name where the troubleshooting logs will be uploaded.",
+      "default": ""
+    },
+    "LambdaRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the IAM role that allows the AWS Lambda function to access the required AWS services and resources. If no role is specified, this Systems Manager Automation will create one IAM role for Lambda in your account with the name `Automation-K8sProxy-Role-<ExecutionId>` that includes the managed policies: `AWSLambdaBasicExecutionRole` and `AWSLambdaVPCAccessExecutionRole`. It is recommended that you provide your own role with these required permissions.",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:role\\/[\\w+\\/=,.@-]+$",
+      "default": ""
+    }
+  },
+  "variables": {
+    "checksOnNodes": {
+      "type": "Boolean",
+      "description": "The boolean variable that indicates if checks have been performed on worker nodes.",
+      "default": false
+    },
+    "cfnStackDeleted": {
+      "type": "Boolean",
+      "description": "The boolean variable that indicates if the CloudFormation stack has been deleted.",
+      "default": false
+    },
+    "eksClusterExists": {
+      "type": "Boolean",
+      "description": "The boolean variable that indicates if the EKS cluster exists.",
+      "default": false
+    },
+    "K8sInfrastructureDeleted": {
+      "type": "Boolean",
+      "description": "The boolean variable that indicates if the proxy Lambda function has been deleted.",
+      "default": false
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "AssertIfTargetClusterExists",
+      "action": "aws:assertAwsResourceProperty",
+      "description": "Asserts if the provided target EKS Cluster specified in the `EksClusterName` parameter exists and is in the `ACTIVE` state.",
+      "maxAttempts": 3,
+      "timeoutSeconds": 60,
+      "isCritical": true,
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "Service": "eks",
+        "Api": "DescribeCluster",
+        "name": "{{ EksClusterName }}",
+        "PropertySelector": "$.cluster.status",
+        "DesiredValues": [
+          "ACTIVE"
+        ]
+      },
+      "nextStep": "UpdateEksClusterExists"
+    },
+    {
+      "name": "UpdateEksClusterExists",
+      "action": "aws:updateVariable",
+      "description": "Updates the boolean value for the `eksClusterExists` variable.",
+      "onFailure": "step:GenerateReport",
+      "maxAttempts": 1,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Name": "variable:eksClusterExists",
+        "Value": true
+      },
+      "nextStep": "GetVpcDnsSettings"
+    },
+    {
+      "name": "GetVpcDnsSettings",
+      "action": "aws:executeScript",
+      "description": "Retrieves VPC DNS settings (enableDnsSupport and enableDnsHostnames) for the EKS cluster VPC.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 300,
+      "nextStep": "BranchOnVpcDnsSettings",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "cluster_name": "{{ EksClusterName }}"
+        },
+        "Handler": "handler/get_vpc_dns_settings.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DnsValidation",
+          "Selector": "$.Payload.DnsValidation",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "EnableDnsSupport",
+          "Selector": "$.Payload.DnsValidation.DnsSupport",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "EnableDnsHostnames",
+          "Selector": "$.Payload.DnsValidation.DnsHostnames",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnVpcDnsSettings",
+      "action": "aws:branch",
+      "description": "Checks if VPC DNS settings are properly configured. If either enableDnsSupport or enableDnsHostnames is false, skips to report generation.",
+      "timeoutSeconds": 60,
+      "isEnd": false,
+      "isCritical": true,
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DeployK8sAuthApisResources",
+            "And": [
+              {
+                "Variable": "{{ GetVpcDnsSettings.EnableDnsSupport }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ GetVpcDnsSettings.EnableDnsHostnames }}",
+                "BooleanEquals": true
+              }
+            ]
+          }
+        ],
+        "Default": "GenerateReport"
+      }
+    },
+    {
+      "name": "DeployK8sAuthApisResources",
+      "action": "aws:executeAutomation",
+      "description": "Executes the SAW Document `AWSSupport-SetupK8sApiProxyForEKS` to deploy a Lambda function as a proxy to make authenticated API calls.",
+      "timeoutSeconds": 3600,
+      "nextStep": "RetrieveCoreDNSDeployment",
+      "isCritical": true,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ EksClusterName }}"
+          ],
+          "Operation": [
+            "Setup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "LambdaRoleArn": [
+            "{{ LambdaRoleArn }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      }
+    },
+    {
+      "name": "RetrieveCoreDNSDeployment",
+      "action": "aws:executeScript",
+      "description": "Retrieves information about the CoreDNS pods deployment, the readiness of CoreDNS pods and the containers in these pods and the readiness of the nodes hosting CoreDNS pods.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "RetrieveAndInspectCoreDNSConfigMap",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "namespace": "{{ CoreDnsNamespace }}",
+          "lambda_function_arn": "{{ DeployK8sAuthApisResources.Output }}"
+        },
+        "Handler": "handler/retrieve_core_dns_deployment.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "LambdaFunctionName",
+          "Selector": "$.Payload.lambda_function_name"
+        },
+        {
+          "Type": "Boolean",
+          "Name": "CoreDnsNodesExist",
+          "Selector": "$.Payload.Response.core_dns_nodes_exist"
+        },
+        {
+          "Type": "StringList",
+          "Name": "CoreDnsHostNodesInstanceIds",
+          "Selector": "$.Payload.Response.core_dns_nodes_instance_ids"
+        },
+        {
+          "Type": "StringList",
+          "Name": "CoreDnsPods",
+          "Selector": "$.Payload.Response.core_dns_pods"
+        },
+        {
+          "Type": "String",
+          "Name": "ClusterIP",
+          "Selector": "$.Payload.Response.cluster_ip"
+        },
+        {
+          "Type": "StringMap",
+          "Name": "Response",
+          "Selector": "$.Payload.Response"
+        }
+      ]
+    },
+    {
+      "name": "RetrieveAndInspectCoreDNSConfigMap",
+      "action": "aws:executeScript",
+      "description": "Retrieves the CoreDNS ConfigMap from the EKS cluster and checks for issues in the CoreDNS ConfigMap configuration.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "ValidateHpaConfiguration",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "namespace": "{{ CoreDnsNamespace }}",
+          "dns_name": "{{ DnsName }}",
+          "lambda_function_name": "{{ RetrieveCoreDNSDeployment.LambdaFunctionName }}"
+        },
+        "Handler": "handler/retrieve_and_inspect_configmap.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "Response",
+          "Selector": "$.Payload.Response"
+        }
+      ]
+    },
+    {
+      "name": "ValidateHpaConfiguration",
+      "action": "aws:executeScript",
+      "description": "Checks if there is HPA configuration for CoreDNS.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "CheckS3BucketPublicStatus",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "namespace": "{{ CoreDnsNamespace }}",
+          "lambda_function_name": "{{ RetrieveCoreDNSDeployment.LambdaFunctionName }}"
+        },
+        "Handler": "handler/validate_hpa_existence.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "Response",
+          "Selector": "$.Payload.Response"
+        }
+      ]
+    },
+    {
+      "name": "CheckS3BucketPublicStatus",
+      "description": "Checks if the Amazon S3 bucket specified in `S3BucketName` allows anonymous, or public read or write access permissions.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ S3BucketName }}",
+          "BucketOwnerAccount": "{{ global:ACCOUNT_ID }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.11",
+        "Attachment": "check_bucket_public_status.zip"
+      },
+      "nextStep": "CollectLogToS3"
+    },
+    {
+      "name": "CollectLogToS3",
+      "action": "aws:executeScript",
+      "description": "Collect CoreDNS logs and upload them to the S3 bucket.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "BranchOnProblematicNodeInstanceId",
+      "isCritical": true,
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "namespace": "{{ CoreDnsNamespace }}",
+          "s3_bucket_name": "{{ S3BucketName }}",
+          "lambda_function_name": "{{ RetrieveCoreDNSDeployment.LambdaFunctionName }}",
+          "core_dns_deployment": "{{ RetrieveCoreDNSDeployment.CoreDnsPods }}"
+        },
+        "Handler": "handler/collect_log_to_s3.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringList",
+          "Name": "Response",
+          "Selector": "$.Payload.Response"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnProblematicNodeInstanceId",
+      "action": "aws:branch",
+      "description": "Checks if a value for the `ProblematicNodeInstanceId` parameter is provided.",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "isCritical": false,
+      "onFailure": "step:CleanupK8sAuthenticationInfrastructure",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "VerifyThatProblematicNodeInstanceBelongsToCluster",
+            "And": [
+              {
+                "Variable": "{{ RetrieveCoreDNSDeployment.CoreDnsNodesExist }}",
+                "BooleanEquals": true
+              },
+              {
+                "Not": {
+                  "Variable": "{{ ProblematicNodeInstanceId }}",
+                  "StringEquals": ""
+                }
+              }
+            ]
+          }
+        ],
+        "Default": "BranchOnCoreDnsDeployment"
+      }
+    },
+    {
+      "name": "VerifyThatProblematicNodeInstanceBelongsToCluster",
+      "action": "aws:executeScript",
+      "description": "Checks if the `ProblematicNodeInstanceId` belongs to the EKS Cluster.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "BranchOnProblematicNodeInstanceStanding",
+      "isCritical": true,
+      "onFailure": "step:BranchOnCoreDnsNodesExistForRunCommandSteps",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "problematic_instance_id": "{{ ProblematicNodeInstanceId }}",
+          "lambda_function_name": "{{ RetrieveCoreDNSDeployment.LambdaFunctionName }}"
+        },
+        "Handler": "handler/check_if_problematic_node_belongs_to_cluster.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "Boolean",
+          "Name": "ProblematicNodeInstanceStanding",
+          "Selector": "$.Payload.ProblematicNodeInstanceStanding"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnProblematicNodeInstanceStanding",
+      "action": "aws:branch",
+      "description": "Branches based on whether the problematic instance belongs to the cluster.",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "isCritical": false,
+      "onFailure": "step:BranchOnCoreDnsNodesExistForRunCommandSteps",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetProblematicInstanceDetails",
+            "Variable": "{{ VerifyThatProblematicNodeInstanceBelongsToCluster.ProblematicNodeInstanceStanding }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "BranchOnCoreDnsNodesExistForRunCommandSteps"
+      }
+    },
+    {
+      "name": "GetProblematicInstanceDetails",
+      "action": "aws:executeScript",
+      "description": "Retrieves details of the problematic instance for probing instance creation.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 60,
+      "onFailure": "step:BranchOnCoreDnsNodesExistForRunCommandSteps",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "nextStep": "CreateProbingInfrastructure",
+      "inputs": {
+        "InputPayload": {
+          "instance_id": "{{ ProblematicNodeInstanceId }}"
+        },
+        "Handler": "handler/get_problematic_instance_details.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ImageId",
+          "Selector": "$.Payload.ImageId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceType",
+          "Selector": "$.Payload.InstanceType",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetId",
+          "Selector": "$.Payload.SubnetId",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Payload.SecurityGroupIds",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CreateProbingInfrastructure",
+      "action": "aws:createStack",
+      "description": "Creates the instance profile and probing EC2 instance via a CloudFormation stack.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "onFailure": "step:DeleteCloudFormationStack",
+      "onCancel": "step:DeleteCloudFormationStack",
+      "nextStep": "GetProbingInstanceId",
+      "inputs": {
+        "Capabilities": [
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "StackName": "AWSSupport-TroubleshootEKSDNSFailure-{{ automation:EXECUTION_ID }}",
+        "OnFailure": "DELETE",
+        "ClientRequestToken": "AWSSupport-TroubleshootEKSDNSFailure-{{ automation:EXECUTION_ID }}",
+        "TimeoutInMinutes": 10,
+        "Parameters": [
+          {
+            "ParameterKey": "ImageId",
+            "ParameterValue": "{{ GetProblematicInstanceDetails.ImageId }}"
+          },
+          {
+            "ParameterKey": "InstanceType",
+            "ParameterValue": "{{ GetProblematicInstanceDetails.InstanceType }}"
+          },
+          {
+            "ParameterKey": "SubnetId",
+            "ParameterValue": "{{ GetProblematicInstanceDetails.SubnetId }}"
+          },
+          {
+            "ParameterKey": "SecurityGroupIds",
+            "ParameterValue": "{{ GetProblematicInstanceDetails.SecurityGroupIds }}"
+          },
+          {
+            "ParameterKey": "TagKey",
+            "ParameterValue": "Name"
+          },
+          {
+            "ParameterKey": "TagValue",
+            "ParameterValue": "AWSSupport-TroubleshootEKSDNSFailure-{{ automation:EXECUTION_ID }}"
+          }
+        ],
+        "TemplateBody": "AWSTemplateFormatVersion: \"2010-09-09\"\nDescription: Template to create the instance profile and probing EC2 instance.\n\nParameters:\n  ImageId:\n    Type: String\n    Description: AMI ID for the probing instance\n  InstanceType:\n    Type: String\n    Description: Instance type for the probing instance\n  SubnetId:\n    Type: String\n    Description: Subnet ID for the probing instance\n  SecurityGroupIds:\n    Type: CommaDelimitedList\n    Description: Security group IDs for the probing instance\n  TagKey:\n    Type: String\n    Description: Tag key for the probing instance\n  TagValue:\n    Type: String\n    Description: Tag value for the probing instance\n\nResources:\n  ProbingEC2InstanceProfileRole:\n    Type: 'AWS::IAM::Role'\n    Properties:\n      RoleName: ProbingEC2InstanceProfileRole\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n          - Action:\n              - 'sts:AssumeRole'\n            Effect: Allow\n            Principal:\n              Service:\n                - ec2.amazonaws.com\n      Path: /\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'\n\n  ProbingEC2InstanceProfile:\n    Type: 'AWS::IAM::InstanceProfile'\n    Properties:\n      InstanceProfileName: ProbingEC2InstanceProfile\n      Path: /\n      Roles: \n        - !Ref ProbingEC2InstanceProfileRole\n\n  ProbingEC2Instance:\n    Type: 'AWS::EC2::Instance'\n    Properties:\n      ImageId: !Ref ImageId\n      InstanceType: !Ref InstanceType\n      IamInstanceProfile: !Ref ProbingEC2InstanceProfile\n      SubnetId: !Ref SubnetId\n      SecurityGroupIds: !Ref SecurityGroupIds\n      MetadataOptions:\n        HttpTokens: required\n        HttpPutResponseHopLimit: 2\n      BlockDeviceMappings:\n        - DeviceName: /dev/xvda\n          Ebs:\n            VolumeSize: 20\n            VolumeType: gp3\n            Encrypted: true\n            DeleteOnTermination: true\n      Tags:\n        - Key: !Ref TagKey\n          Value: !Ref TagValue\n\nOutputs:\n  ProbingEC2InstanceProfileArn:\n    Description: Arn of the instance profile for the probing EC2 instance\n    Value: !GetAtt ProbingEC2InstanceProfile.Arn\n  ProbingEC2InstanceId:\n    Description: Instance ID of the probing EC2 instance\n    Value: !Ref ProbingEC2Instance",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "AWSSupport-TroubleshootEKSDNSFailure-{{ automation:EXECUTION_ID }}"
+          },
+          {
+            "Key": "AWSSupport-TroubleshootEKSDNSFailure-AutomationExecution",
+            "Value": "{{ automation:EXECUTION_ID }}"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "CloudformationStackId",
+          "Selector": "$.StackId",
+          "Type": "String"
+        },
+        {
+          "Name": "CloudformationStackStatus",
+          "Selector": "$.StackStatus",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "GetProbingInstanceId",
+      "action": "aws:executeAwsApi",
+      "description": "Retrieves the probing EC2 instance ID from CloudFormation stack outputs.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 60,
+      "onFailure": "step:DeleteCloudFormationStack",
+      "onCancel": "step:DeleteCloudFormationStack",
+      "nextStep": "WaitForProbingInstanceSSMAgentStateToBeOnline",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ CreateProbingInfrastructure.CloudformationStackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "EC2InstanceID",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'ProbingEC2InstanceId')].OutputValue",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "WaitForProbingInstanceSSMAgentStateToBeOnline",
+      "description": "Waits for the status of the SSM Agent to be `Online` on the probing EC2 instance(s).",
+      "action": "aws:waitForAwsResourceProperty",
+      "nextStep": "RetrieveCoreDNSPodsIPFromProblematicNode",
+      "maxAttempts": 3,
+      "timeoutSeconds": 60,
+      "isCritical": true,
+      "onFailure": "step:DeleteCloudFormationStack",
+      "onCancel": "step:DeleteCloudFormationStack",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ GetProbingInstanceId.EC2InstanceID }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      }
+    },
+    {
+      "name": "RetrieveCoreDNSPodsIPFromProblematicNode",
+      "action": "aws:executeScript",
+      "description": "Retrieves the CoreDNS pods IP from the worker node whose ID is provided with the `ProblematicNodeInstanceId` parameter.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "nextStep": "PerformDNSResolutionOnProbingEC2Instance",
+      "isCritical": true,
+      "onFailure": "step:DeleteCloudFormationStack",
+      "onCancel": "step:DeleteCloudFormationStack",
+      "inputs": {
+        "InputPayload": {
+          "eks_cluster_name": "{{ EksClusterName }}",
+          "namespace": "{{ CoreDnsNamespace }}",
+          "problematic_instance_id": "{{ ProblematicNodeInstanceId }}",
+          "lambda_function_name": "{{ RetrieveCoreDNSDeployment.LambdaFunctionName }}"
+        },
+        "Handler": "handler/retrieve_core_dns_ip.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "CoreDNSIP",
+          "Selector": "$.Payload.Response.core_dns_ip"
+        }
+      ]
+    },
+    {
+      "name": "PerformDNSResolutionOnProbingEC2Instance",
+      "action": "aws:runCommand",
+      "description": "Performs domain name resolution on the probing EC2 instance(s) using the cluster IP and CoreDNS pod IP.",
+      "nextStep": "DeleteCloudFormationStack",
+      "onFailure": "Continue",
+      "onCancel": "step:DeleteCloudFormationStack",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ GetProbingInstanceId.EC2InstanceID }}"
+            ]
+          }
+        ],
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "",
+            "FAILED=0",
+            "",
+            "TMPDIR=$(mktemp -d /tmp/CheckNameResolutionWithinEC2Instance.XXXXX)",
+            "CLUSTER_IP=\"{{ RetrieveCoreDNSDeployment.ClusterIP }}\"",
+            "CORE_DNS_IP=\"{{ RetrieveCoreDNSPodsIPFromProblematicNode.CoreDNSIP }}\"",
+            "",
+            "if [ ${CORE_DNS_IP} == \"Not Found\" ]; then",
+            "    echo \"       Failed: Name resolution because there are no CoreDNS pods in the problematic node.\"",
+            "    exit 0",
+            "fi",
+            "",
+            "# Function to check if yum is locked",
+            "is_yum_locked() {",
+            "  [ -f /var/run/yum.pid ]",
+            "}",
+            "",
+            "# Wait for yum lock to be released",
+            "while is_yum_locked; do",
+            "  sleep 5  # Adjust the sleep duration as needed",
+            "done",
+            "",
+            "",
+            "## 1. Install dns-utils..",
+            "echo \"1. Installing dns-utils.\"",
+            "sudo yum install bind-utils -y  > ${TMPDIR}/yum-install.txt",
+            "",
+            "## 2. Check nslookup kubernetes.default with CoreDNS pod IP.",
+            "echo \"2. Checking nslookup kubernetes.default with CoreDNS pod IP.\"",
+            "nslookup kubernetes.default ${CORE_DNS_IP} | grep -e \"kubernetes.default.svc.cluster.local\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" >> ${TMPDIR}/nslookup.txt",
+            "",
+            "if [ $? -ne 0 ]; then",
+            "    echo \"       Failed: Name resolution failed for kubernetes.default using CoreDNS IP.\"",
+            "    FAILED=$((${FAILED}+2#10))",
+            "else",
+            "    echo \"       Passed: Name resolution succeeded for kubernetes.default using CoreDNS IP.\"",
+            "fi",
+            "",
+            "## 3. Check nslookup amazon.com domain with CoreDNS pod IP.",
+            "echo \"3. Checking nslookup amazon.com domain with CoreDNS pod IP.\"",
+            "nslookup amazon.com ${CORE_DNS_IP} | grep -e \"amazon.com\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" >> ${TMPDIR}/nslookup.txt",
+            "",
+            "if [ $? -ne 0 ]; then",
+            "    echo \"       Failed: Name resolution failed for external domain (amazon.com) using CoreDNS IP.\"",
+            "    FAILED=$((${FAILED}+2#100))",
+            "else",
+            "    echo \"       Passed: Name resolution succeeded for external domain (amazon.com) using CoreDNS IP.\"",
+            "fi",
+            "",
+            "if [ \"{{DnsName}}\" != \"amazon.com\" ]; then",
+            "    ## 3. Check nslookup on stub domain with CoreDNS pod IP.",
+            "    echo \"3. Checking nslookup on stub domain with CoreDNS pod IP.\"",
+            "    nslookup \"{{DnsName}}\" ${CORE_DNS_IP} | grep -e \"{{DnsName}}\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" >> ${TMPDIR}/nslookup.txt",
+            "",
+            "    if [ $? -ne 0 ]; then",
+            "        echo \"       Failed: Name resolution failed for stub domain using CoreDNS IP.\"",
+            "        FAILED=$((${FAILED}+2#1000))",
+            "    else",
+            "        echo \"       Passed: Name resolution succeeded for stub domain using CoreDNS IP.\"",
+            "    fi",
+            "fi",
+            "",
+            "## 4. Install dns-utils..",
+            "echo \"4. Removing dns-utils.\"",
+            "sudo yum remove bind-utils -y  > ${TMPDIR}/yum-remove.txt"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CommandOutput",
+          "Selector": "$.Output",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "DeleteCloudFormationStack",
+      "action": "aws:deleteStack",
+      "description": "Deletes the AWS CloudFormation stack that created the instance profile and probing EC2 instance.",
+      "onFailure": "step:BranchOnCoreDnsNodesExistForRunCommandSteps",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "timeoutSeconds": 120,
+      "nextStep": "UpdateCfnStackDeleted",
+      "isCritical": true,
+      "inputs": {
+        "StackName": "AWSSupport-TroubleshootEKSDNSFailure-{{ automation:EXECUTION_ID }}"
+      }
+    },
+    {
+      "name": "UpdateCfnStackDeleted",
+      "action": "aws:updateVariable",
+      "description": "Updates the boolean value for the `cfnStackDeleted` variable.",
+      "maxAttempts": 1,
+      "timeoutSeconds": 60,
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:cfnStackDeleted",
+        "Value": true
+      },
+      "nextStep": "BranchOnCoreDnsNodesExistForRunCommandSteps"
+    },
+    {
+      "name": "BranchOnCoreDnsDeployment",
+      "action": "aws:branch",
+      "description": "Checks if a value for the `ProblematicNodeInstanceId` parameter is not provided and that CoreDNS host nodes exist.",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "isCritical": true,
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PerformDNSResolutionOnCoreDnsWorkerNodes",
+            "And": [
+              {
+                "Variable": "{{ RetrieveCoreDNSDeployment.CoreDnsNodesExist }}",
+                "BooleanEquals": true
+              },
+              {
+                "Variable": "{{ ProblematicNodeInstanceId }}",
+                "StringEquals": ""
+              }
+            ]
+          }
+        ],
+        "Default": "CleanupK8sAuthenticationInfrastructure"
+      }
+    },
+    {
+      "name": "BranchOnCoreDnsNodesExistForRunCommandSteps",
+      "action": "aws:branch",
+      "description": "Checks if CoreDNS nodes exist before executing aws:runCommand steps. This prevents execution failures when CoreDNS has 0 replicas and there are no worker nodes to target.",
+      "isEnd": false,
+      "timeoutSeconds": 60,
+      "isCritical": true,
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "maxAttempts": 1,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "PerformDNSResolutionOnCoreDnsWorkerNodes",
+            "Variable": "{{ RetrieveCoreDNSDeployment.CoreDnsNodesExist }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "CleanupK8sAuthenticationInfrastructure"
+      }
+    },
+    {
+      "name": "PerformDNSResolutionOnCoreDnsWorkerNodes",
+      "action": "aws:runCommand",
+      "description": "Performs domain name resolution on the worker node using the cluster IP and CoreDNS pod IP.",
+      "nextStep": "VerifyNameserverMatchAndKubeProxyLogsAndIPTableEntries",
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "InstanceIds",
+            "Values": "{{ RetrieveCoreDNSDeployment.CoreDnsHostNodesInstanceIds }}"
+          }
+        ],
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "",
+            "FAILED=0",
+            "",
+            "TMPDIR=$(mktemp -d /tmp/CheckNameResolutionWithinNode.XXXXX)",
+            "KUBELET_CONFIG=/var/lib/kubelet/kubeconfig",
+            "",
+            "## 1. Get the required parameters from kubelet config.",
+            "",
+            "ENDPOINT_URL=$(cat ${KUBELET_CONFIG} | grep -e server | awk '{print $2}')",
+            "CERT=$(cat ${KUBELET_CONFIG} | grep -e certificate-authority | awk '{print $2}')",
+            "CLUSTER_NAME=$(cat ${KUBELET_CONFIG} | grep -e '\"-i\"' --after 1 | sed -n 2p | awk '{print $2}' | tr -d '\"')",
+            "REGION_NAME=$(cat ${KUBELET_CONFIG} | grep -e '--region' --after 1 | sed -n 2p | awk '{print $2}' | tr -d '\"')",
+            "",
+            "TOKEN=$(curl -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\" --silent)",
+            "nodename=$(curl -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/local-hostname --silent)",
+            "",
+            "CLUSTER_IP=\"{{RetrieveCoreDNSDeployment.ClusterIP}}\"",
+            "",
+            "PAYLOAD_PODS=$(curl --cacert ${CERT} -H \"Authorization: Bearer \"$(/usr/bin/aws-iam-authenticator token -i ${CLUSTER_NAME} --region ${REGION_NAME} | jq -rc .status.token) ${ENDPOINT_URL}/api/v1/namespaces/kube-system/pods/?fieldSelector=spec.nodeName=\"${nodename}\" 2>/dev/null)",
+            "PODS_COREDNS=$(echo ${PAYLOAD_PODS} | jq '(.items[])? | select(.metadata.name | startswith(\"coredns\"))')",
+            "POD_COREDNS_IPS=$(echo $PODS_COREDNS | jq -r '.status.podIP')",
+            "COREDNS_IP=($(echo $PODS_COREDNS | jq -r '.status.podIP' | awk '{print $1}'))",
+            "",
+            "# Function to check if yum is locked",
+            "is_yum_locked() {",
+            "  [ -f /var/run/yum.pid ]",
+            "}",
+            "",
+            "# Wait for yum lock to be released",
+            "while is_yum_locked; do",
+            "  sleep 5  # Adjust the sleep duration as needed",
+            "done",
+            "",
+            "## 1. Install dns-utils..",
+            "echo \"1. Installing dns-utils.\"",
+            "sudo yum install bind-utils -y  > ${TMPDIR}/yum-install.txt",
+            "",
+            "## 2. Check nslookup kubernetes.default with Cluster IP.",
+            "echo \"2. Checking nslookup kubernetes.default with Cluster IP.\"",
+            "nslookup kubernetes.default ${CLUSTER_IP} | grep -e \"kubernetes.default.svc.cluster.local\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" > ${TMPDIR}/nslookup.txt",
+            "if [ $? -ne 0 ]; then",
+            "    echo \"       Failed: Name resolution failed for kubernetes.default using ClusterIP.\"",
+            "    FAILED=$((${FAILED}+2#10))",
+            "else",
+            "    echo \"       Passed: Name resolution succeeded for kubernetes.default using ClusterIP.\"",
+            "fi",
+            "",
+            "",
+            "## 3. Check nslookup on external domain name with Cluster IP.",
+            "echo \"3. Checking nslookup on amazon.com with Cluster IP.\"",
+            "nslookup amazon.com ${CLUSTER_IP} | grep -e \"amazon.com\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" >> ${TMPDIR}/nslookup.txt",
+            "            ",
+            "if [ $? -ne 0 ]; then",
+            "    echo \"       Failed: Name resolution failed for external domain (amazon.com) using ClusterIP.\"",
+            "    FAILED=$((${FAILED}+2#100))",
+            "else",
+            "    echo \"       Passed: Name resolution succeeded for external domain (amazon.com) using ClusterIP.\"",
+            "fi",
+            "",
+            "## 4. Check nslookup kubernetes.default with CoreDNS pod IP.",
+            "echo \"4. Checking nslookup on kubernetes.default with CoreDNS pod IP.\"",
+            "nslookup kubernetes.default ${COREDNS_IP} | grep -e \"kubernetes.default.svc.cluster.local\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" >> ${TMPDIR}/nslookup.txt",
+            "",
+            "if [ $? -ne 0 ]; then",
+            "    echo \"       Failed: Name resolution failed for kubernetes.default using CoreDNS IP.\"",
+            "    FAILED=$((${FAILED}+2#1000))",
+            "else",
+            "    echo \"       Passed: Name resolution succeeded for kubernetes.default using CoreDNS IP.\"",
+            "fi",
+            "",
+            "## 5. Check nslookup external domain with CoreDNS pod IP.",
+            "echo \"5. Checking nslookup on amazon.com with CoreDNS pod IP.\"",
+            "nslookup amazon.com ${COREDNS_IP} | grep -e \"amazon.com\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" >> ${TMPDIR}/nslookup.txt",
+            "",
+            "if [ $? -ne 0 ]; then",
+            "    echo \"       Failed: Name resolution failed for external domain (amazon.com) using CoreDNS IP.\"",
+            "    FAILED=$((${FAILED}+2#10000))",
+            "else",
+            "    echo \"       Passed: Name resolution succeeded for external domain (amazon.com) using CoreDNS IP.\"",
+            "fi",
+            "",
+            "if [ \"{{DnsName}}\" != \"amazon.com\" ]; then",
+            "    ## 6. Check nslookup on stub domain domain with CoreDNS pod IP.",
+            "    echo \"6. Checking nslookup on stub domain domain with CoreDNS pod IP.\"",
+            "    nslookup \"{{DnsName}}\" ${COREDNS_IP} | grep -e \"{{DnsName}}\" --after 1 | grep -E \"[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\\.[0-9]{,3}\" >> ${TMPDIR}/nslookup.txt",
+            "",
+            "    if [ $? -ne 0 ]; then",
+            "        echo \"       Failed: Name resolution failed for stub domain using CoreDNS IP.\"",
+            "        FAILED=$((${FAILED}+2#10000))",
+            "    else",
+            "        echo \"       Passed: Name resolution succeeded for stub domain using CoreDNS IP.\"",
+            "    fi",
+            "fi",
+            "",
+            "## 7. Install dns-utils..",
+            "echo \"7. Removing dns-utils.\"",
+            "sudo yum remove bind-utils -y  > ${TMPDIR}/yum-remove.txt"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CommandOutput",
+          "Selector": "$.CommandId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyNameserverMatchAndKubeProxyLogsAndIPTableEntries",
+      "action": "aws:runCommand",
+      "description": "Verifies if the nameserver IP matches the Cluster IP and if kube-proxy pods have access to API Server and if entries in kube-dns are valid.",
+      "nextStep": "VerifyPPSThrottlingOnENIs",
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "InstanceIds",
+            "Values": "{{ RetrieveCoreDNSDeployment.CoreDnsHostNodesInstanceIds }}"
+          }
+        ],
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "",
+            "FAILED=0",
+            "",
+            "TMPDIR=$(mktemp -d /tmp/NameServerMatch.XXXXX)",
+            "KUBELET_CONFIG=/var/lib/kubelet/kubeconfig",
+            "",
+            "",
+            "## 1. Get the required parameters from kubelet config.",
+            "",
+            "ENDPOINT_URL=$(cat ${KUBELET_CONFIG} | grep -e server | awk '{print $2}')",
+            "CERT=$(cat ${KUBELET_CONFIG} | grep -e certificate-authority | awk '{print $2}')",
+            "CLUSTER_NAME=$(cat ${KUBELET_CONFIG} | grep -e '\"-i\"' --after 1 | sed -n 2p | awk '{print $2}' | tr -d '\"')",
+            "REGION_NAME=$(cat ${KUBELET_CONFIG} | grep -e '--region' --after 1 | sed -n 2p | awk '{print $2}' | tr -d '\"')",
+            "",
+            "TOKEN=$(curl -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\" --silent)",
+            "nodename=$(curl -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/local-hostname --silent)",
+            "",
+            "CLUSTER_IP=\"{{RetrieveCoreDNSDeployment.ClusterIP}}\"",
+            "",
+            "PAYLOAD_PODS=$(curl --cacert ${CERT} -H \"Authorization: Bearer \"$(/usr/bin/aws-iam-authenticator token -i ${CLUSTER_NAME} --region ${REGION_NAME} | jq -rc .status.token) ${ENDPOINT_URL}/api/v1/namespaces/kube-system/pods/?fieldSelector=spec.nodeName=\"${nodename}\" 2>/dev/null)",
+            "PODS_COREDNS=$(echo ${PAYLOAD_PODS} | jq '(.items[])? | select(.metadata.name | startswith(\"coredns\"))')",
+            "POD_COREDNS_IPS=$(echo $PODS_COREDNS | jq -r '.status.podIP')",
+            "COREDNS_IP=($(echo $PODS_COREDNS | jq -r '.status.podIP' | awk '{print $1}'))",
+            "",
+            "# 1. Check kube-proxy log.",
+            "",
+            "echo \"1. Checking kube-proxy logs to see if API server access is valid.\"",
+            "FAILED_TO_WATCH_COUNT=$(tail -50 /var/log/pods/kube-system_kube-proxy-*/kube-proxy/0.log | grep -c \"Failed to watch\")",
+            "",
+            "if [ ${FAILED_TO_WATCH_COUNT} -ne 0 ]; then",
+            "echo \"       Failed: Kube-proxy access to API server is not valid.\"",
+            "FAILED=$((${FAILED}+2#10))",
+            "else",
+            "echo \"       Passed: Kube-proxy access to API server is valid.\"",
+            "fi",
+            "",
+            "# 2. Check iptables.",
+            "",
+            "echo \"2. Checking if iptables nat table rules are valid.\"",
+            "IPTABLES_SERVICE_KUBEDNS_ENDPOINTS=$(iptables --wait 1 --numeric --verbose --list --table nat | grep -e \"kube-system/kube-dns:dns ->\" | awk '{print $13}' | awk 'BEGIN {FS=\":\";OFS=\":\"} {print $1}')",
+            "",
+            "echo \"    KUBE DNS ENDPOINTS FOUND IN NAT TABLE: [${IPTABLES_SERVICE_KUBEDNS_ENDPOINTS[*]}]\"",
+            "",
+            "for i in ${IPTABLES_SERVICE_KUBEDNS_ENDPOINTS}; do",
+            "    for j in ${POD_COREDNS_IPS}; do",
+            "        if [ $i == $j ]; then",
+            "            echo \"    The kube-dns endpoint is valid in NAT table: ${i}\"",
+            "            continue 2",
+            "        fi",
+            "    done",
+            "    echo \"       Failed: There is a problem with the iptables nat table.\"",
+            "    FAILED=$((${FAILED}+2#10))",
+            "    break",
+            "done",
+            "IPTABLES_ERROR=8",
+            "if [ ${FAILED} -lt ${IPTABLES_ERROR} ]; then",
+            "echo \"       Passed: There is not any problems with the iptables nat table.\"",
+            "fi",
+            "",
+            "",
+            "## 3. Check if nameserver matches ClusterIP",
+            "echo \"3. Checking if nameserver matches ClusterIP.\"",
+            "NAMESERVER_IP=$(cat /etc/resolv.conf | grep -e \"nameserver\" | awk '{print $2}')",
+            "",
+            "if [ \"${NAMESERVER_IP}\" != \"${CLUSTER_IP}\" ]; then",
+            "echo \"       Failed: nameserver does not match ClusterIP.\"",
+            "FAILED=$((${FAILED}+2#1000))",
+            "else",
+            "echo \"       Passed: nameserver matches ClusterIP.\"",
+            "fi"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CommandOutput",
+          "Selector": "$.CommandId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyPPSThrottlingOnENIs",
+      "action": "aws:runCommand",
+      "description": "Verifies the DNS PPS limit per ENI on the worker nodes.",
+      "nextStep": "UpdateChecksOnNodes",
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupK8sAuthenticationInfrastructure",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "Targets": [
+          {
+            "Key": "InstanceIds",
+            "Values": "{{ RetrieveCoreDNSDeployment.CoreDnsHostNodesInstanceIds }}"
+          }
+        ],
+        "Parameters": {
+          "commands": [
+            "#!/bin/bash",
+            "FAILED=0",
+            "",
+            "",
+            "# Function to check if yum is locked",
+            "is_yum_locked() {",
+            "  [ -f /var/run/yum.pid ]",
+            "}",
+            "",
+            "# Wait for yum lock to be released",
+            "while is_yum_locked; do",
+            "  sleep 5  # Adjust the sleep duration as needed",
+            "done",
+            "",
+            "### 1. By default, the EKS-optimized AMI doesn't include ethtool. Install the tool",
+            "",
+            "sudo yum install -y ethtool > /dev/null 2>&1",
+            "",
+            "### 2. Iterate all interface",
+            "",
+            "for interface in $(ls /sys/class/net)",
+            "do",
+            "    echo \"Checking $interface...\"",
+            "",
+            "    ### Skip the loopback device",
+            "    if [ \"$interface\" = \"lo\" ]; then",
+            "        echo \"Skip to check the loopback device\" > /dev/null 2>&1",
+            "        continue",
+            "    fi",
+            "",
+            "    ### 3. Check the interface is ENA enabled and support monitoring metrics",
+            "    IS_USING_ENA_DRIVER=$(ethtool -i $interface | grep -q \"driver: ena\" && echo true || echo false)",
+            "    if [ \"$IS_USING_ENA_DRIVER\" = true ]; then",
+            "        echo \"$interface has ENA driver supported\\n\"",
+            "    else",
+            "        echo \"$interface is not ENA enabled, will skip to check this interface\\n\"",
+            "        continue",
+            "    fi",
+            "",
+            "    ### 4. Print the ENA driver version. It should be 2.2.10 or later",
+            "    ethtool -i $interface | grep version",
+            "",
+            "    ### 5. Checking if the interface (ENI) exceeded the limit",
+            "    ### Use RegExp to check [1-9]+ matches one or more digits from 1 to 9, but not the digit 0. So if any of the counters have a value of exactly 0, they will be ignored by the script.",
+            "    ### For example:",
+            "    ###  $ ethtool -S $interface | grep exceeded",
+            "    ###      bw_in_allowance_exceeded: 0",
+            "    ###      bw_out_allowance_exceeded: 0",
+            "    ###      pps_allowance_exceeded: 0",
+            "    ###      conntrack_allowance_exceeded: 0",
+            "    ###      linklocal_allowance_exceeded: 0",
+            "    NODE_NET_PERFORMNACE_METRICS=$(ethtool -S $interface | grep exceeded)",
+            "    if [[ $NODE_NET_PERFORMNACE_METRICS =~ [1-9]+ ]]; then",
+            "        echo \"    Failed: At least one counter for $interface has exceeded its allowance.\"",
+            "        echo $NODE_NET_PERFORMNACE_METRICS",
+            "        echo \"\\n\"",
+            "    else",
+            "        echo \"       Passed: All counters for $interface are within their allowances.\"",
+            "        echo \"\\n\"",
+            "    fi",
+            "done",
+            "",
+            "### 6. Remove the ethtool at the end of this step because customer may have any security compliance tool will inspect unwanted packages.",
+            "echo \"6. Removing ethtool.\"",
+            "sudo yum remove -y ethtool > /dev/null 2>&1"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "Name": "CommandOutput",
+          "Selector": "$.CommandId",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "UpdateChecksOnNodes",
+      "action": "aws:updateVariable",
+      "description": "Updates the boolean value for the `checksOnNodes` variable.",
+      "onFailure": "Continue",
+      "timeoutSeconds": 60,
+      "maxAttempts": 1,
+      "inputs": {
+        "Name": "variable:checksOnNodes",
+        "Value": true
+      },
+      "nextStep": "CleanupK8sAuthenticationInfrastructure"
+    },
+    {
+      "name": "CleanupK8sAuthenticationInfrastructure",
+      "action": "aws:executeAutomation",
+      "description": "Executes the SAW Document `AWSSupport-SetupK8sApiProxyForEKS` using the `Cleanup` operation to clean up resources created as part of the automation.",
+      "timeoutSeconds": 3600,
+      "nextStep": "UpdateK8sInfrastructureDeleted",
+      "isCritical": true,
+      "onFailure": "step:CleanUpAllResources",
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ EksClusterName }}"
+          ],
+          "Operation": [
+            "Cleanup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "LambdaRoleArn": [
+            "{{ LambdaRoleArn }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      }
+    },
+    {
+      "name": "UpdateK8sInfrastructureDeleted",
+      "action": "aws:updateVariable",
+      "description": "Updates the boolean value for the `K8sInfrastructureDeleted` variable.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:K8sInfrastructureDeleted",
+        "Value": true
+      },
+      "nextStep": "CleanUpAllResources"
+    },
+    {
+      "name": "CleanUpAllResources",
+      "action": "aws:executeScript",
+      "description": "Comprehensively cleans up resources left behind from the preceding steps.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "CollectOutputFromAllRunCommandSteps",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "k8s_infrastructure_deleted": "{{ variable:K8sInfrastructureDeleted }}",
+          "cfn_stack_deleted": "{{ variable:cfnStackDeleted }}",
+          "stack_name": "AWSSupport-TroubleshootEKSDNSFailure-{{ automation:EXECUTION_ID }}",
+          "lambda_function_name": "{{ RetrieveCoreDNSDeployment.LambdaFunctionName }}"
+        },
+        "Handler": "handler/clean_up_resources_handler.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Selector": "$.Payload.Response",
+          "Name": "Response"
+        }
+      ]
+    },
+    {
+      "name": "CollectOutputFromAllRunCommandSteps",
+      "action": "aws:executeScript",
+      "description": "Collects output from all run command steps that have been executed.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "GenerateReport",
+      "onFailure": "Continue",
+      "isCritical": true,
+      "inputs": {
+        "InputPayload": {
+          "checks_on_nodes": "{{ variable:checksOnNodes }}",
+          "region": "{{ global:REGION }}",
+          "automation_id": "{{ automation:EXECUTION_ID }}"
+        },
+        "Handler": "handler/review_output_from_run_command_steps.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "MapList",
+          "Selector": "$.Payload.Response",
+          "Name": "Response"
+        }
+      ]
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "Compiles the output of the previous steps and outputs a report.",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "vpc_dns_validation": "{{ GetVpcDnsSettings.OutputPayload }}",
+          "core_dns_deployment_checks": "{{ RetrieveCoreDNSDeployment.OutputPayload }}",
+          "configmap_checks": "{{ RetrieveAndInspectCoreDNSConfigMap.OutputPayload }}",
+          "hpa_checks": "{{ ValidateHpaConfiguration.OutputPayload }}",
+          "collect_log_to_s3": "{{ CollectLogToS3.OutputPayload }}",
+          "run_command_steps_output": "{{ CollectOutputFromAllRunCommandSteps.OutputPayload }}",
+          "checks_on_nodes": "{{ variable:checksOnNodes }}",
+          "eks_cluster_exists": "{{ variable:eksClusterExists }}"
+        },
+        "Handler": "handler/generate_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Selector": "$.Payload.Result",
+          "Name": "EvalReport"
+        }
+      ]
+    }
+  ],
+  "files": {
+    "check_bucket_public_status.zip": {
+      "checksums": {
+        "SHA256": "c23dc4ed3063bc6e7410641233eb48efaa7be6205ab89816c24635834cc75a53"
+      }
+    },
+    "attachments.zip": {
+      "checksums": {
+        "SHA256": "dacd6af983f8852b56c4fbe8b7f31f2766fb35b1e72f697d48552d57d65f3bd8"
+      }
+    }
+  }
+}
