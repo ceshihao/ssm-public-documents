@@ -1,0 +1,146 @@
+{
+  "description": "The **AWSSupport-TroubleshootLambdaVpcConnectivity** runbook helps diagnose and troubleshoot network connectivity issues between AWS Lambda functions deployed in an Amazon Virtual Private Cloud (Amazon VPC) and their target destinations. This runbook uses VPC Reachability Analyzer to perform network path analysis, identifying potential issues such as missing NAT gateways, incorrect routing configurations, security group misconfigurations, and network ACL restrictions. The runbook provides actionable recommendations to resolve connectivity problems and ensure proper network communication for VPC-enabled Lambda functions.\n\n### Considerations:\n\n> * You are charged per analysis processed between a source and destination. For more information, see the **Network Analysis** section in [Amazon VPC Pricing](http://aws.amazon.com/vpc/pricing/).\n> * This automation creates a network insights path and network insights analysis in your account using Reachability Analyzer. If the automation completes successfully, the runbook deletes these resources. If the cleanup step fails, the network insights path is not deleted by the runbook and you will need to delete it manually. If you don't delete the network insights path manually, it continues to count towards the quota for your AWS account. For more information about quotas for Reachability Analyzer, see [Quotas for Reachability Analyzer](https://docs.aws.amazon.com/vpc/latest/reachability/reachability-analyzer-limits.html).\n> * This runbook analyzes one Lambda function and one destination per execution.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "LambdaArn": {
+      "type": "String",
+      "description": "(Required) The Amazon Resource Name (ARN) of the AWS Lambda function to analyze. This runbook analyzes one Lambda function per execution.",
+      "allowedPattern": "^arn:(aws[a-zA-Z-]*)?:lambda:[a-z0-9-]+:\\d{12}:function:[a-zA-Z0-9-_]+(:(\\$LATEST|[a-zA-Z0-9-_]+))?$"
+    },
+    "DestinationId": {
+      "type": "String",
+      "description": "(Required) The destination resource for network path analysis. Supports: Amazon Elastic Compute Cloud (Amazon EC2) instance (i-*), Elastic Network Interface (eni-*), VPC Endpoint (vpce-*), Internet Gateway (igw-*), NAT Gateway (nat-*), Transit Gateway (tgw-*), Transit Gateway Attachment (tgw-attach-*), Virtual Private Gateway (vgw-*), VPC Peering Connection (pcx-*), any resource ARN, or an IPv4 address. This runbook analyzes one destination per execution.",
+      "allowedPattern": "^(arn:[^:]+:[^:]+:[^:]*:[^:]*:[^/]+(/[^/]+)*|(i-[a-f0-9]{8}([a-f0-9]{9})?|eni-[a-f0-9]{17}|(vpce|igw|nat|tgw|tgw-attach|vgw|pcx)-[a-f0-9]+)|((25[0-5]|2[0-4][0-9]|[01]?[0-9]{1,2})\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9]{1,2}))$"
+    },
+    "DestinationPort": {
+      "type": "Integer",
+      "description": "(Optional) The target port number that the path analysis will attempt to reach on the destination resource. By default, the analysis considers all combinations of IP addresses and ports.",
+      "default": 0,
+      "allowedPattern": "^([0-9]|[1-9][0-9]{1,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"
+    },
+    "Protocol": {
+      "type": "String",
+      "description": "(Optional) The network protocol to analyze.",
+      "allowedValues": [
+        "TCP",
+        "UDP"
+      ],
+      "default": "TCP"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "InputValidation",
+      "action": "aws:executeScript",
+      "description": "Validates the input parameter values provided by the user, verifies the Lambda function exists and is VPC-enabled, and checks that the required AWS permissions are available.",
+      "timeoutSeconds": 10,
+      "nextStep": "ConnectionCheck",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "LambdaArn": "{{ LambdaArn }}",
+          "DestinationId": "{{ DestinationId }}",
+          "DestinationPort": "{{ DestinationPort }}",
+          "Protocol": "{{ Protocol }}"
+        },
+        "Handler": "input_validation.validate_input",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Type": "StringMap",
+          "Name": "ValidatedParameters",
+          "Selector": "$.Payload"
+        }
+      ]
+    },
+    {
+      "name": "ConnectionCheck",
+      "action": "aws:executeScript",
+      "description": "Discovers the Elastic Network Interfaces (ENIs) associated with the Lambda function, creates VPC Reachability Analyzer network insights paths and analyses, waits for them to complete, and returns the results.",
+      "timeoutSeconds": 360,
+      "onFailure": "step:CleanupReachabilityResourcesOnCancel",
+      "isCritical": true,
+      "nextStep": "SynthOutput",
+      "onCancel": "step:CleanupReachabilityResourcesOnCancel",
+      "inputs": {
+        "InputPayload": "{{ InputValidation.ValidatedParameters }}",
+        "Handler": "connection_check.check_connections",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NetworkInsightsAnalyses",
+          "Selector": "$.Payload.Analysis",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CleanupReachabilityResourcesOnCancel",
+      "action": "aws:executeScript",
+      "description": "Cleans up VPC Reachability Analyzer resources (network insights paths and analyses) created by the ConnectionCheck step when the automation is cancelled or fails.",
+      "timeoutSeconds": 600,
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": "{{ InputValidation.ValidatedParameters }}",
+        "Handler": "cleanup_reachability_resources.cleanup_reachability_resources",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "CleanupStatus",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        },
+        {
+          "Name": "CleanupSummary",
+          "Selector": "$.Payload.Summary",
+          "Type": "StringMap"
+        }
+      ],
+      "isEnd": true
+    },
+    {
+      "name": "SynthOutput",
+      "action": "aws:executeScript",
+      "description": "Analyzes the VPC Reachability Analyzer results to identify connectivity issues and generates prioritized, actionable recommendations for resolving Lambda VPC network problems.",
+      "timeoutSeconds": 5,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": "{{ ConnectionCheck.NetworkInsightsAnalyses }}",
+        "Handler": "synth_output.synth_output",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Findings",
+          "Selector": "$.Payload.Findings",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "SynthOutput.Findings"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "90094de3adb47b522966469279aab10201981e9c650bb2d54a650195cf8fe25a"
+      }
+    }
+  }
+}
