@@ -1,0 +1,597 @@
+{
+  "description": "The **AWSSupport-TroubleshootEKSNetwork** automation runbook helps troubleshoot network connectivity issues in containers running in Amazon Elastic Kubernetes Service (Amazon EKS) clusters by collecting compute and networking statistics from the traffic source and also the destination depending on its type. The following are the destinations the runbook will attempt to troubleshoot:\n- **POD** - Another Kubernetes pod.\n- **SERVICE** - A Kubernetes service.\n- **IP** - An IPv4/IPv6 address, internal or external to the cluster or VPC.\n- **DNS** - A domain name, internal or external to the cluster or VPC.\n\n### Important\n- This runbook executes the following public AWS Systems Manager runbooks: `AWSSupport-SetupK8sApiProxyForEKS` and `AWSSupport-CollectEKSLinuxNodeStatistics`. The `AWSSupport-SetupK8sApiProxyForEKS` runbook creates temporary AWS Lambda functions and AWS Identity and Access Management (IAM) resources in your account to interact with the Amazon EKS Kubernetes API. These resources are automatically cleaned up at the end of the execution.\n- Troubleshooting results, including network configuration details such as IP addresses, instance identifiers, and node-level networking statistics, are uploaded to the Amazon Simple Storage Service (Amazon S3) bucket you provide. Ensure that only authorized users have access to this bucket and that it is configured with appropriate encryption and access policies.\n- The automation execution output will also contain network configuration details visible to any user with access to AWS Systems Manager automation executions in your account.\n\n## Troubleshooting Parameters\nFor any troubleshooting scenarios, the following parameters are mandatory:\n- **AutomationAssumeRole** - The IAM role that will be used by Systems Manager Automation to perform actions on your behalf.\n- **S3BucketName** - The name of the Amazon S3 bucket required for uploading troubleshooting assets.\n- **SourceClusterName** - The name of the Amazon EKS cluster where the source application pod is running.\n- **SourcePodName** - The name of the source application pod to troubleshoot.\n- **SourcePodNamespace** - The namespace where the source application pod resides.\n- **DestinationType** - The type of network traffic destination to troubleshoot.\n- **ConnectionProtocol** - The protocol used by the source application pod to create the connection.\n\nYou can choose only one of the destination types above to begin the troubleshooting process. See the combinations below to understand which parameters are required for each destination type:\n\n- **POD**: DestinationClusterName, DestinationPodName, DestinationPodNamespace\n- **SERVICE**: DestinationClusterName, DestinationServiceName, DestinationServiceNamespace\n- **IP**: DestinationIpAddress\n- **DNS**: DestinationDnsName\n\nThe AutomationAssumeRole requires access to the Amazon EKS cluster(s) using the [supported EKS API access methods](https://docs.aws.amazon.com/eks/latest/userguide/grant-k8s-access.html). If your cluster is using access entries, the `AmazonEKSViewPolicy` access policy is the minimum required policy.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "outputs": [
+    "GenerateReport.Report"
+  ],
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The Amazon Simple Storage Service (Amazon S3) bucket name for uploading troubleshooting assets."
+    },
+    "SourceClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the source Amazon EKS cluster to troubleshoot.",
+      "allowedPattern": "^([0-9A-Za-z][A-Za-z0-9\\-_]{0,99})$"
+    },
+    "SourcePodName": {
+      "type": "String",
+      "description": "(Required) The name of the source Kubernetes pod initiating the network connection.",
+      "allowedPattern": "^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])$"
+    },
+    "SourcePodNamespace": {
+      "type": "String",
+      "description": "(Required) The namespace where the source Kubernetes pod resides.",
+      "allowedPattern": "^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])$"
+    },
+    "DestinationType": {
+      "type": "String",
+      "description": "(Required) The type of network connection destination (POD, SERVICE, IP or DNS).",
+      "allowedValues": [
+        "POD",
+        "SERVICE",
+        "IP",
+        "DNS"
+      ]
+    },
+    "DestinationClusterName": {
+      "type": "String",
+      "description": "(Conditional) The destination Amazon EKS cluster name. Required when DestinationType is POD or SERVICE.",
+      "allowedPattern": "^([0-9A-Za-z][A-Za-z0-9\\-_]{0,99})?$",
+      "default": ""
+    },
+    "ConnectionProtocol": {
+      "type": "String",
+      "description": "(Required) The protocol used for the network connection (tcp, udp, or sctp).",
+      "allowedValues": [
+        "tcp",
+        "udp",
+        "sctp"
+      ]
+    },
+    "DestinationPort": {
+      "type": "Integer",
+      "description": "(Required) The port of the network connection's destination.",
+      "allowedPattern": "^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"
+    },
+    "DestinationPodName": {
+      "type": "String",
+      "description": "(Conditional) The name of the destination Kubernetes pod. Required when DestinationType is POD.",
+      "allowedPattern": "^$|^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$",
+      "default": ""
+    },
+    "DestinationPodNamespace": {
+      "type": "String",
+      "description": "(Conditional) The namespace where the destination Kubernetes pod resides. Required when DestinationType is POD.",
+      "allowedPattern": "^$|^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$",
+      "default": ""
+    },
+    "DestinationServiceName": {
+      "type": "String",
+      "description": "(Conditional) The name of the destination Kubernetes service. Required when DestinationType is SERVICE.",
+      "allowedPattern": "^$|^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$",
+      "default": ""
+    },
+    "DestinationServiceNamespace": {
+      "type": "String",
+      "description": "(Conditional) The namespace where the destination Kubernetes service resides. Required when DestinationType is SERVICE.",
+      "allowedPattern": "^$|^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$",
+      "default": ""
+    },
+    "DestinationIpAddress": {
+      "type": "String",
+      "description": "(Conditional) The destination IPv4 or IPv6 address. Required when DestinationType is IP.",
+      "allowedPattern": "^$|^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$",
+      "default": ""
+    },
+    "DestinationDnsName": {
+      "type": "String",
+      "description": "(Conditional) The destination DNS name. Required when DestinationType is DNS.",
+      "allowedPattern": "^$|^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+\\.?$",
+      "default": ""
+    }
+  },
+  "variables": {
+    "destinationClusterLambdaArn": {
+      "type": "String",
+      "description": "The string variable that stores the name of the destination cluster proxy Lambda ARN, if a destination cluster is being analyzed.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetBucketPublicStatus",
+      "action": "aws:executeScript",
+      "description": "Checks if the target Amazon Simple Storage Service (Amazon S3) bucket potentially grants public read or write access to its objects.",
+      "inputs": {
+        "InputPayload": {
+          "Bucket": "{{ S3BucketName }}"
+        },
+        "Handler": "s3_bucket_public_status.check_bucket_public_status",
+        "Runtime": "python3.11",
+        "Attachment": "artifact_2.zip"
+      },
+      "onFailure": "Abort",
+      "isCritical": true,
+      "outputs": [
+        {
+          "Name": "bucketRegion",
+          "Selector": "$.Payload.location",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "ValidateTroubleshootingParameters"
+    },
+    {
+      "name": "ValidateTroubleshootingParameters",
+      "action": "aws:executeScript",
+      "description": "Verifies the input parameters required for troubleshooting, including cluster existence and parameter combinations for the selected destination type.",
+      "inputs": {
+        "InputPayload": {
+          "SourceClusterName": "{{ SourceClusterName }}",
+          "SourcePodName": "{{ SourcePodName }}",
+          "SourcePodNamespace": "{{ SourcePodNamespace }}",
+          "DestinationPort": "{{ DestinationPort }}",
+          "DestinationType": "{{ DestinationType }}",
+          "DestinationClusterName": "{{ DestinationClusterName }}",
+          "ConnectionProtocol": "{{ ConnectionProtocol }}",
+          "DestinationPodName": "{{ DestinationPodName }}",
+          "DestinationPodNamespace": "{{ DestinationPodNamespace }}",
+          "DestinationServiceName": "{{ DestinationServiceName }}",
+          "DestinationServiceNamespace": "{{ DestinationServiceNamespace }}",
+          "DestinationIpAddress": "{{ DestinationIpAddress }}",
+          "DestinationDnsName": "{{ DestinationDnsName }}"
+        },
+        "Handler": "validate_input_parameters.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "onFailure": "Abort",
+      "maxAttempts": 2,
+      "timeoutSeconds": 600,
+      "isCritical": true,
+      "nextStep": "SetupAuthProxyForSourceEKSCluster"
+    },
+    {
+      "name": "SetupAuthProxyForSourceEKSCluster",
+      "action": "aws:executeAutomation",
+      "description": "Sets up an AWS Lambda function proxy to make Kubernetes API calls on the source Amazon EKS cluster.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ SourceClusterName }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "Operation": [
+            "Setup"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "onFailure": "step:CleanupAuthProxyForSourceEKSCluster",
+      "isCritical": true,
+      "nextStep": "BranchOnDestinationProxySetupRequired"
+    },
+    {
+      "name": "BranchOnDestinationProxySetupRequired",
+      "action": "aws:branch",
+      "description": "Determines whether to set up an AWS Lambda function proxy for a destination Amazon EKS cluster based on the destination type.",
+      "inputs": {
+        "Choices": [
+          {
+            "Or": [
+              {
+                "Variable": "{{ DestinationType }}",
+                "StringEquals": "POD"
+              },
+              {
+                "Variable": "{{ DestinationType }}",
+                "StringEquals": "SERVICE"
+              }
+            ],
+            "NextStep": "SetupAuthProxyForDestinationEKSCluster"
+          }
+        ],
+        "Default": "CollectSourcePodData"
+      },
+      "nextStep": "CollectSourcePodData"
+    },
+    {
+      "name": "SetupAuthProxyForDestinationEKSCluster",
+      "action": "aws:executeAutomation",
+      "description": "Sets up an AWS Lambda function proxy to make Kubernetes API calls on the destination Amazon EKS cluster.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ DestinationClusterName }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "Operation": [
+            "Setup"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "outputs": [
+        {
+          "Name": "DestinationEksClusterLambdaArn",
+          "Selector": "$.Payload",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "step:CleanupAuthProxyForDestinationEKSCluster",
+      "isCritical": true,
+      "nextStep": "UpdateDestinationProxyLambdaArn"
+    },
+    {
+      "name": "UpdateDestinationProxyLambdaArn",
+      "action": "aws:updateVariable",
+      "description": "Updates the string value for the `destinationClusterLambdaArn` variable.",
+      "onFailure": "step:CleanupAuthProxyForSourceEKSCluster",
+      "maxAttempts": 1,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Name": "variable:destinationClusterLambdaArn",
+        "Value": "{{ SetupAuthProxyForDestinationEKSCluster.Output }}"
+      },
+      "nextStep": "CollectSourcePodData"
+    },
+    {
+      "name": "CollectSourcePodData",
+      "action": "aws:executeScript",
+      "description": "Collects and validates the source pod's information including compute engine, instance ID, IP address, and container ID.",
+      "inputs": {
+        "InputPayload": {
+          "SourcePodName": "{{ SourcePodName }}",
+          "SourcePodNamespace": "{{ SourcePodNamespace }}",
+          "SourceClusterName": "{{ SourceClusterName }}",
+          "SourceClusterLambdaArn": "{{ SetupAuthProxyForSourceEKSCluster.Output }}",
+          "DestinationType": "{{ DestinationType }}",
+          "DestinationPodName": "{{ DestinationPodName }}",
+          "DestinationPodNamespace": "{{ DestinationPodNamespace }}",
+          "DestinationClusterName": "{{ DestinationClusterName }}",
+          "DestinationClusterLambdaArn": "{{ variable:destinationClusterLambdaArn }}",
+          "DestinationServiceName": "{{ DestinationServiceName }}",
+          "DestinationServiceNamespace": "{{ DestinationServiceNamespace }}",
+          "DestinationIpAddress": "{{ DestinationIpAddress }}",
+          "DestinationDnsName": "{{ DestinationDnsName }}"
+        },
+        "Handler": "collect_source_pod_data.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "timeoutSeconds": 300,
+      "outputs": [
+        {
+          "Name": "PodNodeInstanceId",
+          "Selector": "$.Payload.PodNodeInstanceId",
+          "Type": "String"
+        },
+        {
+          "Name": "PodIp",
+          "Selector": "$.Payload.PodIp",
+          "Type": "String"
+        },
+        {
+          "Name": "PodSampleContainerId",
+          "Selector": "$.Payload.PodSampleContainerId",
+          "Type": "String"
+        },
+        {
+          "Name": "IsRunningOnFargate",
+          "Selector": "$.Payload.IsRunningOnFargate",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "NetworkTarget",
+          "Selector": "$.Payload.NetworkTarget",
+          "Type": "String"
+        }
+      ],
+      "isCritical": true,
+      "onFailure": "step:CleanupAuthProxyForSourceEKSCluster",
+      "onCancel": "step:CleanupAuthProxyForSourceEKSCluster",
+      "nextStep": "BranchOnSourcePodComputeEngine"
+    },
+    {
+      "name": "BranchOnSourcePodComputeEngine",
+      "action": "aws:branch",
+      "description": "Branches the workflow based on whether the source Kubernetes pod runs on Amazon EC2 to collect Linux networking statistics for the node.",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ CollectSourcePodData.IsRunningOnFargate }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ CollectSourcePodData.PodNodeInstanceId }}",
+                "StartsWith": "i-"
+              }
+            ],
+            "NextStep": "CollectSourceLinuxNodeStatistics"
+          }
+        ],
+        "Default": "CollectDestinationData"
+      },
+      "onCancel": "step:CleanupAuthProxyForSourceEKSCluster",
+      "nextStep": "CollectDestinationData"
+    },
+    {
+      "name": "CollectSourceLinuxNodeStatistics",
+      "action": "aws:executeAutomation",
+      "description": "Collects Linux networking statistics from the source pod's Amazon EC2 node, including iptables rules, conntrack entries, and cgroup metrics.",
+      "timeoutSeconds": 10800,
+      "inputs": {
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ CollectSourcePodData.PodNodeInstanceId }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "S3BucketName": [
+            "{{ S3BucketName }}"
+          ],
+          "ContainerId": [
+            "{{ CollectSourcePodData.PodSampleContainerId }}"
+          ],
+          "NetworkTargets": [
+            "{{ CollectSourcePodData.NetworkTarget }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-CollectEKSLinuxNodeStatistics"
+      },
+      "isCritical": true,
+      "onFailure": "step:CleanupAuthProxyForSourceEKSCluster",
+      "onCancel": "step:CleanupAuthProxyForSourceEKSCluster",
+      "nextStep": "CollectDestinationData"
+    },
+    {
+      "name": "CollectDestinationData",
+      "action": "aws:executeScript",
+      "description": "Collects and validates the destination's information based on the destination type (POD, SERVICE, IP, or DNS).",
+      "inputs": {
+        "InputPayload": {
+          "SourcePodName": "{{ SourcePodName }}",
+          "SourcePodNamespace": "{{ SourcePodNamespace }}",
+          "SourceClusterName": "{{ SourceClusterName }}",
+          "SourceClusterLambdaArn": "{{ SetupAuthProxyForSourceEKSCluster.Output }}",
+          "DestinationIpAddress": "{{ DestinationIpAddress }}",
+          "DestinationDnsName": "{{ DestinationDnsName }}",
+          "DestinationClusterName": "{{ DestinationClusterName }}",
+          "DestinationClusterLambdaArn": "{{ variable:destinationClusterLambdaArn }}",
+          "DestinationPodName": "{{ DestinationPodName }}",
+          "DestinationPodNamespace": "{{ DestinationPodNamespace }}",
+          "DestinationServiceName": "{{ DestinationServiceName }}",
+          "DestinationServiceNamespace": "{{ DestinationServiceNamespace }}",
+          "DestinationType": "{{ DestinationType }}"
+        },
+        "Handler": "collect_destination_data.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "timeoutSeconds": 300,
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Payload.InstanceId",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceRegion",
+          "Selector": "$.Payload.InstanceRegion",
+          "Type": "String"
+        },
+        {
+          "Name": "PodIp",
+          "Selector": "$.Payload.PodIp",
+          "Type": "String"
+        },
+        {
+          "Name": "SampleContainerId",
+          "Selector": "$.Payload.SampleContainerId",
+          "Type": "String"
+        },
+        {
+          "Name": "IsKubernetesNode",
+          "Selector": "$.Payload.IsKubernetesNode",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "IsFargateNode",
+          "Selector": "$.Payload.IsFargateNode",
+          "Type": "Boolean"
+        }
+      ],
+      "isCritical": true,
+      "onFailure": "step:CleanupAuthProxyForSourceEKSCluster",
+      "onCancel": "step:CleanupAuthProxyForSourceEKSCluster",
+      "nextStep": "BranchOnDestinationResults"
+    },
+    {
+      "name": "BranchOnDestinationResults",
+      "action": "aws:branch",
+      "description": "Branches the workflow based on whether the destination Kubernetes pod runs on Amazon EC2 to collect Linux networking statistics for the node.",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ CollectDestinationData.IsFargateNode }}",
+                "BooleanEquals": false
+              },
+              {
+                "Variable": "{{ CollectDestinationData.InstanceId }}",
+                "StartsWith": "i-"
+              },
+              {
+                "Variable": "{{ CollectDestinationData.IsKubernetesNode }}",
+                "BooleanEquals": true
+              }
+            ],
+            "NextStep": "CollectDestinationLinuxNodeStatistics"
+          }
+        ],
+        "Default": "CleanupAuthProxyForSourceEKSCluster"
+      },
+      "onCancel": "step:CleanupAuthProxyForSourceEKSCluster",
+      "onFailure": "step:CleanupAuthProxyForSourceEKSCluster",
+      "nextStep": "CleanupAuthProxyForSourceEKSCluster"
+    },
+    {
+      "name": "CollectDestinationLinuxNodeStatistics",
+      "action": "aws:executeAutomation",
+      "description": "Collects Linux networking statistics from the destination Amazon EC2 node, including iptables rules, conntrack entries, and cgroup metrics.",
+      "timeoutSeconds": 7200,
+      "inputs": {
+        "RuntimeParameters": {
+          "InstanceId": [
+            "{{ CollectDestinationData.InstanceId }}"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ],
+          "S3BucketName": [
+            "{{ S3BucketName }}"
+          ],
+          "ContainerId": [
+            "{{ CollectDestinationData.SampleContainerId }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-CollectEKSLinuxNodeStatistics"
+      },
+      "isCritical": true,
+      "onFailure": "step:CleanupAuthProxyForSourceEKSCluster",
+      "onCancel": "step:CleanupAuthProxyForSourceEKSCluster",
+      "nextStep": "CleanupAuthProxyForSourceEKSCluster"
+    },
+    {
+      "name": "CleanupAuthProxyForSourceEKSCluster",
+      "action": "aws:executeAutomation",
+      "description": "Cleans up the AWS Lambda function proxy resources created for the source Amazon EKS cluster.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ SourceClusterName }}"
+          ],
+          "Operation": [
+            "Cleanup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "isCritical": true,
+      "nextStep": "BranchOnDestinationProxyCleanupRequired",
+      "onFailure": "step:BranchOnDestinationProxyCleanupRequired"
+    },
+    {
+      "name": "BranchOnDestinationProxyCleanupRequired",
+      "action": "aws:branch",
+      "description": "Branches the workflow based on whether the destination auth proxy cleanup is required.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CleanupAuthProxyForDestinationEKSCluster",
+            "Variable": "{{ DestinationType }}",
+            "StringEquals": "POD"
+          },
+          {
+            "NextStep": "CleanupAuthProxyForDestinationEKSCluster",
+            "Variable": "{{ DestinationType }}",
+            "StringEquals": "SERVICE"
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "CleanupAuthProxyForDestinationEKSCluster",
+      "action": "aws:executeAutomation",
+      "description": "Cleans up the AWS Lambda function proxy resources created for the destination Amazon EKS cluster.",
+      "timeoutSeconds": 3600,
+      "inputs": {
+        "RuntimeParameters": {
+          "ClusterName": [
+            "{{ DestinationClusterName }}"
+          ],
+          "Operation": [
+            "Cleanup"
+          ],
+          "AutomationAssumeRole": [
+            "{{ AutomationAssumeRole }}"
+          ]
+        },
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS"
+      },
+      "isCritical": true,
+      "onFailure": "step:GenerateReport",
+      "nextStep": "GenerateReport"
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "Generates a comprehensive troubleshooting report summarizing collected data, identified issues, and recommended actions.",
+      "inputs": {
+        "InputPayload": {
+          "SourceClusterName": "{{ SourceClusterName }}",
+          "SourcePodName": "{{ SourcePodName }}",
+          "SourcePodNamespace": "{{ SourcePodNamespace }}",
+          "DestinationPort": "{{ DestinationPort }}",
+          "DestinationType": "{{ DestinationType }}",
+          "DestinationClusterName": "{{ DestinationClusterName }}",
+          "ConnectionProtocol": "{{ ConnectionProtocol }}",
+          "DestinationPodName": "{{ DestinationPodName }}",
+          "DestinationPodNamespace": "{{ DestinationPodNamespace }}",
+          "DestinationServiceName": "{{ DestinationServiceName }}",
+          "DestinationServiceNamespace": "{{ DestinationServiceNamespace }}",
+          "DestinationIpAddress": "{{ DestinationIpAddress }}",
+          "DestinationDnsName": "{{ DestinationDnsName }}"
+        },
+        "Handler": "generate_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Result",
+          "Type": "String"
+        }
+      ],
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "isEnd": true
+    }
+  ],
+  "files": {
+    "artifact_2.zip": {
+      "checksums": {
+        "SHA256": "c23dc4ed3063bc6e7410641233eb48efaa7be6205ab89816c24635834cc75a53"
+      }
+    },
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "451dc153c784a750e566713b09031e3f230a68f41daf98cca796020176e0f328"
+      }
+    }
+  }
+}
