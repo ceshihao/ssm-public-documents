@@ -1,6 +1,6 @@
 {
   "schemaVersion": "0.3",
-  "description": "The **AWSSupport-TroubleshootEKSWorkerNode** automation runbook helps troubleshoot Amazon Elastic Kubernetes Service (Amazon EKS) worker nodes that are [failing to join an Amazon EKS cluster](https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html#worker-node-fail). This automation runbook checks both the Amazon EKS cluster and the worker node configuration validating the following:\n\n> * Required node tags are applied.\n> * Worker node instance type is supported.\n> * Network communication between the worker node and the cluster API server is allowed.\n> * Node [AWS Identity and Access Management (IAM) role and policies](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html) configuration.\n> * Cluster [IAM role and Policies](https://docs.aws.amazon.com/eks/latest/userguide/service_IAM_role.html) configuration.\n> * Amazon Virtual Private Cloud (VPC) endpoints for [private Clusters](https://docs.aws.amazon.com/eks/latest/userguide/private-clusters.html).\n> * Worker node [Amazon Machine Image (AMI) version](https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html).\n> * VPC DHCP options set.\n> * Kubelet, container runtime and status.\n\n### Prerequisites:\n> * To check the kubelet container runtime and status, the Amazon EC2 instance must be managed by AWS Systems Manager. If your Amazon EC2 instance is not managed and online, this check is skipped.\n\n### Important:\n> * This runbook doesn't make any changes to your Amazon EKS cluster or your worker node.\n> * This runbook doesn't support worker nodes running Windows or Bottlerocket operating systems.",
+  "description": "The **AWSSupport-TroubleshootEKSWorkerNode** automation runbook helps troubleshoot Amazon Elastic Kubernetes Service (Amazon EKS) worker nodes that are [failing to join an Amazon EKS cluster](https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html#worker-node-fail). This automation runbook checks both the Amazon EKS cluster and the worker node configuration validating the following:\n\n> * Required node tags are applied.\n> * Worker node instance type is supported.\n> * Network communication between the worker node and the cluster API server is allowed.\n> * Node [AWS Identity and Access Management (IAM) role and policies](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html) configuration.\n> * Cluster [IAM role and Policies](https://docs.aws.amazon.com/eks/latest/userguide/service_IAM_role.html) configuration.\n> * Amazon Virtual Private Cloud (VPC) endpoints for [private Clusters](https://docs.aws.amazon.com/eks/latest/userguide/private-clusters.html).\n> * Worker node [Amazon Machine Image (AMI) version](https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html).\n> * VPC DHCP options set.\n> * User data validation (AL2 bootstrap.sh and AL2023 NodeConfig YAML).\n> * EKS Access Entries configuration.\n> * EKS managed add-ons status.\n> * DNS resolver and endpoint connectivity (when SSM agent is available).\n> * Kubelet, container runtime and status.\n> * Optional VPC Reachability Analyzer integration.\n\n### Prerequisites:\n> * To check the kubelet container runtime, status, and DNS connectivity, the Amazon EC2 instance must be managed by AWS Systems Manager. If your Amazon EC2 instance is not managed and online, these checks are skipped.\n\n### Important:\n> * This runbook doesn't make any changes to your Amazon EKS cluster or your worker node.\n> * This runbook supports Amazon Linux 2 (AL2) and Amazon Linux 2023 (AL2023) worker nodes.\n> * This runbook doesn't support worker nodes running Windows or Bottlerocket operating systems.",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
     "AutomationAssumeRole": {
@@ -16,6 +16,11 @@
     "WorkerID": {
       "type": "AWS::EC2::Instance::Id",
       "description": "(Required) The Amazon Elastic Compute Cloud (Amazon EC2) instance ID for the worker node which failed to join the Amazon EKS cluster."
+    },
+    "RunVpcReachabilityAnalyzer": {
+      "type": "Boolean",
+      "description": "(Optional) Specify 'true' to run the AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2 child automation to analyze network path connectivity to required EKS endpoints. This provides more accurate results than configuration-only checks but increases execution time. Defaults to 'false'.",
+      "default": false
     }
   },
   "mainSteps": [
@@ -828,6 +833,78 @@
           "Type": "String"
         }
       ],
+      "nextStep": "CheckDNSConnectivity"
+    },
+    {
+      "name": "CheckDNSConnectivity",
+      "description": "Tests DNS resolver reachability and connectivity to EKS API server and required AWS service endpoints from the worker node (requires SSM agent).",
+      "action": "aws:executeScript",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 600,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "NodeData": "{{ GatherClusterNodeData.NodeData }}",
+          "ClusterData": "{{ GatherClusterNodeData.ClusterData }}"
+        },
+        "Handler": "dns_connectivity_check.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnReachabilityAnalyzer"
+    },
+    {
+      "name": "BranchOnReachabilityAnalyzer",
+      "description": "Determines whether to run VPC Reachability Analyzer based on the RunVpcReachabilityAnalyzer parameter.",
+      "action": "aws:branch",
+      "nextStep": "GenerateFinalReport",
+      "inputs": {
+        "Choices": [
+          {
+            "Variable": "{{ RunVpcReachabilityAnalyzer }}",
+            "BooleanEquals": true,
+            "NextStep": "AnalyzeEKSEndpointReachability"
+          }
+        ],
+        "Default": "GenerateFinalReport"
+      }
+    },
+    {
+      "name": "AnalyzeEKSEndpointReachability",
+      "description": "Runs AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2 to analyze network path connectivity from the worker node to the EKS API server endpoint.",
+      "action": "aws:executeAutomation",
+      "onFailure": "Continue",
+      "isCritical": false,
+      "timeoutSeconds": 3600,
+      "maxAttempts": 1,
+      "inputs": {
+        "DocumentName": "AWSSupport-AnalyzeAWSEndpointReachabilityFromEC2",
+        "RuntimeParameters": {
+          "Source": "{{ WorkerID }}",
+          "ServiceEndpoint": "eks.{{ global:REGION }}.amazonaws.com",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "ChildExecutionId",
+          "Selector": "$.ExecutionId",
+          "Type": "String"
+        }
+      ],
       "nextStep": "GenerateFinalReport"
     },
     {
@@ -890,7 +967,9 @@
           "IMDSEndpointReport": "{{ CheckIMDSEndpoint.Report }}",
           "IMDSEndpointStatus": "{{ CheckIMDSEndpoint.Status }}",
           "SystemDaemonsReport": "{{ CheckSystemDaemons.Report }}",
-          "SystemDaemonsStatus": "{{ CheckSystemDaemons.Status }}"
+          "SystemDaemonsStatus": "{{ CheckSystemDaemons.Status }}",
+          "DNSConnectivityReport": "{{ CheckDNSConnectivity.Report }}",
+          "DNSConnectivityStatus": "{{ CheckDNSConnectivity.Status }}"
         },
         "Handler": "generate_final_report.lambda_handler",
         "Runtime": "python3.11",
@@ -911,7 +990,7 @@
   "files": {
     "artifact.zip": {
       "checksums": {
-        "SHA256": "12068165a61b7eb1b475f3918fd4f3e8761f62a9cb68f6b3dcf39ad904c531b0"
+        "SHA256": "18a201f7b2917f8a64c3c2b0cb5e858774c77693c8e9abaacca47e40832c2a65"
       }
     }
   }
