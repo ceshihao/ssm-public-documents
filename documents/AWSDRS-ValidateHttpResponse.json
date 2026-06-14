@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "2.2",
+  "description": "This document verifies response status code for HTTP/HTTPS requests",
+  "parameters": {
+    "Urls": {
+      "type": "String",
+      "description": "(Required) List of HTTP/HTTPS URLs to validate, separated by a single space (for example: https://www.example.com https://www.amazon.com).",
+      "allowedPattern": "^(https?:\\/\\/(?:www\\.)?[-a-zA-Z0-9@:%.\\+~#=]+\\.[a-zA-Z0-9()][-a-zA-Z0-9()@:%\\+.~#?&\\/=]*)(?:\\s(https?:\\/\\/(?:www\\.)?[-a-zA-Z0-9@:%.\\+~#=]+\\.[a-zA-Z0-9()][-a-zA-Z0-9()@:%\\+.~#?&\\/=]*)){0,9}$",
+      "maxChars": 1500
+    },
+    "TotalRetryDurationMinutes": {
+      "type": "String",
+      "description": "(Optional) The total number of minutes to retry failed URLs (for example: 20).",
+      "allowedPattern": "^([1-5]\\d|60)$",
+      "default": "10"
+    },
+    "SuccessCodes": {
+      "type": "String",
+      "description": "(Optional) List of all HTTP response status codes to be considered as success, separated by a single space (for example: 200 201 202).",
+      "allowedPattern": "^([1-5]\\d{2}(\\s|$)){1,20}$",
+      "default": "200"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runPowerShellScript",
+      "name": "ValidateWindowsHttpResponse",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "4000",
+        "runCommand": [
+          "$TimeoutSecs = 30\n$RetryWaitIntervalSecs = 60\n$TotalRetryDurationMinutesInt = [int]'{{TotalRetryDurationMinutes}}'\n$TotalRetryDurationSecs = $TotalRetryDurationMinutesInt * 60\n$SuccessCodes = '{{SuccessCodes}}'.Trim().Split(' ')\n\n$global:pendingUrls = '{{Urls}}'.Split(' ')\n$global:successUrls = @()\n$global:ret = 0\n$global:retryCount = 0\n\nfunction ValidateUrl($url) {\n  Write-Host \"Validating: $url\"\n  try {\n      $response = Invoke-WebRequest -MaximumRedirection 0 -UseBasicParsing -TimeoutSec $TimeoutSecs -Uri $url\n      return CheckStatusCode $url $response.StatusCode\n  }\n  catch {\n      if ($_.Exception.Response) {\n          return CheckStatusCode $url $_.Exception.Response.StatusCode.value__\n      } else {\n          Write-Host \"Error: $url $($_.Exception.Message)\"\n          return $false\n      }\n  }\n}\n\nfunction CheckStatusCode($url, $statusCode) {\nif (\"$statusCode\" -in $SuccessCodes) {\n    Write-Host \"Success: $url ok\"\n    return $true\n} else {\n    Write-Host \"Error: $url $statusCode not success code\"\n    return $false\n}\n}\n\nfunction ValidateUrls {\n  $tmpPendingUrls = @()\n  $urlCount = $pendingUrls.Count\n  for ($i = 0; $i -lt $urlCount; $i++) {\n      $url = $pendingUrls[$i]\n      $startTime = Get-Date\n\n      if (ValidateUrl $url) {\n          $global:successUrls += $url\n      } else {\n          $tmpPendingUrls += $url\n          $global:ret = 1\n      }\n\n      if ($i -lt $urlCount - 1) {\n          $totalTime = (Get-Date) - $startTime\n          if ($totalTime.TotalSeconds -lt $TimeoutSecs) {\n              Start-Sleep -Seconds ($TimeoutSecs - $totalTime.TotalSeconds)\n          }\n      }\n  }\n  $global:pendingUrls = $tmpPendingUrls\n}\n\nfunction RetryFailedUrls {\n  $elapsedRetryTimeSecs = 0\n  while ($pendingUrls.Count -gt 0 -and $elapsedRetryTimeSecs -lt $TotalRetryDurationSecs) {\n      $startTime = Get-Date\n      Start-Sleep -Seconds $RetryWaitIntervalSecs\n      $global:retryCount++\n      Write-Host \"Retrying failed URLs #$retryCount...\"\n      ValidateUrls\n      $elapsedRetryTimeSecs += ((Get-Date) - $startTime).TotalSeconds\n      Write-Host \"Elapsed retry seconds: $elapsedRetryTimeSecs\"\n  }\n\n  if ($pendingUrls.Count -eq 0) {\n      $global:ret = 0\n  }\n}\n\nfunction PrintSummary {\n  Write-Host \"Success count: $($successUrls.Count)\"\n  Write-Host \"Success URLs: $successUrls\"\n  Write-Host \"Fail count: $($pendingUrls.Count)\"\n  Write-Host \"Failed URLs: $pendingUrls\"\n  Write-Host \"Retry count: $retryCount\"\n}\n\nValidateUrls\nRetryFailedUrls\nWrite-Host \"Validation done.\"\nPrintSummary\nexit $ret\n"
+        ]
+      }
+    },
+    {
+      "action": "aws:runShellScript",
+      "name": "ValidateLinuxHttpResponse",
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Linux"
+        ]
+      },
+      "inputs": {
+        "timeoutSeconds": "4000",
+        "runCommand": [
+          "#!/bin/bash\n\nTIMEOUT_SECS=30\nRETRY_WAIT_INTERVAL_SECS=60\nTotalRetryDurationMinutesQuoted='{{TotalRetryDurationMinutes}}'\nTOTAL_RETRY_DURATION_SECS=$((TotalRetryDurationMinutesQuoted * 60))\nIFS=' ' read -ra SUCCESS_CODES <<< '{{SuccessCodes}}'\n\nIFS=' ' read -ra pending_urls <<< '{{Urls}}'\nsuccessful_urls=()\nret=0\nretry_count=0\n\nis_success_code() {\n    for code in \"${SUCCESS_CODES[@]}\"; do\n        if [ \"$1\" == \"$code\" ]; then\n            return 0\n        fi\n    done\n    return 1\n}\n\nvalidate_url() {\n    url=\"$1\"\n    echo \"Validating: $url\"\n    resp_code_or_err=$(curl -s -w \"%{http_code}\" -o /dev/null --show-error -m \"$TIMEOUT_SECS\" \"$url\" 2>&1)\n    exit_code=$?\n\n    if [ \"$exit_code\" -eq 0 ]; then\n        if is_success_code \"$resp_code_or_err\"; then\n            echo \"Success: $url ok\"\n            return 0\n        else\n            echo \"Error: $url $resp_code_or_err not success code\"\n            return 1\n        fi\n    else\n        echo \"Error: $url ${resp_code_or_err%000}\"\n        return 1\n    fi\n}\n\nvalidate_urls() {\n    local start_time\n    tmp_pending_urls=()\n    url_count=\"${#pending_urls[@]}\"\n\n    for ((i=0; i<url_count; i++)); do\n        url=\"${pending_urls[i]}\"\n\n        start_time=$(date +%s)\n        validate_url \"$url\"\n        url_success=\"$?\"\n        end_time=$(date +%s)\n\n        if [ \"$url_success\" -eq 0 ]; then\n            successful_urls+=(\"$url\")\n        else\n            tmp_pending_urls+=(\"$url\")\n            ret=1\n        fi\n\n        if (( i < url_count - 1 )); then\n            total_time=$((end_time - start_time))\n            if (( total_time < TIMEOUT_SECS )); then\n                sleep $((TIMEOUT_SECS - total_time))\n            fi\n        fi\n    done\n\n    pending_urls=(\"${tmp_pending_urls[@]}\")\n}\n\nretry_failed_urls() {\n    elapsed_retry_time_secs=0\n    while (( ${#pending_urls[@]} > 0 )) && (( elapsed_retry_time_secs < TOTAL_RETRY_DURATION_SECS )); do\n        start_time=$(date +%s)\n        sleep \"$RETRY_WAIT_INTERVAL_SECS\"\n        ((retry_count++))\n        echo \"Retrying failed URLs #$retry_count...\"\n        validate_urls\n        elapsed_retry_time_secs=$((elapsed_retry_time_secs + $(date +%s) - start_time))\n        echo \"Elapsed retry seconds: $elapsed_retry_time_secs\"\n    done\n\n    if (( ${#pending_urls[@]} == 0 )); then\n        ret=0\n    fi\n}\n\nprint_summary() {\n    echo \"Success count: ${#successful_urls[@]}\"\n    echo \"Success URLs: ${#successful_urls[*]}\"\n    echo \"Fail count: ${#pending_urls[@]}\"\n    echo \"Failed URLs: ${pending_urls[*]}\"\n    echo \"Retry count: $retry_count\"\n}\n\n\nvalidate_urls\nretry_failed_urls\necho \"Validation done.\"\nprint_summary\nexit $ret\n"
+        ]
+      }
+    }
+  ]
+}

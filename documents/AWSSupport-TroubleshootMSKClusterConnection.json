@@ -1,0 +1,632 @@
+{
+  "description": "# AWSSupport-TroubleshootMSKClusterConnection\n\n## Objective\nAutomated troubleshooting tool to diagnose and resolve Amazon MSK cluster connectivity issues including broker health problems, network configuration issues, and IAM authentication problems.\n\n## Implementation Steps\n1. Verify the execution role has all required permissions\n2. Retrieve MSK cluster configuration and metadata\n3. Analyze broker health metrics to identify performance issues\n4. Deploy CloudFormation stack with VPC-attached Lambda for connectivity testing\n5. Retrieve Lambda function details from created stack\n6. Perform live DNS resolution and TCP connectivity test to MSK endpoint\n7. Route workflow based on connectivity test results\n8. Identify Lambda ENI for use as Reachability Analyzer source\n9. Use VPC Reachability Analyzer to diagnose network connectivity issues\n10. Fallback static analysis of network configuration when Lambda testing fails\n11. Determine if IAM authentication analysis is needed based on port\n12. Retrieve IAM policies attached to client role for analysis\n13. Analyze IAM policies for required MSK permissions\n14. Clean up CloudFormation stack and associated resources\n15. Provide manual cleanup instructions if stack deletion fails\n16. Compile comprehensive troubleshooting results with actionable recommendations.\n\n## Important\nThis runbook uses [VPC Reachability Analyzer](https://docs.aws.amazon.com/vpc/latest/reachability/what-is-reachability-analyzer.html) to diagnose network connectivity issues. Each analysis incurs a charge. For current pricing, see [VPC Reachability Analyzer pricing](https://aws.amazon.com/vpc/pricing/). To skip network path analysis and use static analysis only, ensure the Lambda connectivity test succeeds or the Reachability Analyzer step will be attempted automatically when connectivity fails.",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "variables": {
+    "BrokerHealthIssues": {
+      "type": "StringList",
+      "default": []
+    },
+    "ConnectivityStatus": {
+      "type": "Boolean",
+      "default": false
+    },
+    "ConnectivityIssues": {
+      "type": "StringList",
+      "default": []
+    },
+    "NetworkAnalyses": {
+      "type": "MapList",
+      "default": []
+    },
+    "StaticAnalysisIssues": {
+      "type": "StringList",
+      "default": []
+    },
+    "IAMAuthenticationIssues": {
+      "type": "StringList",
+      "default": []
+    }
+  },
+  "parameters": {
+    "ClusterARN": {
+      "type": "String",
+      "description": "(Required) The ARN of the MSK cluster to troubleshoot.",
+      "allowedPattern": "^arn:(aws|aws-cn|aws-us-gov):kafka:[a-z0-9\\-]+:\\d{12,13}:cluster\\/[a-zA-Z0-9\\-]{1,64}\\/[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[1-5][a-fA-F0-9]{3}-[89abAB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}(-[0-9a-z]{1,2})?$"
+    },
+    "BootstrapEndpoints": {
+      "type": "String",
+      "description": "(Required) The MSK cluster bootstrap endpoint(s). Accepts a single endpoint in hostname:port format or multiple comma-separated endpoints (e.g., broker1:9092,broker2:9092,broker3:9092).",
+      "allowedPattern": "^[a-zA-Z0-9.-]+:[0-9]{1,5}(,[a-zA-Z0-9.-]+:[0-9]{1,5})*$"
+    },
+    "ClientVPC": {
+      "type": "String",
+      "description": "(Required) The VPC ID where the client attempting to connect resides.",
+      "allowedPattern": "^vpc-[a-z0-9]{8,17}$"
+    },
+    "ClientSubnet": {
+      "type": "String",
+      "description": "(Required) The subnet ID where the client attempting to connect resides.",
+      "allowedPattern": "^subnet-[a-z0-9]{8,17}$"
+    },
+    "ClientSecurityGroups": {
+      "type": "String",
+      "description": "(Required) The security group ID(s) of the client attempting to connect. Accepts a single security group or multiple comma-separated security groups (e.g., sg-abc123,sg-def456).",
+      "allowedPattern": "^sg-[a-z0-9]{8,17}(,sg-[a-z0-9]{8,17})*$"
+    },
+    "LambdaAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) IAM role ARN for Lambda function execution with VPC access permissions.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b|aws-iso-e|aws-iso-f|aws-eusc):iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "ClientIAMRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) IAM role ARN used by the client for MSK authentication.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b|aws-iso-e|aws-iso-f|aws-eusc):iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b|aws-iso-e|aws-iso-f|aws-eusc):iam::\\d{12}:role/[\\w+=,.@/-]+$"
+    },
+    "RetainResources": {
+      "type": "Boolean",
+      "description": "(Optional) Whether to retain Network Insights Analysis resources after completion.",
+      "default": false,
+      "allowedValues": [
+        true,
+        false
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "VerifyPermissions",
+      "action": "aws:executeScript",
+      "description": "Verifies that the execution role has all required permissions before proceeding. This prevents partial resource creation (e.g., CloudFormation stacks that cannot be deleted) due to insufficient permissions.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ClusterARN": "{{ ClusterARN }}"
+        },
+        "Handler": "verify_permissions.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Message",
+          "Selector": "$.Payload.Message",
+          "Type": "String"
+        }
+      ],
+      "timeoutSeconds": 120,
+      "nextStep": "DescribeCluster"
+    },
+    {
+      "name": "DescribeCluster",
+      "action": "aws:executeAwsApi",
+      "description": "Retrieves MSK cluster configuration and metadata to understand the cluster's current state and configuration.",
+      "onFailure": "step:ParseBootstrapEndpoint",
+      "inputs": {
+        "Service": "kafka",
+        "Api": "DescribeClusterV2",
+        "ClusterArn": "{{ ClusterARN }}"
+      },
+      "outputs": [
+        {
+          "Name": "ClusterInfo",
+          "Selector": "$.ClusterInfo",
+          "Type": "StringMap"
+        }
+      ],
+      "timeoutSeconds": 300,
+      "nextStep": "CheckBrokerHealth"
+    },
+    {
+      "name": "CheckBrokerHealth",
+      "action": "aws:executeScript",
+      "description": "Analyzes broker health metrics from CloudWatch to identify performance issues such as high CPU, memory, disk usage, or exhausted credit balance.",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "ClusterARN": "{{ ClusterARN }}",
+          "ClusterInfo": "{{ DescribeCluster.ClusterInfo }}"
+        },
+        "Handler": "check_broker_health.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "HealthIssues",
+          "Selector": "$.Payload.HealthIssues",
+          "Type": "StringList"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateBrokerHealthVariable"
+    },
+    {
+      "name": "UpdateBrokerHealthVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the `BrokerHealthIssues` variable with output `HealthIssues` from `CheckBrokerHealth` step.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:BrokerHealthIssues",
+        "Value": "{{ CheckBrokerHealth.HealthIssues }}"
+      },
+      "timeoutSeconds": 60,
+      "nextStep": "ParseBootstrapEndpoint"
+    },
+    {
+      "name": "ParseBootstrapEndpoint",
+      "action": "aws:executeScript",
+      "description": "Parses the bootstrap endpoint to extract hostname and port for connectivity testing.",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "BootstrapEndpoints": "{{ BootstrapEndpoints }}"
+        },
+        "Handler": "parse_bootstrap_endpoint.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Hostname",
+          "Selector": "$.Payload.Hostname",
+          "Type": "String"
+        },
+        {
+          "Name": "Port",
+          "Selector": "$.Payload.Port",
+          "Type": "String"
+        },
+        {
+          "Name": "IsIAMAuth",
+          "Selector": "$.Payload.IsIAMAuth",
+          "Type": "Boolean"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "nextStep": "CreateConnectivityTestLambdaStack"
+    },
+    {
+      "name": "CreateConnectivityTestLambdaStack",
+      "action": "aws:createStack",
+      "description": "Deploys a CloudFormation stack that creates a Lambda function in the client VPC to test connectivity to the MSK cluster. The Lambda function will be used to perform DNS resolution and TCP connectivity tests from within the client's network environment.",
+      "onFailure": "step:PerformStaticAnalysis",
+      "inputs": {
+        "StackName": "msk-connectivity-test-stack-{{automation:EXECUTION_ID}}",
+        "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nDescription: 'Creates a Lambda function in the client VPC to test connectivity to the MSK cluster'\n\nParameters:\n  ClientVPC:\n    Type: String\n    Description: The VPC ID where the client attempting to connect resides\n    AllowedPattern: \"^vpc-[a-z0-9]{8,17}$\"\n    \n  ClientSubnet:\n    Type: String\n    Description: The subnet ID where the client attempting to connect resides\n    AllowedPattern: \"^subnet-[a-z0-9]{8,17}$\"\n    \n  ClientSecurityGroups:\n    Type: CommaDelimitedList\n    Description: The security group ID(s) of the client attempting to connect\n    \n  LambdaAssumeRole:\n    Type: String\n    Description: IAM role ARN for Lambda function execution with VPC access permissions\n    Default: \"\"\n\nConditions:\n  CreateLambdaRole: !Equals [!Ref LambdaAssumeRole, \"\"]\n\nResources:\n  LambdaExecutionRole:\n    Type: AWS::IAM::Role\n    Condition: CreateLambdaRole\n    Properties:\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: lambda.amazonaws.com\n            Action: sts:AssumeRole\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'\n      Tags:\n        - Key: CreatedBy\n          Value: 'AWSSupport-TroubleshootMSKClusterConnection'\n\n  ENICleanupRole:\n    Type: AWS::IAM::Role\n    Properties:\n      AssumeRolePolicyDocument:\n        Version: '2012-10-17'\n        Statement:\n          - Effect: Allow\n            Principal:\n              Service: lambda.amazonaws.com\n            Action: sts:AssumeRole\n      ManagedPolicyArns:\n        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'\n      Tags:\n        - Key: CreatedBy\n          Value: 'AWSSupport-TroubleshootMSKClusterConnection'\n      Policies:\n        - PolicyName: ENICleanupPolicy\n          PolicyDocument:\n            Version: '2012-10-17'\n            Statement:\n              - Effect: Allow\n                Action:\n                  - ec2:DescribeNetworkInterfaces\n                Resource: '*'\n              - Effect: Allow\n                Action:\n                  - ec2:DeleteNetworkInterface\n                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'\n                Condition:\n                  StringLike:\n                    'ec2:Description': !Sub 'AWS Lambda VPC ENI-${ConnectivityTestLambda}*'\n              - Effect: Allow\n                Action:\n                  - lambda:UpdateFunctionConfiguration\n                Resource: !GetAtt ConnectivityTestLambda.Arn\n\n  ENICleanupFunction:\n    Type: AWS::Lambda::Function\n    Properties:\n      Handler: index.lambda_handler\n      Role: !GetAtt ENICleanupRole.Arn\n      Code:\n        ZipFile: |\n          import boto3\n          import cfnresponse\n          import time\n          \n          def lambda_handler(event, context):\n              try:\n                  if event['RequestType'] == 'Delete':\n                      lambda_client = boto3.client('lambda')\n                      ec2 = boto3.client('ec2')\n                      lambda_function_name = event['ResourceProperties']['LambdaFunctionName']\n                      \n                      # Remove VPC configuration from Lambda function\n                      try:\n                          lambda_client.update_function_configuration(\n                              FunctionName=lambda_function_name,\n                              VpcConfig={\n                                'SubnetIds': [],  \n                                'SecurityGroupIds': []\n                              }\n                          )\n                          print(f\"Removed VPC configuration from {lambda_function_name}\")\n                          \n                          # Wait for Lambda to detach from VPC\n                          time.sleep(90)\n                      except Exception as e:\n                          print(f\"Failed to remove VPC config: {str(e)}\")\n                      \n                      # Find and delete ENIs\n                      enis = []\n                      slept_time = 0\n                      while len(enis) == 0 and slept_time < 180:\n                        time.sleep(30)\n                        response = ec2.describe_network_interfaces(\n                            Filters=[\n                                {'Name': 'description', 'Values': [f'AWS Lambda VPC ENI-{lambda_function_name}*']},\n                                {'Name': 'status', 'Values': ['available']}\n                            ]\n                        )\n                        enis = response['NetworkInterfaces']\n                        slept_time += 30\n\n                      for eni in enis:\n                          try:\n                              ec2.delete_network_interface(NetworkInterfaceId=eni['NetworkInterfaceId'])\n                              print(f\"Deleted ENI: {eni['NetworkInterfaceId']}\")\n                          except Exception as e:\n                              print(f\"Failed to delete ENI {eni['NetworkInterfaceId']}: {str(e)}\")\n                  \n                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})\n              except Exception as e:\n                  print(f\"Error: {str(e)}\")\n                  cfnresponse.send(event, context, cfnresponse.FAILED, {})\n      Runtime: python3.11\n      Timeout: 300\n      Tags:\n        - Key: CreatedBy\n          Value: 'AWSSupport-TroubleshootMSKClusterConnection'\n\n  ENICleanup:\n    Type: AWS::CloudFormation::CustomResource\n    Properties:\n      ServiceToken: !GetAtt ENICleanupFunction.Arn\n      LambdaFunctionName: !Ref ConnectivityTestLambda\n\n  ConnectivityTestLambda:\n    Type: AWS::Lambda::Function\n    DeletionPolicy: Delete\n    Properties:\n      Handler: index.lambda_handler\n      Role: !If \n        - CreateLambdaRole\n        - !GetAtt LambdaExecutionRole.Arn\n        - !Ref LambdaAssumeRole\n      Code:\n        ZipFile: |\n          import socket\n          import json\n          \n          def lambda_handler(event, context):\n              try:\n                  endpoint = event['endpoint']\n                  # Support multiple comma-separated endpoints; test all of them\n                  endpoints = [ep.strip() for ep in endpoint.split(',')]\n                  \n                  all_reachable = True\n                  first_resolved_ip = ''\n                  all_issues = []\n                  \n                  for ep in endpoints:\n                      hostname, port = ep.split(':')\n                      port = int(port)\n                      \n                      # Perform DNS resolution\n                      try:\n                          resolved_ip = socket.gethostbyname(hostname)\n                          if not first_resolved_ip:\n                              first_resolved_ip = resolved_ip\n                      except socket.gaierror as e:\n                          all_reachable = False\n                          all_issues.append(f'DNS resolution failed for {hostname}: {str(e)}')\n                          continue\n                      \n                      # Test TCP connectivity\n                      try:\n                          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n                          sock.settimeout(10)\n                          result = sock.connect_ex((resolved_ip, port))\n                          sock.close()\n                          \n                          if result != 0:\n                              all_reachable = False\n                              all_issues.append(f'TCP connection failed to {hostname} ({resolved_ip}:{port})')\n                      except Exception as e:\n                          all_reachable = False\n                          all_issues.append(f'TCP connection test failed for {hostname}: {str(e)}')\n                  \n                  return {\n                      'reachable': all_reachable,\n                      'resolvedIP': first_resolved_ip,\n                      'networkConnectivityIssues': all_issues\n                  }\n                      \n              except Exception as e:\n                  return {\n                      'reachable': False,\n                      'resolvedIP': '',\n                      'networkConnectivityIssues': [f'Unexpected error: {str(e)}']\n                  }\n      Runtime: python3.11\n      Timeout: 300\n      MemorySize: 256\n      VpcConfig:\n        SecurityGroupIds: !Ref ClientSecurityGroups\n        SubnetIds:\n          - !Ref ClientSubnet\n      Tags:\n        - Key: CreatedBy\n          Value: 'AWSSupport-TroubleshootMSKClusterConnection'\n\nOutputs:\n  LambdaFunctionArn:\n    Description: The ARN of the Lambda function created for MSK connectivity testing\n    Value: !GetAtt ConnectivityTestLambda.Arn\n    \n  LambdaFunctionName:\n    Description: The name of the Lambda function created for MSK connectivity testing\n    Value: !Ref ConnectivityTestLambda\n    \n  LambdaExecutionRoleArn:\n    Description: The ARN of the IAM role created for the Lambda function (if created)\n    Value: !If \n      - CreateLambdaRole\n      - !GetAtt LambdaExecutionRole.Arn\n      - !Ref LambdaAssumeRole",
+        "Parameters": [
+          {
+            "ParameterKey": "ClientVPC",
+            "ParameterValue": "{{ ClientVPC }}"
+          },
+          {
+            "ParameterKey": "ClientSubnet",
+            "ParameterValue": "{{ ClientSubnet }}"
+          },
+          {
+            "ParameterKey": "ClientSecurityGroups",
+            "ParameterValue": "{{ ClientSecurityGroups }}"
+          },
+          {
+            "ParameterKey": "LambdaAssumeRole",
+            "ParameterValue": "{{ LambdaAssumeRole }}"
+          }
+        ],
+        "Capabilities": [
+          "CAPABILITY_IAM"
+        ],
+        "OnFailure": "DELETE",
+        "TimeoutInMinutes": 10,
+        "Tags": [
+          {
+            "Key": "CreatedBy",
+            "Value": "AWSSupport-TroubleshootMSKClusterConnection"
+          }
+        ],
+        "ClientRequestToken": "MSKConnectivityTest-{{ automation:EXECUTION_ID }}"
+      },
+      "timeoutSeconds": 900,
+      "nextStep": "DescribeStackResources"
+    },
+    {
+      "name": "DescribeStackResources",
+      "action": "aws:executeAwsApi",
+      "description": "Retrieves the outputs from the CloudFormation stack to get the Lambda function name for connectivity testing.",
+      "onFailure": "step:PerformStaticAnalysis",
+      "inputs": {
+        "Service": "cloudformation",
+        "Api": "DescribeStacks",
+        "StackName": "{{ CreateConnectivityTestLambdaStack.StackId }}"
+      },
+      "outputs": [
+        {
+          "Name": "StackOutputs",
+          "Selector": "$.Stacks[0].Outputs",
+          "Type": "MapList"
+        },
+        {
+          "Name": "LambdaFunctionName",
+          "Selector": "$.Stacks[0].Outputs[?(@.OutputKey == 'LambdaFunctionName')].OutputValue",
+          "Type": "String"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "nextStep": "TestConnectivity"
+    },
+    {
+      "name": "TestConnectivity",
+      "action": "aws:invokeLambdaFunction",
+      "description": "Invokes the Lambda function to test DNS resolution and TCP connectivity to the MSK bootstrap endpoint from within the client VPC.",
+      "onFailure": "step:DescribeNetworkInterfaces",
+      "inputs": {
+        "FunctionName": "{{ DescribeStackResources.LambdaFunctionName }}",
+        "InputPayload": {
+          "endpoint": "{{ BootstrapEndpoints }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Reachable",
+          "Selector": "$.reachable",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ResolvedIP",
+          "Selector": "$.resolvedIP",
+          "Type": "String"
+        },
+        {
+          "Name": "NetworkConnectivityIssues",
+          "Selector": "$.networkConnectivityIssues",
+          "Type": "StringList"
+        }
+      ],
+      "timeoutSeconds": 900,
+      "nextStep": "UpdateConnectivityStatusVariable"
+    },
+    {
+      "name": "UpdateConnectivityStatusVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the `ConnectivityStatus` variable with output `Reachable` from `TestConnectivity` step.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:ConnectivityStatus",
+        "Value": "{{ TestConnectivity.Reachable }}"
+      },
+      "timeoutSeconds": 60,
+      "nextStep": "UpdateConnectivityIssuesVariable"
+    },
+    {
+      "name": "UpdateConnectivityIssuesVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the `ConnectivityIssues` variable with output `NetworkConnectivityIssues` from `TestConnectivity` step.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:ConnectivityIssues",
+        "Value": "{{ TestConnectivity.NetworkConnectivityIssues }}"
+      },
+      "timeoutSeconds": 60,
+      "nextStep": "BranchOnConnectivity"
+    },
+    {
+      "name": "BranchOnConnectivity",
+      "action": "aws:branch",
+      "description": "Routes the workflow based on connectivity test results. If connectivity is successful, skips network analysis steps.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnBootstrapEndpoint",
+            "Variable": "{{ TestConnectivity.Reachable }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "DescribeNetworkInterfaces"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "DescribeNetworkInterfaces",
+      "action": "aws:executeAwsApi",
+      "description": "Identifies Lambda ENI for use as Reachability Analyzer source by querying network interfaces in the client subnet and security group.",
+      "onFailure": "step:PerformStaticAnalysis",
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeNetworkInterfaces",
+        "Filters": [
+          {
+            "Name": "vpc-id",
+            "Values": [
+              "{{ ClientVPC }}"
+            ]
+          },
+          {
+            "Name": "subnet-id",
+            "Values": [
+              "{{ ClientSubnet }}"
+            ]
+          },
+          {
+            "Name": "group-id",
+            "Values": [
+              "{{ ClientSecurityGroups }}"
+            ]
+          },
+          {
+            "Name": "interface-type",
+            "Values": [
+              "lambda"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Name": "NetworkInterfaceId",
+          "Selector": "$.NetworkInterfaces[0].NetworkInterfaceId"
+        }
+      ],
+      "timeoutSeconds": 300,
+      "nextStep": "AnalyzeNetworkPath"
+    },
+    {
+      "name": "AnalyzeNetworkPath",
+      "action": "aws:executeScript",
+      "description": "Uses VPC Reachability Analyzer to diagnose network connectivity issues between the client and MSK cluster.",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "Source": "{{ DescribeNetworkInterfaces.NetworkInterfaceId }}",
+          "Destination": "{{ TestConnectivity.ResolvedIP }}",
+          "DestinationPort": "{{ ParseBootstrapEndpoint.Port }}",
+          "Protocol": "tcp",
+          "KeepResults": "{{ RetainResources }}",
+          "Region": "{{ global:REGION }}"
+        },
+        "Handler": "reachability_analyzer.perform_analysis",
+        "Runtime": "python3.11",
+        "Attachment": "common_artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NetworkAnalyses",
+          "Selector": "$.Payload.analyses",
+          "Type": "MapList"
+        },
+        {
+          "Name": "NetworkAnalysisLinks",
+          "Selector": "$.Payload.console_links",
+          "Type": "StringList"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateNetworkAnalysisVariable"
+    },
+    {
+      "name": "UpdateNetworkAnalysisVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the `NetworkAnalyses` variable with output `NetworkAnalyses` from `AnalyzeNetworkPath` step.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:NetworkAnalyses",
+        "Value": "{{ AnalyzeNetworkPath.NetworkAnalyses }}"
+      },
+      "timeoutSeconds": 60,
+      "nextStep": "BranchOnBootstrapEndpoint"
+    },
+    {
+      "name": "PerformStaticAnalysis",
+      "action": "aws:executeScript",
+      "description": "Performs fallback static analysis of network configuration when Lambda testing or Reachability Analyzer is unavailable. Analyzes route tables, NACLs, and security group rules.",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "ClientVPC": "{{ ClientVPC }}",
+          "ClientSubnet": "{{ ClientSubnet }}",
+          "ClientSecurityGroups": "{{ ClientSecurityGroups }}",
+          "Destination": "{{ ParseBootstrapEndpoint.Hostname }}",
+          "DestinationPort": "{{ ParseBootstrapEndpoint.Port }}",
+          "ClusterInfo": "{{ DescribeCluster.ClusterInfo }}"
+        },
+        "Handler": "perform_static_analysis.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "StaticAnalysisResults",
+          "Selector": "$.Payload.Results",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "Issues",
+          "Selector": "$.Payload.Issues",
+          "Type": "StringList"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateStaticAnalysisVariable"
+    },
+    {
+      "name": "UpdateStaticAnalysisVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the `StaticAnalysisIssues` variable with output `Issues` from `PerformStaticAnalysis` step.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:StaticAnalysisIssues",
+        "Value": "{{ PerformStaticAnalysis.Issues }}"
+      },
+      "timeoutSeconds": 60,
+      "nextStep": "BranchOnBootstrapEndpoint"
+    },
+    {
+      "name": "BranchOnBootstrapEndpoint",
+      "action": "aws:branch",
+      "description": "Determines if IAM authentication analysis is needed based on port and whether a client IAM role was provided.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AnalyzeIAMPolicy",
+            "Variable": "{{ ParseBootstrapEndpoint.IsIAMAuth }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "DeleteConnectivityTestLambdaStack"
+      },
+      "isEnd": false
+    },
+    {
+      "name": "AnalyzeIAMPolicy",
+      "action": "aws:executeScript",
+      "description": "Retrieves and analyzes IAM policies for required MSK permissions, particularly focusing on kafka-cluster:Connect permission which is essential for IAM authentication.",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "ClientIAMRole": "{{ ClientIAMRole }}",
+          "ClusterARN": "{{ ClusterARN }}"
+        },
+        "Handler": "analyze_iam_policy.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "IAMAuthenticationIssues",
+          "Selector": "$.Payload.Issues",
+          "Type": "StringList"
+        },
+        {
+          "Name": "IAMAnalysisResults",
+          "Selector": "$.Payload.Results",
+          "Type": "StringMap"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "nextStep": "UpdateIAMVariable"
+    },
+    {
+      "name": "UpdateIAMVariable",
+      "action": "aws:updateVariable",
+      "description": "Updates the `IAMAuthenticationIssues` variable with output `IAMAuthenticationIssues` from `AnalyzeIAMPolicy` step.",
+      "onFailure": "Continue",
+      "inputs": {
+        "Name": "variable:IAMAuthenticationIssues",
+        "Value": "{{ AnalyzeIAMPolicy.IAMAuthenticationIssues }}"
+      },
+      "timeoutSeconds": 60,
+      "nextStep": "DeleteConnectivityTestLambdaStack"
+    },
+    {
+      "name": "DeleteConnectivityTestLambdaStack",
+      "action": "aws:deleteStack",
+      "description": "Cleans up the CloudFormation stack and associated resources created for connectivity testing.",
+      "onFailure": "step:ShareStackDeletionIntervention",
+      "inputs": {
+        "StackName": "{{ CreateConnectivityTestLambdaStack.StackId }}"
+      },
+      "timeoutSeconds": 3600,
+      "nextStep": "FinalOutput"
+    },
+    {
+      "name": "ShareStackDeletionIntervention",
+      "action": "aws:executeScript",
+      "description": "Provides manual cleanup instructions if stack deletion fails, including steps to remove Lambda, IAM roles, and other resources.",
+      "onFailure": "Continue",
+      "inputs": {
+        "InputPayload": {
+          "StackName": "{{ CreateConnectivityTestLambdaStack.StackId }}"
+        },
+        "Handler": "share_stack_deletion_intervention.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "CleanupInstructions",
+          "Selector": "$.Payload.CleanupInstructions",
+          "Type": "String"
+        }
+      ],
+      "timeoutSeconds": 600,
+      "nextStep": "FinalOutput"
+    },
+    {
+      "name": "FinalOutput",
+      "action": "aws:executeScript",
+      "description": "Compiles comprehensive troubleshooting results with actionable recommendations based on findings from previous steps.",
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "ClusterInfo": "{{ DescribeCluster.ClusterInfo }}",
+          "BrokerHealthIssues": "{{ variable:BrokerHealthIssues }}",
+          "ConnectivityStatus": "{{ variable:ConnectivityStatus }}",
+          "NetworkAnalyses": "{{ variable:NetworkAnalyses }}",
+          "NetworkConnectivityIssues": "{{ variable:StaticAnalysisIssues }}",
+          "IAMAuthenticationIssues": "{{ variable:IAMAuthenticationIssues }}",
+          "IsIAMAuth": "{{ ParseBootstrapEndpoint.IsIAMAuth }}",
+          "CleanupInstructions": "{{ ShareStackDeletionIntervention.CleanupInstructions }}"
+        },
+        "Handler": "final_output.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "BrokerHealthIssues",
+          "Selector": "$.Payload.BrokerHealthIssues",
+          "Type": "StringList"
+        },
+        {
+          "Name": "NetworkConnectivityIssues",
+          "Selector": "$.Payload.NetworkConnectivityIssues",
+          "Type": "StringList"
+        },
+        {
+          "Name": "IAMAuthenticationIssues",
+          "Selector": "$.Payload.IAMAuthenticationIssues",
+          "Type": "StringList"
+        },
+        {
+          "Name": "AuthenticationDocumentation",
+          "Selector": "$.Payload.AuthenticationDocumentation",
+          "Type": "StringList"
+        },
+        {
+          "Name": "TroubleshootingSummary",
+          "Selector": "$.Payload.TroubleshootingSummary",
+          "Type": "String"
+        }
+      ],
+      "onFailure": "Abort",
+      "timeoutSeconds": 600
+    }
+  ],
+  "outputs": [
+    "FinalOutput.BrokerHealthIssues",
+    "FinalOutput.NetworkConnectivityIssues",
+    "FinalOutput.IAMAuthenticationIssues",
+    "FinalOutput.AuthenticationDocumentation",
+    "FinalOutput.TroubleshootingSummary"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "f2144bc3ec50e1f2f38023fd10fa4c8fb9ce37789f69f2732c992f195e9cb505"
+      }
+    },
+    "common_artifact.zip": {
+      "checksums": {
+        "SHA256": "7a2e93d7f35521377ea230244f635ec5f58553deab804ff1166496039192563c"
+      }
+    }
+  }
+}

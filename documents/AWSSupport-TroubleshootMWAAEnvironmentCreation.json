@@ -21,7 +21,7 @@
       "name": "GetMWAAEnvironmentDetails",
       "action": "aws:executeAwsApi",
       "description": "Retrieves the details for the MWAA (Amazon Managed Workflows for Apache Airflow) environment.",
-      "nextStep": "CheckIAMPermissionsOnExecutionRole",
+      "nextStep": "BranchOnEndpointManagement",
       "onFailure": "Abort",
       "isCritical": true,
       "maxAttempts": 3,
@@ -70,6 +70,108 @@
           "Name": "SecurityGroupIds",
           "Selector": "$.Environment.NetworkConfiguration.SecurityGroupIds",
           "Type": "StringList"
+        },
+        {
+          "Name": "EndpointManagement",
+          "Selector": "$.Environment.EndpointManagement",
+          "Type": "String"
+        },
+        {
+          "Name": "EnvironmentStatus",
+          "Selector": "$.Environment.Status",
+          "Type": "String"
+        },
+        {
+          "Name": "WebserverAccessMode",
+          "Selector": "$.Environment.WebserverAccessMode",
+          "Type": "String"
+        },
+        {
+          "Name": "DatabaseVpcEndpointService",
+          "Selector": "$.Environment.DatabaseVpcEndpointService",
+          "Type": "String"
+        },
+        {
+          "Name": "WebserverVpcEndpointService",
+          "Selector": "$.Environment.WebserverVpcEndpointService",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnEndpointManagement",
+      "action": "aws:branch",
+      "description": "Branches the workflow based on whether customer managed endpoints are used.",
+      "nextStep": "GetRequiredEndPointsDetails",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GenerateReport",
+            "And": [
+              {
+                "Variable": "{{GetMWAAEnvironmentDetails.EnvironmentStatus}}",
+                "StringEquals": "CREATING"
+              },
+              {
+                "Variable": "{{GetMWAAEnvironmentDetails.DatabaseVpcEndpointService}}",
+                "StartsWith": "{{"
+              }
+            ]
+          },
+          {
+            "NextStep": "CheckCustomerManagedEndpoints",
+            "And": [
+              {
+                "Variable": "{{GetMWAAEnvironmentDetails.EndpointManagement}}",
+                "StringEquals": "CUSTOMER"
+              },
+              {
+                "Not": {
+                  "And": [
+                    {
+                      "Variable": "{{GetMWAAEnvironmentDetails.EnvironmentStatus}}",
+                      "StringEquals": "CREATING"
+                    },
+                    {
+                      "Variable": "{{GetMWAAEnvironmentDetails.DatabaseVpcEndpointService}}",
+                      "StartsWith": "{{"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ],
+        "Default": "CheckIAMPermissionsOnExecutionRole"
+      }
+    },
+    {
+      "name": "CheckCustomerManagedEndpoints",
+      "action": "aws:executeScript",
+      "description": "Verifies the availability and accessibility of customer managed endpoints.",
+      "nextStep": "CheckIAMPermissionsOnExecutionRole",
+      "onFailure": "Continue",
+      "timeoutSeconds": 300,
+      "maxAttempts": 3,
+      "inputs": {
+        "InputPayload": {
+          "EnvironmentStatus": "{{GetMWAAEnvironmentDetails.EnvironmentStatus}}",
+          "WebserverAccessMode": "{{GetMWAAEnvironmentDetails.WebserverAccessMode}}",
+          "DatabaseVpcEndpointService": "{{GetMWAAEnvironmentDetails.DatabaseVpcEndpointService}}",
+          "WebserverVpcEndpointService": "{{GetMWAAEnvironmentDetails.WebserverVpcEndpointService}}",
+          "SubnetIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}",
+          "SecurityGroupIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}",
+          "CreatedAt": "{{GetMWAAEnvironmentDetails.CreatedAt}}"
+        },
+        "Handler": "check_customer_managed_endpoints.check_customer_managed_endpoints",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "CustomerManagedEndpointsEvaluation",
+          "Selector": "$.Payload",
+          "Type": "String"
         }
       ]
     },
@@ -255,7 +357,8 @@
         "InputPayload": {
           "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}",
           "VpcId": "{{GetRequiredEndPointsDetails.VpcId}}",
-          "SecurityGroupsIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}"
+          "SecurityGroupsIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}",
+          "EndpointManagement": "{{GetMWAAEnvironmentDetails.EndpointManagement}}"
         },
         "Handler": "check_network_reachability.networking_check",
         "Runtime": "python3.11",
@@ -297,7 +400,9 @@
           "SubnetsIds": "{{GetMWAAEnvironmentDetails.SubnetIds}}",
           "VpcId": "{{GetRequiredEndPointsDetails.VpcId}}",
           "SecurityGroupsIds": "{{GetMWAAEnvironmentDetails.SecurityGroupIds}}",
-          "EndPointsDetails": "{{GetRequiredEndPointsDetails.EndPointsDetails}}"
+          "EndPointsDetails": "{{GetRequiredEndPointsDetails.EndPointsDetails}}",
+          "EndpointManagement": "{{GetMWAAEnvironmentDetails.EndpointManagement}}",
+          "EnvironmentStatus": "{{GetMWAAEnvironmentDetails.EnvironmentStatus}}"
         },
         "Handler": "check_service_connectivity.check_connectivity_to_dep_services",
         "Runtime": "python3.11",
@@ -346,6 +451,7 @@
       "inputs": {
         "InputPayload": {
           "EnvironmentName": "{{EnvironmentName}}",
+          "CustomerManagedEndpointsEvaluation": "{{CheckCustomerManagedEndpoints.CustomerManagedEndpointsEvaluation}}",
           "ExecutionRoleEvaluation": "{{CheckIAMPermissionsOnExecutionRole.ExecutionRoleEvaluation}}",
           "KmsKeyPolicyEvaluation": "{{CheckKMSPolicyOnKMSKey.KmsKeyPolicyEvaluation}}",
           "LogGroupsEvaluation": "{{CheckIfRequiredLogGroupsExists.LogGroupsEvaluation}}",
@@ -376,7 +482,7 @@
   "files": {
     "attachments.zip": {
       "checksums": {
-        "SHA256": "1bd981a77bf6bb3a52fea960200a6665646111c7e7f086e0fac408f5f9da41f6"
+        "SHA256": "4c6a0b74a2976f91a2a7260ee4da9195f025981e27252333babc2c6fff5f0e43"
       }
     }
   }
