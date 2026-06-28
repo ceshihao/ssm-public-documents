@@ -1,0 +1,605 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Installs and registers the AWS Systems Manager (SSM) Agent on an Azure virtual machine, enabling you to manage it as a hybrid managed instance through AWS Systems Manager. The document authenticates to Azure using a configured Cloud Connector, validates the target VM, and installs the SSM Agent. Once complete, the VM appears as a managed instance in your Systems Manager console.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "b7517771074c7f39b39d3b01ac347f396dcda322e32427544f0212adbfefdc99"
+      }
+    }
+  },
+  "parameters": {
+    "CloudConnector": {
+      "type": "String",
+      "description": "(Required) The ID of the Systems Manager Cloud Connector that contains your Azure tenant and application configuration. This connector provides the credentials needed to authenticate with Azure.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "AzureVmResourceId": {
+      "type": "String",
+      "description": "(Required) The fully qualified Azure Resource Manager ID of the target virtual machine. Format: /subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.Compute/virtualMachines/{vm-name}. The VM must be in a running state. Both Linux and Windows VMs are supported.",
+      "allowedPattern": "(?i)^/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/resourceGroups/[\\p{L}\\p{N}._()-]{0,89}[\\p{L}\\p{N}_()-]/providers/Microsoft\\.Compute/virtualMachines/[\\p{L}\\p{N}]([\\p{L}\\p{N}._-]{0,100}[\\p{L}\\p{N}])?$"
+    },
+    "ManagedInstanceIamRole": {
+      "type": "String",
+      "description": "(Required) The name of the IAM role that enables the managed instance to communicate with AWS Systems Manager. You can specify a plain role name or include the service-role/ path prefix (for example, service-role/AmazonEC2RunCommandRoleForManagedInstances). Maximum 64 characters.",
+      "allowedPattern": "^[\\p{L}\\p{N}+=,.@\\-_/]{1,64}$"
+    },
+    "ManagedInstanceTags": {
+      "type": "MapList",
+      "default": [],
+      "maxItems": 100,
+      "description": "(Optional) Tags to apply to the managed instance in Systems Manager. Each tag must have a Key and Value. Tags are applied when the instance is first registered or when it is already Online with Azure. Tag keys cannot start with \"aws:\" or use the reserved key \"CloudConnector\".",
+      "allowedPattern": "^\\{[\\s]*\"Key\"[\\s]*:[\\s]*\"(?![aA][wW][sS]:)(?!CloudConnector\")[^\"]{1,128}\"[\\s]*,[\\s]*\"Value\"[\\s]*:[\\s]*\"[^\"]{0,256}\"[\\s]*\\}$"
+    },
+    "SSMAgentVersion": {
+      "type": "String",
+      "description": "(Optional) The version of the SSM Agent to install. Only 'latest' is supported to ensure Azure compatibility.",
+      "default": "latest",
+      "allowedValues": [
+        "latest"
+      ]
+    },
+    "ForceReinstall": {
+      "type": "Boolean",
+      "description": "(Optional) If set to true, overrides an existing SSM Agent registration on the Azure VM. Default set to false skips the registration if Azure VM is registered to SSM.",
+      "default": false
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the IAM role that allows Systems Manager Automation to perform actions on your behalf. This role must have permissions to create activations, describe instances, and assume the Cloud Connector role."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetAzureConfiguration",
+      "action": "aws:executeScript",
+      "description": "Retrieves Azure credentials from the Cloud Connector, validates that the target VM exists and is running, and returns the configuration needed for subsequent steps.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "setup_azure_configuration",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "resource_id": "{{ AzureVmResourceId }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "from azure_ssm_agent.providers import DependencyManager\nboto3_version, botocore_version, azure_identity_version = DependencyManager.setup()\nfrom azure_ssm_agent.providers import (\n    get_cloud_connector_config,\n    parse_azure_resource_id,\n    get_automation_assume_role_tags,\n    create_azure_compute_client,\n    validate_azure_vm\n)\n\ndef setup_azure_configuration(events, context):\n    \"\"\"Setup Azure configuration from Cloud Connector and validate VM\"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    resource_id = events.get(\"resource_id\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n    if not resource_id:\n        raise ValueError(\"The AzureVmResourceId parameter is required but was not provided.\")\n\n    connector_config = get_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region,\n    )\n\n    tenant_id = connector_config[\"tenant_id\"]\n    application_id = connector_config[\"application_id\"]\n    role = connector_config[\"role\"]\n    target_subscriptions = connector_config[\"target_subscriptions\"]\n\n    parsed = parse_azure_resource_id(resource_id)\n    subscription_id = parsed[\"subscription_id\"]\n    resource_group = parsed[\"resource_group\"]\n    vm_name = parsed[\"vm_name\"]\n\n    if target_subscriptions and subscription_id not in target_subscriptions:\n        raise ValueError(\n            \"The Azure subscription is not in the list of allowed subscriptions \"\n            \"configured in the Cloud Connector.\"\n        )\n\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\")\n    automation_assume_role_tags = []\n    if automation_assume_role_arn:\n        automation_assume_role_tags = get_automation_assume_role_tags(\n            automation_assume_role_arn=automation_assume_role_arn,\n        )\n\n    azure_client = create_azure_compute_client(\n        tenant_id=tenant_id,\n        application_id=application_id,\n        role_arn=role,\n        subscription_id=subscription_id,\n        automation_assume_role_tags=automation_assume_role_tags\n    )\n\n    vm_info = validate_azure_vm(\n        azure_client=azure_client,\n        resource_group=resource_group,\n        vm_name=vm_name\n    )\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"azure_identity_version\": azure_identity_version,\n      \"os_type\": vm_info[\"os_type\"],\n      \"location\": vm_info[\"location\"],\n      \"power_state\": vm_info[\"power_state\"],\n      \"publisher\": vm_info[\"publisher\"],\n      \"offer\": vm_info[\"offer\"],\n      \"sku\": vm_info[\"sku\"],\n      \"version\": vm_info[\"version\"]\n    }\n\n    return {\n        \"tenant_id\": tenant_id,\n        \"application_id\": application_id,\n        \"role\": role,\n        \"cloud_connector_id\": cloud_connector_id,\n        \"subscription_id\": subscription_id,\n        \"resource_group\": resource_group,\n        \"vm_name\": vm_name,\n        \"location\": vm_info[\"location\"],\n        \"os_type\": vm_info[\"os_type\"],\n        \"power_state\": vm_info[\"power_state\"],\n        \"azure_vm_guid\": vm_info[\"azure_vm_guid\"],\n        \"automation_assume_role_tags\": automation_assume_role_tags,\n        \"aws_log\": aws_log\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "TenantId",
+          "Selector": "$.Payload.tenant_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ApplicationId",
+          "Selector": "$.Payload.application_id",
+          "Type": "String"
+        },
+        {
+          "Name": "Role",
+          "Selector": "$.Payload.role",
+          "Type": "String"
+        },
+        {
+          "Name": "CloudConnector",
+          "Selector": "$.Payload.cloud_connector_id",
+          "Type": "String"
+        },
+        {
+          "Name": "SubscriptionId",
+          "Selector": "$.Payload.subscription_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ResourceGroup",
+          "Selector": "$.Payload.resource_group",
+          "Type": "String"
+        },
+        {
+          "Name": "VMName",
+          "Selector": "$.Payload.vm_name",
+          "Type": "String"
+        },
+        {
+          "Name": "Location",
+          "Selector": "$.Payload.location",
+          "Type": "String"
+        },
+        {
+          "Name": "OSType",
+          "Selector": "$.Payload.os_type",
+          "Type": "String"
+        },
+        {
+          "Name": "PowerState",
+          "Selector": "$.Payload.power_state",
+          "Type": "String"
+        },
+        {
+          "Name": "AzureVmGuid",
+          "Selector": "$.Payload.azure_vm_guid",
+          "Type": "String"
+        },
+        {
+          "Name": "AutomationAssumeRoleTags",
+          "Selector": "$.Payload.automation_assume_role_tags",
+          "Type": "MapList"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CheckForceReinstall",
+      "action": "aws:branch",
+      "description": "Skips registration check if ForceReinstall is true, routing directly to OS-specific installation.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RouteByOSType",
+            "Variable": "{{ ForceReinstall }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "GetExistingRegistration"
+      }
+    },
+    {
+      "name": "GetExistingRegistration",
+      "action": "aws:executeScript",
+      "description": "Checks whether the SSM Agent is already registered on the Azure VM by reading the registration file. If a registration exists, returns the managed instance ID.",
+      "timeoutSeconds": 300,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "check_existing_registration",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "tenant_id": "{{ GetAzureConfiguration.TenantId }}",
+          "application_id": "{{ GetAzureConfiguration.ApplicationId }}",
+          "role": "{{ GetAzureConfiguration.Role }}",
+          "cloud_connector_id": "{{ GetAzureConfiguration.CloudConnector }}",
+          "subscription_id": "{{ GetAzureConfiguration.SubscriptionId }}",
+          "resource_group": "{{ GetAzureConfiguration.ResourceGroup }}",
+          "vm_name": "{{ GetAzureConfiguration.VMName }}",
+          "location": "{{ GetAzureConfiguration.Location }}",
+          "os_type": "{{ GetAzureConfiguration.OSType }}",
+          "power_state": "{{ GetAzureConfiguration.PowerState }}",
+          "azure_vm_guid": "{{ GetAzureConfiguration.AzureVmGuid }}",
+          "automation_assume_role_tags": "{{ GetAzureConfiguration.AutomationAssumeRoleTags }}"
+        },
+        "Script": "from azure_ssm_agent.providers import DependencyManager\nDependencyManager.setup()\nfrom azure_ssm_agent.providers import (\n    create_azure_compute_client,\n    run_azure_vm_command,\n    find_instance_by_source_id\n)\nfrom azure_ssm_agent.utils import RegistrationParser\n\ndef check_existing_registration(events, context):\n    \"\"\"Check if SSM Agent is already registered on VM, returns registration status and instance ID\"\"\"\n    LINUX_CHECK_SCRIPT = \"\"\"#!/bin/sh\n    ssm_log() {{ echo \"$(date '+%Y-%m-%d %H:%M:%S') $1 $2\"; }}\n    ssm_log INFO \"Checking SSM registration\"\n    REG_FILE=\"/var/lib/amazon/ssm/registration\"\n\n    if [ -f \"$REG_FILE\" ]; then\n        echo \"{reg_file_start}\"\n        cat \"$REG_FILE\"\n        echo \"{reg_file_end}\"\n    else\n        ssm_log INFO \"NO_REGISTRATION\"\n    fi\n    ssm_log INFO \"Check complete\"\n    exit 0\n    \"\"\"\n\n    WINDOWS_CHECK_SCRIPT = \"\"\"function Log($level, $msg) {{ Write-Host \"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $level $msg\" }}\n    Log INFO \"Checking SSM registration\"\n    $RegFile = \"$env:ProgramData\\\\Amazon\\\\SSM\\\\InstanceData\\\\registration\"\n\n    if (Test-Path $RegFile) {{\n        Write-Host \"{reg_file_start}\"\n        Get-Content $RegFile -Raw\n        Write-Host \"{reg_file_end}\"\n    }} else {{\n        Log INFO \"NO_REGISTRATION\"\n    }}\n    Log INFO \"Check complete\"\n    exit 0\n    \"\"\"\n\n    reg_file_start, reg_file_end = RegistrationParser.get_markers()\n\n    CHECK_SCRIPTS = {\n        \"linux\": LINUX_CHECK_SCRIPT.format(reg_file_start=reg_file_start, reg_file_end=reg_file_end),\n        \"windows\": WINDOWS_CHECK_SCRIPT.format(reg_file_start=reg_file_start, reg_file_end=reg_file_end)\n    }\n\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    tenant_id = events.get(\"tenant_id\")\n    application_id = events.get(\"application_id\")\n    role = events.get(\"role\")\n    subscription_id = events.get(\"subscription_id\")\n    resource_group = events.get(\"resource_group\")\n    vm_name = events.get(\"vm_name\")\n    os_type = events.get(\"os_type\")\n    automation_assume_role_tags = events.get(\"automation_assume_role_tags\", [])\n\n    if not all([tenant_id, application_id, role, subscription_id, resource_group, vm_name, os_type]):\n        raise ValueError(\"Required Azure configuration parameters are missing from the previous step.\")\n\n    azure_client = create_azure_compute_client(\n        tenant_id=tenant_id,\n        application_id=application_id,\n        role_arn=role,\n        subscription_id=subscription_id,\n        automation_assume_role_tags=automation_assume_role_tags\n    )\n\n    check_script = CHECK_SCRIPTS.get(os_type.lower())\n    if not check_script:\n        raise ValueError(\"The operating system is not supported. Only Linux and Windows VMs are supported.\")\n\n    output, has_error, used_fallback = run_azure_vm_command(\n        azure_client=azure_client,\n        resource_group=resource_group,\n        vm_name=vm_name,\n        script_content=check_script,\n        os_type=os_type,\n        timeout=60,\n        location=events.get(\"location\"),\n        run_command_name=\"amazon-ssm-agent-if-registered\",\n    )\n\n    try:\n        existing_instance_id = RegistrationParser.extract_mi_id(output)\n        print(f\"[INFO] Registration file found on VM. Existing managed instance: {existing_instance_id}.\")\n    except ValueError:\n        existing_instance_id = \"\"\n        print(\"[INFO] No registration file found on VM.\")\n\n    verified_online = False\n    if not existing_instance_id:\n        azure_vm_guid = events.get(\"azure_vm_guid\", \"\")\n        if azure_vm_guid:\n            print(f\"[INFO] Looking up existing Online instance by Azure VM GUID {azure_vm_guid}.\")\n            instance = find_instance_by_source_id(azure_vm_guid, ssm_region)\n            if instance and instance.get(\"SourceType\") == \"Microsoft.Compute/virtualMachines\":\n                existing_instance_id = instance[\"InstanceId\"]\n                verified_online = True\n            else:\n                print(f\"[INFO] No Online Azure-sourced instance found for Azure VM {azure_vm_guid}.\")\n\n    if existing_instance_id:\n        lookup_method = \"source_id\" if verified_online else \"reg_file\"\n    else:\n        lookup_method = \"none\"\n\n    print(f\"[INFO] Registration check complete. existing_instance_id={existing_instance_id or 'none'}, verified_online={verified_online}.\")\n    return {\n        \"existing_instance_id\": existing_instance_id,\n        \"verified_online\": verified_online,\n        \"script_output\": output or \"\",\n        \"aws_log\": {\n            \"found_registration\": str(bool(existing_instance_id)).lower(),\n            \"verified_online\": str(verified_online).lower(),\n            \"lookup_method\": lookup_method,\n        },\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "ExistingInstanceId",
+          "Selector": "$.Payload.existing_instance_id",
+          "Type": "String"
+        },
+        {
+          "Name": "VerifiedOnline",
+          "Selector": "$.Payload.verified_online",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ScriptOutput",
+          "Selector": "$.Payload.script_output",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CheckRegistrationResult",
+      "action": "aws:branch",
+      "description": "Routes based on registration check: verified online instances skip to return, reg-file instances get verified, otherwise proceed to install.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ReturnExistingOnlineInstance",
+            "Variable": "{{ GetExistingRegistration.VerifiedOnline }}",
+            "BooleanEquals": true
+          },
+          {
+            "NextStep": "GetInstanceInformation",
+            "Variable": "{{ GetExistingRegistration.ExistingInstanceId }}",
+            "StartsWith": "mi-"
+          }
+        ],
+        "Default": "RouteByOSType"
+      }
+    },
+    {
+      "name": "GetInstanceInformation",
+      "action": "aws:executeAwsApi",
+      "description": "Queries Systems Manager for the current status and source type of the existing managed instance.",
+      "timeoutSeconds": 30,
+      "isCritical": false,
+      "onFailure": "step:RouteByOSType",
+      "nextStep": "VerifyInstanceOnline",
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ GetExistingRegistration.ExistingInstanceId }}"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "PingStatus",
+          "Selector": "$.InstanceInformationList[0].PingStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "SourceType",
+          "Selector": "$.InstanceInformationList[0].SourceType",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "VerifyInstanceOnline",
+      "action": "aws:branch",
+      "description": "Checks if the instance is Online with Azure source type to skip reinstallation.",
+      "inputs": {
+        "Choices": [
+          {
+            "And": [
+              {
+                "Variable": "{{ GetInstanceInformation.PingStatus }}",
+                "StringEquals": "Online"
+              },
+              {
+                "Variable": "{{ GetInstanceInformation.SourceType }}",
+                "StringEquals": "Microsoft.Compute/virtualMachines"
+              }
+            ],
+            "NextStep": "ReturnExistingOnlineInstance"
+          }
+        ],
+        "Default": "RouteByOSType"
+      }
+    },
+    {
+      "name": "ReturnExistingOnlineInstance",
+      "action": "aws:executeScript",
+      "description": "The instance is already Online with Azure. Applies any specified tags and returns the existing managed instance ID without reinstalling.",
+      "timeoutSeconds": 30,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "return_online_instance",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "managed_instance_id": "{{ GetExistingRegistration.ExistingInstanceId }}",
+          "cloud_connector_id": "{{ GetAzureConfiguration.CloudConnector }}",
+          "managed_instance_tags": "{{ ManagedInstanceTags }}"
+        },
+        "Script": "from azure_ssm_agent.providers import DependencyManager\nDependencyManager.setup()\nfrom azure_ssm_agent.providers import tag_managed_instance\n\ndef return_online_instance(events, context):\n    \"\"\"Returns Online Azure instance and applies tags\"\"\"\n    ssm_region = context.get('global:REGION')\n    managed_instance_id = events.get(\"managed_instance_id\")\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    managed_instance_tags = events.get(\"managed_instance_tags\", [])\n    \n    tag_managed_instance(\n        instance_id=managed_instance_id,\n        cloud_connector_id=cloud_connector_id,\n        managed_instance_tags=managed_instance_tags,\n        ssm_region=ssm_region,\n    )\n\n    cloud_connector_tag = 1\n    tags_applied_count = len(managed_instance_tags) + cloud_connector_tag\n\n    return {\n        \"status\": \"SUCCESS\",\n        \"activation_id\": \"not-created\",\n        \"managed_instance_id\": managed_instance_id,\n        \"aws_log\": {\n            \"managed_instance_id\": managed_instance_id,\n            \"tags_applied_count\": str(tags_applied_count),\n        },\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "ActivationId",
+          "Selector": "$.Payload.activation_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ManagedInstanceId",
+          "Selector": "$.Payload.managed_instance_id",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "RouteByOSType",
+      "action": "aws:branch",
+      "description": "Routes to the appropriate registration step based on the operating system of the Azure VM (Linux or Windows).",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RegisterAgentOnLinux",
+            "Variable": "{{ GetAzureConfiguration.OSType }}",
+            "StringEquals": "linux"
+          },
+          {
+            "NextStep": "RegisterAgentOnWindows",
+            "Variable": "{{ GetAzureConfiguration.OSType }}",
+            "StringEquals": "windows"
+          }
+        ],
+        "Default": "RegisterAgentOnLinux"
+      }
+    },
+    {
+      "name": "RegisterAgentOnLinux",
+      "action": "aws:executeScript",
+      "description": "Downloads and installs the SSM Agent on the Linux VM using Azure Run Command. Creates a Systems Manager activation, registers the agent, and returns the new managed instance ID.",
+      "timeoutSeconds": 400,
+      "onFailure": "step:CollectSsmAgentLogs",
+      "isCritical": true,
+      "nextStep": "ReturnIfLinuxInstanceOnline",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "register_new_agent_linux",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "tenant_id": "{{ GetAzureConfiguration.TenantId }}",
+          "application_id": "{{ GetAzureConfiguration.ApplicationId }}",
+          "role": "{{ GetAzureConfiguration.Role }}",
+          "cloud_connector_id": "{{ GetAzureConfiguration.CloudConnector }}",
+          "subscription_id": "{{ GetAzureConfiguration.SubscriptionId }}",
+          "resource_group": "{{ GetAzureConfiguration.ResourceGroup }}",
+          "vm_name": "{{ GetAzureConfiguration.VMName }}",
+          "location": "{{ GetAzureConfiguration.Location }}",
+          "os_type": "{{ GetAzureConfiguration.OSType }}",
+          "power_state": "{{ GetAzureConfiguration.PowerState }}",
+          "managed_instance_iam_role": "{{ ManagedInstanceIamRole }}",
+          "managed_instance_tags": "{{ ManagedInstanceTags }}",
+          "ssm_agent_version": "{{ SSMAgentVersion }}",
+          "force_reinstall": "{{ ForceReinstall }}",
+          "automation_assume_role_tags": "{{ GetAzureConfiguration.AutomationAssumeRoleTags }}"
+        },
+        "Script": "from azure_ssm_agent.providers import DependencyManager\nDependencyManager.setup()\nimport base64\nimport hashlib\nimport json\nimport os\nfrom azure_ssm_agent.providers import (\n    create_azure_compute_client,\n    run_azure_vm_command,\n    register_with_cleanup\n)\nimport time\n\nimport azure_ssm_agent\n_SCRIPTS_DIR = os.path.join(os.path.dirname(azure_ssm_agent.__file__), \"scripts\")\n\ndef _read_script_b64(filename):\n    \"\"\"Given script filename, returns base64 encoded content.\"\"\"\n    with open(os.path.join(_SCRIPTS_DIR, filename), \"rb\") as f:\n        return base64.b64encode(f.read()).decode(\"ascii\")\n\ndef register_new_agent_linux(events, context):\n    \"\"\"Register SSM Agent on Linux VM using activation and Azure RunCommand, returns status and instance ID\"\"\"\n    _SSM_AGENT_BOOTSTRAP = None\n\n    LINUX_REGISTRATION_SCRIPT = \"\"\"#!/bin/sh\n    set -e\n\n    WORK_DIR=\"/tmp/ssm_reg_{activation_hash}\"\n\n    ssm_log() {{ echo \"$(date '+%Y-%m-%d %H:%M:%S') $1 $2\"; }}\n\n    if [ -d \"$WORK_DIR\" ]; then\n        ssm_log INFO \"Registration with this activation already in progress\"\n        exit 0\n    fi\n\n    mkdir -p \"$WORK_DIR\"\n    chmod 700 \"$WORK_DIR\"\n\n    cleanup() {{\n        rm -rf \"$WORK_DIR\"\n    }}\n    trap cleanup EXIT INT TERM\n\n    ssm_log INFO \"Starting SSM agent registration\"\n\n    ARCH=$(uname -m)\n    case \"$ARCH\" in\n        x86_64)  CLI_ARCH=\"amd64\" ;;\n        aarch64) CLI_ARCH=\"arm64\" ;;\n        i686|i386) CLI_ARCH=\"386\" ;;\n        *) ssm_log ERROR \"Unsupported architecture: $ARCH\"; exit 41 ;;\n    esac\n    ssm_log INFO \"Detected architecture: $ARCH -> linux_$CLI_ARCH\"\n    {bootstrap_init}\n\n    SSM_S3_BASE=\"{ssm_s3_base}\"\n    CLI_URL=\"$SSM_S3_BASE/linux_$CLI_ARCH/ssm-setup-cli\"\n    SIG_URL=\"$CLI_URL.sig\"\n    ssm_log INFO \"Downloading ssm-setup-cli from $CLI_URL\"\n    if ! curl -f -s -S -L --max-time 60 \"$CLI_URL\" -o \"$WORK_DIR/ssm-setup-cli\"; then\n        ssm_log ERROR \"Download failed\"\n        exit 42\n    fi\n\n    ssm_log INFO \"Downloading signature file from $SIG_URL\"\n    if ! curl -f -s -S -L --max-time 30 \"$SIG_URL\" -o \"$WORK_DIR/ssm-setup-cli.sig\"; then\n        ssm_log ERROR \"Signature file download failed\"\n        exit 43\n    fi\n\n    ssm_log INFO \"Verifying binary signature\"\n    echo \"{integrity_script_b64}\" | base64 -d > \"$WORK_DIR/verify_integrity.sh\"\n    chmod +x \"$WORK_DIR/verify_integrity.sh\"\n    if ! \"$WORK_DIR/verify_integrity.sh\" \"$WORK_DIR/ssm-setup-cli\" \"$WORK_DIR/ssm-setup-cli.sig\"; then\n        ssm_log ERROR \"Signature verification failed\"\n        exit 44\n    fi\n    ssm_log INFO \"Signature verification passed\"\n\n    chmod +x \"$WORK_DIR/ssm-setup-cli\"\n\n    ssm_log INFO \"Executing ssm-setup-cli\"\n    set +e\n    CLI_OUTPUT=$(timeout 120 \"$WORK_DIR/ssm-setup-cli\" {cli_register_args} 2>&1)\n    REG_EXIT=$?\n    set -e\n\n    if [ $REG_EXIT -ne 0 ]; then\n        if [ $REG_EXIT -eq 124 ]; then\n            ssm_log ERROR \"Registration timed out\"\n        else\n            ssm_log ERROR \"Registration failed (exit: $REG_EXIT)\"\n        fi\n    else\n        ssm_log INFO \"Registration successful\"\n        {bootstrap_end}\n    fi\n\n    echo \"EXIT_CODE=$REG_EXIT\"\n    echo \"{compress_script_b64}\" | base64 -d > \"$WORK_DIR/compress_output.sh\"\n    . \"$WORK_DIR/compress_output.sh\"\n    (printf '%s' \"$CLI_OUTPUT\" | compress_output) 2>/dev/null || printf '%s' \"$CLI_OUTPUT\"\n    exit $REG_EXIT\n    \"\"\"\n\n    SSM_S3_BASE_TEMPLATE = \"https://amazon-ssm-{region}.s3.{region}.amazonaws.com/latest\"\n    MANIFEST_URL = None\n    COMMAND_TIMEOUT = 180\n\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    tenant_id = events.get(\"tenant_id\")\n    application_id = events.get(\"application_id\")\n    role = events.get(\"role\")\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    subscription_id = events.get(\"subscription_id\")\n    resource_group = events.get(\"resource_group\")\n    vm_name = events.get(\"vm_name\")\n    managed_instance_iam_role = events.get(\"managed_instance_iam_role\")\n    managed_instance_tags = events.get(\"managed_instance_tags\", [])\n    ssm_agent_version = events.get(\"ssm_agent_version\", \"auto\")\n    automation_assume_role_tags = events.get(\"automation_assume_role_tags\", [])\n    location = events.get(\"location\")\n\n    if not all([tenant_id, application_id, role, cloud_connector_id, subscription_id,\n               resource_group, vm_name, managed_instance_iam_role]):\n        raise ValueError(\"Required Azure configuration parameters are missing from the previous step.\")\n\n    force_reinstall = events.get(\"force_reinstall\", False)\n    use_override = bool(force_reinstall)\n\n    azure_client = create_azure_compute_client(\n        tenant_id=tenant_id,\n        application_id=application_id,\n        role_arn=role,\n        subscription_id=subscription_id,\n        automation_assume_role_tags=automation_assume_role_tags\n    )\n\n    vm_description = f\"Azure VM: {resource_group}/{vm_name}\"\n    instance_name = f\"{subscription_id}:{resource_group}:{vm_name}\"\n\n    activation_params = {\n        \"vm_name\": instance_name,\n        \"vm_description\": vm_description,\n        \"cloud_connector_id\": cloud_connector_id,\n        \"iam_role\": managed_instance_iam_role,\n        \"managed_instance_tags\": managed_instance_tags,\n    }\n\n    def run_linux_command(activation_id, activation_code):\n        \"\"\"Generate and execute Linux registration script\"\"\"\n        from azure_ssm_agent.utils import safe as _safe\n\n        ssm_s3_base = _safe(SSM_S3_BASE_TEMPLATE.format(region=ssm_region))\n        override_flag = \"-override\" if use_override else \"\"\n        activation_hash = hashlib.md5(activation_id.encode()).hexdigest()[:12]\n\n        if ssm_agent_version and ssm_agent_version.lower() in ['stable', 'latest']:\n            version_flag = f\"-version {_safe(ssm_agent_version)} -downgrade\"\n        else:\n            version_flag = \"\"\n\n        bootstrap_init, bootstrap_end = (_SSM_AGENT_BOOTSTRAP[\"init\"], _SSM_AGENT_BOOTSTRAP[\"end\"]) if _SSM_AGENT_BOOTSTRAP else (\"\", \"\")\n\n        cli_register_args = (\n            '-register'\n            f' -activation-code \"{_safe(activation_code)}\"'\n            f' -activation-id \"{_safe(activation_id)}\"'\n            ' -provider \"Azure\"'\n        )\n        if MANIFEST_URL:\n            cli_register_args += f' -manifest-url \"{_safe(MANIFEST_URL)}\"'\n        cli_register_args += f' -region \"{_safe(ssm_region)}\"'\n        if version_flag:\n            cli_register_args += f' {version_flag}'\n        if override_flag:\n            cli_register_args += f' {_safe(override_flag)}'\n\n        register_script = LINUX_REGISTRATION_SCRIPT.format(\n            ssm_s3_base=ssm_s3_base,\n            activation_id=_safe(activation_id),\n            activation_hash=activation_hash,\n            bootstrap_init=bootstrap_init,\n            bootstrap_end=bootstrap_end,\n            cli_register_args=cli_register_args,\n            integrity_script_b64=_read_script_b64(\"setupcli_data_integrity_linux.sh\"),\n            compress_script_b64=_read_script_b64(\"compress_output.sh\"),\n        )\n\n        return run_azure_vm_command(\n            azure_client=azure_client,\n            resource_group=resource_group,\n            vm_name=vm_name,\n            script_content=register_script,\n            os_type=\"linux\",\n            timeout=COMMAND_TIMEOUT,\n            location=location,\n            run_command_name=\"amazon-ssm-agent-registration\",\n        )\n\n    reg_start = time.time()\n    result = register_with_cleanup(\n        activation_params=activation_params,\n        run_command_func=run_linux_command,\n        ssm_region=ssm_region,\n    )\n    registration_duration_ms = int((time.time() - reg_start) * 1000)\n\n    result[\"aws_log\"] = {\n        \"status\": result[\"status\"],\n        \"ping_status\": result.get(\"ping_status\", \"\"),\n        \"used_managed_fallback\": str(result.get(\"used_managed_fallback\", False)).lower(),\n        \"registration_duration_ms\": str(registration_duration_ms),\n        \"script_has_error\": str(result.get(\"script_has_error\", False)).lower(),\n        \"script_exit_code\": result.get(\"script_exit_code\", \"\"),\n        \"infra_error\": str(result.get(\"infra_error\", False)).lower(),\n    }\n\n    if result[\"status\"] == \"FAILED\":\n        print(f\"[AWSLog] {json.dumps(result['aws_log'])}\")\n        print(f\"[INFO] Script output:\\n{result.get('script_output', '')}\")\n        raise ValueError(\"Registration failed\")\n    return result\n"
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "ActivationId",
+          "Selector": "$.Payload.activation_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ManagedInstanceId",
+          "Selector": "$.Payload.managed_instance_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ScriptOutput",
+          "Selector": "$.Payload.script_output",
+          "Type": "String"
+        },
+        {
+          "Name": "PingStatus",
+          "Selector": "$.Payload.ping_status",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "RegisterAgentOnWindows",
+      "action": "aws:executeScript",
+      "description": "Downloads and installs the SSM Agent on the Windows VM using Azure Run Command. Creates a Systems Manager activation, registers the agent, and returns the new managed instance ID.",
+      "timeoutSeconds": 480,
+      "onFailure": "step:CollectSsmAgentLogs",
+      "isCritical": true,
+      "nextStep": "ReturnIfWindowsInstanceOnline",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "register_new_agent_windows",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "tenant_id": "{{ GetAzureConfiguration.TenantId }}",
+          "application_id": "{{ GetAzureConfiguration.ApplicationId }}",
+          "role": "{{ GetAzureConfiguration.Role }}",
+          "cloud_connector_id": "{{ GetAzureConfiguration.CloudConnector }}",
+          "subscription_id": "{{ GetAzureConfiguration.SubscriptionId }}",
+          "resource_group": "{{ GetAzureConfiguration.ResourceGroup }}",
+          "vm_name": "{{ GetAzureConfiguration.VMName }}",
+          "location": "{{ GetAzureConfiguration.Location }}",
+          "os_type": "{{ GetAzureConfiguration.OSType }}",
+          "power_state": "{{ GetAzureConfiguration.PowerState }}",
+          "managed_instance_iam_role": "{{ ManagedInstanceIamRole }}",
+          "managed_instance_tags": "{{ ManagedInstanceTags }}",
+          "ssm_agent_version": "{{ SSMAgentVersion }}",
+          "force_reinstall": "{{ ForceReinstall }}",
+          "automation_assume_role_tags": "{{ GetAzureConfiguration.AutomationAssumeRoleTags }}"
+        },
+        "Script": "from azure_ssm_agent.providers import DependencyManager\nDependencyManager.setup()\nimport base64\nimport hashlib\nimport json\nimport os\nfrom azure_ssm_agent.providers import (\n    create_azure_compute_client,\n    run_azure_vm_command,\n    register_with_cleanup\n)\nimport time\n\nimport azure_ssm_agent\n_SCRIPTS_DIR = os.path.join(os.path.dirname(azure_ssm_agent.__file__), \"scripts\")\n\ndef _read_script_b64(filename):\n    \"\"\"Given script filename, returns base64 encoded content.\"\"\"\n    with open(os.path.join(_SCRIPTS_DIR, filename), \"rb\") as f:\n        return base64.b64encode(f.read()).decode(\"ascii\")\n\ndef register_new_agent_windows(events, context):\n    \"\"\"Register SSM Agent on Windows VM using activation and Azure RunCommand, returns status and instance ID\"\"\"\n    _SSM_AGENT_BOOTSTRAP = None\n\n    WINDOWS_REGISTRATION_SCRIPT = \"\"\"$ErrorActionPreference = \"Continue\"\n\n    $WorkDir = \"$env:TEMP\\\\ssm_reg_{activation_hash}\"\n\n    function Log($level, $msg) {{ Write-Host \"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $level $msg\" }}\n\n    if (Test-Path $WorkDir) {{\n        Log INFO \"Registration with this activation already in progress\"\n        exit 0\n    }}\n\n    try {{\n        New-Item -ItemType Directory -Path $WorkDir | Out-Null\n        Log INFO \"Starting SSM agent registration\"\n        {bootstrap_init}\n\n        $CliPath = Join-Path $WorkDir \"ssm-setup-cli.exe\"\n\n        Log INFO \"Downloading ssm-setup-cli\"\n        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\n        try {{\n            $webClient = New-Object System.Net.WebClient\n            $webClient.DownloadFile(\"{cli_url}\", $CliPath)\n        }} catch {{\n            Log ERROR \"Download failed: $($_.Exception.Message)\"\n            exit 42\n        }}\n\n        Log INFO \"Verifying binary signature\"\n        $integrityBytes = [Convert]::FromBase64String(\"{integrity_script_b64}\")\n        $integrityScript = [System.Text.Encoding]::UTF8.GetString($integrityBytes)\n        $integrityPath = Join-Path $WorkDir \"verify_integrity.ps1\"\n        Set-Content -Path $integrityPath -Value $integrityScript\n        $integrityResult = & powershell.exe -ExecutionPolicy Bypass -File $integrityPath -SetupCliPath $CliPath 2>&1 | Out-String\n        $integrityExit = $LASTEXITCODE\n        Write-Host $integrityResult\n        if ($integrityExit -ne 0) {{\n            Log ERROR \"Signature verification failed\"\n            exit 44\n        }}\n        Log INFO \"Signature verification passed\"\n\n        Log INFO \"Executing ssm-setup-cli\"\n        $cliArgs = @({cli_register_args})\n        if (\"{use_override}\" -eq \"True\") {{\n            $cliArgs += \"-override\"\n        }}\n        $cliOutput = & $CliPath $cliArgs 2>&1 | Out-String\n        $exitCode = $LASTEXITCODE\n\n        if ($exitCode -eq 0) {{\n            Log INFO \"Registration successful\"\n            {bootstrap_end}\n        }} else {{\n            Log ERROR \"Registration failed (exit: $exitCode)\"\n        }}\n\n        Write-Host \"EXIT_CODE=$exitCode\"\n        try {{\n            $compressBytes = [Convert]::FromBase64String(\"{compress_script_b64}\")\n            $compressScript = [System.Text.Encoding]::UTF8.GetString($compressBytes)\n            Invoke-Expression $compressScript\n            Write-Host (Compress-Output $cliOutput)\n        }} catch {{\n            Write-Host $cliOutput\n        }}\n        if ($exitCode -ne 0) {{ exit $exitCode }}\n    }} catch {{\n        Log ERROR \"$($_.Exception.Message)\"\n        Write-Host \"EXIT_CODE=50\"\n        exit 50\n    }} finally {{\n        if (Test-Path $WorkDir) {{\n            Remove-Item -Path $WorkDir -Recurse -Force\n        }}\n    }}\n\n    exit 0\n    \"\"\"\n\n    CLI_URL_TEMPLATE = \"https://amazon-ssm-{region}.s3.{region}.amazonaws.com/latest/windows_amd64/ssm-setup-cli.exe\"\n    MANIFEST_URL = None\n    COMMAND_TIMEOUT = 240\n\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    tenant_id = events.get(\"tenant_id\")\n    application_id = events.get(\"application_id\")\n    role = events.get(\"role\")\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    subscription_id = events.get(\"subscription_id\")\n    resource_group = events.get(\"resource_group\")\n    vm_name = events.get(\"vm_name\")\n    managed_instance_iam_role = events.get(\"managed_instance_iam_role\")\n    managed_instance_tags = events.get(\"managed_instance_tags\", [])\n    ssm_agent_version = events.get(\"ssm_agent_version\", \"auto\")\n    automation_assume_role_tags = events.get(\"automation_assume_role_tags\", [])\n    location = events.get(\"location\")\n\n    if not all([tenant_id, application_id, role, cloud_connector_id, subscription_id,\n               resource_group, vm_name, managed_instance_iam_role]):\n        raise ValueError(\"Required Azure configuration parameters are missing from the previous step.\")\n\n    force_reinstall = events.get(\"force_reinstall\", False)\n    use_override = bool(force_reinstall)\n\n    azure_client = create_azure_compute_client(\n        tenant_id=tenant_id,\n        application_id=application_id,\n        role_arn=role,\n        subscription_id=subscription_id,\n        automation_assume_role_tags=automation_assume_role_tags\n    )\n\n    vm_description = f\"Azure VM: {resource_group}/{vm_name}\"\n    instance_name = f\"{subscription_id}:{resource_group}:{vm_name}\"\n\n    activation_params = {\n        \"vm_name\": instance_name,\n        \"vm_description\": vm_description,\n        \"cloud_connector_id\": cloud_connector_id,\n        \"iam_role\": managed_instance_iam_role,\n        \"managed_instance_tags\": managed_instance_tags,\n    }\n\n    def run_windows_command(activation_id, activation_code):\n        \"\"\"Generate and execute Windows registration script\"\"\"\n        from azure_ssm_agent.utils import safe as _safe\n\n        cli_url = _safe(CLI_URL_TEMPLATE.format(region=ssm_region))\n        use_override_str = \"True\" if use_override else \"False\"\n        activation_hash = hashlib.md5(activation_id.encode()).hexdigest()[:12]\n\n        if ssm_agent_version and ssm_agent_version.lower() in ['stable', 'latest']:\n            version_flag_args = f', \"-version\", \"{_safe(ssm_agent_version)}\", \"-downgrade\"'\n        else:\n            version_flag_args = \"\"\n\n        bootstrap_init, bootstrap_end = (_SSM_AGENT_BOOTSTRAP[\"init\"], _SSM_AGENT_BOOTSTRAP[\"end\"]) if _SSM_AGENT_BOOTSTRAP else (\"\", \"\")\n\n        cli_register_args = (\n            '\"-register\", \"-activation-code\", \"{0}\", \"-activation-id\", \"{1}\", '\n            '\"-provider\", \"Azure\"'\n        ).format(_safe(activation_code), _safe(activation_id))\n        if MANIFEST_URL:\n            cli_register_args += f', \"-manifest-url\", \"{_safe(MANIFEST_URL)}\"'\n        cli_register_args += f', \"-region\", \"{_safe(ssm_region)}\"'\n        if version_flag_args:\n            cli_register_args += version_flag_args\n\n        register_script = WINDOWS_REGISTRATION_SCRIPT.format(\n            cli_url=cli_url,\n            activation_id=_safe(activation_id),\n            activation_hash=activation_hash,\n            cli_register_args=cli_register_args,\n            bootstrap_init=bootstrap_init,\n            bootstrap_end=bootstrap_end,\n            use_override=_safe(use_override_str),\n            integrity_script_b64=_read_script_b64(\"setupcli_data_integrity_windows.ps1\"),\n            compress_script_b64=_read_script_b64(\"Compress-Output.ps1\"),\n        )\n\n        return run_azure_vm_command(\n            azure_client=azure_client,\n            resource_group=resource_group,\n            vm_name=vm_name,\n            script_content=register_script,\n            os_type=\"windows\",\n            timeout=COMMAND_TIMEOUT,\n            location=location,\n            run_command_name=\"amazon-ssm-agent-registration\",\n        )\n\n    reg_start = time.time()\n    result = register_with_cleanup(\n        activation_params=activation_params,\n        run_command_func=run_windows_command,\n        ssm_region=ssm_region,\n    )\n    registration_duration_ms = int((time.time() - reg_start) * 1000)\n\n    result[\"aws_log\"] = {\n        \"status\": result[\"status\"],\n        \"ping_status\": result.get(\"ping_status\", \"\"),\n        \"used_managed_fallback\": str(result.get(\"used_managed_fallback\", False)).lower(),\n        \"registration_duration_ms\": str(registration_duration_ms),\n        \"script_has_error\": str(result.get(\"script_has_error\", False)).lower(),\n        \"script_exit_code\": result.get(\"script_exit_code\", \"\"),\n        \"infra_error\": str(result.get(\"infra_error\", False)).lower(),\n    }\n\n    if result[\"status\"] == \"FAILED\":\n        print(f\"[AWSLog] {json.dumps(result['aws_log'])}\")\n        print(f\"[INFO] Script output:\\n{result.get('script_output', '')}\")\n        raise ValueError(\"Registration failed\")\n    return result\n"
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "ActivationId",
+          "Selector": "$.Payload.activation_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ManagedInstanceId",
+          "Selector": "$.Payload.managed_instance_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ScriptOutput",
+          "Selector": "$.Payload.script_output",
+          "Type": "String"
+        },
+        {
+          "Name": "PingStatus",
+          "Selector": "$.Payload.ping_status",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "ReturnIfLinuxInstanceOnline",
+      "action": "aws:branch",
+      "description": "Skip polling if agent is already Online after registration",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "WaitForLinuxInstanceOnline",
+            "Not": {
+              "Variable": "{{ RegisterAgentOnLinux.PingStatus }}",
+              "StringEquals": "Online"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReturnIfWindowsInstanceOnline",
+      "action": "aws:branch",
+      "description": "Skip polling if agent is already Online after registration",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "WaitForWindowsInstanceOnline",
+            "Not": {
+              "Variable": "{{ RegisterAgentOnWindows.PingStatus }}",
+              "StringEquals": "Online"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "WaitForLinuxInstanceOnline",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the newly registered Linux instance to report Online status in Systems Manager.",
+      "timeoutSeconds": 60,
+      "onFailure": "step:CollectSsmAgentLogs",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ RegisterAgentOnLinux.ManagedInstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      }
+    },
+    {
+      "name": "WaitForWindowsInstanceOnline",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the newly registered Windows instance to report Online status in Systems Manager.",
+      "timeoutSeconds": 90,
+      "onFailure": "step:CollectSsmAgentLogs",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ RegisterAgentOnWindows.ManagedInstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      }
+    },
+    {
+      "name": "CollectSsmAgentLogs",
+      "action": "aws:executeScript",
+      "description": "Collects SSM Agent logs from the VM for diagnosis when the instance fails to come online.",
+      "timeoutSeconds": 240,
+      "onFailure": "Continue",
+      "isCritical": false,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "collect_agent_logs",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "tenant_id": "{{ GetAzureConfiguration.TenantId }}",
+          "application_id": "{{ GetAzureConfiguration.ApplicationId }}",
+          "role": "{{ GetAzureConfiguration.Role }}",
+          "subscription_id": "{{ GetAzureConfiguration.SubscriptionId }}",
+          "resource_group": "{{ GetAzureConfiguration.ResourceGroup }}",
+          "vm_name": "{{ GetAzureConfiguration.VMName }}",
+          "location": "{{ GetAzureConfiguration.Location }}",
+          "os_type": "{{ GetAzureConfiguration.OSType }}",
+          "automation_assume_role_tags": "{{ GetAzureConfiguration.AutomationAssumeRoleTags }}"
+        },
+        "Script": "from azure_ssm_agent.providers import DependencyManager\nDependencyManager.setup()\nimport os\nfrom azure_ssm_agent.providers import (\n    create_azure_compute_client,\n    run_azure_vm_command,\n)\n\nimport azure_ssm_agent\n_SCRIPTS_DIR = os.path.join(os.path.dirname(azure_ssm_agent.__file__), \"scripts\")\n\nLINUX_LOG_SCRIPT_SUFFIX = (\n    'ERRORS_LOG=\"/var/log/amazon/ssm/errors.log\"\\n'\n    'AGENT_LOG=\"/var/log/amazon/ssm/amazon-ssm-agent.log\"\\n'\n    'CUTOFF=$(date -u -d \"5 minutes ago\" \"+%Y-%m-%d %H:%M\" 2>/dev/null || date -u -v-5M \"+%Y-%m-%d %H:%M\" 2>/dev/null || echo \"\")\\n'\n    'OUTPUT=\"\"\\n'\n    'if [ -f \"$AGENT_LOG\" ]; then\\n'\n    '    if [ -n \"$CUTOFF\" ]; then\\n'\n    '        AGENT_LINES=$(awk -v cutoff=\"$CUTOFF\" \\'$0 >= cutoff || !/^[0-9]{4}-[0-9]{2}-[0-9]{2} /\\' \"$AGENT_LOG\")\\n'\n    '    else\\n'\n    '        AGENT_LINES=$(tail -100 \"$AGENT_LOG\")\\n'\n    '    fi\\n'\n    '    if [ -n \"$AGENT_LINES\" ]; then\\n'\n    '        OUTPUT=\"=== amazon-ssm-agent.log ===\\\\n$AGENT_LINES\"\\n'\n    '    fi\\n'\n    'fi\\n'\n    'if [ -f \"$ERRORS_LOG\" ]; then\\n'\n    '    ERROR_LINES=$(cat \"$ERRORS_LOG\")\\n'\n    '    if [ -n \"$ERROR_LINES\" ]; then\\n'\n    '        if [ -n \"$OUTPUT\" ]; then OUTPUT=\"$OUTPUT\\\\n\"; fi\\n'\n    '        OUTPUT=\"${OUTPUT}=== errors.log ===\\\\n$ERROR_LINES\"\\n'\n    '    fi\\n'\n    'fi\\n'\n    'if [ -z \"$OUTPUT\" ]; then\\n'\n    '    echo \"not found\"\\n'\n    '    exit 0\\n'\n    'fi\\n'\n    'printf \\'%s\\' \"$OUTPUT\" | compress_output\\n'\n)\n\nWINDOWS_LOG_SCRIPT_SUFFIX = (\n    '$ErrorsLog = \"$env:ProgramData\\\\Amazon\\\\SSM\\\\Logs\\\\errors.log\"\\n'\n    '$AgentLog = \"$env:ProgramData\\\\Amazon\\\\SSM\\\\Logs\\\\amazon-ssm-agent.log\"\\n'\n    'try { $cutoff = (Get-Date).AddMinutes(-5).ToUniversalTime().ToString(\"yyyy-MM-dd HH:mm\") } catch { $cutoff = \"\" }\\n'\n    '$output = @()\\n'\n    'if (Test-Path $AgentLog) {\\n'\n    '    if ($cutoff) {\\n'\n    '        $agentLines = Get-Content $AgentLog | Where-Object {\\n'\n    '            if ($_ -match \"^(\\\\d{4}-\\\\d{2}-\\\\d{2} \\\\d{2}:\\\\d{2})\") { $matches[1] -ge $cutoff } else { $true }\\n'\n    '        }\\n'\n    '    } else {\\n'\n    '        $agentLines = Get-Content $AgentLog | Select-Object -Last 100\\n'\n    '    }\\n'\n    '    if ($agentLines) { $output += \"=== amazon-ssm-agent.log ===\"; $output += $agentLines }\\n'\n    '}\\n'\n    'if (Test-Path $ErrorsLog) {\\n'\n    '    $errorLines = Get-Content $ErrorsLog\\n'\n    '    if ($errorLines) { $output += \"=== errors.log ===\"; $output += $errorLines }\\n'\n    '}\\n'\n    'if (-not $output) {\\n'\n    '    Write-Host \"not found\"\\n'\n    '    exit 0\\n'\n    '}\\n'\n    'Write-Host (Compress-Output ($output -join \"`n\"))\\n'\n)\n\ndef collect_agent_logs(events, context):\n    with open(os.path.join(_SCRIPTS_DIR, \"compress_output.sh\"), \"r\") as f:\n        compress_sh = f.read()\n    with open(os.path.join(_SCRIPTS_DIR, \"Compress-Output.ps1\"), \"r\") as f:\n        compress_ps = f.read()\n\n    LOG_SCRIPTS = {\n        \"linux\": \"#!/bin/sh\\n\" + compress_sh + \"\\n\" + LINUX_LOG_SCRIPT_SUFFIX,\n        \"windows\": compress_ps + \"\\n\" + WINDOWS_LOG_SCRIPT_SUFFIX,\n    }\n\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    tenant_id = events.get(\"tenant_id\")\n    application_id = events.get(\"application_id\")\n    role = events.get(\"role\")\n    subscription_id = events.get(\"subscription_id\")\n    resource_group = events.get(\"resource_group\")\n    vm_name = events.get(\"vm_name\")\n    os_type = events.get(\"os_type\", \"\").lower()\n\n    if not all([tenant_id, application_id, role, subscription_id, resource_group, vm_name]):\n        raise ValueError(\"Required Azure configuration parameters are missing from the previous step.\")\n\n    if os_type not in LOG_SCRIPTS:\n        raise ValueError(\"The operating system is not supported. Only Linux and Windows VMs are supported.\")\n\n    azure_client = create_azure_compute_client(\n        tenant_id=tenant_id,\n        application_id=application_id,\n        role_arn=role,\n        subscription_id=subscription_id,\n        automation_assume_role_tags=events.get(\"automation_assume_role_tags\", []),\n    )\n\n    logs_collected = False\n    try:\n        output, has_error, used_fallback = run_azure_vm_command(\n            azure_client=azure_client,\n            resource_group=resource_group,\n            vm_name=vm_name,\n            script_content=LOG_SCRIPTS[os_type],\n            os_type=os_type,\n            timeout=60,\n            location=events.get(\"location\"),\n            run_command_name=\"amazon-ssm-agent-collect-logs\",\n        )\n        logs_collected = bool(output and output.strip() != \"not found\")\n        print(f\"[INFO] Collected agent logs from VM, output length {len(output)}.\")\n    except Exception as e:\n        output = f\"Failed to collect agent logs: {type(e).__name__}\"\n        print(\"[ERROR] Failed to collect agent logs from VM.\")\n\n    return {\n        \"agent_logs\": output or \"\",\n        \"aws_log\": {\n            \"logs_collected\": str(logs_collected).lower(),\n        },\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "AgentLogs",
+          "Selector": "$.Payload.agent_logs",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GetAzureConfiguration.OSType",
+    "GetAzureConfiguration.VMName",
+    "GetAzureConfiguration.Location",
+    "GetExistingRegistration.ExistingInstanceId",
+    "RegisterAgentOnLinux.ManagedInstanceId",
+    "RegisterAgentOnLinux.PingStatus",
+    "RegisterAgentOnWindows.ManagedInstanceId",
+    "RegisterAgentOnWindows.PingStatus",
+    "ReturnExistingOnlineInstance.ManagedInstanceId"
+  ]
+}
