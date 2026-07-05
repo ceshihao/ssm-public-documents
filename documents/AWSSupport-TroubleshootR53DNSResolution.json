@@ -1,0 +1,522 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The **AWSSupport-TroubleshootR53DNSResolution** automation runbook helps troubleshoot DNS resolution issues by analyzing the complete resolution path from an Amazon Virtual Private Cloud (VPC) or Amazon Elastic Compute Cloud (EC2) instance perspective. It identifies configuration problems across VPC DNS settings, Amazon Route 53 (Route 53) Resolver, Private Hosted Zones, DNS Firewall, and public DNS delegation chains.\n\n### Supported scenarios:\n\n> * VPC DNS attributes (DNS Support, DNS Hostnames) and DHCP option sets including custom DNS server detection.\n> * Route 53 Resolver rules precedence evaluation and Profile associations.\n> * DNS Firewall rule group evaluation including multi-rule group priority, CNAME redirection inspection, and cross-account or AWS-managed domain list detection.\n> * Private Hosted Zone record lookup, VPC Endpoint Private Hosted Zone resolution, and override detection when DNS Hostnames is disabled.\n> * Route 53 Resolver Outbound Endpoint network connectivity analysis (security groups, NACLs, route tables) and forwarding loop detection.\n> * Public DNS delegation chain validation, nameserver consistency, lame delegation detection, and domain registration status via RDAP.\n\n### Limitations:\n\n> * This runbook performs read-only analysis and does not modify any AWS resources.\n> * CNAME records are not chased to their final target for further analysis.\n> * AWS-managed Firewall domain lists and cross-account Firewall rule groups are detected but their contents cannot be inspected.\n> * Cross-account Route 53 Profiles are detected but cannot be fully analyzed.\n> * DNS Firewall fail-open or fail-closed behavior during service unavailability is not evaluated.\n> * Custom DNS server responses configured via DHCP options cannot be verified.\n> * Domain registration status analysis is not available for all top-level domains.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "variables": {
+    "ResolvedVpcId": {
+      "type": "String",
+      "default": ""
+    }
+  },
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ResourceId": {
+      "type": "String",
+      "description": "(Optional) The Amazon Elastic Compute Cloud (EC2) instance ID (i-xxxxxxxxx) or Amazon Virtual Private Cloud (VPC) ID (vpc-xxxxxxxxx) for VPC-specific DNS analysis. If not provided, this runbook will perform public DNS resolution analysis instead of VPC-specific analysis.",
+      "default": "",
+      "allowedPattern": "^(i-[a-z0-9]{8,17}|vpc-[a-f0-9]{8,17})?$"
+    },
+    "DnsRecordName": {
+      "type": "String",
+      "description": "(Required) The fully qualified domain name (FQDN) to analyze for DNS resolution issues.",
+      "allowedPattern": "^([a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9_])?\\.)*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\\.[a-zA-Z]{2,}\\.?$",
+      "minChars": 1,
+      "maxChars": 253
+    },
+    "RecordType": {
+      "type": "String",
+      "description": "(Optional) The DNS record type to query for the specified domain name.",
+      "default": "A",
+      "allowedValues": [
+        "A",
+        "AAAA",
+        "CNAME",
+        "CAA",
+        "MX",
+        "NAPTR",
+        "NS",
+        "PTR",
+        "SOA",
+        "SPF",
+        "SRV",
+        "TXT"
+      ]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "BranchOnResourceType",
+      "action": "aws:branch",
+      "description": "Determines the analysis path based on ResourceId type. Branches to different steps based on whether ResourceId is an instance ID (i-*), VPC ID (vpc-*), or empty.",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetVpcIdFromInstance",
+            "Variable": "{{ ResourceId }}",
+            "StartsWith": "i-"
+          },
+          {
+            "NextStep": "SetVpcIdFromParameter",
+            "Variable": "{{ ResourceId }}",
+            "StartsWith": "vpc-"
+          }
+        ],
+        "Default": "AnalyzeDelegationChain"
+      },
+      "nextStep": "AnalyzeDelegationChain"
+    },
+    {
+      "name": "GetVpcIdFromInstance",
+      "action": "aws:executeAwsApi",
+      "description": "Retrieves VPC ID from the specified EC2 instance. Only executed when ResourceId is an instance ID (i-xxxxxxxxx).",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 60,
+      "maxAttempts": 3,
+      "inputs": {
+        "Service": "ec2",
+        "Api": "DescribeInstances",
+        "InstanceIds": [
+          "{{ ResourceId }}"
+        ]
+      },
+      "outputs": [
+        {
+          "Name": "VpcId",
+          "Selector": "$.Reservations[0].Instances[0].VpcId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "SetResolvedVpcIdFromInstance"
+    },
+    {
+      "name": "SetResolvedVpcIdFromInstance",
+      "action": "aws:updateVariable",
+      "description": "Set the ResolvedVpcId variable with the VPC ID retrieved from the instance.",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Name": "variable:ResolvedVpcId",
+        "Value": "{{ GetVpcIdFromInstance.VpcId }}"
+      },
+      "nextStep": "GatherVpcConfiguration"
+    },
+    {
+      "name": "SetVpcIdFromParameter",
+      "action": "aws:updateVariable",
+      "description": "Set the ResolvedVpcId variable with the VPC ID provided directly in ResourceId parameter.",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Name": "variable:ResolvedVpcId",
+        "Value": "{{ ResourceId }}"
+      },
+      "nextStep": "GatherVpcConfiguration"
+    },
+    {
+      "name": "GatherVpcConfiguration",
+      "action": "aws:executeScript",
+      "description": "Gathers VPC configuration including VPC details, DHCP options, and DNS attributes (enableDnsSupport, enableDnsHostnames). This consolidated step retrieves all VPC-level settings needed for DNS analysis.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}"
+        },
+        "Handler": "gather_vpc_configuration.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "VpcConfiguration",
+          "Selector": "$.Payload.VpcConfiguration",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GatherRoute53ResolverConfiguration"
+    },
+    {
+      "name": "GatherRoute53ResolverConfiguration",
+      "action": "aws:executeScript",
+      "description": "Gathers all Amazon Route 53 Resolver configuration including Resolver configs, endpoints, Route 53 Profiles, and DNS Firewall rule groups. This consolidated step retrieves all Resolver-related settings needed for DNS analysis.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}"
+        },
+        "Handler": "gather_route53_resolver_configuration.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ResolverConfiguration",
+          "Selector": "$.Payload.ResolverConfiguration",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GatherDnsResolutionSources"
+    },
+    {
+      "name": "GatherDnsResolutionSources",
+      "action": "aws:executeScript",
+      "description": "Gathers all DNS resolution sources including matching Resolver Rules, Private Hosted Zones, DNS records, Reverse DNS configuration, and Auto-Defined Rules. This consolidated step collects all information needed to determine DNS resolution precedence.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}",
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "RecordType": "{{ RecordType }}",
+          "VpcConfiguration": "{{ GatherVpcConfiguration.VpcConfiguration }}",
+          "ResolverConfiguration": "{{ GatherRoute53ResolverConfiguration.ResolverConfiguration }}"
+        },
+        "Handler": "gather_dns_resolution_sources.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "DnsResolutionSources",
+          "Selector": "$.Payload.DnsResolutionSources",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "AnalyzeDnsServerConfiguration"
+    },
+    {
+      "name": "AnalyzeDnsServerConfiguration",
+      "action": "aws:executeScript",
+      "description": "Analyzes VPC DNS Server configuration from DHCP Options. Determines DNS Server Type (AmazonProvidedDNS vs Custom DNS), checks if DNS Server IPs are Inbound Endpoints or within the same VPC, determines if VPC Resolver is in use, and generates Conditional Forwarding recommendations for Custom DNS configurations.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}",
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "VpcConfiguration": "{{ GatherVpcConfiguration.VpcConfiguration }}",
+          "ResolverConfiguration": "{{ GatherRoute53ResolverConfiguration.ResolverConfiguration }}"
+        },
+        "Handler": "analyze_dns_server_configuration.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AnalysisResult",
+          "Selector": "$.Payload.AnalysisResult",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "EvaluateFirewallBlocking"
+    },
+    {
+      "name": "EvaluateFirewallBlocking",
+      "action": "aws:executeScript",
+      "description": "Evaluates DNS Firewall rule groups to determine if they are blocking the target domain. This step performs analysis on the collected firewall data to identify blocking rules.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}",
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "RecordType": "{{ RecordType }}",
+          "ResolverConfiguration": "{{ GatherRoute53ResolverConfiguration.ResolverConfiguration }}",
+          "DnsServerAnalysisResult": "{{ AnalyzeDnsServerConfiguration.AnalysisResult }}"
+        },
+        "Handler": "evaluate_firewall_blocking.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AnalysisResult",
+          "Selector": "$.Payload.AnalysisResult",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "DeterminePrecedence"
+    },
+    {
+      "name": "DeterminePrecedence",
+      "action": "aws:executeScript",
+      "description": "Determines which DNS resolution path takes precedence based on the matching resolver rules and private hosted zones. This step applies the DNS resolution precedence rules to identify which path would handle DNS resolution for the target domain.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "VpcConfiguration": "{{ GatherVpcConfiguration.VpcConfiguration }}",
+          "DnsServerAnalysisResult": "{{ AnalyzeDnsServerConfiguration.AnalysisResult }}",
+          "DnsResolutionSources": "{{ GatherDnsResolutionSources.DnsResolutionSources }}",
+          "ResolverConfiguration": "{{ GatherRoute53ResolverConfiguration.ResolverConfiguration }}",
+          "FirewallAnalysisResult": "{{ EvaluateFirewallBlocking.AnalysisResult }}"
+        },
+        "Handler": "determine_precedence.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ResolutionPath",
+          "Selector": "$.Payload.ResolutionPath",
+          "Type": "String"
+        },
+        {
+          "Name": "PrecedenceResults",
+          "Selector": "$.Payload.PrecedenceResults",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnResolutionPath"
+    },
+    {
+      "name": "BranchOnResolutionPath",
+      "action": "aws:branch",
+      "description": "Branches based on the determined DNS resolution path. This step directs the analysis to the appropriate path based on whether resolver rules, private hosted zones, or public DNS would handle resolution for the target domain.",
+      "timeoutSeconds": 60,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GatherResolverNetworkConfiguration",
+            "Variable": "{{ DeterminePrecedence.ResolutionPath }}",
+            "StringEquals": "RESOLVER_RULE_ANALYSIS"
+          },
+          {
+            "NextStep": "AnalyzePrivateHostedZone",
+            "Variable": "{{ DeterminePrecedence.ResolutionPath }}",
+            "StringEquals": "PHZ_ANALYSIS"
+          },
+          {
+            "NextStep": "AnalyzeDelegationChain",
+            "Variable": "{{ DeterminePrecedence.ResolutionPath }}",
+            "StringEquals": "PUBLIC_ANALYSIS"
+          },
+          {
+            "NextStep": "GenerateFinalReport",
+            "Variable": "{{ DeterminePrecedence.ResolutionPath }}",
+            "StringEquals": "AUTO_DEFINED_ANALYSIS"
+          }
+        ],
+        "Default": "GenerateFinalReport"
+      },
+      "nextStep": "GenerateFinalReport"
+    },
+    {
+      "name": "GatherResolverNetworkConfiguration",
+      "action": "aws:executeScript",
+      "description": "Gathers network configuration for Resolver Outbound Endpoint including Security Groups, Network ACLs, Route Tables, and Prefix Lists. This step collects all network settings needed for connectivity analysis.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}",
+          "ResolverConfiguration": "{{ GatherRoute53ResolverConfiguration.ResolverConfiguration }}",
+          "DnsResolutionSources": "{{ GatherDnsResolutionSources.DnsResolutionSources }}"
+        },
+        "Handler": "gather_resolver_network_configuration.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ResolverNetworkConfiguration",
+          "Selector": "$.Payload.ResolverNetworkConfiguration",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "AnalyzeResolverConnectivity"
+    },
+    {
+      "name": "AnalyzeResolverConnectivity",
+      "action": "aws:executeScript",
+      "description": "Analyzes connectivity between the Resolver Outbound Endpoint and target DNS servers using collected network configuration. Evaluates security groups, network ACLs, and route tables to identify connectivity issues and generates recommendations.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ResolverNetworkConfiguration": "{{ GatherResolverNetworkConfiguration.ResolverNetworkConfiguration }}",
+          "DnsResolutionSources": "{{ GatherDnsResolutionSources.DnsResolutionSources }}",
+          "DnsServerConfiguration": "{{ AnalyzeDnsServerConfiguration.AnalysisResult }}",
+          "PrecedenceResults": "{{ DeterminePrecedence.PrecedenceResults }}",
+          "ResolverConfiguration": "{{ GatherRoute53ResolverConfiguration.ResolverConfiguration }}"
+        },
+        "Handler": "analyze_resolver_connectivity.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AnalysisResult",
+          "Selector": "$.Payload.AnalysisResult",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateFinalReport"
+    },
+    {
+      "name": "AnalyzePrivateHostedZone",
+      "action": "aws:executeScript",
+      "description": "Analyzes the Private Hosted Zone configuration and records for the target domain. This step provides detailed information about how the Private Hosted Zone would resolve the target domain.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "RecordType": "{{ RecordType }}",
+          "VpcConfiguration": "{{ GatherVpcConfiguration.VpcConfiguration }}",
+          "DnsResolutionSources": "{{ GatherDnsResolutionSources.DnsResolutionSources }}",
+          "DnsServerConfiguration": "{{ AnalyzeDnsServerConfiguration.AnalysisResult }}",
+          "PrecedenceResults": "{{ DeterminePrecedence.PrecedenceResults }}",
+          "FirewallAnalysisResult": "{{ EvaluateFirewallBlocking.AnalysisResult }}"
+        },
+        "Handler": "analyze_private_hosted_zone.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AnalysisResult",
+          "Selector": "$.Payload.AnalysisResult",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateFinalReport"
+    },
+    {
+      "name": "AnalyzeDelegationChain",
+      "action": "aws:executeScript",
+      "description": "Analyzes the complete DNS delegation chain from root servers. Performs iterative DNS resolution to build delegation chain, validates nameserver consistency between parent and authoritative zones, detects missing delegation levels using QNAME minimization, and collects RDAP data for domain registration information.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "RecordType": "{{ RecordType }}"
+        },
+        "Handler": "analyze_delegation_chain.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AnalysisResult",
+          "Selector": "$.Payload.AnalysisResult",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "AnalyzePublicDnsResolution"
+    },
+    {
+      "name": "AnalyzePublicDnsResolution",
+      "action": "aws:executeScript",
+      "description": "Performs public DNS resolution, checks for matching Amazon Route 53 public hosted zones, and compares hosted zone nameservers with the delegation chain to detect mismatches and CNAME records.",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "InputPayload": {
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "RecordType": "{{ RecordType }}",
+          "DelegationChainResults": "{{ AnalyzeDelegationChain.AnalysisResult }}",
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}",
+          "FirewallAnalysisResult": "{{ EvaluateFirewallBlocking.AnalysisResult }}"
+        },
+        "Handler": "analyze_public_dns_resolution.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "AnalysisResult",
+          "Selector": "$.Payload.AnalysisResult",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateFinalReport"
+    },
+    {
+      "name": "GenerateFinalReport",
+      "action": "aws:executeScript",
+      "description": "Generates comprehensive DNS analysis report from all executed analysis steps. This step consolidates results from whichever resolution path was taken (Resolver Rule, Private Hosted Zone, or Public DNS).",
+      "onFailure": "Abort",
+      "onCancel": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "DnsRecordName": "{{ DnsRecordName }}",
+          "RecordType": "{{ RecordType }}",
+          "ResolvedVpcId": "{{ variable:ResolvedVpcId }}",
+          "GatheredData": {
+            "VpcConfiguration": "{{ GatherVpcConfiguration.VpcConfiguration }}",
+            "ResolverConfiguration": "{{ GatherRoute53ResolverConfiguration.ResolverConfiguration }}",
+            "DnsResolutionSources": "{{ GatherDnsResolutionSources.DnsResolutionSources }}",
+            "PrecedenceResults": "{{ DeterminePrecedence.PrecedenceResults }}"
+          },
+          "AnalysisSteps": {
+            "DnsServerConfiguration": "{{ AnalyzeDnsServerConfiguration.AnalysisResult }}",
+            "ResolutionPath": "{{ DeterminePrecedence.ResolutionPath }}",
+            "FirewallAnalysisResult": "{{ EvaluateFirewallBlocking.AnalysisResult }}",
+            "ResolverConnectivity": "{{ AnalyzeResolverConnectivity.AnalysisResult }}",
+            "PrivateHostedZone": "{{ AnalyzePrivateHostedZone.AnalysisResult }}",
+            "DelegationChain": "{{ AnalyzeDelegationChain.AnalysisResult }}",
+            "PublicDnsResolution": "{{ AnalyzePublicDnsResolution.AnalysisResult }}"
+          }
+        },
+        "Handler": "generate_final_report.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        }
+      ],
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "GenerateFinalReport.Report"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "30472aedd84b04557c83a63ba8809104fa1c0c9d22f2f42fd9e07d4cbb36f8f6"
+      }
+    }
+  }
+}

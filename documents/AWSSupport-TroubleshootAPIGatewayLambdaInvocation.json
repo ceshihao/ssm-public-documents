@@ -1,0 +1,534 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The **AWSSupport-TroubleshootAPIGatewayLambdaInvocation** runbook helps you troubleshoot Amazon API Gateway integrations with AWS Lambda functions in HTTP and REST APIs, when used as an integration or as an authorizer.\n\n### Supported Use Cases\n\n- **Insufficient/Missing Permissions**: Identifies missing permissions in Lambda resource policies or IAM roles\n- **Lambda Function Throttling**: Detects throttling due to concurrency limits and provides recommendations\n- **Lambda Integration Timeout**: Analyzes timeout issues and suggests optimization strategies\n- **Lambda Function Errors**: Identifies function errors and guides to log analysis\n- **Lambda Malformed Response**: Detects response format issues for integrations and authorizers\n- **Invalid Configuration**: Validates API Gateway and Lambda configuration\n\n### Limitations\n\nThe following scenarios are not covered:\n- Cross-account Lambda scenarios\n- Mapping templates, regex/Integration Response\n- IAM or Cognito Authorizers\n- Client-side throttling on API Gateway\n\n### Required Permissions\n\nThis automation requires read-only permissions for API Gateway, Lambda, IAM, and CloudWatch services.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    },
+    "ApiId": {
+      "type": "String",
+      "description": "(Required) The API ID for the API that requires troubleshooting.",
+      "allowedPattern": "^[a-zA-Z0-9]{10}$"
+    },
+    "HttpMethod": {
+      "type": "String",
+      "description": "(Required) The HTTP Method for the resource/route that requires troubleshooting.",
+      "allowedValues": [
+        "ANY",
+        "DELETE",
+        "HEAD",
+        "OPTIONS",
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "$default"
+      ]
+    },
+    "RouteIdOrResourceId": {
+      "type": "String",
+      "description": "(Required) The Route ID or Resource ID with a Lambda Integration that requires troubleshooting. e.g. Route ID = 'dsyrv84' in the HTTP API Route 'GET /path (ID: dsyrv84)' or Resource ID = 'jklob2' in the REST API path.",
+      "allowedPattern": "^[a-zA-Z0-9]{4,10}$"
+    },
+    "StageName": {
+      "type": "String",
+      "description": "(Required) The stage that the API is deployed to.",
+      "allowedPattern": "^(\\$default|[a-zA-Z0-9\\_\\-]{1,128})$"
+    },
+    "StartTime": {
+      "type": "String",
+      "description": "(Optional) Start Time in UTC from the given day to identify which timeframe needs to be queried. The format must be 'yyyy-MM-ddTHH:mm:ss' and timezone needs to be UTC. For example, 2023-01-25T00:00:00. The Start Time must not be greater than 30 days in the past. If this input is missing/invalid the default value used will be 2 days from the End Time or 2 days from the current time.",
+      "allowedPattern": "^$|^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])T(2[0-3]|[01][0-9]):[0-5][0-9]:[0-5][0-9]$",
+      "default": ""
+    },
+    "EndTime": {
+      "type": "String",
+      "description": "(Optional) End Time in UTC from the given day to identify which timeframe needs to be queried. The format must be 'yyyy-MM-ddTHH:mm:ss' and timezone needs to be UTC. For example, 2023-01-25T00:00:00. The End Time must not be more than 2 days from the Start Time. If this input is missing/invalid the default value used will be the current time.",
+      "allowedPattern": "^$|^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])T(2[0-3]|[01][0-9]):[0-5][0-9]:[0-5][0-9]$",
+      "default": ""
+    }
+  },
+  "variables": {
+    "ValidateResourcesAndInputsPayload": {
+      "type": "String",
+      "default": "",
+      "description": "Default OutputPayload for ValidateResourcesAndInputs lambda function"
+    },
+    "CheckAPIGatewayLambdaInvokePermissionsPayload": {
+      "type": "String",
+      "default": "",
+      "description": "Default OutputPayload for CheckAPIGatewayLambdaInvokePermissions lambda function"
+    },
+    "GetAPIMetricsPayload": {
+      "type": "String",
+      "default": "",
+      "description": "Default OutputPayload for GetAPIMetrics lambda function"
+    },
+    "GetLambdaMetricsPayload": {
+      "type": "String",
+      "default": "",
+      "description": "Default OutputPayload for GetLambdaMetrics lambda function"
+    },
+    "CompareAPIGatewayAndLambdaMetricsPayload": {
+      "type": "String",
+      "default": "",
+      "description": "Default OutputPayload for CompareAPIGatewayAndLambdaMetrics lambda function"
+    },
+    "AuthorizerAndIntegrationTroubleshootingPayload": {
+      "type": "String",
+      "default": "",
+      "description": "Default OutputPayload for AuthorizerAndIntegrationTroubleshooting lambda function"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ValidateResourcesAndInputs",
+      "description": "Validates that the API Gateway resources exist, confirms Lambda integration/authorizer presence, validates time inputs and sets defaults if needed, and extracts function and API details. This step calls various API Gateway and Lambda APIs to gather configuration information and validates that all required resources are properly configured.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "ApiId": "{{ ApiId }}",
+          "HttpMethod": "{{ HttpMethod }}",
+          "RouteIdOrResourceId": "{{ RouteIdOrResourceId }}",
+          "StageName": "{{ StageName }}",
+          "StartTime": "{{ StartTime }}",
+          "EndTime": "{{ EndTime }}"
+        },
+        "Handler": "validate_inputs_and_verify_resources.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ResourceArns",
+          "Selector": "$.Payload.ResourceArns",
+          "Type": "StringList"
+        },
+        {
+          "Name": "ResourcePath",
+          "Selector": "$.Payload.ResourcePath",
+          "Type": "String"
+        },
+        {
+          "Name": "ApiName",
+          "Selector": "$.Payload.ApiName",
+          "Type": "String"
+        },
+        {
+          "Name": "ApiType",
+          "Selector": "$.Payload.ApiType",
+          "Type": "String"
+        },
+        {
+          "Name": "ApiStageDetailedMetricsEnabled",
+          "Selector": "$.Payload.ApiStageDetailedMetricsEnabled",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "LambdaIntegrationExists",
+          "Selector": "$.Payload.LambdaIntegrationExists",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "LambdaIntegrationDetails",
+          "Selector": "$.Payload.LambdaIntegrationDetails",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "LambdaIntegrationFunctionDetails",
+          "Selector": "$.Payload.LambdaIntegrationFunctionDetails",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "LambdaAuthorizerExists",
+          "Selector": "$.Payload.LambdaAuthorizerExists",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "LambdaAuthorizerDetails",
+          "Selector": "$.Payload.LambdaAuthorizerDetails",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "LambdaAuthorizerFunctionDetails",
+          "Selector": "$.Payload.LambdaAuthorizerFunctionDetails",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "DefaultTimeDeltaUsed",
+          "Selector": "$.Payload.DefaultTimeDeltaUsed",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload.StartTime",
+          "Type": "String"
+        },
+        {
+          "Name": "EndTime",
+          "Selector": "$.Payload.EndTime",
+          "Type": "String"
+        },
+        {
+          "Name": "AllRequiredInputsValid",
+          "Selector": "$.Payload.AllRequiredInputsValid",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "InvalidRequiredInputs",
+          "Selector": "$.Payload.InvalidRequiredInputs",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "UpdateValidationVariable",
+      "maxAttempts": 3
+    },
+    {
+      "name": "UpdateValidationVariable",
+      "description": "Updates variables with validation results for use in final report compilation.",
+      "action": "aws:updateVariable",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Name": "variable:ValidateResourcesAndInputsPayload",
+        "Value": "{{ ValidateResourcesAndInputs.OutputPayload }}"
+      },
+      "nextStep": "BranchOnValidInputsAndLambdaResources"
+    },
+    {
+      "name": "BranchOnValidInputsAndLambdaResources",
+      "description": "Branches the execution flow based on whether all required inputs and resources are valid and whether a Lambda integration or authorizer is found. If this fails, execution jumps to the results compilation step to provide errors and details to the customer.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CheckAPIGatewayLambdaInvokePermissions",
+            "And": [
+              {
+                "Variable": "{{ ValidateResourcesAndInputs.AllRequiredInputsValid }}",
+                "BooleanEquals": true
+              },
+              {
+                "Or": [
+                  {
+                    "Variable": "{{ ValidateResourcesAndInputs.LambdaIntegrationExists }}",
+                    "BooleanEquals": true
+                  },
+                  {
+                    "Variable": "{{ ValidateResourcesAndInputs.LambdaAuthorizerExists }}",
+                    "BooleanEquals": true
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "Default": "CompileResults"
+      },
+      "nextStep": "CheckAPIGatewayLambdaInvokePermissions"
+    },
+    {
+      "name": "CheckAPIGatewayLambdaInvokePermissions",
+      "description": "Checks IAM role permissions via policy simulation and validates Lambda resource policy permissions for API Gateway to invoke Lambda functions. Uses IAM policy simulation APIs to determine if the configured IAM role or Lambda resource policy has sufficient permissions. Generates example policies if permissions are insufficient.",
+      "action": "aws:executeScript",
+      "onFailure": "step:CompileResults",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "LambdaIntegrationDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationDetails }}",
+          "LambdaIntegrationFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationFunctionDetails }}",
+          "LambdaIntegrationExists": "{{ ValidateResourcesAndInputs.LambdaIntegrationExists }}",
+          "LambdaAuthorizerDetails": "{{ ValidateResourcesAndInputs.LambdaAuthorizerDetails }}",
+          "LambdaAuthorizerFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaAuthorizerFunctionDetails }}",
+          "LambdaAuthorizerExists": "{{ ValidateResourcesAndInputs.LambdaAuthorizerExists }}",
+          "ResourceArns": "{{ ValidateResourcesAndInputs.ResourceArns }}"
+        },
+        "Runtime": "python3.11",
+        "Handler": "check_api_gateway_lambda_invoke_permissions.lambda_handler",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "InvokeAllowed",
+          "Selector": "$.Payload.InvokeAllowed",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "ExamplePolicies",
+          "Selector": "$.Payload.ExamplePolicies",
+          "Type": "StringMap"
+        }
+      ],
+      "nextStep": "UpdatePermissionsVariable",
+      "maxAttempts": 3
+    },
+    {
+      "name": "UpdatePermissionsVariable",
+      "description": "Updates variables with permission check results for use in final report compilation.",
+      "action": "aws:updateVariable",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Name": "variable:CheckAPIGatewayLambdaInvokePermissionsPayload",
+        "Value": "{{ CheckAPIGatewayLambdaInvokePermissions.OutputPayload }}"
+      },
+      "nextStep": "BranchOnInvokeAllowed"
+    },
+    {
+      "name": "BranchOnInvokeAllowed",
+      "description": "Branches execution based on whether API Gateway has sufficient permissions to invoke the Lambda functions. If permissions are insufficient, execution jumps to results compilation to provide permission-related recommendations.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetAPIMetrics",
+            "Variable": "{{ CheckAPIGatewayLambdaInvokePermissions.InvokeAllowed }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "CompileResults"
+      },
+      "nextStep": "GetAPIMetrics"
+    },
+    {
+      "name": "GetAPIMetrics",
+      "description": "Fetches API Gateway metrics including 4xxError, 5xxError, Count, Latency, and IntegrationLatency from CloudWatch within the specified time range. Analyzes error patterns and determines if there are API-level issues that need further investigation.",
+      "action": "aws:executeScript",
+      "onFailure": "step:CompileResults",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "StartTime": "{{ ValidateResourcesAndInputs.StartTime }}",
+          "EndTime": "{{ ValidateResourcesAndInputs.EndTime }}",
+          "ApiName": "{{ ValidateResourcesAndInputs.ApiName }}",
+          "ApiId": "{{ ApiId }}",
+          "StageName": "{{ StageName }}",
+          "ApiType": "{{ ValidateResourcesAndInputs.ApiType }}",
+          "ApiStageDetailedMetricsEnabled": "{{ ValidateResourcesAndInputs.ApiStageDetailedMetricsEnabled }}",
+          "HttpMethod": "{{ HttpMethod }}",
+          "ResourcePath": "{{ ValidateResourcesAndInputs.ResourcePath }}"
+        },
+        "Handler": "get_api_metrics.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ApiErrorsExist",
+          "Selector": "$.Payload.ApiErrorsExist",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "UpdateAPIMetricsVariable",
+      "maxAttempts": 3
+    },
+    {
+      "name": "UpdateAPIMetricsVariable",
+      "description": "Updates variables with API metrics results for use in final report compilation.",
+      "action": "aws:updateVariable",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Name": "variable:GetAPIMetricsPayload",
+        "Value": "{{ GetAPIMetrics.OutputPayload }}"
+      },
+      "nextStep": "BranchOnAPIErrorMetricsExist"
+    },
+    {
+      "name": "BranchOnAPIErrorMetricsExist",
+      "description": "Branches execution based on whether API Gateway error metrics exist within the specified time range. If no errors are detected, execution jumps to results compilation to indicate no issues were found.",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetLambdaMetrics",
+            "Variable": "{{ GetAPIMetrics.ApiErrorsExist }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "CompileResults"
+      },
+      "nextStep": "GetLambdaMetrics"
+    },
+    {
+      "name": "GetLambdaMetrics",
+      "description": "Fetches Lambda function metrics including Invocations, Throttles, Errors, Duration, ConcurrentExecutions, and other relevant metrics from CloudWatch. Correlates Lambda metrics with API error timestamps to identify the root cause of issues.",
+      "action": "aws:executeScript",
+      "onFailure": "step:CompileResults",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "StartTime": "{{ ValidateResourcesAndInputs.StartTime }}",
+          "EndTime": "{{ ValidateResourcesAndInputs.EndTime }}",
+          "LambdaIntegrationFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationFunctionDetails }}",
+          "LambdaAuthorizerFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaAuthorizerFunctionDetails }}",
+          "LambdaIntegrationExists": "{{ ValidateResourcesAndInputs.LambdaIntegrationExists }}",
+          "LambdaIntegrationDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationDetails }}",
+          "LambdaAuthorizerExists": "{{ ValidateResourcesAndInputs.LambdaAuthorizerExists }}"
+        },
+        "Handler": "get_lambda_metrics.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "nextStep": "UpdateLambdaMetricsVariable",
+      "maxAttempts": 3
+    },
+    {
+      "name": "UpdateLambdaMetricsVariable",
+      "description": "Updates variables with Lambda metrics results for use in final report compilation.",
+      "action": "aws:updateVariable",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Name": "variable:GetLambdaMetricsPayload",
+        "Value": "{{ GetLambdaMetrics.OutputPayload }}"
+      },
+      "nextStep": "CompareAPIGatewayAndLambdaMetrics"
+    },
+    {
+      "name": "CompareAPIGatewayAndLambdaMetrics",
+      "description": "Analyzes and correlates API Gateway and Lambda metrics to identify specific issues such as throttling patterns, timeout scenarios, and unhandled function errors. Determines the root cause by comparing concurrent executions with reserved concurrency, checking for provisioned concurrency spillovers, and analyzing duration vs integration latency.",
+      "action": "aws:executeScript",
+      "onFailure": "step:CompileResults",
+      "timeoutSeconds": 300,
+      "inputs": {
+        "InputPayload": {
+          "GetAPIMetricsPayload": "{{ variable:GetAPIMetricsPayload }}",
+          "GetLambdaMetricsPayload": "{{ variable:GetLambdaMetricsPayload }}",
+          "LambdaIntegrationFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationFunctionDetails }}",
+          "LambdaAuthorizerFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaAuthorizerFunctionDetails }}",
+          "LambdaIntegrationDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationDetails }}",
+          "LambdaAuthorizerDetails": "{{ ValidateResourcesAndInputs.LambdaAuthorizerDetails }}",
+          "ApiType": "{{ ValidateResourcesAndInputs.ApiType }}"
+        },
+        "Handler": "compare_api_gateway_and_lambda_metrics.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "nextStep": "UpdateAnalysisVariable",
+      "maxAttempts": 3
+    },
+    {
+      "name": "UpdateAnalysisVariable",
+      "description": "Updates variables with metrics analysis results for use in final report compilation.",
+      "action": "aws:updateVariable",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Name": "variable:CompareAPIGatewayAndLambdaMetricsPayload",
+        "Value": "{{ CompareAPIGatewayAndLambdaMetrics.OutputPayload }}"
+      },
+      "nextStep": "AuthorizerAndIntegrationTroubleshooting"
+    },
+    {
+      "name": "AuthorizerAndIntegrationTroubleshooting",
+      "description": "Provides specific troubleshooting guidance for Lambda authorizers and integrations when no Lambda errors are detected but API errors persist. Analyzes response format issues and provides recommendations for proper Lambda function output formatting.",
+      "action": "aws:executeScript",
+      "onFailure": "step:CompileResults",
+      "timeoutSeconds": 180,
+      "inputs": {
+        "InputPayload": {
+          "CompareAPIGatewayAndLambdaMetricsPayload": "{{ variable:CompareAPIGatewayAndLambdaMetricsPayload }}",
+          "LambdaIntegrationExists": "{{ ValidateResourcesAndInputs.LambdaIntegrationExists }}",
+          "LambdaAuthorizerExists": "{{ ValidateResourcesAndInputs.LambdaAuthorizerExists }}"
+        },
+        "Handler": "authorizer_and_integration_troubleshooting.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "nextStep": "UpdateTroubleshootingVariable",
+      "maxAttempts": 3
+    },
+    {
+      "name": "UpdateTroubleshootingVariable",
+      "description": "Updates variables with troubleshooting results for use in final report compilation.",
+      "action": "aws:updateVariable",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Name": "variable:AuthorizerAndIntegrationTroubleshootingPayload",
+        "Value": "{{ AuthorizerAndIntegrationTroubleshooting.OutputPayload }}"
+      },
+      "nextStep": "CompileResults"
+    },
+    {
+      "name": "CompileResults",
+      "description": "Compiles a comprehensive summary report of all findings, validation issues, permission problems, and troubleshooting recommendations. Generates actionable guidance with relevant metrics, references, and next steps for resolving API Gateway Lambda integration issues.",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isEnd": true,
+      "timeoutSeconds": 180,
+      "inputs": {
+        "InputPayload": {
+          "ValidateResourcesAndInputsPayload": "{{ variable:ValidateResourcesAndInputsPayload }}",
+          "CheckAPIGatewayLambdaInvokePermissionsPayload": "{{ variable:CheckAPIGatewayLambdaInvokePermissionsPayload }}",
+          "GetAPIMetricsPayload": "{{ variable:GetAPIMetricsPayload }}",
+          "GetLambdaMetricsPayload": "{{ variable:GetLambdaMetricsPayload }}",
+          "CompareAPIGatewayAndLambdaMetricsPayload": "{{ variable:CompareAPIGatewayAndLambdaMetricsPayload }}",
+          "AuthorizerAndIntegrationTroubleshootingPayload": "{{ variable:AuthorizerAndIntegrationTroubleshootingPayload }}",
+          "ApiId": "{{ ApiId }}",
+          "HttpMethod": "{{ HttpMethod }}",
+          "StageName": "{{ StageName }}",
+          "ResourceArns": "{{ ValidateResourcesAndInputs.ResourceArns }}",
+          "ApiName": "{{ ValidateResourcesAndInputs.ApiName }}",
+          "ApiType": "{{ ValidateResourcesAndInputs.ApiType }}",
+          "ApiStageDetailedMetricsEnabled": "{{ ValidateResourcesAndInputs.ApiStageDetailedMetricsEnabled }}",
+          "LambdaIntegrationExists": "{{ ValidateResourcesAndInputs.LambdaIntegrationExists }}",
+          "LambdaIntegrationDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationDetails }}",
+          "LambdaIntegrationFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaIntegrationFunctionDetails }}",
+          "LambdaAuthorizerExists": "{{ ValidateResourcesAndInputs.LambdaAuthorizerExists }}",
+          "LambdaAuthorizerDetails": "{{ ValidateResourcesAndInputs.LambdaAuthorizerDetails }}",
+          "LambdaAuthorizerFunctionDetails": "{{ ValidateResourcesAndInputs.LambdaAuthorizerFunctionDetails }}",
+          "DefaultTimeDeltaUsed": "{{ ValidateResourcesAndInputs.DefaultTimeDeltaUsed }}",
+          "StartTime": "{{ ValidateResourcesAndInputs.StartTime }}",
+          "EndTime": "{{ ValidateResourcesAndInputs.EndTime }}"
+        },
+        "Handler": "compile_results.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "TroubleshootingFindings",
+          "Selector": "$.Payload.TroubleshootingFindings",
+          "Type": "String"
+        },
+        {
+          "Name": "Recommendations",
+          "Selector": "$.Payload.Recommendations",
+          "Type": "String"
+        },
+        {
+          "Name": "MetricsData",
+          "Selector": "$.Payload.MetricsData",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "References",
+          "Selector": "$.Payload.References",
+          "Type": "StringList"
+        }
+      ],
+      "maxAttempts": 3
+    }
+  ],
+  "outputs": [
+    "CompileResults.TroubleshootingFindings",
+    "CompileResults.Recommendations",
+    "CompileResults.MetricsData",
+    "CompileResults.References"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "38cabb443f8b9e6837a01bee1f41b62634505613cd6218aab0178e00909ee4e9"
+      }
+    }
+  }
+}

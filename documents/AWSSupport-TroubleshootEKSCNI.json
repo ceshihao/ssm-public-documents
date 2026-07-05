@@ -1,0 +1,280 @@
+{
+  "schemaVersion": "0.3",
+  "description": "The AWSSupport-TroubleshootEKSCNI runbook diagnoses issues with the Amazon Virtual Private Cloud (Amazon VPC) CNI plugin on Amazon Elastic Kubernetes Service (Amazon EKS) worker nodes. It runs comprehensive diagnostic checks including addon status, IAM authentication, networking configuration, and connectivity. This runbook deploys temporary AWS Lambda resources and may incur associated charges.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "EksClusterName": {
+      "type": "String",
+      "description": "(Required) The name of the Amazon Elastic Kubernetes Service (Amazon EKS) cluster to troubleshoot.",
+      "allowedPattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"
+    },
+    "InstanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) The Amazon Elastic Compute Cloud (Amazon EC2) instance ID of the worker node."
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:role\\/[\\w+\\/=,.@-]+$"
+    },
+    "S3BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Optional) The Amazon Simple Storage Service (Amazon S3) bucket for detailed logs (must be secure: not public, encryption enabled).",
+      "default": ""
+    },
+    "S3BucketOwnerAccount": {
+      "type": "String",
+      "description": "(Optional) The AWS account that owns the Amazon S3 bucket. If you do not specify this parameter, the runbook assumes that the bucket is in this account.",
+      "allowedPattern": "^$|^\\{\\{ global:ACCOUNT_ID \\}\\}$|^[0-9]{12}$",
+      "default": "{{ global:ACCOUNT_ID }}"
+    },
+    "LambdaRoleArn": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the AWS Identity and Access Management (IAM) role for the AWS Lambda function to authenticate against the Amazon Elastic Kubernetes Service (Amazon EKS) cluster.",
+      "default": "",
+      "allowedPattern": "^$|^arn:(aws|aws-cn|aws-us-gov|aws-iso(-[a-z])?):iam::[0-9]{12}:role\\/[\\w+\\/=,.@-]+$"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckConcurrency",
+      "description": "Ensures there is only one execution of this runbook targeting the same region. If another execution is in progress, it returns an error and ends.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "isCritical": true,
+      "onFailure": "Abort",
+      "nextStep": "ValidatePrerequisites",
+      "inputs": {
+        "Handler": "handlers/check_concurrency.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "NoExecutionFound",
+          "Selector": "$.Payload.NoExecutionFound",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ValidatePrerequisites",
+      "description": "Validates all prerequisites including cluster state, instance status, SSM connectivity, VPC DNS settings, and IAM permissions.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "BranchOnValidation",
+      "onFailure": "step:GenerateReport",
+      "inputs": {
+        "InputPayload": {
+          "EksClusterName": "{{ EksClusterName }}",
+          "InstanceId": "{{ InstanceId }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "S3BucketName": "{{ S3BucketName }}",
+          "S3BucketOwnerAccount": "{{ S3BucketOwnerAccount }}"
+        },
+        "Handler": "handlers/validate_prerequisites.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "IsValid",
+          "Selector": "$.Payload.IsValid",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "BucketSecure",
+          "Selector": "$.Payload.BucketSecure",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "Findings",
+          "Selector": "$.Payload.Findings",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnValidation",
+      "description": "Routes execution based on prerequisite validation results.",
+      "action": "aws:branch",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DeployK8sApiProxy",
+            "Variable": "{{ ValidatePrerequisites.IsValid }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "GenerateReport"
+      }
+    },
+    {
+      "name": "DeployK8sApiProxy",
+      "description": "Deploys an AWS Lambda function to make authenticated K8s API calls to the Amazon EKS cluster.",
+      "action": "aws:executeAutomation",
+      "timeoutSeconds": 3600,
+      "maxAttempts": 1,
+      "nextStep": "ValidateNodeInCluster",
+      "onFailure": "step:CleanupResources",
+      "onCancel": "step:CleanupResources",
+      "inputs": {
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS",
+        "RuntimeParameters": {
+          "ClusterName": "{{ EksClusterName }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "LambdaRoleArn": "{{ LambdaRoleArn }}",
+          "Operation": "Setup"
+        }
+      }
+    },
+    {
+      "name": "ValidateNodeInCluster",
+      "description": "Verifies that the Amazon EC2 instance is a registered node in the Amazon EKS cluster via K8s API.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 300,
+      "maxAttempts": 1,
+      "nextStep": "BranchOnNodeValidation",
+      "onFailure": "step:CleanupResources",
+      "onCancel": "step:CleanupResources",
+      "inputs": {
+        "InputPayload": {
+          "LambdaFunctionArn": "{{ DeployK8sApiProxy.Output }}",
+          "InstanceId": "{{ InstanceId }}",
+          "EksClusterName": "{{ EksClusterName }}"
+        },
+        "Handler": "handlers/validate_node_in_cluster.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "IsValid",
+          "Selector": "$.Payload.IsValid",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "NodeName",
+          "Selector": "$.Payload.NodeName",
+          "Type": "String"
+        },
+        {
+          "Name": "Findings",
+          "Selector": "$.Payload.Findings",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "BranchOnNodeValidation",
+      "description": "Routes execution based on node validation results.",
+      "action": "aws:branch",
+      "isEnd": false,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RunCNIChecks",
+            "Variable": "{{ ValidateNodeInCluster.IsValid }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "CleanupResources"
+      }
+    },
+    {
+      "name": "RunCNIChecks",
+      "description": "Executes all CNI diagnostic checks including addon status, IAM authentication, connectivity, node health, networking, security groups, and log collection.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "CleanupResources",
+      "onFailure": "Continue",
+      "onCancel": "step:CleanupResources",
+      "inputs": {
+        "InputPayload": {
+          "LambdaFunctionArn": "{{ DeployK8sApiProxy.Output }}",
+          "InstanceId": "{{ InstanceId }}",
+          "EksClusterName": "{{ EksClusterName }}",
+          "S3BucketName": "{{ S3BucketName }}",
+          "S3BucketOwnerAccount": "{{ S3BucketOwnerAccount }}",
+          "BucketSecure": "{{ ValidatePrerequisites.BucketSecure }}",
+          "NodeName": "{{ ValidateNodeInCluster.NodeName }}"
+        },
+        "Handler": "handlers/run_all_cni_checks.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ChecksCompleted",
+          "Selector": "$.Payload.ChecksCompleted",
+          "Type": "String"
+        },
+        {
+          "Name": "Findings",
+          "Selector": "$.Payload.Findings",
+          "Type": "MapList"
+        }
+      ]
+    },
+    {
+      "name": "CleanupResources",
+      "description": "Cleans up the AWS Lambda function and associated resources deployed during the diagnostic checks.",
+      "action": "aws:executeAutomation",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "nextStep": "GenerateReport",
+      "onFailure": "Continue",
+      "inputs": {
+        "DocumentName": "AWSSupport-SetupK8sApiProxyForEKS",
+        "RuntimeParameters": {
+          "ClusterName": "{{ EksClusterName }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+          "LambdaRoleArn": "{{ LambdaRoleArn }}",
+          "Operation": "Cleanup"
+        }
+      }
+    },
+    {
+      "name": "GenerateReport",
+      "description": "Generates a diagnostic report with human-readable messages and actionable recommendations for each finding.",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 600,
+      "maxAttempts": 1,
+      "onFailure": "Abort",
+      "isEnd": true,
+      "inputs": {
+        "InputPayload": {
+          "ValidationPayload": "{{ ValidatePrerequisites.OutputPayload }}",
+          "NodeValidationPayload": "{{ ValidateNodeInCluster.OutputPayload }}",
+          "ChecksPayload": "{{ RunCNIChecks.OutputPayload }}",
+          "S3BucketName": "{{ S3BucketName }}"
+        },
+        "Handler": "handlers/generate_report.script_handler",
+        "Runtime": "python3.11",
+        "Attachment": "attachments.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "GenerateReport.Report"
+  ],
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "SHA256": "e367059fc9bb00609358449eb5838e2323bcf9fa80d03ecc1fdde30c4a1348cd"
+      }
+    }
+  }
+}

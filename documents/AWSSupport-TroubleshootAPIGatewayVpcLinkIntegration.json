@@ -1,0 +1,894 @@
+{
+  "description": "The **AWSSupport-TroubleshootAPIGatewayVpcLinkIntegration** runbook helps you troubleshoot Amazon API Gateway VPC Link integration issues by analyzing the configuration of your API Gateway API, VPC Link, and backend services. It performs comprehensive diagnostics to identify common issues and provide actionable recommendations.\n\n### What does this document do?\n- Identifies the API type (REST or HTTP) and extracts integration parameters\n- Validates VPC Link configuration and status\n- Analyzes load balancer configuration, listeners, and target health\n- Checks security group compatibility between VPC Link and backend services\n- Validates TLS certificate configuration when applicable\n- Examines service discovery configuration for HTTP APIs with AWS Cloud Map integration\n- Generates a comprehensive diagnostic report with actionable recommendations\n\n### Input Parameters\n- **API ID**: The ID of the Amazon API Gateway API with VPC Link integration\n- **API Resource Path**: The API resource path for troubleshooting (e.g., '/users/{id}', '/api/v1/products')\n- **API Method**: The HTTP method for the API resource (GET, POST, PUT, DELETE, etc.)\n- **AutomationAssumeRole**: (Optional) The ARN of the role that allows Automation to perform actions on your behalf\n\n### Prerequisites\n- You must have permissions to describe Amazon API Gateway APIs, VPC Links, load balancers, and related resources\n- The API must exist in your AWS account and have a VPC Link integration configured\n\n### Limitations\n- Only validates standard HTTP (port 80) and HTTPS (port 443) listener configurations. Custom ports are not supported.\n- Supports REST API and HTTP API types only.\n- Cross-account VPC Link configurations are not supported.\n\n### Security Considerations\n- This automation performs read-only operations and does not modify any resources\n- It requires minimal permissions for diagnostic APIs only\n- All remediation actions are provided as CLI commands for manual execution\n\n### Output\nA comprehensive diagnostic report with:\n- Overall integration health status\n- Detailed analysis of each component in the integration path\n- Specific issues identified with actionable recommendations\n- CLI commands for remediation where applicable",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "ApiId": {
+      "type": "String",
+      "description": "(Required) The ID of the API Gateway API which has the VPC Link integration to troubleshoot.",
+      "allowedPattern": "^[a-z0-9]{10}$"
+    },
+    "ApiResourcePath": {
+      "type": "String",
+      "description": "(Required) The API resource path with VPC Link integration configured. Provide only the API path excluding stage and custom domain name base path if applicable. Examples: '/users/{id}', '/api/v1/products', '/health', '$default'. Use '/' for root path.",
+      "allowedPattern": "^(/[a-zA-Z0-9._/{}+-]*|\\$default)$"
+    },
+    "ApiMethod": {
+      "type": "String",
+      "description": "(Required) The HTTP method that has VPC Link integration configured on the specified API resource path. For $default path in HTTP API, select ANY.",
+      "allowedValues": [
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "PATCH",
+        "HEAD",
+        "OPTIONS",
+        "ANY"
+      ]
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The Amazon Resource Name (ARN) of the AWS Identity and Access Management (IAM) role that allows Systems Manager Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses the permissions of the user that starts this runbook.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "ExtractApiTypeAndIntegrationParams",
+      "action": "aws:executeScript",
+      "description": "Identifies whether the API is a REST API or HTTP API by attempting to retrieve the API details. Based on the confirmed API type, finds the most appropriate resource/route that matches the provided path and HTTP method using unified path matching logic. Extracts integration parameters including resource ID, route ID, and integration ID needed for subsequent troubleshooting steps.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ApiId": "{{ ApiId }}",
+          "ApiResourcePath": "{{ ApiResourcePath }}",
+          "ApiMethod": "{{ ApiMethod }}"
+        },
+        "Handler": "extract_api_type_and_integration_params.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ApiType",
+          "Selector": "$.Payload.ApiType",
+          "Type": "String"
+        },
+        {
+          "Name": "IdentifiedApiPath",
+          "Selector": "$.Payload.IdentifiedApiPath",
+          "Type": "String"
+        },
+        {
+          "Name": "IdentifiedMethod",
+          "Selector": "$.Payload.IdentifiedMethod",
+          "Type": "String"
+        },
+        {
+          "Name": "ResourceId",
+          "Selector": "$.Payload.ResourceId",
+          "Type": "String"
+        },
+        {
+          "Name": "IntegrationId",
+          "Selector": "$.Payload.IntegrationId",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GetApiIntegration",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "GetApiIntegration",
+      "action": "aws:executeScript",
+      "description": "Retrieves the integration configuration details for the identified API based on the API type determined in the previous step. For REST APIs, uses apigateway:GetIntegration with the API ID, resource ID, and HTTP method. For HTTP APIs, uses apigatewayv2:GetIntegration with the API ID and integration ID. Validates that the integration exists and is properly configured for VPC Link troubleshooting.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ApiId": "{{ ApiId }}",
+          "ApiType": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+          "ResourceId": "{{ ExtractApiTypeAndIntegrationParams.ResourceId }}",
+          "IdentifiedMethod": "{{ ExtractApiTypeAndIntegrationParams.IdentifiedMethod }}",
+          "IdentifiedApiPath": "{{ ExtractApiTypeAndIntegrationParams.IdentifiedApiPath }}",
+          "IntegrationId": "{{ ExtractApiTypeAndIntegrationParams.IntegrationId }}"
+        },
+        "Handler": "get_api_integration.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "IntegrationType",
+          "Selector": "$.Payload.IntegrationType",
+          "Type": "String"
+        },
+        {
+          "Name": "IntegrationUri",
+          "Selector": "$.Payload.IntegrationUri",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectionType",
+          "Selector": "$.Payload.ConnectionType",
+          "Type": "String"
+        },
+        {
+          "Name": "ConnectionId",
+          "Selector": "$.Payload.ConnectionId",
+          "Type": "String"
+        },
+        {
+          "Name": "TlsConfig_insecureSkipVerification",
+          "Selector": "$.Payload.TlsConfig_insecureSkipVerification",
+          "Type": "String"
+        },
+        {
+          "Name": "TlsConfig_ServerNameToVerify",
+          "Selector": "$.Payload.TlsConfig_ServerNameToVerify",
+          "Type": "String"
+        },
+        {
+          "Name": "IntegrationTarget",
+          "Selector": "$.Payload.IntegrationTarget",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnConnectionType",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "BranchOnConnectionType",
+      "action": "aws:branch",
+      "description": "Evaluates the integration details to determine if the integration uses a VPC Link. Examines the ConnectionType property returned by the GetApiIntegration step. If ConnectionType is 'VPC_LINK', routes the execution to the VPC Link analysis path. If ConnectionType is not 'VPC_LINK', routes to the GenerateReport step with appropriate information.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetVpcLinkDetails",
+            "Variable": "{{ GetApiIntegration.ConnectionType }}",
+            "StringEquals": "VPC_LINK"
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetVpcLinkDetails",
+      "action": "aws:executeScript",
+      "description": "Retrieves detailed information about the integrated VPC Link. Uses apigateway:GetVpcLink for REST APIs or apigatewayv2:GetVpcLink for HTTP APIs with the connectionId from the integration. Captures critical VPC Link properties including status, name, target ARNs, security groups, and subnet IDs.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ApiType": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+          "ConnectionId": "{{ GetApiIntegration.ConnectionId }}"
+        },
+        "Handler": "get_vpc_link_details.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "VpcLinkId",
+          "Selector": "$.Payload.VpcLinkId",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcLinkStatus",
+          "Selector": "$.Payload.VpcLinkStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcLinkName",
+          "Selector": "$.Payload.VpcLinkName",
+          "Type": "String"
+        },
+        {
+          "Name": "TargetArns",
+          "Selector": "$.Payload.TargetArns",
+          "Type": "String"
+        },
+        {
+          "Name": "SecurityGroupIds",
+          "Selector": "$.Payload.SecurityGroupIds",
+          "Type": "String"
+        },
+        {
+          "Name": "SubnetIds",
+          "Selector": "$.Payload.SubnetIds",
+          "Type": "String"
+        },
+        {
+          "Name": "VpcLinkVersion",
+          "Selector": "$.Payload.VpcLinkVersion",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnVpcLinkStatus",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "BranchOnVpcLinkStatus",
+      "action": "aws:branch",
+      "description": "Evaluates the VPC Link status from the GetVpcLinkDetails step to determine if the VPC Link is in AVAILABLE state. If VpcLinkStatus is 'AVAILABLE', routes the execution for further troubleshooting. If VpcLinkStatus is not 'AVAILABLE' (e.g., 'PENDING', 'DELETING', 'FAILED', 'INACTIVE'), routes to the GenerateReport step with appropriate diagnostic information.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnAPIType",
+            "Variable": "{{ GetVpcLinkDetails.VpcLinkStatus }}",
+            "StringEquals": "AVAILABLE"
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "BranchOnAPIType",
+      "action": "aws:branch",
+      "description": "Branches the automation workflow based on the API type determined in the ExtractApiTypeAndIntegrationParams step. Evaluates the ApiType property (either 'REST' or 'HTTP') to determine the appropriate path for further analysis. For REST APIs, routes to the GetLoadBalancerDetails step directly since REST API VPC Links connect directly to Network Load Balancers. For HTTP APIs, routes to the BranchOnIntegrationType step since HTTP API VPC Links can connect to various backend services and require additional parsing.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetLoadBalancerDetails",
+            "Variable": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+            "StringEquals": "REST"
+          },
+          {
+            "NextStep": "BranchOnIntegrationType",
+            "Variable": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+            "StringEquals": "HTTP"
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "BranchOnIntegrationType",
+      "action": "aws:branch",
+      "description": "Analyzes the integration URI from the GetApiIntegration step to determine the backend service type. Uses pattern matching on the IntegrationUri to identify if the backend is an Elastic Load Balancer or AWS Cloud Map (Service Discovery). For HTTP APIs, branches to the appropriate next step based on the detected integration type.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "GetLoadBalancerDetails",
+            "Variable": "{{ GetApiIntegration.IntegrationUri }}",
+            "Contains": "elasticloadbalancing"
+          },
+          {
+            "NextStep": "GetServiceDiscoveryDetails",
+            "Variable": "{{ GetApiIntegration.IntegrationUri }}",
+            "Contains": "servicediscovery"
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "GetLoadBalancerDetails",
+      "action": "aws:executeScript",
+      "description": "Retrieves comprehensive information about the load balancer associated with the VPC Link integration. For REST APIs, uses the target ARN from TargetArns output of GetVpcLinkDetails step. For HTTP APIs, uses the load balancer ARN extracted from the IntegrationUri from GetApiIntegration step. Captures critical load balancer properties including status, type (ALB/NLB), scheme, VPC ID, security groups, subnet details and availability zones.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ApiType": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+          "IntegrationUri": "{{ GetApiIntegration.IntegrationUri }}",
+          "TargetArns": "{{ GetVpcLinkDetails.TargetArns }}",
+          "IntegrationTarget": "{{ GetApiIntegration.IntegrationTarget }}"
+        },
+        "Handler": "get_load_balancer_details.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "LoadBalancerArn",
+          "Selector": "$.Payload.LoadBalancerArn",
+          "Type": "String"
+        },
+        {
+          "Name": "LoadBalancerName",
+          "Selector": "$.Payload.LoadBalancerName",
+          "Type": "String"
+        },
+        {
+          "Name": "LoadBalancerType",
+          "Selector": "$.Payload.LoadBalancerType",
+          "Type": "String"
+        },
+        {
+          "Name": "LoadBalancerScheme",
+          "Selector": "$.Payload.LoadBalancerScheme",
+          "Type": "String"
+        },
+        {
+          "Name": "LoadBalancerState",
+          "Selector": "$.Payload.LoadBalancerState",
+          "Type": "String"
+        },
+        {
+          "Name": "LoadBalancerVpcId",
+          "Selector": "$.Payload.LoadBalancerVpcId",
+          "Type": "String"
+        },
+        {
+          "Name": "LoadBalancerSecurityGroups",
+          "Selector": "$.Payload.LoadBalancerSecurityGroups",
+          "Type": "String"
+        },
+        {
+          "Name": "LoadBalancerSubnetIds",
+          "Selector": "$.Payload.LoadBalancerSubnetIds",
+          "Type": "String"
+        },
+        {
+          "Name": "EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic",
+          "Selector": "$.Payload.EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnLoadBalancerAvailability",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "GetServiceDiscoveryDetails",
+      "action": "aws:executeScript",
+      "description": "Retrieves information about the AWS Cloud Map (Service Discovery) service associated with the VPC Link integration. Extracts the service ID from the IntegrationUri for HTTP APIs with Service Discovery backends. Makes sequential API calls to AWS Cloud Map to get service and namespace details. Validates that both service and namespace exist and are not empty.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "IntegrationUri": "{{ GetApiIntegration.IntegrationUri }}"
+        },
+        "Handler": "get_service_discovery_details.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "ServiceId",
+          "Selector": "$.Payload.ServiceId",
+          "Type": "String"
+        },
+        {
+          "Name": "ServiceName",
+          "Selector": "$.Payload.ServiceName",
+          "Type": "String"
+        },
+        {
+          "Name": "ServiceArn",
+          "Selector": "$.Payload.ServiceArn",
+          "Type": "String"
+        },
+        {
+          "Name": "NamespaceId",
+          "Selector": "$.Payload.NamespaceId",
+          "Type": "String"
+        },
+        {
+          "Name": "NamespaceName",
+          "Selector": "$.Payload.NamespaceName",
+          "Type": "String"
+        },
+        {
+          "Name": "NamespaceArn",
+          "Selector": "$.Payload.NamespaceArn",
+          "Type": "String"
+        },
+        {
+          "Name": "ServiceDiscoveryStatus",
+          "Selector": "$.Payload.ServiceDiscoveryStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "ErrorMessage",
+          "Selector": "$.Payload.ErrorMessage",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateReport",
+      "maxAttempts": 3,
+      "timeoutSeconds": 300
+    },
+    {
+      "name": "BranchOnLoadBalancerAvailability",
+      "action": "aws:branch",
+      "description": "Evaluates the load balancer state from the GetLoadBalancerDetails step to determine if the load balancer is active and operational. Examines the State.Code property returned by the GetLoadBalancerDetails step. If State.Code is 'active', routes the execution to the load balancer type analysis path. If State.Code is not 'active' (e.g., 'provisioning', 'failed', 'inactive'), routes to the GenerateReport step with appropriate diagnostic information.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnVPCLinkVersion",
+            "Variable": "{{ GetLoadBalancerDetails.LoadBalancerState }}",
+            "StringEquals": "active"
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "BranchOnVPCLinkVersion",
+      "action": "aws:branch",
+      "description": "Branches the automation workflow based on the VPC Link version determined in the GetVpcLinkDetails step. For VPC Link v1 (NLB integration), routes to the DescribeAndValidateListenerConfig step to verify listener configuration. For VPC Link v2 (ALB/NLB integration), routes to the VerifySubnetAndSecurityGroupConfig step to validate subnet and security group configurations.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DescribeAndValidateListenerConfig",
+            "Variable": "{{ GetVpcLinkDetails.VpcLinkVersion }}",
+            "StringEquals": "v1"
+          },
+          {
+            "NextStep": "VerifySubnetAndSecurityGroupConfig",
+            "Variable": "{{ GetVpcLinkDetails.VpcLinkVersion }}",
+            "StringEquals": "v2"
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "VerifySubnetAndSecurityGroupConfig",
+      "action": "aws:executeScript",
+      "description": "Performs comprehensive validation of the subnet and security group configuration for Application Load Balancers (ALBs) with HTTP VPC Links. Analyzes various scenarios including HTTP VPC Link in private/public subnets with internal/external ALB/NLB. Identifies problematic configurations where the ALB/NLB scheme is 'internet-facing' (external) AND the VPC Link is deployed in public subnets. Performs security group compatibility check between VPC Link and ALB.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "SecurityGroupIds": "{{ GetVpcLinkDetails.SecurityGroupIds }}",
+          "SubnetIds": "{{ GetVpcLinkDetails.SubnetIds }}",
+          "LoadBalancerSecurityGroups": "{{ GetLoadBalancerDetails.LoadBalancerSecurityGroups }}",
+          "LoadBalancerScheme": "{{ GetLoadBalancerDetails.LoadBalancerScheme }}",
+          "LoadBalancerType": "{{ GetLoadBalancerDetails.LoadBalancerType }}",
+          "LoadBalancerSubnetIds": "{{ GetLoadBalancerDetails.LoadBalancerSubnetIds }}",
+          "LoadBalancerName": "{{ GetLoadBalancerDetails.LoadBalancerName }}"
+        },
+        "Handler": "verify_subnet_and_security_group_config.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "IsProblematicConfig",
+          "Selector": "$.Payload.IsProblematicConfig",
+          "Type": "String"
+        },
+        {
+          "Name": "VPCLinkSubnetType",
+          "Selector": "$.Payload.VPCLinkSubnetType",
+          "Type": "String"
+        },
+        {
+          "Name": "IsSGOutboundAllowed",
+          "Selector": "$.Payload.IsOutboundAllowed",
+          "Type": "String"
+        },
+        {
+          "Name": "IsSGInboundAllowed",
+          "Selector": "$.Payload.IsInboundAllowed",
+          "Type": "String"
+        },
+        {
+          "Name": "VPCSecurityGroupAllowingOutbound",
+          "Selector": "$.Payload.VPCSecurityGroupAllowingOutbound",
+          "Type": "String"
+        },
+        {
+          "Name": "LBSecurityGroupAllowingInbound",
+          "Selector": "$.Payload.LBSecurityGroupAllowingInbound",
+          "Type": "String"
+        },
+        {
+          "Name": "VPCLinkNACLOutboundAllows",
+          "Selector": "$.Payload.VPCLinkNACLOutboundAllows",
+          "Type": "String"
+        },
+        {
+          "Name": "VPCLinkNACLInboundAllows",
+          "Selector": "$.Payload.VPCLinkNACLInboundAllows",
+          "Type": "String"
+        },
+        {
+          "Name": "LBNACLOutboundAllows",
+          "Selector": "$.Payload.LBNACLOutboundAllows",
+          "Type": "String"
+        },
+        {
+          "Name": "LBNACLInboundAllows",
+          "Selector": "$.Payload.LBNACLInboundAllows",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "DescribeAndValidateListenerConfig",
+      "maxAttempts": 3,
+      "timeoutSeconds": 900
+    },
+    {
+      "name": "DescribeAndValidateListenerConfig",
+      "action": "aws:executeScript",
+      "description": "Describes listeners and validates endpoint configuration for API Gateway VPC Link integrations. For REST APIs: describes all load balancer listeners, parses endpoint protocol from integration URI, and finds matching listener based on standard protocol/port mapping (HTTP->TCP:80, HTTPS->TLS/TCP:443). For HTTP APIs: describes the specific listener from integration URI. Returns listener details including protocol, port, and certificate ARN for both API types. Note: Only validates standard HTTP/HTTPS ports (80/443) as custom ports are out of scope.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ApiType": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+          "IntegrationUri": "{{ GetApiIntegration.IntegrationUri }}",
+          "LoadBalancerArn": "{{ GetLoadBalancerDetails.LoadBalancerArn }}"
+        },
+        "Handler": "describe_and_validate_listener_config.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "EndpointProtocol",
+          "Selector": "$.Payload.EndpointProtocol",
+          "Type": "String"
+        },
+        {
+          "Name": "MatchingListenerArn",
+          "Selector": "$.Payload.MatchingListenerArn",
+          "Type": "String"
+        },
+        {
+          "Name": "ListenerProtocol",
+          "Selector": "$.Payload.ListenerProtocol",
+          "Type": "String"
+        },
+        {
+          "Name": "ListenerPort",
+          "Selector": "$.Payload.ListenerPort",
+          "Type": "String"
+        },
+        {
+          "Name": "CertificateArn",
+          "Selector": "$.Payload.CertificateArn",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "BranchOnCertificateRequired",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600
+    },
+    {
+      "name": "BranchOnCertificateRequired",
+      "action": "aws:branch",
+      "description": "Branches the automation workflow based on whether a certificate is required for the integration. If a certificate is required, routes to the DescribeAndValidateCertificate step for certificate validation. If no certificate is required, bypasses certificate validation and proceeds to the DescribeTargetsAndTargetGroups step.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DescribeTargetsAndTargetGroups",
+            "Variable": "{{ DescribeAndValidateListenerConfig.CertificateArn }}",
+            "StringEquals": ""
+          }
+        ],
+        "Default": "DescribeAndValidateCertificate"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "DescribeAndValidateCertificate",
+      "action": "aws:executeScript",
+      "description": "Retrieves and validates certificate details for TLS connections from DescribeAndValidateListenerConfig step. Performs different validation checks based on API type. For HTTP APIs, validates that the certificate covers the hostname specified in the TLS configuration. For REST APIs, validates that the certificate covers the domain of the endpoint URL. Verifies certificate validity including expiration date, hostname matching, and certificate chain.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ApiType": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+          "TlsConfig_ServerNameToVerify": "{{ GetApiIntegration.TlsConfig_ServerNameToVerify }}",
+          "CertificateArn": "{{ DescribeAndValidateListenerConfig.CertificateArn }}",
+          "IntegrationUri": "{{ GetApiIntegration.IntegrationUri }}",
+          "TlsConfig_insecureSkipVerification": "{{ GetApiIntegration.TlsConfig_insecureSkipVerification }}"
+        },
+        "Handler": "describe_and_validate_certificate.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "IntegratedHostName",
+          "Selector": "$.Payload.IntegratedHostName",
+          "Type": "String"
+        },
+        {
+          "Name": "CertificateArn",
+          "Selector": "$.Payload.CertificateArn",
+          "Type": "String"
+        },
+        {
+          "Name": "CertDomainName",
+          "Selector": "$.Payload.CertDomainName",
+          "Type": "String"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        },
+        {
+          "Name": "Issuer",
+          "Selector": "$.Payload.Issuer",
+          "Type": "String"
+        },
+        {
+          "Name": "IsExpired",
+          "Selector": "$.Payload.IsExpired",
+          "Type": "String"
+        },
+        {
+          "Name": "IsFromTrustedCA",
+          "Selector": "$.Payload.IsFromTrustedCA",
+          "Type": "String"
+        },
+        {
+          "Name": "TrustedCAAlias",
+          "Selector": "$.Payload.TrustedCAAlias",
+          "Type": "String"
+        },
+        {
+          "Name": "ValidationError",
+          "Selector": "$.Payload.ValidationError",
+          "Type": "String"
+        },
+        {
+          "Name": "IsChainValid",
+          "Selector": "$.Payload.IsChainValid",
+          "Type": "String"
+        },
+        {
+          "Name": "ChainError",
+          "Selector": "$.Payload.ChainError",
+          "Type": "String"
+        },
+        {
+          "Name": "IsHostnameCovered",
+          "Selector": "$.Payload.IsHostnameCovered",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "DescribeTargetsAndTargetGroups",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600
+    },
+    {
+      "name": "DescribeTargetsAndTargetGroups",
+      "action": "aws:executeScript",
+      "description": "Retrieves information about the target group associated with the listener and checks the health of the specific target. Uses the listener's default action to identify the target group, then checks the health of the target. Focuses on the single relevant target group rather than all target groups for the load balancer. Determines if the target is an ALB or not for further processing decisions.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "MatchingListenerArn": "{{ DescribeAndValidateListenerConfig.MatchingListenerArn }}"
+        },
+        "Handler": "describe_targets_and_target_groups.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "TargetGroups",
+          "Selector": "$.Payload.TargetGroups",
+          "Type": "String"
+        },
+        {
+          "Name": "IsAllTargetsHealthy",
+          "Selector": "$.Payload.IsAllTargetsHealthy",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "HasALBTargets",
+          "Selector": "$.Payload.HasALBTargets",
+          "Type": "Boolean"
+        }
+      ],
+      "nextStep": "BranchOnTargetHealth",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600
+    },
+    {
+      "name": "BranchOnTargetHealth",
+      "action": "aws:branch",
+      "description": "Evaluates the target health status from the DescribeTargetsAndTargetGroups step to determine if the target is healthy and operational. Examines the Target.HealthStatus property returned by the previous step. If HealthStatus is 'healthy', routes the execution to the target type analysis path. If HealthStatus is 'unhealthy' or if there are no targets, routes to the GenerateReport step with appropriate diagnostic information.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "BranchOnTargetType",
+            "Variable": "{{ DescribeTargetsAndTargetGroups.IsAllTargetsHealthy }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "BranchOnTargetType",
+      "action": "aws:branch",
+      "description": "Evaluates the target type from the DescribeTargetsAndTargetGroups step to determine if the target is an Application Load Balancer (ALB). Examines the TargetGroup.TargetType property returned by the DescribeTargetsAndTargetGroups step. If TargetType is 'alb', routes the execution to the VerifyTargetALBListeners step for further analysis of the ALB configuration. If TargetType is not 'alb', routes directly to the GenerateReport step.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "VerifyTargetALBListeners",
+            "Variable": "{{ DescribeTargetsAndTargetGroups.HasALBTargets }}",
+            "BooleanEquals": true
+          }
+        ],
+        "Default": "GenerateReport"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "VerifyTargetALBListeners",
+      "action": "aws:executeScript",
+      "description": "Retrieves and validates the listener configuration of an Application Load Balancer (ALB) that is being used as a target in a target group. This step validates NLB+ALB multi-tier architecture configurations by checking protocol compatibility, port matching, and certificate validation based on API type and TLS configuration.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "TargetGroups": "{{ DescribeTargetsAndTargetGroups.TargetGroups }}",
+          "NLBListenerArn": "{{ DescribeAndValidateListenerConfig.MatchingListenerArn }}",
+          "NLBListenerProtocol": "{{ DescribeAndValidateListenerConfig.ListenerProtocol }}",
+          "ApiType": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+          "IntegrationUri": "{{ GetApiIntegration.IntegrationUri }}",
+          "TlsConfig_ServerNameToVerify": "{{ GetApiIntegration.TlsConfig_ServerNameToVerify }}",
+          "TlsConfig_insecureSkipVerification": "{{ GetApiIntegration.TlsConfig_insecureSkipVerification }}"
+        },
+        "Handler": "verify_target_alb_listeners.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "IsNLBListenerProtocolValid",
+          "Selector": "$.Payload.IsNLBListenerProtocolValid",
+          "Type": "String"
+        },
+        {
+          "Name": "ALBValidationResults",
+          "Selector": "$.Payload.ALBValidationResults",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "GenerateReport",
+      "maxAttempts": 3,
+      "timeoutSeconds": 600
+    },
+    {
+      "name": "GenerateReport",
+      "action": "aws:executeScript",
+      "description": "Generates a comprehensive diagnostic report that consolidates all findings from previous steps. Organizes the analysis results into logical sections based on the components involved in the VPC Link integration. Creates a structured, human-readable report with an executive summary, streamlined analysis, and specific recommendations. Includes actionable remediation steps with specific AWS CLI commands for each identified issue.",
+      "onFailure": "Abort",
+      "inputs": {
+        "InputPayload": {
+          "ApiDetails": {
+            "ApiId": "{{ ApiId }}",
+            "ApiType": "{{ ExtractApiTypeAndIntegrationParams.ApiType }}",
+            "ResourcePath": "{{ ExtractApiTypeAndIntegrationParams.IdentifiedApiPath }}",
+            "HttpMethod": "{{ ExtractApiTypeAndIntegrationParams.IdentifiedMethod }}",
+            "ResourceId": "{{ ExtractApiTypeAndIntegrationParams.ResourceId }}",
+            "IntegrationId": "{{ ExtractApiTypeAndIntegrationParams.IntegrationId }}"
+          },
+          "IntegrationDetails": {
+            "IntegrationType": "{{ GetApiIntegration.IntegrationType }}",
+            "IntegrationUri": "{{ GetApiIntegration.IntegrationUri }}",
+            "ConnectionType": "{{ GetApiIntegration.ConnectionType }}",
+            "ConnectionId": "{{ GetApiIntegration.ConnectionId }}",
+            "TlsConfig_insecureSkipVerification": "{{ GetApiIntegration.TlsConfig_insecureSkipVerification }}",
+            "TlsConfig_ServerNameToVerify": "{{ GetApiIntegration.TlsConfig_ServerNameToVerify }}"
+          },
+          "VpcLinkDetails": {
+            "VpcLinkId": "{{ GetVpcLinkDetails.VpcLinkId }}",
+            "VpcLinkStatus": "{{ GetVpcLinkDetails.VpcLinkStatus }}",
+            "VpcLinkName": "{{ GetVpcLinkDetails.VpcLinkName }}",
+            "TargetArns": "{{ GetVpcLinkDetails.TargetArns }}",
+            "SecurityGroupIds": "{{ GetVpcLinkDetails.SecurityGroupIds }}",
+            "SubnetIds": "{{ GetVpcLinkDetails.SubnetIds }}",
+            "VpcLinkVersion": "{{ GetVpcLinkDetails.VpcLinkVersion }}"
+          },
+          "LoadBalancerDetails": {
+            "LoadBalancerArn": "{{ GetLoadBalancerDetails.LoadBalancerArn }}",
+            "LoadBalancerName": "{{ GetLoadBalancerDetails.LoadBalancerName }}",
+            "LoadBalancerType": "{{ GetLoadBalancerDetails.LoadBalancerType }}",
+            "LoadBalancerScheme": "{{ GetLoadBalancerDetails.LoadBalancerScheme }}",
+            "LoadBalancerState": "{{ GetLoadBalancerDetails.LoadBalancerState }}",
+            "LoadBalancerVpcId": "{{ GetLoadBalancerDetails.LoadBalancerVpcId }}",
+            "LoadBalancerSecurityGroups": "{{ GetLoadBalancerDetails.LoadBalancerSecurityGroups }}",
+            "LoadBalancerSubnetIds": "{{ GetLoadBalancerDetails.LoadBalancerSubnetIds }}",
+            "EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic": "{{ GetLoadBalancerDetails.EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic }}"
+          },
+          "ServiceDiscoveryDetails": {
+            "ServiceId": "{{ GetServiceDiscoveryDetails.ServiceId }}",
+            "ServiceName": "{{ GetServiceDiscoveryDetails.ServiceName }}",
+            "ServiceArn": "{{ GetServiceDiscoveryDetails.ServiceArn }}",
+            "NamespaceId": "{{ GetServiceDiscoveryDetails.NamespaceId }}",
+            "NamespaceName": "{{ GetServiceDiscoveryDetails.NamespaceName }}",
+            "NamespaceArn": "{{ GetServiceDiscoveryDetails.NamespaceArn }}",
+            "ServiceDiscoveryStatus": "{{ GetServiceDiscoveryDetails.ServiceDiscoveryStatus }}",
+            "ErrorMessage": "{{ GetServiceDiscoveryDetails.ErrorMessage }}"
+          },
+          "EndpointValidation": {
+            "EndpointProtocol": "{{ DescribeAndValidateListenerConfig.EndpointProtocol }}",
+            "MatchingListenerArn": "{{ DescribeAndValidateListenerConfig.MatchingListenerArn }}",
+            "ListenerProtocol": "{{ DescribeAndValidateListenerConfig.ListenerProtocol }}",
+            "ListenerPort": "{{ DescribeAndValidateListenerConfig.ListenerPort }}",
+            "CertificateArn": "{{ DescribeAndValidateListenerConfig.CertificateArn }}"
+          },
+          "SubnetAndSecurityGroupValidation": {
+            "IsProblematicConfig": "{{ VerifySubnetAndSecurityGroupConfig.IsProblematicConfig }}",
+            "VPCLinkSubnetType": "{{ VerifySubnetAndSecurityGroupConfig.VPCLinkSubnetType }}",
+            "IsSGOutboundAllowed": "{{ VerifySubnetAndSecurityGroupConfig.IsSGOutboundAllowed }}",
+            "IsSGInboundAllowed": "{{ VerifySubnetAndSecurityGroupConfig.IsSGInboundAllowed }}",
+            "VPCSecurityGroupAllowingOutbound": "{{ VerifySubnetAndSecurityGroupConfig.VPCSecurityGroupAllowingOutbound }}",
+            "LBSecurityGroupAllowingInbound": "{{ VerifySubnetAndSecurityGroupConfig.LBSecurityGroupAllowingInbound }}",
+            "VPCLinkNACLOutboundAllows": "{{ VerifySubnetAndSecurityGroupConfig.VPCLinkNACLOutboundAllows }}",
+            "VPCLinkNACLInboundAllows": "{{ VerifySubnetAndSecurityGroupConfig.VPCLinkNACLInboundAllows }}",
+            "LBNACLOutboundAllows": "{{ VerifySubnetAndSecurityGroupConfig.LBNACLOutboundAllows }}",
+            "LBNACLInboundAllows": "{{ VerifySubnetAndSecurityGroupConfig.LBNACLInboundAllows }}"
+          },
+          "CertificateValidation": {
+            "IntegratedHostName": "{{ DescribeAndValidateCertificate.IntegratedHostName }}",
+            "CertificateArn": "{{ DescribeAndValidateCertificate.CertificateArn }}",
+            "CertDomainName": "{{ DescribeAndValidateCertificate.CertDomainName }}",
+            "Status": "{{ DescribeAndValidateCertificate.Status }}",
+            "Issuer": "{{ DescribeAndValidateCertificate.Issuer }}",
+            "IsExpired": "{{ DescribeAndValidateCertificate.IsExpired }}",
+            "IsFromTrustedCA": "{{ DescribeAndValidateCertificate.IsFromTrustedCA }}",
+            "TrustedCAAlias": "{{ DescribeAndValidateCertificate.TrustedCAAlias }}",
+            "IsChainValid": "{{ DescribeAndValidateCertificate.IsChainValid }}",
+            "ChainError": "{{ DescribeAndValidateCertificate.ChainError }}",
+            "IsHostnameCovered": "{{ DescribeAndValidateCertificate.IsHostnameCovered }}"
+          },
+          "TargetGroupValidation": {
+            "TargetGroups": "{{ DescribeTargetsAndTargetGroups.TargetGroups }}",
+            "IsAllTargetsHealthy": "{{ DescribeTargetsAndTargetGroups.IsAllTargetsHealthy }}",
+            "HasALBTargets": "{{ DescribeTargetsAndTargetGroups.HasALBTargets }}"
+          },
+          "ALBTargetValidation": {
+            "IsNLBProtocolValid": "{{ VerifyTargetALBListeners.IsNLBListenerProtocolValid }}",
+            "ALBValidationResults": "{{ VerifyTargetALBListeners.ALBValidationResults }}"
+          }
+        },
+        "Handler": "generate_report.lambda_handler",
+        "Runtime": "python3.11",
+        "Attachment": "artifact.zip"
+      },
+      "outputs": [
+        {
+          "Name": "Report",
+          "Selector": "$.Payload.Report",
+          "Type": "String"
+        },
+        {
+          "Name": "OverallStatus",
+          "Selector": "$.Payload.OverallStatus",
+          "Type": "String"
+        },
+        {
+          "Name": "BlockingIssuesCount",
+          "Selector": "$.Payload.BlockingIssuesCount",
+          "Type": "Integer"
+        },
+        {
+          "Name": "RecommendationsCount",
+          "Selector": "$.Payload.RecommendationsCount",
+          "Type": "Integer"
+        }
+      ],
+      "maxAttempts": 3,
+      "timeoutSeconds": 120,
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "GenerateReport.Report",
+    "GenerateReport.OverallStatus",
+    "GenerateReport.BlockingIssuesCount",
+    "GenerateReport.RecommendationsCount"
+  ],
+  "files": {
+    "artifact.zip": {
+      "checksums": {
+        "SHA256": "ce651cfef1789b4dd6e7191d3f7d6a88981ec1eaf5042ca3d9ecf77024fadfb2"
+      }
+    }
+  }
+}
