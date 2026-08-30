@@ -1,0 +1,282 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-DiagnoseHybridActivationIssues\n\n## What does this document do?\nThis runbook diagnoses hybrid activation issues that prevent on-premises servers and virtual machines from being\nmanaged by AWS Systems Manager. The runbook checks activation codes for expiry, IAM permission issues, and registration limits.\n\n## Input Parameters\n\n- **DiagnosisExecutionId**: A unique ID that separates the results from different runbook executions.\n- **AutomationAssumeRole**: The role that the runbook assumes to perform a diagnosis.\n- **BucketName**: The S3 bucket that the runbook uses to store its output.\n- **BucketOwner**: The owner of the S3 bucket used to store output.\n\n## Output Parameters\n* PublishAggregateResult.aggregate_output: The aggregated diagnosis output.\n* PublishAggregateResult.had_failure: An indication of whether or not the execution experienced a failure.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The role assumed by the runbook to perform batching and diagnosis."
+    },
+    "BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the S3 bucket used to store output."
+    },
+    "BucketOwner": {
+      "type": "String",
+      "description": "(Required) The owner of the S3 bucket used to store output.",
+      "allowedPattern": "^\\d{12}$"
+    },
+    "DiagnosisExecutionId": {
+      "type": "String",
+      "description": "(Required) A unique identifier used to separate the S3 output of different runbook executions.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "variables": {
+    "HadFailure": {
+      "type": "Boolean",
+      "description": "Used to determine whether the execution experienced a failure.",
+      "default": false
+    },
+    "S3EncryptionType": {
+      "type": "String",
+      "description": "S3 Server-side encryption type.",
+      "default": "AES256"
+    },
+    "S3EncryptionKey": {
+      "type": "String",
+      "description": "S3 Server-side encryption Key ARN.",
+      "default": ""
+    },
+    "AllActivations": {
+      "type": "MapList",
+      "description": "Stores all activations across paginated calls",
+      "default": []
+    },
+    "NextToken": {
+      "type": "String",
+      "description": "Pagination token for DescribeActivations",
+      "default": ""
+    }
+  },
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "a7edc5d45b30221e880cfdc05d4f154f9ef0e1078956b8b38d4cd39d87f11d27"
+      },
+      "size": 2418
+    }
+  },
+  "mainSteps": [
+    {
+      "description": "## GetS3EncryptionConfiguration\nDetermines the S3 Bucket encryption type.",
+      "name": "GetS3EncryptionConfiguration",
+      "action": "aws:executeScript",
+      "nextStep": "UpdateS3EncryptionType",
+      "isEnd": false,
+      "onFailure": "step:UpdateHadFailureTrue",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}"
+        },
+        "Script": "import boto3\nfrom attachments.s3_utils import S3WrapperClient\n\ndef script_handler(events, context):\n    bucket_name = events['BucketName']\n    bucket_owner = events['BucketOwner']\n    s3_client = S3WrapperClient(bucket_owner)\n    encryption_type = 'AES256'  # Default to SSE-S3\n    encryption_key = 'N/A'\n\n    response = s3_client.get_bucket_encryption(Bucket=bucket_name)\n    encryption_rules = response.get('ServerSideEncryptionConfiguration', {}).get('Rules', [])\n    if encryption_rules:\n        default_encryption = encryption_rules[0].get('ApplyServerSideEncryptionByDefault', {})\n        encryption_type = default_encryption.get('SSEAlgorithm', 'AES256')\n        encryption_key = default_encryption.get('KMSMasterKeyID', 'N/A')\n\n    return {\n        'S3EncryptionType': encryption_type,\n        'S3EncryptionKey': encryption_key\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "S3EncryptionType",
+          "Type": "String",
+          "Selector": "$.Payload.S3EncryptionType"
+        },
+        {
+          "Name": "S3EncryptionKey",
+          "Type": "String",
+          "Selector": "$.Payload.S3EncryptionKey"
+        }
+      ]
+    },
+    {
+      "description": "## Updates the HadFailure variable whereever a step fails.",
+      "name": "UpdateHadFailureTrue",
+      "action": "aws:updateVariable",
+      "nextStep": "PublishAggregateResult",
+      "isCritical": true,
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:HadFailure",
+        "Value": true
+      }
+    },
+    {
+      "description": "## UpdateS3EncryptionType\nUpdates the S3 Bucket encryption type.",
+      "name": "UpdateS3EncryptionType",
+      "action": "aws:updateVariable",
+      "nextStep": "UpdateS3EncryptionKey",
+      "isEnd": false,
+      "onFailure": "step:UpdateHadFailureTrue",
+      "inputs": {
+        "Name": "variable:S3EncryptionType",
+        "Value": "{{ GetS3EncryptionConfiguration.S3EncryptionType }}"
+      }
+    },
+    {
+      "description": "## UpdateS3EncryptionKey\nUpdates the S3 Bucket encryption key.",
+      "name": "UpdateS3EncryptionKey",
+      "action": "aws:updateVariable",
+      "nextStep": "GetActivationDetailsLoop",
+      "isEnd": false,
+      "onFailure": "step:UpdateHadFailureTrue",
+      "inputs": {
+        "Name": "variable:S3EncryptionKey",
+        "Value": "{{ GetS3EncryptionConfiguration.S3EncryptionKey }}"
+      }
+    },
+    {
+      "name": "GetActivationDetailsLoop",
+      "action": "aws:loop",
+      "nextStep": "DiagnoseActivations",
+      "isEnd": false,
+      "onFailure": "step:UpdateHadFailureTrue",
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Variable": "{{ GetActivationPage.should_continue }}",
+          "BooleanEquals": true
+        },
+        "Steps": [
+          {
+            "name": "GetActivationPage",
+            "action": "aws:executeScript",
+            "nextStep": "MergeActivations",
+            "isEnd": false,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "get_activations",
+              "InputPayload": {
+                "NextToken": "{{ variable:NextToken }}"
+              },
+              "Script": "import boto3\nimport datetime\nfrom botocore.config import Config\n\ndef get_activations(events, context):\n    config = Config(retries={\"max_attempts\": 5, \"mode\": \"standard\"})\n    ssm = boto3.client('ssm', config=config)\n\n    kwargs = {'MaxResults': 50}\n    if events.get('NextToken') and events.get('NextToken') != '':\n        kwargs['NextToken'] = events['NextToken']\n\n    response = ssm.describe_activations(**kwargs)\n\n    # Convert all datetime objects to strings\n    activation_list = [\n      {\n        \"ActivationId\": activation[\"ActivationId\"],\n        \"ExpirationDate\": activation[\"ExpirationDate\"].astimezone(datetime.timezone.utc).isoformat(),\n        \"IamRole\": activation[\"IamRole\"],\n        \"RegistrationLimit\": activation[\"RegistrationLimit\"],\n        \"RegistrationsCount\": activation[\"RegistrationsCount\"],\n      }\n      for activation in response.get('ActivationList', [])\n    ]\n    next_token = response.get('NextToken', '')\n\n    return {\n        'ActivationList': activation_list,\n        'NextToken': next_token,\n        'should_continue': bool(next_token)\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "ActivationList",
+                "Selector": "$.Payload.ActivationList",
+                "Type": "MapList"
+              },
+              {
+                "Name": "NextToken",
+                "Selector": "$.Payload.NextToken",
+                "Type": "String"
+              },
+              {
+                "Name": "should_continue",
+                "Selector": "$.Payload.should_continue",
+                "Type": "Boolean"
+              }
+            ]
+          },
+          {
+            "name": "MergeActivations",
+            "action": "aws:executeScript",
+            "nextStep": "UpdateAllActivations",
+            "isEnd": false,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "merge_activations",
+              "InputPayload": {
+                "AllActivations": "{{ variable:AllActivations }}",
+                "NewActivations": "{{ GetActivationPage.ActivationList }}"
+              },
+              "Script": "def merge_activations(events, context):\n    current_activations = events['AllActivations']\n    new_activations = events['NewActivations']\n\n    merged = current_activations + new_activations\n\n    return {'MergedActivations': merged}\n"
+            },
+            "outputs": [
+              {
+                "Name": "MergedActivations",
+                "Selector": "$.Payload.MergedActivations",
+                "Type": "MapList"
+              }
+            ]
+          },
+          {
+            "name": "UpdateAllActivations",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateNextToken",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:AllActivations",
+              "Value": "{{ MergeActivations.MergedActivations }}"
+            }
+          },
+          {
+            "name": "UpdateNextToken",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:NextToken",
+              "Value": "{{ GetActivationPage.NextToken }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Diagnose all activations for expiry and IAM permission issues",
+      "name": "DiagnoseActivations",
+      "action": "aws:executeScript",
+      "nextStep": "PublishAggregateResult",
+      "isEnd": false,
+      "onFailure": "step:UpdateHadFailureTrue",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "diagnose_activations",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "ActivationList": "{{ variable:AllActivations }}",
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}"
+        },
+        "Script": "import datetime\nimport boto3\nimport json\nfrom botocore.config import Config\nfrom attachments.s3_utils import S3WrapperClient\n\nconfig = Config(retries={\"max_attempts\": 5, \"mode\": \"standard\"})\niam_client = boto3.client('iam', config=config)\n\n# Required SSM actions for managed instances\nSSM_REQUIRED_ACTIONS = [\n    \"ssm:DescribeAssociation\",\n    \"ssm:GetDeployablePatchSnapshotForInstance\",\n    \"ssm:GetDocument\",\n    \"ssm:DescribeDocument\",\n    \"ssm:GetManifest\",\n    \"ssm:GetParameter\",\n    \"ssm:GetParameters\",\n    \"ssm:ListAssociations\",\n    \"ssm:ListInstanceAssociations\",\n    \"ssm:PutInventory\",\n    \"ssm:PutComplianceItems\",\n    \"ssm:PutConfigurePackageResult\",\n    \"ssm:UpdateAssociationStatus\",\n    \"ssm:UpdateInstanceAssociationStatus\",\n    \"ssm:UpdateInstanceInformation\",\n    \"ssmmessages:CreateControlChannel\",\n    \"ssmmessages:CreateDataChannel\",\n    \"ssmmessages:OpenControlChannel\",\n    \"ssmmessages:OpenDataChannel\",\n    \"ec2messages:AcknowledgeMessage\",\n    \"ec2messages:DeleteMessage\",\n    \"ec2messages:FailMessage\",\n    \"ec2messages:GetEndpoint\",\n    \"ec2messages:GetMessages\",\n    \"ec2messages:SendReply\",\n]\n\ndef simulate_principal_policy(role_arn):\n    response = iam_client.simulate_principal_policy(\n        PolicySourceArn=role_arn,\n        ActionNames=SSM_REQUIRED_ACTIONS,\n        ResourceArns=[\"*\"]\n    )\n\n    denied_actions = []\n    allowed_actions = []\n    for result in response[\"EvaluationResults\"]:\n        action = result[\"EvalActionName\"]\n        decision = result[\"EvalDecision\"]\n\n        if decision.lower() == \"allowed\":\n            allowed_actions.append(action)\n        else:\n            denied_actions.append(action)\n\n    return allowed_actions, denied_actions\n\ndef diagnose_activations(events, context):\n    s3_client = S3WrapperClient(events[\"BucketOwner\"],events[\"S3EncryptionType\"], events[\"S3EncryptionKey\"], context.get(\"automation:EXECUTION_ID\"))\n\n    activations = events['ActivationList']\n    diagnosis_execution_id = events['DiagnosisExecutionId']\n    bucket_name = events['BucketName']\n\n    insufficient_activation_codes = 0\n    current_time = datetime.datetime.now(datetime.timezone.utc)\n    account_id = context.get('global:ACCOUNT_ID')\n    region = context.get('global:REGION')\n\n    for activation in activations:\n        activation_id = activation.get('ActivationId')\n\n        # Check expiry\n        is_expired = False\n        expiry_date = activation.get('ExpirationDate')\n        if expiry_date:\n            try:\n                # Parse ISO format string back to datetime\n                expiry_time = datetime.datetime.fromisoformat(expiry_date)\n                is_expired = current_time > expiry_time\n            except (ValueError, TypeError) as e:\n                print(f\"Error parsing expiry date for activation {activation_id}: {e}. Treating as expired.\")\n                is_expired = True\n        else:\n            is_expired = True\n\n        # Check IAM permissions\n        allowed_actions = []\n        denied_actions = SSM_REQUIRED_ACTIONS.copy()\n        iam_role = activation.get('IamRole')\n\n        if iam_role:\n            try:\n                role_name = iam_role.split('/')[-1]\n                response = iam_client.get_role(RoleName=role_name)\n                role_arn = response['Role']['Arn']\n                allowed_actions, denied_actions = simulate_principal_policy(role_arn=role_arn)\n            except iam_client.exceptions.NoSuchEntityException:\n                print(f\"IAM role '{iam_role}' not found for activation {activation_id}. All actions will be marked as denied.\")\n            except Exception as e:\n                print(f\"Error checking IAM permissions for activation {activation_id} with role '{iam_role}': {e}. All actions will be marked as denied.\")\n\n        # Check registration limit\n        registration_limit = activation.get('RegistrationLimit', 0)\n        registrations_count = activation.get('RegistrationsCount', 0)\n        is_registration_full = registrations_count >= registration_limit\n\n        # Check if insufficient (has denied actions, expired, or registration full)\n        if denied_actions or is_expired or is_registration_full:\n            insufficient_activation_codes += 1\n\n        # Create per activation output\n        activation_output = {\n            \"Permissions\": {\n                \"allowed_actions\": allowed_actions,\n                \"denied_actions\": denied_actions\n            },\n            \"IsActivationCodeExpired\": is_expired,\n            \"RegistrationLimit\": registration_limit,\n            \"RegistrationsCount\": registrations_count,\n            \"IsRegistrationFull\": is_registration_full\n        }\n\n        # Write per activation result to S3\n        object_key = f\"actions/diagnosis/{diagnosis_execution_id}/output/{account_id}/{region}/{activation_id}.json\"\n        s3_client.put_object(\n            Bucket=bucket_name,\n            Key=object_key,\n            Body=json.dumps(activation_output)\n        )\n\n    return {\n        'InsufficientActivationCodes': insufficient_activation_codes,\n        '_ProcessedActivationCount': len(activations)\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "DiagnosisResult",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "description": "Write diagnosis execution summary to S3",
+      "name": "PublishAggregateResult",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "publish_results",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+          "BucketName": "{{ BucketName }}",
+          "DiagnosisResult": "{{ DiagnoseActivations.DiagnosisResult }}",
+          "HadFailure": "{{ variable:HadFailure }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+          "BucketOwner": "{{ BucketOwner }}"
+        },
+        "Script": "import boto3\nfrom attachments.s3_utils import S3WrapperClient\n\ndef publish_results(events, context):\n    s3_client = S3WrapperClient(events[\"BucketOwner\"],events[\"S3EncryptionType\"], events[\"S3EncryptionKey\"], context.get(\"automation:EXECUTION_ID\"))\n\n    # Use diagnosis results\n    diagnosis_result = events['DiagnosisResult']\n    insufficient_activation_codes = diagnosis_result.get('InsufficientActivationCodes', 0)\n\n    # Write execution summary to S3\n    account_id = context.get('global:ACCOUNT_ID')\n    region = context.get('global:REGION')\n    object_key = f\"actions/diagnosis/{events['DiagnosisExecutionId']}/summary/DiagnoseHybridActivationIssues/{account_id}/{region}/{insufficient_activation_codes}\"\n\n    s3_client.put_object(\n        Bucket=events['BucketName'],\n        Key=object_key,\n        Body=b\"\"\n    )\n\n    return {\n        'aggregate_output': {\n            'InsufficientActivationCodes': insufficient_activation_codes,\n            '_ProcessedActivationCount': diagnosis_result.get('_ProcessedActivationCount', 0)\n        },\n        'had_failure': events.get(\"HadFailure\")\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "aggregate_output",
+          "Selector": "$.Payload.aggregate_output",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "had_failure",
+          "Selector": "$.Payload.had_failure",
+          "Type": "Boolean"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "PublishAggregateResult.aggregate_output",
+    "PublishAggregateResult.had_failure"
+  ]
+}

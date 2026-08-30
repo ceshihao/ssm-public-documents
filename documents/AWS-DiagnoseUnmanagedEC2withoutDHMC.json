@@ -1,0 +1,350 @@
+{
+  "schemaVersion": "0.3",
+  "description": "# AWS-DiagnoseUnmanagedEC2withoutDHMC\n\n## What does this document do?\nThis runbook is used for diagnosing SSM DHMC (Default Host Management Configuration) configuration issues \nthat prevent EC2 instances from being managed by AWS Systems Manager. The runbook checks if SSM DHMC is \nenabled and if DHMC attached role has proper policies for EC2 instances to be managed.\n\n## Input Parameters\n\n- **DiagnosisExecutionId**: A unique ID that separates the results from different runbook executions.\n- **AutomationAssumeRole**: The role that the runbook assumes to perform a diagnosis.\n- **BucketName**: The S3 bucket that the runbook uses to store its output.\n\n## Output Parameters\n* PublishAggregateResult.aggregate_output: The aggregated diagnosis output.\n* PublishAggregateResult.had_failure: An indication of whether or not the execution experienced a failure.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The role assumed by the runbook to perform batching and diagnosis."
+    },
+    "BucketName": {
+      "type": "AWS::S3::Bucket::Name",
+      "description": "(Required) The name of the S3 bucket used to store output."
+    },
+    "BucketOwner": {
+      "type": "String",
+      "description": "(Required) The owner of the S3 bucket used to store output.",
+      "allowedPattern": "^\\d{12}$"
+    },
+    "DiagnosisExecutionId": {
+      "type": "String",
+      "description": "(Required) A unique identifier used to separate the S3 output of different runbook executions.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "RunScriptTimeout": {
+      "type": "Integer",
+      "description": "(Optional) The time limit for long-running executeScript steps. Reduce this this value if you experience\nstep failures.",
+      "allowedPattern": "^([1-5]?\\d{1,2}|600)$",
+      "default": 540
+    }
+  },
+  "variables": {
+    "AggregatedOutput": {
+      "type": "StringMap",
+      "description": "Used to store the aggregate of issue and finding summary between loop iterations, and identifies how many instances\nare associated with a specific subcategory of known issues.",
+      "default": {}
+    },
+    "InstanceNextToken": {
+      "type": "String",
+      "description": "Used to track the previous output state of InstanceNextToken, so a next iteration pick ups where the\nprevious left off.",
+      "default": ""
+    },
+    "HadFailure": {
+      "type": "Boolean",
+      "description": "Used to determine whether the execution experienced a failure.",
+      "default": false
+    },
+    "S3EncryptionType": {
+      "type": "String",
+      "description": "S3 Server-side encryption type.",
+      "default": "AES256"
+    },
+    "S3EncryptionKey": {
+      "type": "String",
+      "description": "S3 Server-side encryption Key ARN.",
+      "default": ""
+    },
+    "UnmanagedNodeCount": {
+      "type": "Integer",
+      "description": "Total count of unmanaged nodes found.",
+      "default": 0
+    }
+  },
+  "mainSteps": [
+    {
+      "description": "## GetS3EncryptionConfiguration\nDetermines the S3 Bucket encryption type.",
+      "name": "GetS3EncryptionConfiguration",
+      "action": "aws:executeScript",
+      "nextStep": "UpdateS3EncryptionType",
+      "isEnd": false,
+      "onFailure": "step:UpdateHadFailureTrue",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}"
+        },
+        "Script": "import boto3\nfrom botocore.config import Config\n\nconfig = Config(retries={\"max_attempts\": 5, \"mode\": \"standard\"})\ns3_client = boto3.client(\"s3\", config=config)\n\ndef script_handler(events, context):\n    bucket_name = events['BucketName']\n    bucket_owner = events['BucketOwner']\n    encryption_type = 'AES256'  # Default to SSE-S3\n    encryption_key = 'N/A'\n\n    response = s3_client.get_bucket_encryption(Bucket=bucket_name)\n    encryption_rules = response.get('ServerSideEncryptionConfiguration', {}).get('Rules', [])\n    if encryption_rules:\n        default_encryption = encryption_rules[0].get('ApplyServerSideEncryptionByDefault', {})\n        encryption_type = default_encryption.get('SSEAlgorithm', 'AES256')\n        encryption_key = default_encryption.get('KMSMasterKeyID', 'N/A')\n\n    return {\n        'S3EncryptionType': encryption_type,\n        'S3EncryptionKey': encryption_key\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "S3EncryptionType",
+          "Type": "String",
+          "Selector": "$.Payload.S3EncryptionType"
+        },
+        {
+          "Name": "S3EncryptionKey",
+          "Type": "String",
+          "Selector": "$.Payload.S3EncryptionKey"
+        }
+      ]
+    },
+    {
+      "description": "## Updates the HadFailure variable whereever a step fails.",
+      "name": "UpdateHadFailureTrue",
+      "action": "aws:updateVariable",
+      "nextStep": "PublishAggregateResult",
+      "isCritical": true,
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:HadFailure",
+        "Value": true
+      }
+    },
+    {
+      "description": "## UpdateS3EncryptionType\nUpdates the S3 Bucket encryption type.",
+      "name": "UpdateS3EncryptionType",
+      "action": "aws:updateVariable",
+      "nextStep": "UpdateS3EncryptionKey",
+      "onFailure": "step:UpdateHadFailureTrue",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:S3EncryptionType",
+        "Value": "{{ GetS3EncryptionConfiguration.S3EncryptionType }}"
+      }
+    },
+    {
+      "description": "## UpdateS3EncryptionKey\nUpdates the S3 Bucket encryption key.",
+      "name": "UpdateS3EncryptionKey",
+      "action": "aws:updateVariable",
+      "nextStep": "FindUnmanagedNodesLoop",
+      "onFailure": "step:UpdateHadFailureTrue",
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:S3EncryptionKey",
+        "Value": "{{ GetS3EncryptionConfiguration.S3EncryptionKey }}"
+      }
+    },
+    {
+      "name": "FindUnmanagedNodesLoop",
+      "action": "aws:loop",
+      "nextStep": "Branch",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Variable": "{{ FindUnmanagedNodes.should_continue }}",
+          "BooleanEquals": true
+        },
+        "Steps": [
+          {
+            "description": "## FindUnmanagedNodes\nThis step identifies nodes that are not managed by Systems Manager.\n* First, it queries EC2 for running instances, then checks for the subset of those instances which are\n  known to Systems Manager. The remaining nodes are therefore unmanaged nodes.\n* This step runs in a loop until either the time limit provided by the RunScriptTimeout parameter has\n  elapsed, or if we have finished processing all instances in the account-Region.\n* It writes a file at the end of its execution which contains information relating to the unmanaged\n  instances it identified.",
+            "name": "FindUnmanagedNodes",
+            "action": "aws:executeScript",
+            "maxAttempts": 3,
+            "nextStep": "UpdateFindUnmanagedNodesLoopState",
+            "isCritical": false,
+            "isEnd": false,
+            "onFailure": "step:RegisterFindUnmanagedNodesFailure",
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "handler",
+              "InputPayload": {
+                "BucketName": "{{ BucketName }}",
+                "BucketOwner": "{{ BucketOwner }}",
+                "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+                "InstanceNextToken": "{{ variable:InstanceNextToken }}",
+                "UnmanagedNodeCount": "{{ variable:UnmanagedNodeCount }}",
+                "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+                "S3EncryptionKey": "{{ variable:S3EncryptionKey }}",
+                "Iteration": "{{ FindUnmanagedNodesLoop.CurrentIteration }}",
+                "TimeoutSeconds": "{{ RunScriptTimeout }}"
+              },
+              "Script": "import json\nimport time\nimport boto3\nfrom botocore.config import Config\n\ndef chunk(lst, n):\n  for i in range(0, len(lst), n):\n      yield lst[i : i + n]\n\ndef find_managed_instances(ssm_client, instance_ids):\n    \"\"\"Given a list of instance_ids, returns the subset of the input which are managed\"\"\"\n    managed_set = set()\n    for instance_chunk in chunk(instance_ids, 100):\n        page_iterator = ssm_client.get_paginator(\"describe_instance_information\").paginate(\n            Filters=[\n                {\"Key\": \"InstanceIds\", \"Values\": instance_chunk},\n                {\"Key\": \"PingStatus\", \"Values\": [\"Online\"]}\n            ]\n        )\n        for page in page_iterator:\n            for instance in page[\"InstanceInformationList\"]:\n                managed_set.add(instance[\"InstanceId\"])\n    return managed_set\n\n\ndef get_instance_page(ec2_client, next_token, MaxResults=1000):\n    \"\"\"Returns a dict with the instance_id as key, and the value is the minimal instance object we need for diagnosis\"\"\"\n\n    filters = [{\"Name\": \"instance-state-name\", \"Values\": [\"running\", \"stopping\", \"stopped\"]}]\n    kwargs = {\n        \"Filters\": filters,\n        \"MaxResults\": MaxResults\n    }\n    if next_token:\n        kwargs[\"NextToken\"] = next_token\n\n    result = ec2_client.describe_instances(**kwargs)\n\n    instances = []\n    for reservation in result.get(\"Reservations\", []):\n        for instance in reservation.get(\"Instances\", []):\n            instances.append(instance[\"InstanceId\"])\n    return instances, result.get(\"NextToken\", None)\n\ndef find_unmanaged_instances(ssm_client, instances):\n    unmanaged_instances = []\n    managed_instances = find_managed_instances(ssm_client, instances)\n    for instance_id in instances:\n        if instance_id not in managed_instances:\n            unmanaged_instances.append(instance_id)\n    return unmanaged_instances\n\ndef handler(event, context):\n    start_time = time.time()\n\n    # required parameters\n    instance_next_token = event.get(\"InstanceNextToken\", None)\n    unmanaged_node_count = event.get(\"UnmanagedNodeCount\", 0)\n\n    # optional parameters\n    timeout_seconds = event.get(\"TimeoutSeconds\", 540)\n    describe_instances_page_size = event.get(\"DescribeInstancesPageSize\", 1000)\n\n    # clients\n    config = Config(retries={\"max_attempts\": 5, \"mode\": \"standard\"})\n    ec2_client = boto3.client(\"ec2\", config=config)\n    ssm_client = boto3.client(\"ssm\", config=config)\n\n    first_run = True\n    while instance_next_token or first_run:\n        first_run = False\n\n        instances, _next_token = get_instance_page(ec2_client, instance_next_token, MaxResults=describe_instances_page_size)\n        unmanaged_instances = find_unmanaged_instances(ssm_client, instances)\n        unmanaged_node_count += len(unmanaged_instances)\n        instance_next_token = _next_token\n\n        if time.time() - start_time > timeout_seconds:\n            break\n\n    return {\n        \"InstanceNextToken\": instance_next_token,\n        \"ShouldContinue\": bool(instance_next_token),\n        \"UnmanagedNodeCount\": unmanaged_node_count\n    }\n"
+            },
+            "outputs": [
+              {
+                "Name": "instance_next_token",
+                "Type": "String",
+                "Selector": "$.Payload.InstanceNextToken"
+              },
+              {
+                "Name": "should_continue",
+                "Type": "Boolean",
+                "Selector": "$.Payload.ShouldContinue"
+              },
+              {
+                "Name": "unmanaged_count",
+                "Type": "Integer",
+                "Selector": "$.Payload.UnmanagedNodeCount"
+              }
+            ]
+          },
+          {
+            "description": "## RegisterFindUnmanagedNodesFailure\nUpdates the HadFailure variable",
+            "name": "RegisterFindUnmanagedNodesFailure",
+            "action": "aws:updateVariable",
+            "nextStep": "WriteSummaryToS3",
+            "isCritical": true,
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:HadFailure",
+              "Value": true
+            }
+          },
+          {
+            "description": "## UpdateFindUnmanagedNodesLoopState\nUpdates the InstanceNextToken variable",
+            "name": "UpdateFindUnmanagedNodesLoopState",
+            "action": "aws:updateVariable",
+            "nextStep": "UpdateUnmanagedNodeCount",
+            "isCritical": true,
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:InstanceNextToken",
+              "Value": "{{ FindUnmanagedNodes.instance_next_token }}"
+            }
+          },
+          {
+            "description": "## UpdateUnmanagedNodeCount\nUpdates the UnmanagedNodeCount variable",
+            "name": "UpdateUnmanagedNodeCount",
+            "action": "aws:updateVariable",
+            "isCritical": true,
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:UnmanagedNodeCount",
+              "Value": "{{ FindUnmanagedNodes.unmanaged_count }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Branch",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "DiagnoseSSMConfiguration",
+            "Variable": "{{ variable:UnmanagedNodeCount }}",
+            "NumericGreater": 0
+          }
+        ],
+        "Default": "WriteSummaryToS3"
+      }
+    },
+    {
+      "name": "DiagnoseSSMConfiguration",
+      "action": "aws:executeScript",
+      "nextStep": "UpdateDiagnosisAggregateSummary",
+      "isEnd": false,
+      "onFailure": "step:RegisterDiagnoseSSMConfigurationFailure",
+      "outputs": [
+        {
+          "Name": "diagnosis_summary",
+          "Type": "StringMap",
+          "Selector": "$.Payload"
+        }
+      ],
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "BucketName": "{{ BucketName }}",
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}"
+        },
+        "Script": "import boto3\nimport json\nfrom botocore.config import Config\n\nconfig = Config(retries={\"max_attempts\": 5, \"mode\": \"standard\"})\nssm_client = boto3.client(\"ssm\", config=config)\niam_client = boto3.client(\"iam\", config=config)\ns3_client = boto3.client(\"s3\", config=config)\n\n# - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore\n#   https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AmazonSSMManagedInstanceCore.html\nSSM_REQUIRED_ACTIONS = [\n    \"ssm:DescribeAssociation\",\n    \"ssm:GetDeployablePatchSnapshotForInstance\",\n    \"ssm:GetDocument\",\n    \"ssm:DescribeDocument\",\n    \"ssm:GetManifest\",\n    \"ssm:GetParameter\",\n    \"ssm:GetParameters\",\n    \"ssm:ListAssociations\",\n    \"ssm:ListInstanceAssociations\",\n    \"ssm:PutInventory\",\n    \"ssm:PutComplianceItems\",\n    \"ssm:PutConfigurePackageResult\",\n    \"ssm:UpdateAssociationStatus\",\n    \"ssm:UpdateInstanceAssociationStatus\",\n    \"ssm:UpdateInstanceInformation\",\n    \"ssmmessages:CreateControlChannel\",\n    \"ssmmessages:CreateDataChannel\",\n    \"ssmmessages:OpenControlChannel\",\n    \"ssmmessages:OpenDataChannel\",\n    \"ec2messages:AcknowledgeMessage\",\n    \"ec2messages:DeleteMessage\",\n    \"ec2messages:FailMessage\",\n    \"ec2messages:GetEndpoint\",\n    \"ec2messages:GetMessages\",\n    \"ec2messages:SendReply\",\n]\n\n\ndef simulate_principal_policy(role_arn: str):\n    response = iam_client.simulate_principal_policy(\n        PolicySourceArn=role_arn,\n        ActionNames=SSM_REQUIRED_ACTIONS,\n        ResourceArns=[\"*\"]\n    )\n    # Analyze the results\n    denied_actions = []\n    allowed_actions = []\n    for result in response[\"EvaluationResults\"]:\n        action = result[\"EvalActionName\"]\n        decision = result[\"EvalDecision\"]\n\n        if decision.lower() == \"allowed\":\n            allowed_actions.append(action)\n        else:\n            denied_actions.append(action)\n\n    return allowed_actions, denied_actions\n\ndef get_dhmc_role_arn() -> str | None:\n    # Check if DHMC is enabled\n    response = ssm_client.get_service_setting(\n        SettingId=\"/ssm/managed-instance/default-ec2-instance-management-role\"\n    )\n\n    role_name = response.get(\"ServiceSetting\", {}).get(\"SettingValue\")\n\n    # If no role is configured or it's set to $None\n    if not role_name or role_name == \"$None\":\n        return None\n\n    try:\n        role_arn = iam_client.get_role(\n            RoleName = role_name\n        ).get(\"Role\", {}).get(\"Arn\", \"\")\n        return role_arn\n    except iam_client.exceptions.NoSuchEntityException:\n        return None\n\ndef store_diagnosis_output(\n    bucket_name: str,\n    body,\n    diagnosis_execution_id: str,\n    account_id: str,\n    region: str\n):\n    s3_client.put_object(\n        Body=body,\n        Bucket=bucket_name,\n        Key=f\"actions/diagnosis/{diagnosis_execution_id}/output/{account_id}/{region}/FindingDHMC.json\"\n    )\n\ndef handler(event, context):\n    diagnosis_execution_id = event.get(\"DiagnosisExecutionId\")\n    account_id = context.get(\"global:ACCOUNT_ID\")\n    region = context.get(\"global:REGION\")\n\n    bucket_name = event[\"BucketName\"]\n\n    role_arn = get_dhmc_role_arn()\n    if not role_arn:\n        store_diagnosis_output(\n            bucket_name=bucket_name,\n            body=json.dumps({\n                \"IsDHMCEnabled\": False\n            }),\n            diagnosis_execution_id=diagnosis_execution_id,\n            account_id=account_id,\n            region=region\n        )\n        return {\n          \"IsDHMCEnabled\": False\n        }\n\n    allowed_actions, denied_actions = simulate_principal_policy(role_arn=role_arn)\n\n    store_diagnosis_output(\n        bucket_name=bucket_name,\n        body=json.dumps({\n            \"IsDHMCEnabled\": True,\n            \"allowed_actions\": allowed_actions,\n            \"denied_actions\": denied_actions\n        }),\n        diagnosis_execution_id=diagnosis_execution_id,\n        account_id=account_id,\n        region=region\n    )\n\n    has_proper_policies = len(denied_actions) == 0\n\n    return {\n      \"IsDHMCEnabled\": True,\n      \"HasDHMCProperPolicies\": has_proper_policies\n    }"
+      }
+    },
+    {
+      "name": "RegisterDiagnoseSSMConfigurationFailure",
+      "description": "## RegisterDiagnoseSSMConfigurationFailure\nUpdates the HadFailure variable when DiagnoseSSMConfiguration fails",
+      "action": "aws:updateVariable",
+      "nextStep": "WriteSummaryToS3",
+      "isCritical": true,
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:HadFailure",
+        "Value": true
+      }
+    },
+    {
+      "name": "UpdateDiagnosisAggregateSummary",
+      "description": "## UpdateDiagnosisAggregateSummary\nUpdates the AggregatedOutput variable",
+      "action": "aws:updateVariable",
+      "isCritical": true,
+      "nextStep": "WriteSummaryToS3",
+      "inputs": {
+        "Name": "variable:AggregatedOutput",
+        "Value": "{{ DiagnoseSSMConfiguration.diagnosis_summary }}"
+      }
+    },
+    {
+      "description": "## WriteSummaryToS3\nWrites a summary of findings to S3.",
+      "name": "WriteSummaryToS3",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "nextStep": "PublishAggregateResult",
+      "isEnd": false,
+      "onFailure": "step:RegisterWriteSummaryToS3Failure",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "AggregatedOutput": "{{ variable:AggregatedOutput }}",
+          "UnmanagedNodeCount": "{{ variable:UnmanagedNodeCount }}",
+          "BucketName": "{{ BucketName }}",
+          "BucketOwner": "{{ BucketOwner }}",
+          "DiagnosisExecutionId": "{{ DiagnosisExecutionId }}",
+          "S3EncryptionType": "{{ variable:S3EncryptionType }}",
+          "S3EncryptionKey": "{{ variable:S3EncryptionKey }}"
+        },
+        "Script": "import boto3\nfrom botocore.config import Config\n\nconfig = Config(retries={\"max_attempts\": 5, \"mode\": \"standard\"})\ns3_client = boto3.client(\"s3\", config=config)\n\nFINDING_DHMC = \"FindingDHMC\"\n\ndef get_object_key(diagnosis_execution_id, finding_id, account_id, region, findings_count):\n    return f\"actions/diagnosis/{diagnosis_execution_id}/summary/{finding_id}/{account_id}/{region}/{findings_count}\"\n\ndef as_bool(value):\n    # StringMap values may round-trip as native booleans or as strings.\n    if isinstance(value, str):\n        return value.strip().lower() == \"true\"\n    return bool(value)\n\ndef handler(event, context):\n    s3_bucket = event.get(\"BucketName\")\n    diagnosis_execution_id = event.get(\"DiagnosisExecutionId\")\n    unmanaged_node_count = int(event.get(\"UnmanagedNodeCount\", 0))\n    aggregate_output = event.get(\"AggregatedOutput\", {})\n\n    account_id = context.get(\"global:ACCOUNT_ID\")\n    region = context.get(\"global:REGION\")\n\n    # DHMC is an account-level setting, so it only explains unmanaged nodes when it\n    # is disabled or its role is missing required permissions. If DiagnoseSSMConfiguration\n    # did not run (no unmanaged nodes) or failed, aggregate_output is empty and there is\n    # nothing to report. When DHMC is enabled with proper policies, the unmanaged nodes are\n    # caused by something else, so this runbook must not surface a DHMC finding.\n    if not aggregate_output or unmanaged_node_count <= 0:\n        return\n\n    is_dhmc_enabled = as_bool(aggregate_output.get(\"IsDHMCEnabled\", False))\n    has_proper_policies = as_bool(aggregate_output.get(\"HasDHMCProperPolicies\", False))\n    dhmc_has_finding = (not is_dhmc_enabled) or (not has_proper_policies)\n\n    if not dhmc_has_finding:\n        return\n\n    obj_key = get_object_key(diagnosis_execution_id, FINDING_DHMC, account_id, region, unmanaged_node_count)\n    s3_client.put_object(Body=b\"\", Bucket=s3_bucket, Key=obj_key)\n"
+      }
+    },
+    {
+      "description": "## RegisterWriteSummaryToS3Failure\nUpdates the HadFailure variable when WriteSummaryToS3 fails",
+      "name": "RegisterWriteSummaryToS3Failure",
+      "action": "aws:updateVariable",
+      "nextStep": "PublishAggregateResult",
+      "isCritical": true,
+      "isEnd": false,
+      "inputs": {
+        "Name": "variable:HadFailure",
+        "Value": true
+      }
+    },
+    {
+      "description": "## PublishAggregateResult\nMakes the results of diagnosis available to parent executions.",
+      "name": "PublishAggregateResult",
+      "action": "aws:executeScript",
+      "isCritical": false,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "AggregatedOutput": "{{ variable:AggregatedOutput }}",
+          "HadFailure": "{{ variable:HadFailure }}"
+        },
+        "Script": "def script_handler(event, context):\n    return event\n"
+      },
+      "outputs": [
+        {
+          "Name": "aggregate_output",
+          "Type": "StringMap",
+          "Selector": "$.Payload.AggregatedOutput"
+        },
+        {
+          "Name": "had_failure",
+          "Type": "String",
+          "Selector": "$.Payload.HadFailure"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    "PublishAggregateResult.aggregate_output",
+    "PublishAggregateResult.had_failure"
+  ]
+}
