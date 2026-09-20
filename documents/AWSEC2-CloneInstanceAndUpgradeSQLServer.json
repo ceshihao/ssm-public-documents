@@ -150,6 +150,10 @@
             "$v = $instanceDetails.Version.subString(0, $instanceDetails.Version.indexOf(\".\"))",
             "if ($v -ge 10) {",
             "if ($v -eq 10 ) {",
+            "if ($targetSQLVersion -eq '2019') {",
+            "Write-Host \"SQL Server 2008/2008 R2 cannot be upgraded directly to SQL Server 2019. Supported targets from 2008/2008 R2 are 2014, 2016, or 2017.\"",
+            "exit 1",
+            "}",
             "if ($instanceDetails.SP -lt 3) {",
             "Write-host \"SQL Server Version 2008 , apply patch for SQL Server 2008\"",
             "}",
@@ -158,6 +162,11 @@
             "}",
             "}",
             "else {",
+            "if ((($targetSQLVersion -eq '2014') -and ($v -eq 12)) -or (($targetSQLVersion -eq '2016') -and ($v -eq 13)) -or (($targetSQLVersion -eq '2017') -and ($v -eq 14)) -or (($targetSQLVersion -eq '2019') -and ($v -eq 15)))",
+            "{",
+            "Write-Host \"SQL Server is already at the target version $targetSQLVersion. No upgrade is required.\"",
+            "exit 1",
+            "}",
             "if (($v -eq 13) -and ($targetSQLVersion -eq '2014'))",
             "{ ",
             "Write-Host \"Current SQL Version 2016, cannot downgrade to 2014.\"",
@@ -1850,6 +1859,14 @@
             "else {",
             "Invoke-expression \"$NEWDRIVE\\setup.exe /q /ACTION=upgrade /INSTANCEID=$INSTANCENAME /INSTANCENAME=$INSTANCENAME /IACCEPTSQLSERVERLICENSETERMS /IACCEPTRSUNINSTALL \"",
             "}",
+            "$setupExitCode = $LASTEXITCODE",
+            "Write-Host \"SQL Server setup.exe exited with code $setupExitCode\"",
+            "# SQL Server setup returns 0 on success and 3010 on success (reboot required). Any other value is a failure.",
+            "if (($setupExitCode -ne 0) -and ($setupExitCode -ne 3010)) {",
+            "Write-Error \"SQL Server upgrade failed. setup.exe exit code: $setupExitCode\"",
+            "exit 1",
+            "}",
+            "Write-Host \"SQL Server upgrade reported success (setup.exe exit code $setupExitCode)\"",
             "}",
             "catch {",
             "Write-Error $_.Exception.Message",
@@ -1911,6 +1928,43 @@
         "DesiredValues": [
           "Online"
         ]
+      },
+      "isCritical": "true",
+      "nextStep": "checkAfterSQLServerUpgrade"
+    },
+    {
+      "name": "checkAfterSQLServerUpgrade",
+      "action": "aws:runCommand",
+      "maxAttempts": 3,
+      "onFailure": "step:deleteServerUpgradeInstance",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ getServerUpgradeInstance.InstanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "$instances = (get-itemproperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\").InstalledInstances",
+            "Write-host $instances",
+            "$instance = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL\").$instances",
+            "Write-host $instance",
+            "$instanceDetails = (Get-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\$instance\\Setup\")",
+            "Write-host $instanceDetails",
+            "$v = $instanceDetails.Version.subString(0, $instanceDetails.Version.indexOf(\".\"))",
+            "Write-host $v",
+            "$targetVersion = {{ TargetSQLVersion }}",
+            "if (($targetVersion -eq '2014' -and $v -eq 12) -or ($targetVersion -eq '2016' -and $v -eq 13) -or ($targetVersion -eq '2017' -and $v -eq 14) -or ($targetVersion -eq '2019' -and $v -eq 15))",
+            "{",
+            "write-host \" SQL Server upgrades successfully\"",
+            "Write-host \" Good SQLServer version $($v)\"",
+            "exit 0",
+            "}",
+            "else {",
+            "Write-host \" Wrong SQLServer version $($v)\"",
+            "exit 1",
+            "}"
+          ]
+        }
       },
       "isCritical": "true",
       "nextStep": "detachSQLServerMediaVolume"
