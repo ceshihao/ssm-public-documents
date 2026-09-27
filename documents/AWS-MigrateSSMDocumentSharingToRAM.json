@@ -1,0 +1,233 @@
+{
+  "schemaVersion": "0.3",
+  "description": "### Document Name - AWS-MigrateSSMDocumentSharingToRAM\n\n## What does this document do?\nThis automation document migrates SSM documents from custom sharing (using ModifyDocumentPermission) to AWS Resource Access Manager (RAM) resource shares. The document can migrate a single document or all documents in an account that have custom sharing enabled. After migration, document sharing will be managed through RAM, and ModifyDocumentPermission/DescribeDocumentPermission APIs will throw 4xx exception.\n\n## Input Parameters\n* DocumentName: (Required) The name of the SSM document to migrate. Use '*' to migrate all documents with custom sharing in the account.\n* AutomationAssumeRole: (Required) The ARN of the IAM role that allows Systems Manager Automation to perform actions on your behalf.\n* OrganizationalUnits: (Optional) A map of document name to a list of AWS Organizations organizational unit (OU) ids and/or organization ids to grant access to. When a document has an entry here, the migration creates a resource policy with those principals instead of enumerating individually shared accounts. Use the '*' key to supply a default list applied to any document without its own entry. Sharing with OUs/organizations reduces resource policy size, grants access automatically to new accounts joining the OU/organization, and helps avoid the RAM limit of 5,000 principal associations per resource share.",
+  "parameters": {
+    "DocumentName": {
+      "type": "String",
+      "description": "(Required) The name of the SSM document to migrate to RAM. Use '*' to migrate all documents with custom sharing.",
+      "allowedPattern": "^(\\*|[a-zA-Z0-9_\\.\\-]{3,128})$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the IAM role that allows Systems Manager Automation to perform actions on your behalf."
+    },
+    "OrganizationalUnits": {
+      "type": "StringMap",
+      "description": "(Optional) Map of document name to a list of OU ids (ou-*) and/or organization ids (o-*) to grant access to. Use the '*' key as a default for documents without an explicit entry. When provided for a document, these principals replace individual account enumeration.",
+      "default": {},
+      "allowedPattern": "^\\{[a-zA-Z0-9_*.\":,\\[\\]\\s-]*\\}$"
+    }
+  },
+  "variables": {
+    "NextToken": {
+      "type": "String",
+      "description": "(Optional) Used to store the NextToken for paginated ListDocuments API calls when migrating all documents.",
+      "default": ""
+    }
+  },
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "mainSteps": [
+    {
+      "description": "Determines whether to migrate a single document or all documents in the account based on the DocumentName parameter.",
+      "name": "ShouldMigrateForAllDocuments",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "Loop",
+            "Variable": "{{ DocumentName }}",
+            "StringEquals": "*"
+          }
+        ],
+        "Default": "GetResourcePolicies"
+      }
+    },
+    {
+      "description": "Checks if the document already has a RAM resource policy to avoid duplicate migration.",
+      "name": "GetResourcePolicies",
+      "action": "aws:executeAwsApi",
+      "nextStep": "ShouldMigrateToRAM",
+      "isEnd": false,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "GetResourcePolicies",
+        "ResourceArn": "arn:{{ global:AWS_PARTITION }}:ssm:{{ global:REGION }}:{{ global:ACCOUNT_ID }}:document/{{ DocumentName }}"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Selector": "$.Policies[0].Policy",
+          "Name": "Policy"
+        }
+      ]
+    },
+    {
+      "description": "Verifies that the document does not already have a RAM resource policy before proceeding with migration.",
+      "name": "ShouldMigrateToRAM",
+      "action": "aws:branch",
+      "isEnd": true,
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "FetchDocumentPermissions",
+            "Not": {
+              "Variable": "{{ GetResourcePolicies.Policy }}",
+              "Contains": "Statement"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Iterates through all documents in the account with custom sharing, processing up to 50 documents per iteration.",
+      "name": "Loop",
+      "action": "aws:loop",
+      "isEnd": true,
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Not": {
+            "Variable": "{{ variable:NextToken }}",
+            "StringEquals": ""
+          }
+        },
+        "Steps": [
+          {
+            "description": "Lists documents with custom sharing and starts rate automation executions to migrate them in parallel.",
+            "name": "FetchDocumentsAndStartMigration",
+            "action": "aws:executeScript",
+            "nextStep": "HasAutomationExecutionId",
+            "isEnd": false,
+            "inputs": {
+              "Runtime": "python3.11",
+              "Handler": "script_handler",
+              "InputPayload": {
+                "NextToken": "{{ variable:NextToken }}",
+                "AutomationAssumeRole": "{{ AutomationAssumeRole }}",
+                "OrganizationalUnits": "{{ OrganizationalUnits }}"
+              },
+              "Script": "import boto3\nimport json\nimport time\nimport random\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nTHROTTLING_ERROR_CODES = [\n    'ThrottlingException',\n    'TooManyRequestsException',\n    'RequestLimitExceeded'\n]\nPERMISSION_TYPE_SHARE = 'Share'\n\n# Name of this runbook. Bulk ('*') migration starts one rate-controlled child\n# execution per document, and each child must invoke this same document. The\n# build step (Setup/create_document.py) replaces the token below with the actual\n# document name, so the published document simply reads the published name.\nMIGRATION_DOCUMENT_NAME = 'AWS-MigrateSSMDocumentSharingToRAM'\n\nBOTO3_MAX_RETRY_ATTEMPTS = 10\nBOTO3_RETRY_MODE = 'adaptive'\nDEFAULT_BASE_DELAY = 0.5  # 500ms\nDEFAULT_MAX_RETRIES = 5\nDEFAULT_MAX_BACKOFF = 20  # 20 seconds cap\n\n# Endpoint override for the SSM client. None = default regional endpoint (prod).\n# Setup/create_document.py --gamma rewrites this to the pre-release SSM (sonic)\n# endpoint when building the gamma-only document variant.\nSSM_ENDPOINT_URL = None\n\ndef _call_with_rate_limit_and_retry(api_call, params, base_delay=DEFAULT_BASE_DELAY, max_retries=DEFAULT_MAX_RETRIES):\n    \"\"\"\n    Helper function to call SSM API with rate limiting and exponential backoff retry logic.\n\n    Args:\n        api_call: The API method to call (e.g., ssm_client.describe_document_permission)\n        params: Dictionary of parameters for the API call\n        base_delay: Base delay in seconds between calls (default 0.5s for 2 TPS)\n        max_retries: Maximum number of retry attempts\n\n    Returns:\n        API response\n    \"\"\"\n    for attempt in range(max_retries):\n        try:\n            response = api_call(**params)\n            return response\n\n        except ClientError as e:\n            error_code = e.response.get('Error', {}).get('Code', '')\n\n            # Only retry on throttling errors\n            if error_code in THROTTLING_ERROR_CODES:\n                if attempt < max_retries - 1:\n                    # Exponential backoff with full jitter\n                    max_sleep = min(base_delay * (2 ** attempt), DEFAULT_MAX_BACKOFF)\n                    sleep_time = random.uniform(0, max_sleep)\n                    print(f\"Throttled on attempt {attempt + 1}, sleeping for {sleep_time:.2f}s\")\n                    time.sleep(sleep_time)\n                else:\n                    # Max retries reached\n                    print(f\"Max retries reached for {api_call.__name__}\")\n                    raise\n            else:\n                # Non-retryable error, fail fast\n                print(f\"Non-retryable error: {error_code}\")\n                raise\n\n    # Should not reach here, but just in case\n    raise Exception(f\"Failed to call {api_call.__name__} after {max_retries} attempts\")\n\n\ndef script_handler(events, context):\n    # Configure boto3 client with retry settings\n    # Use adaptive retry mode with exponential backoff and jitter\n    retry_config = Config(\n        retries={\n            'max_attempts': BOTO3_MAX_RETRY_ATTEMPTS,\n            'mode': BOTO3_RETRY_MODE\n        }\n    )\n    ssm = boto3.client('ssm', config=retry_config, endpoint_url=SSM_ENDPOINT_URL)\n\n    # List 50 documents\n    params = {\n        'MaxResults': 50,\n        'Filters': [{'Key': 'Owner', 'Values': ['Self']}]\n    }\n    if events.get('NextToken'):\n        params['NextToken'] = events['NextToken']\n\n    response = ssm.list_documents(**params)\n    documents = response['DocumentIdentifiers']\n    next_token = response.get('NextToken', '')\n\n    # Filter documents based on permissions\n    filtered_docs = []\n    for doc in documents:\n        describe_permission_params = {\n            'Name': doc['Name'],\n            'PermissionType': PERMISSION_TYPE_SHARE\n        }\n        # Call API with rate limiting and retry logic\n        try:\n            describe_permission_response = _call_with_rate_limit_and_retry(\n                ssm.describe_document_permission, \n                describe_permission_params\n            )\n        except ClientError as e:\n            # Documents already migrated to RAM (or otherwise managed by a\n            # resource policy) reject DescribeDocumentPermission with\n            # InvalidDocumentOperation. They are already migrated, so skip them\n            # instead of failing the whole batch.\n            if e.response.get('Error', {}).get('Code') == 'InvalidDocumentOperation':\n                print(f\"Skipping already RAM/resource-policy shared document: {doc['Name']}\")\n                continue\n            raise\n        account_ids = describe_permission_response.get('AccountIds', [])\n        if account_ids and 'all' not in account_ids:\n            filtered_docs.append(doc['Name'])\n\n    if not filtered_docs:\n        print(\"No documents to process\")\n        return {'NextToken': next_token, 'AutomationExecutionId': ''}\n\n    print(f\"Documents: {filtered_docs}\")\n\n    # Forward the OrganizationalUnits map to each child execution so per-document\n    # migration shares with the configured OUs/organizations. The document\n    # parameter is a StringMap, which start_automation_execution expects as a\n    # single JSON-encoded string value.\n    parameters = {\n        'AutomationAssumeRole': [events.get('AutomationAssumeRole', '')]\n    }\n    organizational_units = events.get('OrganizationalUnits')\n    if organizational_units:\n        parameters['OrganizationalUnits'] = [json.dumps(organizational_units)]\n\n    # Start automation execution with rate control\n    exec_response = ssm.start_automation_execution(\n        DocumentName=MIGRATION_DOCUMENT_NAME,\n        Parameters=parameters,\n        Mode='Auto',\n        MaxConcurrency='25%',\n        MaxErrors='1',\n        TargetParameterName='DocumentName',\n        Targets=[{\n            'Key': 'ParameterValues',\n            'Values': filtered_docs\n        }]\n    )\n\n    return {\n        'AutomationExecutionId': exec_response['AutomationExecutionId'],\n        'NextToken': next_token,\n    }"
+            },
+            "outputs": [
+              {
+                "Type": "String",
+                "Name": "AutomationExecutionId",
+                "Selector": "$.Payload.AutomationExecutionId"
+              },
+              {
+                "Type": "String",
+                "Name": "NextToken",
+                "Selector": "$.Payload.NextToken"
+              }
+            ]
+          },
+          {
+            "description": "Checks if rate control automation execution were started for document migration.",
+            "name": "HasAutomationExecutionId",
+            "action": "aws:branch",
+            "inputs": {
+              "Choices": [
+                {
+                  "NextStep": "WaitOnAWSResourceProperty",
+                  "Not": {
+                    "Variable": "{{ FetchDocumentsAndStartMigration.AutomationExecutionId }}",
+                    "StringEquals": ""
+                  }
+                }
+              ],
+              "Default": "UpdateNextToken"
+            }
+          },
+          {
+            "description": "Waits for the rate control automation execution to complete successfully before proceeding to the next batch.",
+            "name": "WaitOnAWSResourceProperty",
+            "action": "aws:waitForAwsResourceProperty",
+            "nextStep": "UpdateNextToken",
+            "isEnd": false,
+            "inputs": {
+              "Service": "ssm",
+              "Api": "GetAutomationExecution",
+              "AutomationExecutionId": "{{ FetchDocumentsAndStartMigration.AutomationExecutionId }}",
+              "PropertySelector": "$.AutomationExecution.AutomationExecutionStatus",
+              "DesiredValues": [
+                "Success"
+              ]
+            }
+          },
+          {
+            "description": "Updates the NextToken variable to continue processing the next batch of documents.",
+            "name": "UpdateNextToken",
+            "action": "aws:updateVariable",
+            "isEnd": true,
+            "inputs": {
+              "Name": "variable:NextToken",
+              "Value": "{{ FetchDocumentsAndStartMigration.NextToken }}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "description": "Retrieves all account IDs that have access to the document through custom sharing permissions.",
+      "name": "FetchDocumentPermissions",
+      "action": "aws:executeScript",
+      "nextStep": "MigrateSSMDocumentSharingToRAM",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "Script": "import boto3\nimport time\nimport random\nfrom botocore.config import Config\nfrom botocore.exceptions import ClientError\n\nTHROTTLING_ERROR_CODES = [\n    'ThrottlingException',\n    'TooManyRequestsException',\n    'RequestLimitExceeded'\n]\nPERMISSION_TYPE_SHARE = 'Share'\nMAX_RESULTS_DESCRIBE_PERMISSION = 200\nBOTO3_MAX_RETRY_ATTEMPTS = 10\nBOTO3_RETRY_MODE = 'adaptive'\nDEFAULT_BASE_DELAY = 0.5  # 500ms\nDEFAULT_JITTER_MAX = 0.1  # 100ms jitter\nDEFAULT_MAX_RETRIES = 5\nDEFAULT_MAX_BACKOFF = 20  # 20 seconds cap\n\n# Endpoint override for the SSM client. The published (prod) document uses the\n# default regional endpoint (None). The gamma-only document variant is built by\n# Setup/create_document.py --gamma, which rewrites this constant to the\n# pre-release SSM (sonic) endpoint so gamma testing targets the pre-release stack.\nSSM_ENDPOINT_URL = None\n\ndef _call_with_rate_limit_and_retry(api_call, params, base_delay=DEFAULT_BASE_DELAY, max_retries=DEFAULT_MAX_RETRIES):\n    \"\"\"\n    Helper function to call SSM API with rate limiting and exponential backoff retry logic.\n\n    Args:\n        api_call: The API method to call (e.g., ssm_client.describe_document_permission)\n        params: Dictionary of parameters for the API call\n        base_delay: Base delay in seconds between calls (default 0.5s for 2 TPS)\n        max_retries: Maximum number of retry attempts\n\n    Returns:\n        API response\n    \"\"\"\n    for attempt in range(max_retries):\n        try:\n            response = api_call(**params)\n            return response\n\n        except ClientError as e:\n            error_code = e.response.get('Error', {}).get('Code', '')\n\n            # Only retry on throttling errors\n            if error_code in THROTTLING_ERROR_CODES:\n                if attempt < max_retries - 1:\n                    # Exponential backoff with full jitter\n                    max_sleep = min(base_delay * (2 ** attempt), DEFAULT_MAX_BACKOFF)\n                    sleep_time = random.uniform(0, max_sleep)\n                    print(f\"Throttled on attempt {attempt + 1}, sleeping for {sleep_time:.2f}s\")\n                    time.sleep(sleep_time)\n                else:\n                    # Max retries reached\n                    print(f\"Max retries reached for {api_call.__name__}\")\n                    raise\n            else:\n                # Non-retryable error, fail fast\n                print(f\"Non-retryable error: {error_code}\")\n                raise\n\n    # Should not reach here, but just in case\n    raise Exception(f\"Failed to call {api_call.__name__} after {max_retries} attempts\")\n\ndef script_handler(events, context):\n    # Configure boto3 client with retry settings\n    # Use adaptive retry mode with exponential backoff and jitter\n    retry_config = Config(\n        retries={\n            'max_attempts': BOTO3_MAX_RETRY_ATTEMPTS,\n            'mode': BOTO3_RETRY_MODE\n        }\n    )\n    ssm = boto3.client('ssm', config=retry_config, endpoint_url=SSM_ENDPOINT_URL)\n\n    document_name = events.get('DocumentName')\n    all_account_ids = []\n    next_token = None\n\n    while True:\n        params = {\n            'Name': document_name,\n            'PermissionType': PERMISSION_TYPE_SHARE,\n            'MaxResults': MAX_RESULTS_DESCRIBE_PERMISSION\n        }\n        if next_token:\n            params['NextToken'] = next_token\n\n        # Call API with rate limiting and retry logic\n        response = _call_with_rate_limit_and_retry(\n            ssm.describe_document_permission, \n            params, \n            base_delay=DEFAULT_BASE_DELAY\n        )\n\n        all_account_ids.extend(response.get('AccountIds', []))\n        next_token = response.get('NextToken')\n\n        # Add delay between successful pagination calls to respect API TPS limit\n        # With jitter to avoid coordinated calls from concurrent executions\n        if next_token:\n            jitter = random.uniform(0, DEFAULT_JITTER_MAX)\n            time.sleep(DEFAULT_BASE_DELAY + jitter)\n        else:\n            break\n\n    print(f\"Total Account IDs: {len(all_account_ids)}\")\n\n    return {\n        'AccountIds': all_account_ids,\n    }",
+        "InputPayload": {
+          "DocumentName": "{{ DocumentName }}"
+        }
+      }
+    },
+    {
+      "description": "Creates a RAM resource share with the document permissions, promotes the permission and resource share, and completes the migration to RAM.",
+      "name": "MigrateSSMDocumentSharingToRAM",
+      "action": "aws:executeScript",
+      "isEnd": true,
+      "onCancel": "step:RollbackCustomSharingToRAM",
+      "onFailure": "step:RollbackCustomSharingToRAM",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "Payload": "{{ FetchDocumentPermissions.OutputPayload }}",
+          "OwnerAccountId": "{{ global:ACCOUNT_ID }}",
+          "Partition": "{{ global:AWS_PARTITION }}",
+          "Region": "{{ global:REGION }}",
+          "DocumentName": "{{ DocumentName }}",
+          "OrganizationalUnits": "{{ OrganizationalUnits }}"
+        },
+        "Script": "import boto3\nimport json\nimport time\n\nUNPROMOTED_FEATURE_SETS = ['CREATED_FROM_POLICY']\n\n# Prefixes used to classify a principal token supplied in the OrganizationalUnits\n# map. Each token is either an organizational unit ('ou-') or an organization\n# ('o-') id. Order matters: 'ou-' must be tested before 'o-' because 'ou-...'\n# also starts with 'o'.\nORGANIZATIONAL_UNIT_ID_PREFIX = 'ou-'\nORGANIZATION_ID_PREFIX = 'o-'\n\n# PutResourcePolicy creates the RAM resource share asynchronously, so the share\n# may not be immediately visible in ListResources. Poll with bounded backoff to\n# allow the share to become available before giving up.\nMAX_WAIT_SECONDS = 300\nINITIAL_RETRY_DELAY_SECONDS = 2\nMAX_RETRY_DELAY_SECONDS = 30\nSSM_POLICY_ACTIONS = [\n    'ssm:GetDocument',\n    'ssm:DescribeDocument',\n    'ssm:ListDocumentVersions',\n    'ssm:ListTagsForResource',\n    'ssm:AddTagsToResource',\n    'ssm:RemoveTagsFromResource',\n    'ssm:StartAutomationExecution',\n    'ssm:SendCommand',\n    'ssm:CreateAssociation',\n    'ssm:CreateAssociationBatch',\n    'ssm:DeleteAssociation',\n    'ssm:DescribeAssociation',\n    'ssm:UpdateAssociation',\n    'ssm:UpdateAssociationStatus',\n    'ssm:StartSession',\n    'ssm:GetCalendar',\n    'ssm:GetCalendarState',\n    'ssm:ListCalendarEvents'\n]\n\n# Endpoint overrides for the SSM and RAM clients. None = default regional\n# endpoint, used by the published (prod) document. Setup/create_document.py\n# --gamma rewrites these to the pre-release SSM (sonic) and RAM endpoints when\n# building the gamma-only document variant.\nSSM_ENDPOINT_URL = None\nRAM_ENDPOINT_URL = None\n\ndef _get_unpromoted_resource_share_arn(ram_client, resource_arn):\n    \"\"\"\n    Helper function to find the unpromoted resource share ARN for a given resource.    \n    Args:\n        ram_client: Boto3 RAM client\n        resource_arn: ARN of the SSM document resource\n\n    Returns:\n        Resource share ARN with an unpromoted feature set (CREATED_FROM_POLICY),\n        or None if not found within MAX_WAIT_SECONDS\n    \"\"\"\n    delay = INITIAL_RETRY_DELAY_SECONDS\n    deadline = time.time() + MAX_WAIT_SECONDS\n\n    while True:\n        # Get the resource share ARN by listing resources with our document ARN\n        list_resources_response = ram_client.list_resources(\n            resourceOwner='SELF',\n            resourceArns=[resource_arn]\n        )\n\n        resources = list_resources_response.get('resources', [])\n        if resources:\n            # A resource can be part of multiple resource shares\n            # We need to find the one with an unpromoted feature set\n            resource_share_arns = [r['resourceShareArn'] for r in resources]\n\n            # Get details of all resource shares\n            get_shares_response = ram_client.get_resource_shares(\n                resourceOwner='SELF',\n                resourceShareArns=resource_share_arns\n            )\n\n            # Find the resource share with an unpromoted feature set\n            for share in get_shares_response.get('resourceShares', []):\n                feature_set = share.get('featureSet')\n                if feature_set in UNPROMOTED_FEATURE_SETS:\n                    return share['resourceShareArn']\n\n        # The share (or its feature set) may not have propagated yet.\n        # Retry with bounded backoff until we hit the deadline.\n        if time.time() >= deadline:\n            return None\n\n        time.sleep(delay)\n        delay = min(delay * 2, MAX_RETRY_DELAY_SECONDS)\n\ndef _resolve_organizational_units(organizational_units, document_name):\n    \"\"\"Return the principal-token list configured for a document, if any.\n\n    ``organizational_units`` is the optional OrganizationalUnits map (document\n    name -> list of OU/organization ids). A document's own entry takes precedence\n    over the '*' default entry, including a present-but-empty entry: an explicit\n    empty list for the document opts it out of OU sharing (falling back to\n    account enumeration) rather than inheriting the '*' default. Returns an empty\n    list when no entry applies, in which case the caller falls back to account\n    enumeration.\n    \"\"\"\n    if not organizational_units:\n        return []\n    if document_name in organizational_units:\n        return organizational_units[document_name]\n    return organizational_units.get('*') or []\n\n\ndef _get_organization_id(organizations_client):\n    \"\"\"Resolve the caller's AWS Organizations organization id (o-*).\n\n    Organization and OU condition values embed the organization id, which the\n    OrganizationalUnits input does not carry. Mirroring RAM CreateResourceShare,\n    we resolve it at runtime from DescribeOrganization rather than requiring\n    callers to supply it.\n    \"\"\"\n    return organizations_client.describe_organization()['Organization']['Id']\n\n\ndef _get_organizational_unit_path(organizations_client, organization_id, ou_id):\n    \"\"\"Return the full org path for an OU, e.g. 'o-abc/r-def/ou-def-1/ou-def-2/'.\n\n    aws:PrincipalOrgPaths matches on the OU's full ancestry path, not the bare\n    OU id, so an OU nested under other OUs only matches if the whole path is\n    present. We build it by walking ListParents from the OU up to the root\n    (the same path RAM itself generates when sharing with an OU). The returned\n    path is org id first, then root, then each intermediate OU, then the target\n    OU, with a trailing '/' so a StringLike '<path>/*' matches the OU and every\n    account beneath it.\n    \"\"\"\n    ancestors = []\n    current_id = ou_id\n    # Walk upward until we reach the organization root (r-*). Every non-root\n    # entity in an organization has exactly one parent.\n    while not current_id.startswith('r-'):\n        ancestors.append(current_id)\n        parents = organizations_client.list_parents(ChildId=current_id)['Parents']\n        current_id = parents[0]['Id']\n    root_id = current_id\n\n    # ancestors is target-first (leaf -> ...); the path reads root-down.\n    path_segments = [organization_id, root_id] + list(reversed(ancestors))\n    return '/'.join(path_segments) + '/'\n\n\ndef _build_statement(actions, resource_arn):\n    \"\"\"Return a base Allow statement for the given actions/resource.\n\n    Callers add a Principal '*' plus a Condition scoping access to the\n    organization (aws:PrincipalOrgID) or OU (aws:PrincipalOrgPaths).\n    \"\"\"\n    return {\n        \"Effect\": \"Allow\",\n        \"Action\": actions,\n        \"Resource\": resource_arn,\n    }\n\n\ndef _build_policy_statements(tokens, owner_account_id, actions,\n                             resource_arn, organizations_client):\n    \"\"\"Build resource-policy statements from OrganizationalUnits tokens.\n\n    Each token is an OU or organization id, classified by prefix and mapped to a\n    distinct statement shape (verified against policies RAM generates for the\n    same principals):\n\n      * 'ou-' -> Principal '*' + ForAnyValue:StringLike on aws:PrincipalOrgPaths\n                 (full path)\n      * 'o-'  -> Principal '*' + StringEquals on aws:PrincipalOrgID, excluding\n                 the owner account via StringNotEquals aws:PrincipalAccount\n\n    The organization id (needed by both cases) is resolved lazily on first use.\n    An unrecognized token raises ValueError rather than silently granting no\n    access.\n    \"\"\"\n    statements = []\n    organization_id = None\n\n    for token in tokens:\n        if token.startswith(ORGANIZATIONAL_UNIT_ID_PREFIX):\n            if organization_id is None:\n                organization_id = _get_organization_id(organizations_client)\n            ou_path = _get_organizational_unit_path(\n                organizations_client, organization_id, token\n            )\n            statement = _build_statement(actions, resource_arn)\n            statement[\"Principal\"] = \"*\"\n            # PutResourcePolicy rejects a statement that scopes on\n            # aws:PrincipalOrgPaths (or aws:PrincipalOrgID) unless it also\n            # excludes the owner account via StringNotEquals aws:PrincipalAccount\n            # to deny intra-account sharing.\n            # aws:PrincipalOrgPaths is a multivalued key, so it requires a set\n            # operator (ForAnyValue:StringLike) with a list value to match a\n            # principal; a scalar StringLike matches nobody. This mirrors the\n            # shape RAM generates for an OU principal.\n            statement[\"Condition\"] = {\n                \"ForAnyValue:StringLike\": {\"aws:PrincipalOrgPaths\": [f\"{ou_path}*\"]},\n                \"StringNotEquals\": {\"aws:PrincipalAccount\": owner_account_id},\n            }\n            statements.append(statement)\n        elif token.startswith(ORGANIZATION_ID_PREFIX):\n            statement = _build_statement(actions, resource_arn)\n            statement[\"Principal\"] = \"*\"\n            statement[\"Condition\"] = {\n                \"StringEquals\": {\"aws:PrincipalOrgID\": token},\n                \"StringNotEquals\": {\"aws:PrincipalAccount\": owner_account_id},\n            }\n            statements.append(statement)\n        else:\n            raise ValueError(\n                f\"Unrecognized OrganizationalUnits token '{token}': expected an \"\n                f\"organizational unit ('ou-*') or organization ('o-*') id.\"\n            )\n\n    return statements\n\n\ndef script_handler(events, context):\n    ssm = boto3.client('ssm', endpoint_url=SSM_ENDPOINT_URL)\n    ram = boto3.client('ram', endpoint_url=RAM_ENDPOINT_URL)\n\n    # Extract parameters from events\n    payload = json.loads(events[\"Payload\"])\n    account_ids = payload[\"Payload\"][\"AccountIds\"]\n\n    document_name = events.get('DocumentName')\n    region = events.get('Region')\n    partition = events.get('Partition')\n    owner_account_id = events.get('OwnerAccountId')\n    organizational_units = events.get('OrganizationalUnits') or {}\n\n    # Construct resource ARN\n    resource_arn = f\"arn:{partition}:ssm:{region}:{owner_account_id}:document/{document_name}\"\n\n    # When OUs/organizations are configured for this document, share with those\n    # principals instead of enumerating individually shared accounts. Organization\n    # and OU principals are expressed as condition-scoped statements (Principal\n    # '*' + aws:PrincipalOrgID / aws:PrincipalOrgPaths) rather than principal\n    # ARNs. This keeps the policy small, grants access to accounts joining the OU\n    # automatically, and avoids the RAM limit of 5,000 principal associations per\n    # share.\n    ou_tokens = _resolve_organizational_units(organizational_units, document_name)\n\n    if 'all' in account_ids:\n        raise Exception(\n            f\"Document '{document_name}' is shared publicly and cannot be \"\n            f\"migrated to a RAM resource share.\"\n        )\n\n    if not account_ids and not ou_tokens:\n        return {\n            'ResourceArn': resource_arn,\n            'Message': f\"Document '{document_name}' has no permissions to migrate; skipping.\"\n        }\n\n    if ou_tokens:\n        organizations = boto3.client('organizations')\n        statements = _build_policy_statements(\n            ou_tokens, owner_account_id,\n            SSM_POLICY_ACTIONS, resource_arn, organizations\n        )\n    else:\n        statements = [{\n            \"Effect\": \"Allow\",\n            \"Principal\": {\n                \"AWS\": [f\"arn:{partition}:iam::{account_id}:root\" for account_id in account_ids]\n            },\n            \"Action\": SSM_POLICY_ACTIONS,\n            \"Resource\": resource_arn\n        }]\n\n    # Construct resource policy\n    resource_policy = {\n        \"Version\": \"2012-10-17\",\n        \"Statement\": statements\n    }\n\n    # Put resource policy\n    put_response = ssm.put_resource_policy(\n        ResourceArn=resource_arn,\n        Policy=json.dumps(resource_policy)\n    )\n\n    # Get the unpromoted resource share ARN\n    resource_share_arn = _get_unpromoted_resource_share_arn(ram, resource_arn)\n\n    if not resource_share_arn:\n        raise Exception(f\"Could not find unpromoted resource share for document: {resource_arn}\")\n\n    # Promote resource share created from policy\n    promote_response = ram.promote_resource_share_created_from_policy(\n        resourceShareArn=resource_share_arn\n    )\n\n    print(f\"Promote Resource Share Success for {resource_share_arn}: {promote_response['returnValue']}\")\n\n    return {\n        'ResourceArn': resource_arn,\n        'ResourceShareArn': resource_share_arn,\n    }"
+      },
+      "outputs": [
+        {
+          "Type": "String",
+          "Selector": "$.Payload.ResourceShareArn",
+          "Name": "ResourceShareArn"
+        }
+      ]
+    },
+    {
+      "description": "Rollback step that runs if the migration fails or is cancelled. Deletes the resource policy with DeletionMode=RollbackMigration, which reverts the document to its previous custom sharing, then deletes the unpromoted RAM resource share if it still exists.",
+      "name": "RollbackCustomSharingToRAM",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "OwnerAccountId": "{{ global:ACCOUNT_ID }}",
+          "Partition": "{{ global:AWS_PARTITION }}",
+          "Region": "{{ global:REGION }}",
+          "DocumentName": "{{ DocumentName }}",
+          "ResourceShareArn": "{{ MigrateSSMDocumentSharingToRAM.ResourceShareArn }}"
+        },
+        "Script": "import boto3\n\nUNPROMOTED_FEATURE_SETS = ['CREATED_FROM_POLICY', 'PROMOTING_TO_STANDARD']\n\n# Endpoint overrides for the SSM and RAM clients. None = default regional\n# endpoint, used by the published (prod) document. Setup/create_document.py\n# --gamma rewrites these to the pre-release SSM (sonic) and RAM endpoints when\n# building the gamma-only document variant.\nSSM_ENDPOINT_URL = None\nRAM_ENDPOINT_URL = None\n\nDELETION_MODE_ROLLBACK_MIGRATION = 'RollbackMigration'\n\n# Temporary: DeletionMode is not in the boto3 the aws:executeScript sandbox ships\n# yet, so botocore would reject it. Remove this and _ssm_client() once it catches up.\nSSM_BOTOCORE_PATCH = {\n    'shapes': {\n        'DeletionMode': {\n            'type': 'string',\n            'enum': ['RemoveSharing', 'RollbackMigration'],\n        },\n    },\n    'members': {\n        'DeleteResourcePolicyRequest': {\n            'DeletionMode': {'shape': 'DeletionMode'},\n        },\n    },\n}\n\n\ndef _patch_ssm_service_model(service_description):\n    shapes = service_description.get('shapes', {})\n\n    for name, definition in SSM_BOTOCORE_PATCH['shapes'].items():\n        if name not in shapes:\n            shapes[name] = definition\n\n    patched = False\n    for shape_name, new_members in SSM_BOTOCORE_PATCH['members'].items():\n        members = shapes.get(shape_name, {}).get('members')\n        if members is None:\n            continue\n        for member_name, definition in new_members.items():\n            if member_name not in members:\n                members[member_name] = definition\n                patched = True\n\n    return patched\n\n\ndef _ssm_client():\n    # load_service_model is instance-cached, so patching the description it\n    # returns patches the same dict the client is then built from\n    session = boto3.DEFAULT_SESSION or boto3.Session()\n    service_description = session._session.get_component('data_loader') \\\n        .load_service_model('ssm', 'service-2')\n    _patch_ssm_service_model(service_description)\n\n    return session.client('ssm', endpoint_url=SSM_ENDPOINT_URL)\n\n\ndef _get_unpromoted_resource_share_arn(ram_client, resource_arn):\n    \"\"\"\n    Helper function to find the unpromoted resource share ARN for a given resource.    \n    Args:\n        ram_client: Boto3 RAM client\n        resource_arn: ARN of the SSM document resource\n\n    Returns:\n        Resource share ARN with CREATED_FROM_POLICY or PROMOTING_TO_STANDARD feature set,\n        or None if not found\n    \"\"\"\n    # Get the resource share ARN by listing resources with our document ARN\n    list_resources_response = ram_client.list_resources(\n        resourceOwner='SELF',\n        resourceArns=[resource_arn]\n    )\n\n    resources = list_resources_response.get('resources', [])\n    if not resources:\n        return None\n\n    # A resource can be part of multiple resource shares\n    # We need to find the one with featureSet=CREATED_FROM_POLICY or PROMOTING_TO_STANDARD\n    resource_share_arns = [r['resourceShareArn'] for r in resources]\n\n    # Get details of all resource shares\n    get_shares_response = ram_client.get_resource_shares(\n        resourceOwner='SELF',\n        resourceShareArns=resource_share_arns\n    )\n\n    # Find the resource share with CREATED_FROM_POLICY or PROMOTING_TO_STANDARD feature set\n    for share in get_shares_response.get('resourceShares', []):\n        feature_set = share.get('featureSet')\n        if feature_set in UNPROMOTED_FEATURE_SETS:\n            return share['resourceShareArn']\n\n    return None\n\ndef script_handler(events, context):\n    ssm = _ssm_client()\n    ram = boto3.client('ram', endpoint_url=RAM_ENDPOINT_URL)\n\n    # Extract parameters from events\n    document_name = events.get('DocumentName')\n    region = events.get('Region')\n    partition = events.get('Partition')\n    owner_account_id = events.get('OwnerAccountId')\n    resource_share_arn = events.get('ResourceShareArn')\n\n    # Construct resource ARN\n    resource_arn = f\"arn:{partition}:ssm:{region}:{owner_account_id}:document/{document_name}\"\n\n    try:\n        # Check if there's a resource policy (indicates PutResourcePolicy was called)\n        get_response = ssm.get_resource_policies(\n            ResourceArn=resource_arn\n        )\n\n        policies = get_response.get('Policies', [])\n\n        rolled_back = False\n        if policies:\n            # Must run before the resource share is deleted, since deleting the\n            # share deletes the resource policy too\n            policy = policies[0]\n            ssm.delete_resource_policy(\n                ResourceArn=resource_arn,\n                PolicyId=policy['PolicyId'],\n                PolicyHash=policy['PolicyHash'],\n                DeletionMode=DELETION_MODE_ROLLBACK_MIGRATION\n            )\n            rolled_back = True\n            print(f\"Deleted resource policy with DeletionMode={DELETION_MODE_ROLLBACK_MIGRATION} - \"\n                  f\"reverted {resource_arn} to Custom sharing\")\n        else:\n            print(\"No resource policies found - nothing to revert to Custom sharing\")\n\n        unpromoted_share_arn = _get_unpromoted_resource_share_arn(ram, resource_arn)\n\n        if not unpromoted_share_arn:\n            print(f\"No unpromoted resource share found for: {resource_arn}\")\n            return {\n                'ResourceArn': resource_arn,\n                'RolledBackToCustomSharing': rolled_back\n            }\n\n        ram.delete_resource_share(resourceShareArn=unpromoted_share_arn)\n        print(f\"Deleted unpromoted resource share: {unpromoted_share_arn}\")\n\n        return {\n            'ResourceArn': resource_arn,\n            'DeletedResourceShare': unpromoted_share_arn,\n            'RolledBackToCustomSharing': rolled_back\n        }\n\n    except Exception as e:\n        print(f\"Error during rollback: {str(e)}\")\n        raise"
+      }
+    }
+  ]
+}
