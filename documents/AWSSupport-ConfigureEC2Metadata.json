@@ -3,6 +3,10 @@
   "schemaVersion": "0.3",
   "assumeRole": "{{ AutomationAssumeRole }}",
   "outputs": [
+    "getCurrentMetadataOptions.InitialState",
+    "getCurrentMetadataOptions.InitialMetadataAccess",
+    "getCurrentMetadataOptions.InitialIMDSv2",
+    "getCurrentMetadataOptions.InitialHttpPutResponseHopLimit",
     "describeMetadataOptions.State",
     "describeMetadataOptions.MetadataAccess",
     "describeMetadataOptions.IMDSv2",
@@ -18,25 +22,27 @@
       "type": "Integer",
       "allowedPattern": "^([0-9]|[1-5][0-9]|6[0-4])$",
       "default": 0,
-      "description": "(Optional) The desired HTTP PUT response hop limit value (`1-64`) for instance metadata requests. This value controls the number of hops the PUT response can traverse. Recommended value for HttpPutResponseHopLimit is `1` which prevents the response from traveling outside of the instance. Default is `0`."
+      "description": "(Optional) The desired HTTP PUT response hop limit value (`1-64`) for instance metadata requests. This value controls the number of hops the PUT response can traverse. Recommended value for HttpPutResponseHopLimit is `1` which prevents the response from traveling outside of the instance. Specify `0` to keep the current value. Default is `0`."
     },
     "EnforceIMDSv2": {
       "type": "String",
       "default": "optional",
       "allowedValues": [
         "optional",
-        "required"
+        "required",
+        "unchanged"
       ],
-      "description": "(Optional) Enforce IMDSv2. If you choose `required`, IMDSv2 will be enforced. If you choose `optional`, both IMDSv1 and IMDSv2 will be enabled for metadata access (IMDSv2 won't be required). If you enforce IMDSv2 (`required`), the applications that use IMDSv1 might not function correctly. Before enforcing IMDSv2, make sure your applications that uses IMDS are upgraded to a version that support IMDSv2. Default is `optional`."
+      "description": "(Optional) Enforce IMDSv2. If you choose `required`, IMDSv2 will be enforced. If you choose `optional`, both IMDSv1 and IMDSv2 will be enabled for metadata access (IMDSv2 won't be required). If you enforce IMDSv2 (`required`), the applications that use IMDSv1 might not function correctly. Before enforcing IMDSv2, make sure your applications that uses IMDS are upgraded to a version that support IMDSv2. Default is `optional`. Specify `unchanged` to keep the current value instead of applying the default."
     },
     "MetadataAccess": {
       "type": "String",
       "default": "enabled",
       "allowedValues": [
         "enabled",
-        "disabled"
+        "disabled",
+        "unchanged"
       ],
-      "description": "(Optional) Allow or deny instance metadata access in the Amazon EC2 instance. If you specify 'disabled', all other parameters will be ignored and the metadata access will be denied for the instance. Default is 'enabled'."
+      "description": "(Optional) Allow or deny instance metadata access in the Amazon EC2 instance. If you specify 'disabled', all other parameters will be ignored and the metadata access will be denied for the instance. Default is 'enabled'. Specify `unchanged` to keep the current value instead of applying the default. If the current value is `disabled`, `unchanged` also ignores all other parameters."
     },
     "AutomationAssumeRole": {
       "type": "AWS::IAM::Role::Arn",
@@ -46,6 +52,58 @@
   },
   "mainSteps": [
     {
+      "name": "getCurrentMetadataOptions",
+      "action": "aws:executeScript",
+      "description": "Gets the current IMDS options of the instance and resolves the `HttpTokens` and `HttpEndpoint` values to apply. `unchanged` resolves to the current value.",
+      "isCritical": true,
+      "onFailure": "Abort",
+      "timeoutSeconds": 120,
+      "maxAttempts": 2,
+      "inputs": {
+        "InputPayload": {
+          "InstanceId": "{{ InstanceId }}",
+          "EnforceIMDSv2": "{{ EnforceIMDSv2 }}",
+          "MetadataAccess": "{{ MetadataAccess }}"
+        },
+        "Handler": "script_handler",
+        "Runtime": "python3.11",
+        "Script": "# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n# SPDX-License-Identifier: LicenseRef-.amazon.com.-AmznSL-1.0\n# Licensed under the Amazon Software License  http://aws.amazon.com/asl/\n\nimport sys\nfrom typing import Dict, Optional, Union\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nsys.tracebacklimit = 0\n\nUNCHANGED = \"unchanged\"\n\n\ndef script_handler(events: Dict[str, str], _: object) -> Dict[str, Optional[Union[str, int]]]:\n    \"\"\"\n    Gets the current IMDS options of the instance and resolves the values to apply.\n\n    For EnforceIMDSv2 and MetadataAccess, `unchanged` resolves to the current value.\n\n    Args:\n        events (dict): InstanceId, EnforceIMDSv2 and MetadataAccess input parameters\n        _ (object): Unused context parameter\n\n    Returns:\n        dict: Initial IMDS options and the HttpTokens and HttpEndpoint values to apply\n\n    Raises:\n        RuntimeError: If the instance can't be described\n        ValueError: If the response doesn't contain the IMDS options\n    \"\"\"\n    instance_id = events[\"InstanceId\"]\n    ec2 = boto3.client(\"ec2\")\n    try:\n        response = ec2.describe_instances(InstanceIds=[instance_id])\n    except ClientError as error:\n        raise RuntimeError(f\"Failed to describe instance {instance_id}: {error}\") from None\n\n    try:\n        metadata_options = response[\"Reservations\"][0][\"Instances\"][0][\"MetadataOptions\"]\n    except (KeyError, IndexError):\n        raise ValueError(f\"IMDS options not found for instance {instance_id}\") from None\n\n    current_http_tokens = metadata_options.get(\"HttpTokens\")\n    current_http_endpoint = metadata_options.get(\"HttpEndpoint\")\n\n    target_http_tokens = events[\"EnforceIMDSv2\"]\n    if target_http_tokens == UNCHANGED:\n        target_http_tokens = current_http_tokens\n\n    target_http_endpoint = events[\"MetadataAccess\"]\n    if target_http_endpoint == UNCHANGED:\n        target_http_endpoint = current_http_endpoint\n\n    return {\n        \"InitialState\": metadata_options.get(\"State\"),\n        \"InitialIMDSv2\": current_http_tokens,\n        \"InitialMetadataAccess\": current_http_endpoint,\n        \"InitialHttpPutResponseHopLimit\": metadata_options.get(\"HttpPutResponseHopLimit\"),\n        \"TargetHttpTokens\": target_http_tokens,\n        \"TargetHttpEndpoint\": target_http_endpoint,\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "InitialState",
+          "Selector": "$.Payload.InitialState",
+          "Type": "String"
+        },
+        {
+          "Name": "InitialMetadataAccess",
+          "Selector": "$.Payload.InitialMetadataAccess",
+          "Type": "String"
+        },
+        {
+          "Name": "InitialIMDSv2",
+          "Selector": "$.Payload.InitialIMDSv2",
+          "Type": "String"
+        },
+        {
+          "Name": "InitialHttpPutResponseHopLimit",
+          "Selector": "$.Payload.InitialHttpPutResponseHopLimit",
+          "Type": "Integer"
+        },
+        {
+          "Name": "TargetHttpTokens",
+          "Selector": "$.Payload.TargetHttpTokens",
+          "Type": "String"
+        },
+        {
+          "Name": "TargetHttpEndpoint",
+          "Selector": "$.Payload.TargetHttpEndpoint",
+          "Type": "String"
+        }
+      ],
+      "nextStep": "branchOnMetadataAccess"
+    },
+    {
       "name": "branchOnMetadataAccess",
       "action": "aws:branch",
       "description": "Branches the automation based on the value of `MetadataAccess` input parameter.",
@@ -53,7 +111,7 @@
         "Choices": [
           {
             "NextStep": "disableMetadataAccess",
-            "Variable": "{{ MetadataAccess }}",
+            "Variable": "{{ getCurrentMetadataOptions.TargetHttpEndpoint }}",
             "StringEquals": "disabled"
           }
         ],
@@ -105,8 +163,8 @@
         "Service": "ec2",
         "Api": "ModifyInstanceMetadataOptions",
         "InstanceId": "{{ InstanceId }}",
-        "HttpEndpoint": "{{ MetadataAccess }}",
-        "HttpTokens": "{{ EnforceIMDSv2 }}"
+        "HttpEndpoint": "{{ getCurrentMetadataOptions.TargetHttpEndpoint }}",
+        "HttpTokens": "{{ getCurrentMetadataOptions.TargetHttpTokens }}"
       },
       "nextStep": "waitBeforeAssertingIMDSv2State"
     },
@@ -133,8 +191,8 @@
         "Service": "ec2",
         "Api": "ModifyInstanceMetadataOptions",
         "InstanceId": "{{ InstanceId }}",
-        "HttpEndpoint": "{{ MetadataAccess }}",
-        "HttpTokens": "{{ EnforceIMDSv2 }}",
+        "HttpEndpoint": "{{ getCurrentMetadataOptions.TargetHttpEndpoint }}",
+        "HttpTokens": "{{ getCurrentMetadataOptions.TargetHttpTokens }}",
         "HttpPutResponseHopLimit": "{{ HttpPutResponseHopLimit }}"
       },
       "nextStep": "castHttpPutResponseHopLimit"
@@ -204,7 +262,7 @@
         "Choices": [
           {
             "NextStep": "assertIMDSv2IsEnforced",
-            "Variable": "{{ EnforceIMDSv2 }}",
+            "Variable": "{{ getCurrentMetadataOptions.TargetHttpTokens }}",
             "StringEquals": "required"
           }
         ],
