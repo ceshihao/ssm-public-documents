@@ -1,0 +1,546 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Creates or updates a Google Cloud OS Policy Orchestrator that installs, updates, or uninstalls an AWS Systems Manager Distributor package on Google Cloud virtual machines. The document authenticates to Google Cloud using a configured Cloud Connector, verifies that the OS Config API and VM Manager are enabled, builds an OS policy from the Distributor package definition, upserts the orchestrator that applies it, waits for the orchestrator to finish rolling the OS policy out, and then runs AWS-InstallDistributorPackageOnGcp-VerifyInstallation on each virtual machine that is not yet compliant with it.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "67dca4904ad196c750f134601182c1e3cfb399bfb5d63ca1dc81b4533ceae946"
+      }
+    }
+  },
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the IAM role that allows Systems Manager Automation to perform actions on your behalf."
+    },
+    "CloudConnector": {
+      "type": "String",
+      "description": "(Required) The ID of the Systems Manager Cloud Connector that contains your Google Cloud organization, project, and workload identity configuration. This connector provides the credentials needed to authenticate with Google Cloud.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "GCPVmResourceId": {
+      "type": "String",
+      "description": "(Optional) The relative resource name of a Google Cloud virtual machine to verify before the OS policy orchestrator is created. Format: projects/{project-id}/zones/{zone}/instances/{instance-name}. The optional //compute.googleapis.com/ prefix is accepted. When specified, the VM must be in a RUNNING state, must have VM Manager enabled, must run an operating system the Distributor package publishes an artifact for, its project must be one of the projects this automation is narrowed to, and its zone must be one of the zones GCPRegions and GCPZones narrow it to. When unspecified, no individual VM is verified and the orchestrator covers every VM in scope.",
+      "default": "",
+      "allowedPattern": "^$|^(//compute\\.googleapis\\.com/)?projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/zones/[a-z]+-[a-z]+[0-9]+-[a-z]/instances/[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"
+    },
+    "GCPProjectIds": {
+      "type": "StringList",
+      "description": "(Optional) The Google Cloud projects the OS policy orchestrator is scoped to. Each project must be in the scope of the Cloud Connector. If unspecified, the projects configured on the Cloud Connector are used, and a Cloud Connector that names no projects covers every project in its Google Cloud organization.",
+      "default": [],
+      "maxItems": 50,
+      "allowedPattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+    },
+    "GCPRegions": {
+      "type": "StringList",
+      "description": "(Optional) The Google Cloud regions the OS policy orchestrator is scoped to, for example us-central1. Each region is expanded into all of its zones, unless GCPZones names zones in that region, in which case only those zones are used. The zones are read from one project: the project of GCPVmResourceId if specified, else the first project in scope, else the project the Cloud Connector's workload identity pool is in. If neither GCPRegions nor GCPZones is specified, the orchestrator covers every zone of every project in scope.",
+      "default": [],
+      "maxItems": 50,
+      "allowedPattern": "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"
+    },
+    "GCPZones": {
+      "type": "StringList",
+      "description": "(Optional) The Google Cloud zones the OS policy orchestrator is scoped to, for example us-central1-a. A zone in one of the GCPRegions narrows that region to the zones named here, and a zone in any other region is added on its own. Each zone must exist in the project GCPRegions reads its zones from. If neither GCPRegions nor GCPZones is specified, the orchestrator covers every zone of every project in scope.",
+      "default": [],
+      "maxItems": 50,
+      "allowedPattern": "^[a-z][-a-z0-9]{0,61}[0-9]-[a-z]$"
+    },
+    "PackageName": {
+      "type": "String",
+      "description": "(Required) The name of the Systems Manager Distributor package to install, update, or uninstall.",
+      "allowedValues": [
+        "AmazonInspector2-InspectorVmScanner"
+      ]
+    },
+    "Action": {
+      "type": "String",
+      "description": "(Optional) Whether to install, uninstall, or update the package. Defaults to Install.",
+      "default": "Install",
+      "allowedValues": [
+        "Install",
+        "Uninstall",
+        "Update"
+      ]
+    },
+    "InstallationType": {
+      "type": "String",
+      "description": "(Optional) The installation strategy. 'Uninstall and reinstall' removes the existing package before installing the new version; the package is unavailable until reinstallation completes. 'In-place update' leaves the existing files and runs only the update script.",
+      "default": "Uninstall and reinstall",
+      "allowedValues": [
+        "Uninstall and reinstall",
+        "In-place update"
+      ]
+    },
+    "Version": {
+      "type": "String",
+      "description": "(Optional) The version of the package to install. If unspecified, the default version of the Distributor package is used.",
+      "default": "",
+      "allowedPattern": "^[a-zA-Z0-9._-]{0,128}$"
+    },
+    "AdditionalArguments": {
+      "type": "StringMap",
+      "description": "(Optional) Additional parameters passed as environment variables to the package installation script. All keys must begin with SSM_. The values are stored in clear text in the Google Cloud OS policy, where anyone who can read the OS policy assignment can see them, so do not pass secrets. Anything the package scripts print, these values included, is also returned in this automation's output for a virtual machine where the installation fails.",
+      "default": {},
+      "maxChars": 4096,
+      "allowedPattern": "^\\{(\\s*\"SSM_[A-Za-z0-9_]+\"\\s*:\\s*\"[^\"]*\"\\s*,?\\s*)*\\}$"
+    },
+    "RolloutPercentage": {
+      "type": "Integer",
+      "description": "(Optional) The maximum percentage of target virtual machines per zone that Google Cloud updates at a time. Defaults to 100.",
+      "default": 100,
+      "allowedPattern": "^([1-9][0-9]?|100)$"
+    },
+    "RolloutWaitTime": {
+      "type": "Integer",
+      "description": "(Optional) The number of seconds, from 0 to 86400, that Google Cloud waits after finishing one rollout wave before starting the next. Defaults to 0.",
+      "default": 0,
+      "allowedPattern": "^([0-9]{1,4}|[1-7][0-9]{4}|8[0-5][0-9]{3}|86[0-3][0-9]{2}|86400)$"
+    },
+    "OrchestratorName": {
+      "type": "String",
+      "description": "(Optional) The ID of the Google Cloud OS Policy Orchestrator to create or update: 2 to 63 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit. The OS policy assignment it manages takes the same ID. The orchestrator goes under the same organization or project either way. If this automation already created an orchestrator with this ID there for another Cloud Connector, that orchestrator is updated and its scope replaced. A run with a different ID creates a new orchestrator and leaves the previous one in place, still applying its OS policy. If unspecified, the ID is built from the package name and the first 8 characters of the Cloud Connector ID.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z][a-z0-9-]{0,61}[a-z0-9]$"
+    },
+    "VerifyMaxConcurrency": {
+      "type": "String",
+      "description": "(Optional) The maximum number of virtual machines the VerifyInstallation step verifies at a time, as a number or as a percentage of the virtual machines it verifies, for example 50 or 10%. Each verification reads the Google Cloud OS Config API, so a higher value uses more of the project's OS Config read quota. Defaults to 50.",
+      "default": "50",
+      "allowedPattern": "^([1-9][0-9]{0,6}|[1-9][0-9]?%|100%)$"
+    },
+    "VerifyMaxErrors": {
+      "type": "String",
+      "description": "(Optional) The number of virtual machine verifications, or the percentage of them, that can fail before the VerifyInstallation step stops starting new ones, for example 100 or 10%. Any failed verification still fails this automation. Defaults to 100.",
+      "default": "100",
+      "allowedPattern": "^(0|[1-9][0-9]{0,6}|[0-9]%|[1-9][0-9]%|100%)$"
+    }
+  },
+  "variables": {
+    "OrchestratorVerdict": {
+      "type": "String",
+      "description": "(Optional) Whether the last check found the OS policy orchestrator's rollout finished (SETTLED), ended as failed (FAILED), or is still running or was replaced by a newer one (WAIT). Defaults to WAIT so that the first check runs.",
+      "default": "WAIT"
+    },
+    "IterationDetail": {
+      "type": "StringMap",
+      "description": "(Optional) What the last check found about the OS policy orchestrator's rollout: iteration_id, iteration_state, progress, performed_actions and failed_actions. These travel as one map rather than as a variable each because an aws:updateVariable step writes exactly one variable, and they are only ever written together.",
+      "default": {}
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetGcpConfiguration",
+      "action": "aws:executeScript",
+      "description": "Reads the Google Cloud configuration from the Cloud Connector, exchanges the AWS credentials for a Google Cloud access token, resolves the projects and zones the OS policy orchestrator is scoped to, and verifies that the OS Config API is enabled for each project in scope and that any virtual machine named by GCPVmResourceId is running with VM Manager enabled. For that virtual machine, it also reads the operating system its OS inventory reports.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "get_gcp_configuration",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "resource_id": "{{ GCPVmResourceId }}",
+          "project_ids": "{{ GCPProjectIds }}",
+          "regions": "{{ GCPRegions }}",
+          "zones": "{{ GCPZones }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "import json\n\nfrom ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom ssm_gcp.exceptions import ValidationException\nfrom ssm_gcp.providers import (\n    OSCONFIG_SERVICE,\n    assert_instance_is_running,\n    assert_service_enabled,\n    check_vm_manager_enabled,\n    credential_source,\n    encode_scope_zones,\n    get_instance,\n    get_os_inventory,\n    get_project_number_map,\n    parse_vm_resource_id,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n    resolve_scope_zones,\n    resolve_target_projects,\n    validate_project_in_scope\n)\nfrom ssm_gcp.policy.orchestrator_builder import (\n    assert_project_in_orchestrator_scope,\n    assert_zone_in_orchestrator_scope,\n    home_project_number,\n    resolve_parent\n)\n\nDOCUMENT_NAME = 'AWS-InstallDistributorPackageOnGcp'\nAPI_STATE_NOT_VERIFIED = 'NOT_VERIFIED'\nNOT_APPLICABLE = 'not_applicable'\n\n@step_handler\ndef get_gcp_configuration(events, context):\n    \"\"\"Resolve the Google Cloud configuration and verify the prerequisites.\n    \"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    resource_id = events.get(\"resource_id\")\n    requested_project_ids = events.get(\"project_ids\")\n    requested_regions = events.get(\"regions\")\n    requested_zones = events.get(\"zones\")\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n\n    config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region\n    )\n\n    scope_projects = resolve_target_projects(config, requested_project_ids)\n\n    target = parse_vm_resource_id(resource_id) if resource_id else {}\n    project_id = target.get(\"project_id\", \"\")\n    zone = target.get(\"zone\", \"\")\n    instance_name = target.get(\"instance_name\", \"\")\n\n    if project_id:\n        validate_project_in_scope(config, project_id)\n        assert_project_in_orchestrator_scope(project_id, scope_projects)\n        assert_zone_in_orchestrator_scope(\n            zone, requested_regions, requested_zones\n        )\n\n    organization_id = config[\"organization_id\"] or \"\"\n    service_account_email = config[\"service_account_email\"]\n    target_projects = config[\"target_projects\"]\n\n    zone_lookup_project = \"\"\n    if requested_regions or requested_zones:\n        zone_lookup_project = (\n            project_id\n            or (scope_projects[0] if scope_projects else \"\")\n            or home_project_number(config[\"workload_identity_pool_provider\"])\n        )\n        if not zone_lookup_project:\n            raise ValidationException(\n                \"GCPRegions or GCPZones narrows this automation to particular \"\n                \"Google Cloud regions or zones, and resolving them requires a \"\n                \"project to read their zones from. The Cloud Connector names \"\n                \"no project, and its workload identity pool provider is not a \"\n                \"resource name of the form projects/{project-number}/locations/\"\n                \"global/workloadIdentityPools/{pool-id}/providers/{provider-id}. \"\n                \"Specify GCPProjectIds or GCPVmResourceId, or reconfigure the \"\n                \"Cloud Connector with the full resource name of its workload \"\n                \"identity pool provider.\"\n            )\n\n    parent = resolve_parent(\n        organization_id,\n        config[\"workload_identity_pool_provider\"],\n        target_projects\n    )\n\n    credentials = resolve_gcp_credentials(\n        config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=DOCUMENT_NAME\n    )\n\n    verified_projects = list(scope_projects) or (\n        [project_id] if project_id else []\n    )\n    numbers_by_project = get_project_number_map(verified_projects, credentials)\n    project_number = numbers_by_project.get(project_id, \"\")\n\n    scope_project_numbers = [\n        numbers_by_project[scope_project] for scope_project in scope_projects\n    ]\n\n    api_states = [\n        assert_service_enabled(number, OSCONFIG_SERVICE, credentials)\n        for number in numbers_by_project.values()\n    ]\n    osconfig_api_state = api_states[0] if api_states else API_STATE_NOT_VERIFIED\n    if not api_states:\n        _log_no_project_to_verify()\n\n    scope_locations = (\n        resolve_scope_zones(\n            zone_lookup_project,\n            requested_regions,\n            requested_zones,\n            credentials\n        )\n        if requested_regions or requested_zones\n        else []\n    )\n\n    vm_status = \"\"\n    vm_manager_source = NOT_APPLICABLE\n    vm_os = {\"state\": NOT_APPLICABLE, \"short_name\": \"\", \"version\": \"\"}\n    if project_id:\n        instance = get_instance(\n            project_id, zone, instance_name, credentials, tolerate_status=(404,)\n        )\n        vm_status = assert_instance_is_running(instance)\n        vm_manager_source = check_vm_manager_enabled(\n            instance, project_id, credentials\n        )\n        vm_os = get_os_inventory(project_id, zone, instance_name, credentials)\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"credential_source\": credential_source(),\n      \"zone\": zone,\n      \"vm_checked\": \"true\" if project_id else \"false\",\n      \"vm_status\": vm_status,\n      \"osconfig_api_state\": osconfig_api_state,\n      \"vm_manager_source\": vm_manager_source,\n      \"vm_os_inventory\": vm_os[\"state\"],\n      \"vm_os_short_name\": vm_os[\"short_name\"],\n      \"target_project_count\": str(len(target_projects)),\n      \"scope_project_count\": str(len(scope_projects)),\n      \"scope_location_count\": str(len(scope_locations)),\n      \"zone_lookup_project\": zone_lookup_project,\n      \"orchestrator_parent\": (\n          \"organization\" if parent.startswith(\"organizations/\") else \"project\"\n      )\n    }\n\n    return {\n        \"organization_id\": organization_id,\n        \"parent\": parent,\n        \"project_id\": project_id,\n        \"project_number\": project_number,\n        \"zone\": zone,\n        \"instance_name\": instance_name,\n        \"service_account_email\": service_account_email,\n        \"scope_projects\": scope_projects,\n        \"scope_project_numbers\": scope_project_numbers,\n        \"scope_locations\": encode_scope_zones(scope_locations),\n        \"vm_status\": vm_status,\n        \"vm_os_short_name\": vm_os[\"short_name\"],\n        \"vm_os_version\": vm_os[\"version\"],\n        \"aws_log\": aws_log\n    }\n\ndef _log_no_project_to_verify():\n    \"\"\"Records that no project's OS Config API state could be read.\n    \"\"\"\n    print(\n        json.dumps(\n            {\n                \"operation\": \"verifying that the required Google Cloud APIs are enabled\",\n                \"message\": (\n                    \"this automation is scoped to the whole organization and names \"\n                    \"no virtual machine, so no project's OS Config API state was \"\n                    \"read; specify GCPProjectIds or GCPVmResourceId to have it \"\n                    \"verified\"\n                ),\n                \"service\": OSCONFIG_SERVICE\n            }\n        )\n    )\n"
+      },
+      "outputs": [
+        {
+          "Name": "OrganizationId",
+          "Selector": "$.Payload.organization_id",
+          "Type": "String"
+        },
+        {
+          "Name": "Parent",
+          "Selector": "$.Payload.parent",
+          "Type": "String"
+        },
+        {
+          "Name": "ProjectId",
+          "Selector": "$.Payload.project_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ProjectNumber",
+          "Selector": "$.Payload.project_number",
+          "Type": "String"
+        },
+        {
+          "Name": "Zone",
+          "Selector": "$.Payload.zone",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceName",
+          "Selector": "$.Payload.instance_name",
+          "Type": "String"
+        },
+        {
+          "Name": "ServiceAccountEmail",
+          "Selector": "$.Payload.service_account_email",
+          "Type": "String"
+        },
+        {
+          "Name": "ScopeProjects",
+          "Selector": "$.Payload.scope_projects",
+          "Type": "StringList"
+        },
+        {
+          "Name": "ScopeProjectNumbers",
+          "Selector": "$.Payload.scope_project_numbers",
+          "Type": "StringList"
+        },
+        {
+          "Name": "ScopeLocations",
+          "Selector": "$.Payload.scope_locations",
+          "Type": "String"
+        },
+        {
+          "Name": "VmStatus",
+          "Selector": "$.Payload.vm_status",
+          "Type": "String"
+        },
+        {
+          "Name": "VmOsShortName",
+          "Selector": "$.Payload.vm_os_short_name",
+          "Type": "String"
+        },
+        {
+          "Name": "VmOsVersion",
+          "Selector": "$.Payload.vm_os_version",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "GetPackageManifest",
+      "action": "aws:executeScript",
+      "description": "Reads the Systems Manager Distributor package document, resolves the requested version to a concrete one, and returns the public download URL and SHA256 checksum of each artifact the package publishes for an operating system Google Cloud supports.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "get_package_manifest",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "package_name": "{{ PackageName }}",
+          "version": "{{ Version }}"
+        },
+        "Script": "from ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom gcp_distributor.providers.ssm_package_provider import (\n    get_distributor_package\n)\n\n@step_handler\ndef get_package_manifest(events, context):\n    \"\"\"Resolve the Distributor package to a table of downloadable artifacts.\n    \"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    package_name = events.get(\"package_name\")\n    version = events.get(\"version\")\n\n    if not package_name:\n        raise ValueError(\"The PackageName parameter is required but was not provided.\")\n\n    package = get_distributor_package(\n        package_name=package_name,\n        version=version,\n        ssm_region=ssm_region\n    )\n\n    artifacts = package[\"artifacts\"]\n    platforms = sorted({artifact[\"platform\"] for artifact in artifacts})\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"package_version\": package[\"version\"],\n      \"requested_version\": version or \"default\",\n      \"artifact_count\": str(len(artifacts)),\n      \"platform_count\": str(len(platforms)),\n      \"platforms\": \",\".join(platforms)\n    }\n\n    return {\n        \"package_name\": package[\"name\"],\n        \"package_version\": package[\"version\"],\n        \"artifacts\": artifacts,\n        \"aws_log\": aws_log\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "PackageVersion",
+          "Selector": "$.Payload.package_version",
+          "Type": "String"
+        },
+        {
+          "Name": "Artifacts",
+          "Selector": "$.Payload.artifacts",
+          "Type": "MapList"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "UpsertOsPolicyOrchestrator",
+      "action": "aws:executeScript",
+      "description": "Builds the OS policy assignment for the resolved package, refuses a virtual machine named by GCPVmResourceId whose operating system the package publishes no artifact for, and creates or updates the Google Cloud OS Policy Orchestrator that applies it to every project and zone in scope. The orchestrator is created under the Cloud Connector organization, or, when the Cloud Connector names no organization, in the project that holds its workload identity pool, scoped to the projects in scope.",
+      "timeoutSeconds": 600,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "upsert_os_policy_orchestrator",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "requested_orchestrator_name": "{{ OrchestratorName }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}",
+          "parent": "{{ GetGcpConfiguration.Parent }}",
+          "scope_project_numbers": "{{ GetGcpConfiguration.ScopeProjectNumbers }}",
+          "scope_locations": "{{ GetGcpConfiguration.ScopeLocations }}",
+          "package_name": "{{ PackageName }}",
+          "package_version": "{{ GetPackageManifest.PackageVersion }}",
+          "artifacts": "{{ GetPackageManifest.Artifacts }}",
+          "action": "{{ Action }}",
+          "installation_type": "{{ InstallationType }}",
+          "rollout_percentage": "{{ RolloutPercentage }}",
+          "rollout_wait_time": "{{ RolloutWaitTime }}",
+          "additional_arguments": "{{ AdditionalArguments }}",
+          "vm_os_short_name": "{{ GetGcpConfiguration.VmOsShortName }}",
+          "vm_os_version": "{{ GetGcpConfiguration.VmOsVersion }}"
+        },
+        "Script": "import json\n\nfrom ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom ssm_gcp.exceptions import ValidationException\nfrom ssm_gcp.providers import (\n    credential_source,\n    decode_scope_zones,\n    instance_filter_excludes_os,\n    orchestrated_policy_digest,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials\n)\nfrom ssm_gcp.providers.osconfig_client import upsert_orchestrator\nfrom ssm_gcp.policy.orchestrator_builder import (\n    build_orchestrator_name,\n    superseded_parent\n)\nfrom ssm_gcp.policy.origin import build_origin\nfrom gcp_distributor.policy.os_policy_builder import build_os_policy_assignment\nfrom gcp_distributor.policy.distributor_orchestrator import (\n    build_orchestrator,\n    resolve_orchestrator_naming\n)\n\nDOCUMENT_NAME = 'AWS-InstallDistributorPackageOnGcp'\n\n@step_handler\ndef upsert_os_policy_orchestrator(events, context):\n    \"\"\"Build the OS policy assignment and upsert the orchestrator for it.\n    \"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n    aws_account_id = context.get('global:ACCOUNT_ID')\n    if not aws_account_id:\n        raise ValueError(\"Could not determine the AWS account for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    requested_orchestrator_name = events.get(\"requested_orchestrator_name\") or \"\"\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\")\n    parent = events.get(\"parent\")\n    scope_project_numbers = events.get(\"scope_project_numbers\") or []\n    scope_locations = decode_scope_zones(events.get(\"scope_locations\"))\n    package_name = events.get(\"package_name\")\n    package_version = events.get(\"package_version\")\n    artifacts = events.get(\"artifacts\") or []\n    action = events.get(\"action\")\n    installation_type = events.get(\"installation_type\")\n    rollout_percentage = events.get(\"rollout_percentage\")\n    rollout_wait_time = events.get(\"rollout_wait_time\")\n    additional_arguments = events.get(\"additional_arguments\")\n    vm_os_short_name = events.get(\"vm_os_short_name\") or \"\"\n    vm_os_version = events.get(\"vm_os_version\") or \"\"\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n    if not package_name:\n        raise ValueError(\"The PackageName parameter is required but was not provided.\")\n    if not parent:\n        raise ValueError(\"The GetGcpConfiguration step returned no Google Cloud organization or project to create the OS policy orchestrator in.\")\n\n    package = {\n        \"name\": package_name,\n        \"version\": package_version,\n        \"artifacts\": artifacts\n    }\n\n    orchestrator_id, policy_id, log_suffix = resolve_orchestrator_naming(\n        package_name, cloud_connector_id, requested_orchestrator_name\n    )\n    orchestrator_name = build_orchestrator_name(parent, orchestrator_id)\n    origin = build_origin(aws_account_id, ssm_region, cloud_connector_id)\n\n    assignment = build_os_policy_assignment(\n        package,\n        action,\n        installation_type,\n        _whole_number(rollout_percentage, \"RolloutPercentage\"),\n        _whole_number(rollout_wait_time, \"RolloutWaitTime\"),\n        log_suffix=log_suffix,\n        additional_arguments=additional_arguments,\n        aws_region=ssm_region,\n        policy_id=policy_id,\n        origin=origin\n    )\n\n    if instance_filter_excludes_os(\n        assignment.get(\"instanceFilter\"), vm_os_short_name, vm_os_version\n    ):\n        raise ValidationException(\n            \"The target Google Cloud virtual machine runs an operating \"\n            f\"system ({vm_os_short_name}) that the Distributor package \"\n            \"publishes no artifact for, so the OS policy would never be \"\n            \"applied to it. Name a virtual machine running a supported \"\n            \"operating system in GCPVmResourceId, or leave it empty.\"\n        )\n\n    body = build_orchestrator(\n        package_name,\n        action,\n        policy_id,\n        assignment,\n        project_numbers=scope_project_numbers,\n        locations=scope_locations,\n        origin=origin\n    )\n\n    config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region\n    )\n    credentials = resolve_gcp_credentials(\n        config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=DOCUMENT_NAME\n    )\n\n    result = upsert_orchestrator(\n        orchestrator_name,\n        parent,\n        orchestrator_id,\n        policy_id,\n        body,\n        credentials,\n        superseded_parent=superseded_parent(\n            config[\"organization_id\"] or \"\",\n            config[\"workload_identity_pool_provider\"],\n            config[\"target_projects\"]\n        )\n    )\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"credential_source\": credential_source(),\n      \"package_version\": package_version,\n      \"policy_id\": policy_id,\n      \"orchestrator_id\": orchestrator_id,\n      \"created\": str(result[\"created\"]).lower(),\n      \"status\": result[\"state\"],\n      \"iteration_state\": result[\"iteration_state\"],\n      \"artifact_count\": str(len(artifacts)),\n      \"resource_group_count\": str(len(assignment[\"osPolicies\"][0][\"resourceGroups\"])),\n      \"scope_project_count\": str(len(scope_project_numbers)),\n      \"scope_location_count\": str(len(scope_locations))\n    }\n\n    stored = result[\"orchestrator\"]\n    scope = stored.get(\"orchestrationScope\")\n\n    return {\n        \"orchestrator_name\": result[\"name\"],\n        \"created\": result[\"created\"],\n        \"status\": result[\"state\"],\n        \"iteration_state\": result[\"iteration_state\"],\n        \"policy_id\": policy_id,\n        \"prior_iteration_id\": result[\"prior_iteration_id\"],\n        \"policy_digest\": orchestrated_policy_digest(stored),\n        \"orchestration_scope\": json.dumps(\n            scope if isinstance(scope, dict) else {},\n            sort_keys=True,\n            separators=(\",\", \":\")\n        ),\n        \"aws_log\": aws_log\n    }\n\ndef _whole_number(value, parameter_name):\n    \"\"\"Given a step input, returns it as an int or raises naming the parameter.\"\"\"\n    if isinstance(value, bool) or value is None or value == \"\":\n        raise ValidationException(\n            f\"The {parameter_name} parameter must be a whole number.\"\n        )\n    try:\n        return int(str(value).strip())\n    except (TypeError, ValueError):\n        raise ValidationException(\n            f\"The {parameter_name} parameter must be a whole number.\"\n        )\n"
+      },
+      "outputs": [
+        {
+          "Name": "OrchestratorResourceName",
+          "Selector": "$.Payload.orchestrator_name",
+          "Type": "String"
+        },
+        {
+          "Name": "Created",
+          "Selector": "$.Payload.created",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "IterationState",
+          "Selector": "$.Payload.iteration_state",
+          "Type": "String"
+        },
+        {
+          "Name": "PolicyId",
+          "Selector": "$.Payload.policy_id",
+          "Type": "String"
+        },
+        {
+          "Name": "PriorIterationId",
+          "Selector": "$.Payload.prior_iteration_id",
+          "Type": "String"
+        },
+        {
+          "Name": "PolicyDigest",
+          "Selector": "$.Payload.policy_digest",
+          "Type": "String"
+        },
+        {
+          "Name": "OrchestrationScope",
+          "Selector": "$.Payload.orchestration_scope",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "WaitForOrchestratorIteration",
+      "action": "aws:loop",
+      "description": "Waits for the OS Policy Orchestrator to finish rolling out the OS policy.",
+      "nextStep": "AssertIterationSettled",
+      "isEnd": false,
+      "inputs": {
+        "MaxIterations": 100,
+        "LoopCondition": {
+          "Variable": "{{ variable:OrchestratorVerdict }}",
+          "StringEquals": "WAIT"
+        },
+        "Steps": [
+          {
+            "name": "GetOrchestratorIteration",
+            "action": "aws:executeScript",
+            "description": "Reads the OS Policy Orchestrator and reports whether the rollout that the previous step started has finished.",
+            "timeoutSeconds": 120,
+            "onFailure": "Abort",
+            "isCritical": true,
+            "nextStep": "RecordOrchestratorVerdict",
+            "isEnd": false,
+            "inputs": {
+              "Runtime": "python3.12",
+              "Handler": "get_orchestrator_iteration",
+              "CloudConnector": "{{ CloudConnector }}",
+              "Attachment": "attachments.zip",
+              "InputPayload": {
+                "cloud_connector_id": "{{ CloudConnector }}",
+                "automation_assume_role_arn": "{{ AutomationAssumeRole }}",
+                "orchestrator_name": "{{ UpsertOsPolicyOrchestrator.OrchestratorResourceName }}",
+                "prior_iteration_id": "{{ UpsertOsPolicyOrchestrator.PriorIterationId }}"
+              },
+              "Script": "import json\n\nfrom ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom ssm_gcp.exceptions import (\n    ResourceExhaustedException,\n    TransientServiceError\n)\nfrom ssm_gcp.providers import (\n    credential_source,\n    get_orchestrator_verdict,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n    unread_orchestrator_verdict\n)\n\nDOCUMENT_NAME = 'AWS-InstallDistributorPackageOnGcp'\nOPERATION = 'waiting for the Google Cloud OS policy orchestrator rollout'\n\n@step_handler\ndef get_orchestrator_iteration(events, context):\n    \"\"\"Read the orchestrator once and say whether its rollout has settled.\n    \"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\")\n    orchestrator_name = events.get(\"orchestrator_name\")\n    prior_iteration_id = events.get(\"prior_iteration_id\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n    if not orchestrator_name:\n        raise ValueError(\"The UpsertOsPolicyOrchestrator step returned no Google Cloud OS policy orchestrator to wait for.\")\n\n    try:\n        config = resolve_cloud_connector_config(\n            cloud_connector_id=cloud_connector_id,\n            ssm_region=ssm_region\n        )\n        credentials = resolve_gcp_credentials(\n            config,\n            automation_assume_role_arn=automation_assume_role_arn,\n            role_session_name=DOCUMENT_NAME\n        )\n\n        verdict = get_orchestrator_verdict(\n            orchestrator_name,\n            credentials,\n            prior_iteration_id=prior_iteration_id or \"\"\n        )\n    except (TransientServiceError, ResourceExhaustedException) as error:\n        _log_unread_check(error)\n        verdict = unread_orchestrator_verdict()\n\n    if verdict[\"error_message\"]:\n        print(\n            json.dumps(\n                {\n                    \"operation\": OPERATION,\n                    \"iteration_id\": verdict[\"iteration_id\"],\n                    \"iteration_state\": verdict[\"iteration_state\"],\n                    \"failed_actions\": verdict[\"failed_actions\"],\n                    \"error_message\": verdict[\"error_message\"]\n                }\n            )\n        )\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"credential_source\": credential_source(),\n      \"verdict\": verdict[\"verdict\"],\n      \"iteration_state\": verdict[\"iteration_state\"],\n      \"reconciling\": str(verdict[\"reconciling\"]).lower(),\n      \"progress\": verdict[\"progress\"],\n      \"performed_actions\": verdict[\"performed_actions\"],\n      \"failed_actions\": verdict[\"failed_actions\"],\n      \"has_iteration_error\": str(bool(verdict[\"error_message\"])).lower()\n    }\n\n    return {\n        \"verdict\": verdict[\"verdict\"],\n        \"iteration_detail\": {\n            \"iteration_id\": verdict[\"iteration_id\"],\n            \"iteration_state\": verdict[\"iteration_state\"],\n            \"progress\": verdict[\"progress\"],\n            \"performed_actions\": verdict[\"performed_actions\"],\n            \"failed_actions\": verdict[\"failed_actions\"],\n            \"failed_locations\": verdict[\"failed_locations\"]\n        },\n        \"aws_log\": aws_log\n    }\n\ndef _log_unread_check(error):\n    \"\"\"Records a check that could not read the rollout, and is retried.\n    \"\"\"\n    print(\n        json.dumps(\n            {\n                \"operation\": OPERATION,\n                \"message\": \"this check could not read the orchestrator; the next check retries\",\n                \"error_type\": type(error).__name__\n            }\n        )\n    )\n"
+            },
+            "outputs": [
+              {
+                "Name": "Verdict",
+                "Selector": "$.Payload.verdict",
+                "Type": "String"
+              },
+              {
+                "Name": "IterationDetail",
+                "Selector": "$.Payload.iteration_detail",
+                "Type": "StringMap"
+              },
+              {
+                "Name": "AWSLog",
+                "Selector": "$.Payload.aws_log",
+                "Type": "StringMap"
+              }
+            ]
+          },
+          {
+            "name": "RecordOrchestratorVerdict",
+            "action": "aws:updateVariable",
+            "description": "Update the orchestrator status.",
+            "nextStep": "RecordIterationDetail",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:OrchestratorVerdict",
+              "Value": "{{ GetOrchestratorIteration.Verdict }}"
+            }
+          },
+          {
+            "name": "RecordIterationDetail",
+            "action": "aws:updateVariable",
+            "description": "Update the iteration detail.",
+            "nextStep": "ShouldWaitForIteration",
+            "isEnd": false,
+            "inputs": {
+              "Name": "variable:IterationDetail",
+              "Value": "{{ GetOrchestratorIteration.IterationDetail }}"
+            }
+          },
+          {
+            "name": "ShouldWaitForIteration",
+            "action": "aws:branch",
+            "description": "Waits before the next check only while the rollout is still running.",
+            "inputs": {
+              "Choices": [
+                {
+                  "NextStep": "SleepBeforeIterationCheck",
+                  "Variable": "{{ GetOrchestratorIteration.Verdict }}",
+                  "StringEquals": "WAIT"
+                }
+              ],
+              "Default": "EndIterationCheck"
+            }
+          },
+          {
+            "name": "SleepBeforeIterationCheck",
+            "action": "aws:sleep",
+            "description": "Waits before the next check.",
+            "isEnd": true,
+            "inputs": {
+              "Duration": "PT2M"
+            }
+          },
+          {
+            "name": "EndIterationCheck",
+            "action": "aws:sleep",
+            "description": "Ends this check without waiting, because the rollout has finished.",
+            "isEnd": true,
+            "inputs": {
+              "Duration": "PT1S"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "AssertIterationSettled",
+      "action": "aws:executeScript",
+      "description": "Reports the result of the OS Policy Orchestrator rollout. A rollout that did not finish within the checks the previous step made, or that finished with failed locations, is reported in IterationState and FailedActions rather than failing the automation, because the next step verifies each virtual machine, every one of them in that case, and the orchestrator retries the failed locations at its next iteration.",
+      "timeoutSeconds": 60,
+      "onFailure": "Continue",
+      "isCritical": false,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "assert_iteration_settled",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "verdict": "{{ variable:OrchestratorVerdict }}",
+          "iteration_detail": "{{ variable:IterationDetail }}"
+        },
+        "Script": "import json\n\nfrom ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom ssm_gcp.exceptions import ServiceRequestError\nfrom ssm_gcp.providers import ITERATION_FAILED, ITERATION_SETTLED\n\nOPERATION = 'waiting for the Google Cloud OS policy orchestrator rollout'\nCOMPLIANCE_FILTER_SKIP = 'SKIP_COMPLIANT'\nCOMPLIANCE_FILTER_ALL = 'ALL'\n\n@step_handler\ndef assert_iteration_settled(events, context):\n    \"\"\"Turn the last check into the rollout's result, or into a timeout.\n    \"\"\"\n    verdict = events.get(\"verdict\")\n    detail = _detail_map(events.get(\"iteration_detail\"))\n    iteration_id = detail.get(\"iteration_id\") or \"\"\n    iteration_state = detail.get(\"iteration_state\") or \"NOT_STARTED\"\n    progress = detail.get(\"progress\") or \"0\"\n    performed_actions = detail.get(\"performed_actions\") or \"0\"\n    failed_actions = detail.get(\"failed_actions\") or \"0\"\n    failed_locations = detail.get(\"failed_locations\") or \"\"\n\n    settled = verdict == ITERATION_SETTLED\n    failed = verdict == ITERATION_FAILED\n\n    compliance_filter = COMPLIANCE_FILTER_ALL if failed else COMPLIANCE_FILTER_SKIP\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"verdict\": str(verdict or \"\"),\n      \"outcome\": \"settled\" if settled else (\n          \"failed\" if failed else \"timed_out\"\n      ),\n      \"iteration_state\": iteration_state,\n      \"progress\": progress,\n      \"performed_actions\": performed_actions,\n      \"failed_actions\": failed_actions,\n      \"compliance_filter\": compliance_filter,\n    }\n\n    if failed:\n        _log_outcome(\n            verdict,\n            iteration_id,\n            iteration_state,\n            aws_log[\"outcome\"],\n            _failure_message(\n                iteration_state, performed_actions, failed_actions, failed_locations\n            )\n        )\n\n    if settled or failed:\n        return {\n            \"iteration_id\": iteration_id,\n            \"iteration_state\": iteration_state,\n            \"failed_actions\": failed_actions,\n            \"failed_locations\": failed_locations,\n            \"compliance_filter\": compliance_filter,\n            \"aws_log\": aws_log\n        }\n\n    message = _timeout_message(\n        iteration_state,\n        progress,\n        performed_actions,\n        failed_actions\n    )\n    _log_outcome(\n        verdict, iteration_id, iteration_state, aws_log[\"outcome\"], message\n    )\n\n    raise ServiceRequestError(message)\n\ndef _log_outcome(verdict, iteration_id, iteration_state, outcome, message):\n    \"\"\"Records how the wait ended, and why, in the ExecutionLog.\n    \"\"\"\n    print(\n        json.dumps(\n            {\n                \"operation\": OPERATION,\n                \"verdict\": str(verdict or \"\"),\n                \"iteration_id\": iteration_id,\n                \"iteration_state\": iteration_state,\n                \"outcome\": outcome,\n                \"message\": message\n            }\n        )\n    )\n\ndef _failure_message(\n    iteration_state, performed_actions, failed_actions, failed_locations\n):\n    \"\"\"Given a rollout that ended with failed locations, describes it.\n    \"\"\"\n    where = (\n        f\" in {failed_locations.replace(',', ', ')}\" if failed_locations else \"\"\n    )\n    return (\n        f\"The Google Cloud OS policy orchestrator's rollout ended \"\n        f\"{iteration_state}, with {failed_actions} of {performed_actions} \"\n        f\"actions failed{where}. This step's FailedLocations output lists \"\n        \"those zones, and the GetOrchestratorIteration step's ExecutionLog \"\n        \"output has Google Cloud's error. The orchestrator retries them at its next iteration, and \"\n        \"the VerifyInstallation step verifies every running virtual machine, the \"\n        \"compliant ones too, because a virtual machine in a failed location \"\n        \"can still report compliance with the previous revision. A zone \"\n        \"fails while its previous rollout is still in progress, which a \"\n        \"virtual machine there that the OS policy targets causes: a suspended \"\n        \"one until it is resumed or deleted, and one that was stopped when \"\n        \"that rollout began for 20 to 40 minutes. When \"\n        \"every zone of a project failed, that project usually does not grant \"\n        \"the OS Config rollout service agent of the orchestrator's \"\n        \"organization or project the roles/osconfig.rolloutServiceAgent role.\"\n    )\n\ndef _timeout_message(\n    iteration_state,\n    progress,\n    performed_actions,\n    failed_actions\n):\n    \"\"\"Given the last check, returns the timeout message.\n    \"\"\"\n    return (\n        f\"Google Cloud had not finished rolling out the OS policy when this \"\n        f\"automation stopped waiting for it. At the last check its rollout was \"\n        f\"{iteration_state}, {progress}% complete, with {performed_actions} \"\n        f\"actions done and {failed_actions} failed. A suspended virtual machine \"\n        f\"that the OS policy targets holds its zone's rollout until it is \"\n        f\"resumed or deleted; to find one, run gcloud compute instances list \"\n        f\"--filter=status=SUSPENDED. The orchestrator keeps applying the policy \"\n        f\"on its own, so nothing needs to be undone. Do not run this automation \"\n        f\"again to wait longer, because every update restarts the rollout. Run \"\n        f\"AWS-InstallDistributorPackageOnGcp-VerifyInstallation later to verify \"\n        f\"individual virtual machines.\"\n    )\n\ndef _detail_map(value):\n    \"\"\"Given the recorded iteration detail, returns it as a mapping.\n    \"\"\"\n    if isinstance(value, dict):\n        return value\n\n    if isinstance(value, str) and value.strip():\n        try:\n            parsed = json.loads(value)\n        except ValueError:\n            return {}\n        if isinstance(parsed, dict):\n            return parsed\n\n    return {}\n"
+      },
+      "outputs": [
+        {
+          "Name": "IterationId",
+          "Selector": "$.Payload.iteration_id",
+          "Type": "String"
+        },
+        {
+          "Name": "IterationState",
+          "Selector": "$.Payload.iteration_state",
+          "Type": "String"
+        },
+        {
+          "Name": "FailedActions",
+          "Selector": "$.Payload.failed_actions",
+          "Type": "String"
+        },
+        {
+          "Name": "FailedLocations",
+          "Selector": "$.Payload.failed_locations",
+          "Type": "String"
+        },
+        {
+          "Name": "ComplianceFilter",
+          "Selector": "$.Payload.compliance_filter",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "VerifyInstallation",
+      "action": "aws:executeAutomation",
+      "description": "Runs AWS-InstallDistributorPackageOnGcp-VerifyInstallation on each Google Cloud virtual machine in the Cloud Connector's scope that is not yet compliant with the OS policy the OS Policy Orchestrator assigned. When GCPRegions or GCPZones narrowed the OS Policy Orchestrator to some zones, only the virtual machines in those zones are verified. After a rollout that ended with failed locations it runs on every virtual machine in the scope, because a virtual machine in a failed location can still report compliance with the previous revision of the OS policy.",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "isEnd": true,
+      "inputs": {
+        "DocumentName": "AWS-InstallDistributorPackageOnGcp-VerifyInstallation",
+        "TargetParameterName": "GCPVmResourceId",
+        "MaxConcurrency": "{{ VerifyMaxConcurrency }}",
+        "MaxErrors": "{{ VerifyMaxErrors }}",
+        "Targets": [
+          {
+            "Key": "CloudConnector",
+            "Values": [
+              "{\"cloudConnectorId\":\"{{ CloudConnector }}\",\"zones\":{{ GetGcpConfiguration.ScopeLocations }},\"osPolicyComplianceFilter\":\"{{ AssertIterationSettled.ComplianceFilter }}\",\"osPolicyOrchestratorName\":\"{{ UpsertOsPolicyOrchestrator.OrchestratorResourceName }}\"}"
+            ]
+          }
+        ],
+        "RuntimeParameters": {
+          "CloudConnector": "{{ CloudConnector }}",
+          "OSPolicyOrchestratorName": "{{ UpsertOsPolicyOrchestrator.OrchestratorResourceName }}",
+          "OSPolicyAssignmentId": "{{ UpsertOsPolicyOrchestrator.PolicyId }}",
+          "OSPolicyDigest": "{{ UpsertOsPolicyOrchestrator.PolicyDigest }}",
+          "OSPolicyOrchestrationScope": "{{ UpsertOsPolicyOrchestrator.OrchestrationScope }}",
+          "PackageName": "{{ PackageName }}",
+          "Action": "{{ Action }}",
+          "Version": "{{ GetPackageManifest.PackageVersion }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        }
+      }
+    }
+  ],
+  "outputs": [
+    "UpsertOsPolicyOrchestrator.OrchestratorResourceName",
+    "UpsertOsPolicyOrchestrator.Created",
+    "UpsertOsPolicyOrchestrator.Status",
+    "AssertIterationSettled.IterationId",
+    "AssertIterationSettled.IterationState",
+    "AssertIterationSettled.FailedActions",
+    "AssertIterationSettled.FailedLocations"
+  ]
+}

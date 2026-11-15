@@ -1,0 +1,609 @@
+{
+  "description": "Verifies that the AWS Systems Manager Agent installation succeeded on a Google Cloud virtual machine. Using a Cloud Connector, it confirms the VM is running with VM Manager enabled, waits for the SSM Agent OS policy assignment to report compliant and for the managed instance to come online in Systems Manager, then labels the VM ssm-managed so the OS policy orchestrator no longer targets it. A VM that is not found ends the runbook successfully without verifying. Companion runbooks create the hybrid activation and install the agent.\n",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "fa5f7a3527e5d75146af14697212be219e171b693fed4b8408a88ed881b872cb"
+      }
+    }
+  },
+  "parameters": {
+    "CloudConnector": {
+      "type": "String",
+      "description": "(Required) The ID of the Systems Manager Cloud Connector that contains your Google Cloud organization, project, and workload identity configuration. This connector provides the credentials needed to authenticate with Google Cloud.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "GCPVmResourceId": {
+      "type": "String",
+      "description": "(Required) The relative resource name of the target Google Cloud virtual machine. Format: projects/{project-id}/zones/{zone}/instances/{instance-name}. The optional //compute.googleapis.com/ prefix is accepted. The VM must be in a RUNNING state and must have VM Manager enabled.",
+      "allowedPattern": "^(//compute\\.googleapis\\.com/)?projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/zones/[a-z]+-[a-z]+[0-9]+-[a-z]/instances/[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"
+    },
+    "OSPolicyOrchestratorInfo": {
+      "type": "String",
+      "description": "(Required) The JSON object AWS-InstallSSMAgentOnGCP-ApplyOSPolicy outputs as OrchestratorInfo: \"name\", the orchestrator's resource name; \"upsert_time\", when the orchestrator was upserted, reports from before which are ignored (empty when ApplyOSPolicy skipped the rollout, so the latest report is used); and optionally \"assignment_id\" and \"scope\", which spare reading the orchestrator.",
+      "allowedPattern": "^\\{[-A-Za-z0-9_.:/,\"\\\\\\[\\]{} ]{0,8190}\\}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the IAM role that allows Systems Manager Automation to perform actions on your behalf. This role must have permissions to create activations, read the target virtual machine, and assume the Cloud Connector role."
+    }
+  },
+  "variables": {
+    "ComplianceVerdict": {
+      "type": "String",
+      "description": "(Optional) Whether the last compliance check said to stop or to keep waiting. Defaults to WAIT so that the first check runs.",
+      "default": "WAIT"
+    },
+    "ComplianceDetail": {
+      "type": "StringMap",
+      "description": "(Optional) Google Cloud's last report on this VM's OS policy: compliance_state, its reason, and failure_detail. One map, because aws:updateVariable writes one variable.",
+      "default": {}
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "CheckCompliance",
+      "action": "aws:executeScript",
+      "description": "Exchanges AWS credentials for a Google Cloud token once, then verifies the VM, reads its zone's current revision of the orchestrator's OS policy assignment, and reads its compliance report once before waiting. The VM is verified first, because Google answers a report for a VM that does not exist with the same not-found as one not yet written: the OS Config API must be enabled, and the VM running with VM Manager enabled. A VM not found, or already labeled ssm-managed, ends at the next two steps. The revision says whether the zone carries this run's OS policies, which it does not where the last rollout failed; with assignment_id and scope in OSPolicyOrchestratorInfo the orchestrator is not read, and the revision's create time is compared with upsert_time instead. An OS Config read refused for a spent read quota is sent again a minute or more later, for up to 450 s of waiting across the step. A result, an untargeted VM or a failure ends without waiting. Otherwise ReportsParent and ReportSelector are what WaitForCompliance watches.",
+      "timeoutSeconds": 600,
+      "onFailure": "step:CleanupMetadata",
+      "isCritical": true,
+      "nextStep": "EvaluateVmExists",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "check_compliance",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "resource_id": "{{ GCPVmResourceId }}",
+          "orchestrator_info": "{{ OSPolicyOrchestratorInfo }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "import json\n\nfrom ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom ssm_gcp.exceptions import ValidationException\nfrom ssm_gcp.providers import (\n    OSCONFIG_SERVICE,\n    assert_instance_is_running,\n    assert_service_enabled,\n    assert_zone_shaped,\n    check_vm_manager_enabled,\n    credential_source,\n    first_check_quota_deadline,\n    get_assignment_revision,\n    get_instance,\n    get_orchestrator,\n    orchestrated_policy_digest,\n    parse_vm_resource_id,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n    revision_created_before,\n    scope_excludes,\n    validate_project_in_scope\n)\nfrom gcp_ssm_agent.providers.gcp_vm_manager import (\n    SSM_MANAGED_LABEL_KEY,\n    SSM_MANAGED_LABEL_VALUE,\n    SSM_ACTIVATION_ID_KEY,\n    get_instance_metadata_value\n)\nfrom gcp_verify.report.check import check_report\n\nDOCUMENT_NAME = 'AWS-InstallSSMAgentOnGCP-VerifyVMStatus'\n\n_UNCHECKED_OUTPUTS = (\n    \"activation_id\",\n    \"metadata_found\",\n    \"assignment_id\",\n    \"assignment_exists\",\n    \"revision_id\",\n    \"revision_create_time\",\n    \"rollout_state\",\n    \"assignment_current\",\n    \"instance_filter\",\n    \"orchestration_scope\",\n    \"verdict\",\n    \"enforcement_log\",\n    \"agent_logs\",\n    \"osconfig_agent_log\",\n    \"platform\",\n    \"last_run_id\",\n    \"report_revision_id\",\n    \"report_update_time\",\n    \"checked_at\",\n    \"reports_parent\",\n    \"report_selector\"\n)\n\n@step_handler\ndef check_compliance(events, context):\n    \"\"\"Verify the target machine, read its zone's assignment, and classify its report once.\n    \"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    quota_deadline = first_check_quota_deadline()\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    resource_id = events.get(\"resource_id\")\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n    if not resource_id:\n        raise ValueError(\"The GCPVmResourceId parameter is required but was not provided.\")\n\n    if not events.get(\"orchestrator_info\"):\n        raise ValueError(\"The OSPolicyOrchestratorInfo parameter is required but was not provided.\")\n\n    info = _orchestrator_info(events.get(\"orchestrator_info\"))\n    orchestrator_name = info[\"name\"]\n    orchestrator_update_time = info.get(\"upsert_time\") or \"\"\n    passed = _passed_assignment(info)\n\n    target = parse_vm_resource_id(resource_id)\n    project_id = target[\"project_id\"]\n    instance_name = target[\"instance_name\"]\n    zone = assert_zone_shaped(target[\"zone\"])\n\n    config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region\n    )\n    validate_project_in_scope(config, project_id)\n\n    credentials = resolve_gcp_credentials(\n        config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=DOCUMENT_NAME\n    )\n\n    osconfig_api_state = assert_service_enabled(\n        project_id, OSCONFIG_SERVICE, credentials\n    )\n\n    instance = get_instance(\n        project_id,\n        zone,\n        instance_name,\n        credentials,\n        tolerate_status=(404,)\n    )\n\n    machine = {\n        \"project_id\": project_id,\n        \"zone\": zone,\n        \"instance_name\": instance_name,\n        \"service_account_email\": config[\"service_account_email\"],\n        \"orchestrator_name\": orchestrator_name,\n        \"orchestrator_update_time\": orchestrator_update_time\n    }\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"credential_source\": credential_source(),\n      \"zone\": zone,\n      \"osconfig_api_state\": osconfig_api_state,\n      \"orchestrator_name\": orchestrator_name,\n      \"orchestrator_update_time\": orchestrator_update_time\n    }\n\n    if instance is None:\n        aws_log.update(\n            vm_found=\"false\",\n            message=\"Target VM not found, skipping verification\"\n        )\n        return _unchecked(\n            machine,\n            aws_log,\n            vm_found=False,\n            ssm_managed=False,\n            metadata_found=False,\n            vm_status=\"\",\n            vm_source_id=\"\",\n            last_start_timestamp=\"\"\n        )\n\n    vm_instance_id = str(getattr(instance, \"id\", \"\") or \"\")\n\n    vm_source_id = f\"{project_id}:{zone}:{vm_instance_id}\"\n\n    activation_id = get_instance_metadata_value(instance, SSM_ACTIVATION_ID_KEY)\n\n    metadata_found = bool(activation_id)\n\n    vm_status = assert_instance_is_running(instance)\n    vm_manager_source = check_vm_manager_enabled(\n        instance, project_id, credentials\n    )\n    last_start_timestamp = str(\n        getattr(instance, \"last_start_timestamp\", \"\") or \"\"\n    )\n\n    ssm_managed = False\n    for label_key, label_value in instance.labels.items():\n        if (label_key == SSM_MANAGED_LABEL_KEY\n                and label_value == SSM_MANAGED_LABEL_VALUE):\n            ssm_managed = True\n            break\n\n    aws_log.update(\n        vm_found=\"true\",\n        vm_status=vm_status,\n        activation_id=activation_id,\n        metadata_found=str(metadata_found).lower(),\n        vm_manager_source=vm_manager_source,\n        ssm_managed=str(ssm_managed).lower()\n    )\n    machine.update(\n        vm_found=True,\n        ssm_managed=ssm_managed,\n        vm_status=vm_status,\n        activation_id=activation_id,\n        metadata_found=metadata_found,\n        vm_source_id=vm_source_id,\n        last_start_timestamp=last_start_timestamp\n    )\n\n    if ssm_managed:\n        aws_log[\"message\"] = \"Target VM already labeled ssm-managed, skipping verification\"\n        return _unchecked(machine, aws_log)\n\n    orchestrator_read = passed is None\n    if orchestrator_read:\n        orchestrator = get_orchestrator(orchestrator_name, credentials)\n        assignment_id = _orchestrated_assignment_id(orchestrator)\n        scope = orchestrator.get(\"orchestrationScope\")\n    else:\n        assignment_id = passed[\"assignment_id\"]\n        scope = passed[\"scope\"]\n\n    revision = get_assignment_revision(\n        project_id, zone, assignment_id, credentials,\n        quota_deadline=quota_deadline\n    )\n\n    if orchestrator_read:\n        payload_digest = orchestrated_policy_digest(orchestrator)\n        zone_has_policies = (\n            not payload_digest\n            or not revision[\"policy_digest\"]\n            or revision[\"policy_digest\"] == payload_digest\n        )\n    else:\n        zone_has_policies = not revision_created_before(\n            revision, str(orchestrator_update_time or \"\")\n        )\n    assignment_current = str(\n        zone_has_policies\n        or scope_excludes(scope, project_id, zone, credentials)\n    ).lower()\n    assignment_exists = str(revision[\"exists\"]).lower()\n    instance_filter = json.dumps(revision[\"instance_filter\"], sort_keys=True)\n    orchestration_scope = json.dumps(\n        scope if isinstance(scope, dict) else {}, sort_keys=True\n    )\n\n    report = check_report(\n        {\n            \"project_id\": project_id,\n            \"zone\": zone,\n            \"instance_name\": instance_name,\n            \"last_start_timestamp\": last_start_timestamp,\n            \"assignment_id\": assignment_id,\n            \"revision_id\": revision[\"revision_id\"],\n            \"revision_create_time\": revision[\"revision_create_time\"],\n            \"assignment_exists\": assignment_exists,\n            \"rollout_state\": revision[\"rollout_state\"],\n            \"assignment_current\": assignment_current,\n            \"instance_filter\": instance_filter,\n            \"orchestration_scope\": orchestration_scope,\n            \"orchestrator_update_time\": orchestrator_update_time\n        },\n        credentials,\n        final_check=False,\n        quota_deadline=quota_deadline\n    )\n\n    aws_log.update(\n        orchestrator_read=str(orchestrator_read).lower(),\n        assignment_id=assignment_id,\n        assignment_exists=assignment_exists,\n        revision_id=revision[\"revision_id\"],\n        baseline=str(revision[\"baseline\"]).lower(),\n        reconciling=str(revision[\"reconciling\"]).lower(),\n        assignment_current=assignment_current,\n        instance_filter_os_count=str(\n            len(revision[\"instance_filter\"].get(\"inventories\") or ())\n        )\n    )\n    aws_log.update(report[\"aws_log\"])\n\n    machine.update(\n        assignment_id=assignment_id,\n        assignment_exists=assignment_exists,\n        revision_id=revision[\"revision_id\"],\n        revision_create_time=revision[\"revision_create_time\"],\n        rollout_state=revision[\"rollout_state\"],\n        assignment_current=assignment_current,\n        instance_filter=instance_filter,\n        orchestration_scope=orchestration_scope,\n        verdict=report[\"verdict\"],\n        compliance_detail=report[\"compliance_detail\"],\n        enforcement_log=report[\"enforcement_log\"],\n        agent_logs=report[\"agent_logs\"],\n        osconfig_agent_log=report[\"osconfig_agent_log\"],\n        platform=report[\"platform\"],\n        last_run_id=report[\"last_run_id\"],\n        report_revision_id=report[\"report_revision_id\"],\n        report_update_time=report[\"report_update_time\"],\n        checked_at=report[\"checked_at\"],\n        reports_parent=report[\"reports_parent\"],\n        report_selector=report[\"report_selector\"],\n        aws_log=aws_log\n    )\n    return machine\n\ndef _unchecked(machine, aws_log, **known):\n    \"\"\"Given a machine this run does not verify, returns the payload the next two steps end on.\n    \"\"\"\n    payload = dict.fromkeys(_UNCHECKED_OUTPUTS, \"\")\n    payload.update(machine)\n    payload.update(known)\n    payload.update(\n        compliance_detail={\"compliance_state\": \"\", \"reason\": \"\"},\n        aws_log=aws_log\n    )\n    return payload\n\ndef _orchestrator_info(info):\n    \"\"\"Given OSPolicyOrchestratorInfo, returns it parsed, or raises naming what is missing.\n\n    Requires only \"name\". \"upsert_time\" is empty when ApplyOSPolicy skipped the\n    rollout, which check_report treats as \"use the latest report\".\n    \"\"\"\n    if isinstance(info, str):\n        try:\n            info = json.loads(info)\n        except ValueError:\n            info = None\n    if not isinstance(info, dict) or not info.get(\"name\"):\n        raise ValidationException(\n            \"The OSPolicyOrchestratorInfo parameter is not a JSON object with \"\n            \"a name. Pass the OrchestratorInfo output of \"\n            \"AWS-InstallSSMAgentOnGCP-ApplyOSPolicy.\"\n        )\n    return info\n\ndef _passed_assignment(info):\n    assignment_id = info.get(\"assignment_id\")\n    scope = info.get(\"scope\")\n    if isinstance(scope, str):\n        try:\n            scope = json.loads(scope)\n        except ValueError:\n            return None\n    if not assignment_id or not isinstance(scope, dict):\n        return None\n\n    return {\"assignment_id\": str(assignment_id), \"scope\": scope}\n\ndef _orchestrated_assignment_id(orchestrator):\n    \"\"\"Given the orchestrator, returns the ID of the assignment it orchestrates.\n    \"\"\"\n    if orchestrator is None:\n        raise ValidationException(\n            \"The Google Cloud OS policy orchestrator named by \"\n            \"OSPolicyOrchestratorInfo does not exist, so no OS policy \"\n            \"assignment will ever be created for this virtual machine. Run \"\n            \"AWS-InstallSSMAgentOnGCP-ApplyOSPolicy, then pass its \"\n            \"OrchestratorInfo output to this automation.\"\n        )\n\n    orchestrated = orchestrator.get(\"orchestratedResource\")\n    assignment_id = (\n        orchestrated.get(\"id\") if isinstance(orchestrated, dict) else None\n    )\n    if not assignment_id:\n        raise ValidationException(\n            \"The Google Cloud OS policy orchestrator named by \"\n            \"OSPolicyOrchestratorInfo orchestrates no OS policy assignment. \"\n            \"Pass the OrchestratorInfo output of \"\n            \"AWS-InstallSSMAgentOnGCP-ApplyOSPolicy to this \"\n            \"automation.\"\n        )\n\n    return str(assignment_id)\n"
+      },
+      "outputs": [
+        {
+          "Name": "ProjectId",
+          "Selector": "$.Payload.project_id",
+          "Type": "String"
+        },
+        {
+          "Name": "Zone",
+          "Selector": "$.Payload.zone",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceName",
+          "Selector": "$.Payload.instance_name",
+          "Type": "String"
+        },
+        {
+          "Name": "ServiceAccountEmail",
+          "Selector": "$.Payload.service_account_email",
+          "Type": "String"
+        },
+        {
+          "Name": "ActivationId",
+          "Selector": "$.Payload.activation_id",
+          "Type": "String"
+        },
+        {
+          "Name": "MetadataFound",
+          "Selector": "$.Payload.metadata_found",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "VmFound",
+          "Selector": "$.Payload.vm_found",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "SsmManaged",
+          "Selector": "$.Payload.ssm_managed",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "VMSourceId",
+          "Selector": "$.Payload.vm_source_id",
+          "Type": "String"
+        },
+        {
+          "Name": "VmStatus",
+          "Selector": "$.Payload.vm_status",
+          "Type": "String"
+        },
+        {
+          "Name": "LastStartTimestamp",
+          "Selector": "$.Payload.last_start_timestamp",
+          "Type": "String"
+        },
+        {
+          "Name": "OrchestratorName",
+          "Selector": "$.Payload.orchestrator_name",
+          "Type": "String"
+        },
+        {
+          "Name": "OrchestratorUpdateTime",
+          "Selector": "$.Payload.orchestrator_update_time",
+          "Type": "String"
+        },
+        {
+          "Name": "AssignmentId",
+          "Selector": "$.Payload.assignment_id",
+          "Type": "String"
+        },
+        {
+          "Name": "AssignmentExists",
+          "Selector": "$.Payload.assignment_exists",
+          "Type": "String"
+        },
+        {
+          "Name": "RevisionId",
+          "Selector": "$.Payload.revision_id",
+          "Type": "String"
+        },
+        {
+          "Name": "RevisionCreateTime",
+          "Selector": "$.Payload.revision_create_time",
+          "Type": "String"
+        },
+        {
+          "Name": "RolloutState",
+          "Selector": "$.Payload.rollout_state",
+          "Type": "String"
+        },
+        {
+          "Name": "AssignmentCurrent",
+          "Selector": "$.Payload.assignment_current",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceFilter",
+          "Selector": "$.Payload.instance_filter",
+          "Type": "String"
+        },
+        {
+          "Name": "OrchestrationScope",
+          "Selector": "$.Payload.orchestration_scope",
+          "Type": "String"
+        },
+        {
+          "Name": "Verdict",
+          "Selector": "$.Payload.verdict",
+          "Type": "String"
+        },
+        {
+          "Name": "ComplianceDetail",
+          "Selector": "$.Payload.compliance_detail",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "EnforcementLog",
+          "Selector": "$.Payload.enforcement_log",
+          "Type": "String"
+        },
+        {
+          "Name": "AgentLogs",
+          "Selector": "$.Payload.agent_logs",
+          "Type": "String"
+        },
+        {
+          "Name": "OSConfigAgentLog",
+          "Selector": "$.Payload.osconfig_agent_log",
+          "Type": "String"
+        },
+        {
+          "Name": "Platform",
+          "Selector": "$.Payload.platform",
+          "Type": "String"
+        },
+        {
+          "Name": "LastRunId",
+          "Selector": "$.Payload.last_run_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportRevisionId",
+          "Selector": "$.Payload.report_revision_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportUpdateTime",
+          "Selector": "$.Payload.report_update_time",
+          "Type": "String"
+        },
+        {
+          "Name": "CheckedAt",
+          "Selector": "$.Payload.checked_at",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportsParent",
+          "Selector": "$.Payload.reports_parent",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportSelector",
+          "Selector": "$.Payload.report_selector",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "EvaluateVmExists",
+      "action": "aws:branch",
+      "isEnd": true,
+      "description": "Continues when CheckCompliance found the VM, and otherwise ends successfully without verifying, as for a VM too new to be visible yet.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "EvaluateAlreadyManaged",
+            "Variable": "{{ CheckCompliance.VmFound }}",
+            "BooleanEquals": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "EvaluateAlreadyManaged",
+      "action": "aws:branch",
+      "isEnd": true,
+      "description": "Ends successfully without verifying a VM already labeled ssm-managed by an earlier run.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ShouldWaitForCompliance",
+            "Variable": "{{ CheckCompliance.SsmManaged }}",
+            "BooleanEquals": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ShouldWaitForCompliance",
+      "action": "aws:branch",
+      "description": "Waits only while Google Cloud is still working, and otherwise goes straight to the final check.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "WaitForCompliance",
+            "Variable": "{{ CheckCompliance.Verdict }}",
+            "StringEquals": "WAIT"
+          }
+        ],
+        "Default": "GetComplianceReport"
+      }
+    },
+    {
+      "name": "WaitForCompliance",
+      "action": "aws:waitForGcpResourceProperty",
+      "description": "Lists the VM's compliance reports until this assignment's, at a revision that counts, says COMPLIANT or NON_COMPLIANT. It lists rather than gets, because a report not yet written is a not-found that would end the wait. It waits up to 20 hours, and a failed read ends it. Not critical: AssertCompliance reports a timeout.",
+      "timeoutSeconds": 72000,
+      "onFailure": "Continue",
+      "isCritical": false,
+      "nextStep": "GetComplianceReport",
+      "isEnd": false,
+      "inputs": {
+        "Service": "osconfig",
+        "Api": "OsConfigZonalService.ListOSPolicyAssignmentReports",
+        "Package": "gcp_default",
+        "CloudConnector": "{{ CloudConnector }}",
+        "parent": "{{ CheckCompliance.ReportsParent }}",
+        "PageSize": 100,
+        "PropertySelector": "{{ CheckCompliance.ReportSelector }}",
+        "DesiredValues": [
+          "1",
+          "2",
+          "COMPLIANT",
+          "NON_COMPLIANT"
+        ]
+      }
+    },
+    {
+      "name": "GetComplianceReport",
+      "action": "aws:executeScript",
+      "description": "Reads and classifies the report after the wait, for AssertCompliance, reusing a terminal CheckCompliance verdict instead of reading again. A wait that ran out is a timeout; a failed read is retried up to three times. With no report it reads the OS inventory, and with no assignment in the zone the orchestrator's scope, to tell a VM not yet reported from one the policy never reaches. EnforcementLog is the end of the install log, AgentLogs the SSM Agent's logs, and OSConfigAgentLog the OS Config agent's serial-console lines when it never reported.",
+      "timeoutSeconds": 120,
+      "maxAttempts": 3,
+      "onFailure": "step:CleanupMetadata",
+      "isCritical": true,
+      "nextStep": "AssertCompliance",
+      "isEnd": false,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "get_compliance_report",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}",
+          "project_id": "{{ CheckCompliance.ProjectId }}",
+          "zone": "{{ CheckCompliance.Zone }}",
+          "instance_name": "{{ CheckCompliance.InstanceName }}",
+          "assignment_id": "{{ CheckCompliance.AssignmentId }}",
+          "revision_id": "{{ CheckCompliance.RevisionId }}",
+          "revision_create_time": "{{ CheckCompliance.RevisionCreateTime }}",
+          "assignment_exists": "{{ CheckCompliance.AssignmentExists }}",
+          "rollout_state": "{{ CheckCompliance.RolloutState }}",
+          "assignment_current": "{{ CheckCompliance.AssignmentCurrent }}",
+          "instance_filter": "{{ CheckCompliance.InstanceFilter }}",
+          "orchestration_scope": "{{ CheckCompliance.OrchestrationScope }}",
+          "last_start_timestamp": "{{ CheckCompliance.LastStartTimestamp }}",
+          "orchestrator_update_time": "{{ CheckCompliance.OrchestratorUpdateTime }}",
+          "final_check": "true",
+          "prior_verdict": "{{ CheckCompliance.Verdict }}",
+          "prior_compliance_detail": "{{ CheckCompliance.ComplianceDetail }}",
+          "prior_enforcement_log": "{{ CheckCompliance.EnforcementLog }}",
+          "prior_agent_logs": "{{ CheckCompliance.AgentLogs }}",
+          "prior_osconfig_agent_log": "{{ CheckCompliance.OSConfigAgentLog }}",
+          "prior_platform": "{{ CheckCompliance.Platform }}",
+          "prior_last_run_id": "{{ CheckCompliance.LastRunId }}",
+          "prior_report_revision_id": "{{ CheckCompliance.ReportRevisionId }}",
+          "prior_report_update_time": "{{ CheckCompliance.ReportUpdateTime }}",
+          "prior_reports_parent": "{{ CheckCompliance.ReportsParent }}",
+          "prior_report_selector": "{{ CheckCompliance.ReportSelector }}",
+          "prior_aws_log": "{{ CheckCompliance.AWSLog }}"
+        },
+        "Script": "from datetime import datetime, timezone\n\nfrom ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom ssm_gcp.providers import (\n    TERMINAL_VERDICTS,\n    credential_source,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials\n)\nfrom gcp_verify.report.check import check_report, json_mapping\n\nDOCUMENT_NAME = 'AWS-InstallSSMAgentOnGCP-VerifyVMStatus'\n\n@step_handler\ndef get_compliance_report(events, context):\n    \"\"\"Read one compliance report and say whether it is a result.\n\n    If CheckCompliance already reached a terminal verdict before any\n    wait, reuse it: it will not change and no newer report exists, so\n    re-reading only spends the GCP OS Config read quota for nothing.\n    \"\"\"\n    prior_verdict = str(events.get(\"prior_verdict\") or \"\")\n    if prior_verdict in TERMINAL_VERDICTS:\n        return _reuse_prior_verdict(events)\n\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\")\n    final_check = str(events.get(\"final_check\") or \"\").lower() == \"true\"\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n    if not events.get(\"assignment_id\"):\n        raise ValueError(\"The CheckCompliance step returned no Google Cloud OS policy assignment to check.\")\n\n    config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region\n    )\n    credentials = resolve_gcp_credentials(\n        config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=DOCUMENT_NAME\n    )\n\n    report = check_report(\n        {\n            \"project_id\": events.get(\"project_id\"),\n            \"zone\": events.get(\"zone\"),\n            \"instance_name\": events.get(\"instance_name\"),\n            \"last_start_timestamp\": events.get(\"last_start_timestamp\"),\n            \"assignment_id\": events.get(\"assignment_id\"),\n            \"revision_id\": events.get(\"revision_id\"),\n            \"revision_create_time\": events.get(\"revision_create_time\"),\n            \"assignment_exists\": events.get(\"assignment_exists\"),\n            \"rollout_state\": events.get(\"rollout_state\"),\n            \"assignment_current\": events.get(\"assignment_current\"),\n            \"instance_filter\": events.get(\"instance_filter\"),\n            \"orchestration_scope\": events.get(\"orchestration_scope\"),\n            \"orchestrator_update_time\": events.get(\"orchestrator_update_time\")\n        },\n        credentials,\n        final_check=final_check\n    )\n\n    aws_log = dict(report[\"aws_log\"])\n    aws_log[\"boto3_version\"] = boto3_version\n    aws_log[\"botocore_version\"] = botocore_version\n    aws_log[\"google_auth_version\"] = google_auth_version\n    aws_log[\"credential_source\"] = credential_source()\n\n    return {\n        \"verdict\": report[\"verdict\"],\n        \"compliance_detail\": report[\"compliance_detail\"],\n        \"enforcement_log\": report[\"enforcement_log\"],\n        \"agent_logs\": report[\"agent_logs\"],\n        \"osconfig_agent_log\": report[\"osconfig_agent_log\"],\n        \"platform\": report[\"platform\"],\n        \"last_run_id\": report[\"last_run_id\"],\n        \"report_revision_id\": report[\"report_revision_id\"],\n        \"report_update_time\": report[\"report_update_time\"],\n        \"checked_at\": report[\"checked_at\"],\n        \"reports_parent\": report[\"reports_parent\"],\n        \"report_selector\": report[\"report_selector\"],\n        \"aws_log\": aws_log\n    }\n\ndef _reuse_prior_verdict(events):\n    \"\"\"Return CheckCompliance's own terminal result, without re-reading.\"\"\"\n    return {\n        \"verdict\": str(events.get(\"prior_verdict\") or \"\"),\n        \"compliance_detail\": json_mapping(events.get(\"prior_compliance_detail\")),\n        \"enforcement_log\": str(events.get(\"prior_enforcement_log\") or \"\"),\n        \"agent_logs\": str(events.get(\"prior_agent_logs\") or \"\"),\n        \"osconfig_agent_log\": str(events.get(\"prior_osconfig_agent_log\") or \"\"),\n        \"platform\": str(events.get(\"prior_platform\") or \"\"),\n        \"last_run_id\": str(events.get(\"prior_last_run_id\") or \"\"),\n        \"report_revision_id\": str(events.get(\"prior_report_revision_id\") or \"\"),\n        \"report_update_time\": str(events.get(\"prior_report_update_time\") or \"\"),\n        \"checked_at\": datetime.now(timezone.utc).isoformat(timespec=\"seconds\"),\n        \"reports_parent\": str(events.get(\"prior_reports_parent\") or \"\"),\n        \"report_selector\": str(events.get(\"prior_report_selector\") or \"\"),\n        \"aws_log\": json_mapping(events.get(\"prior_aws_log\"))\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "Verdict",
+          "Selector": "$.Payload.verdict",
+          "Type": "String"
+        },
+        {
+          "Name": "ComplianceDetail",
+          "Selector": "$.Payload.compliance_detail",
+          "Type": "StringMap"
+        },
+        {
+          "Name": "EnforcementLog",
+          "Selector": "$.Payload.enforcement_log",
+          "Type": "String"
+        },
+        {
+          "Name": "AgentLogs",
+          "Selector": "$.Payload.agent_logs",
+          "Type": "String"
+        },
+        {
+          "Name": "OSConfigAgentLog",
+          "Selector": "$.Payload.osconfig_agent_log",
+          "Type": "String"
+        },
+        {
+          "Name": "Platform",
+          "Selector": "$.Payload.platform",
+          "Type": "String"
+        },
+        {
+          "Name": "LastRunId",
+          "Selector": "$.Payload.last_run_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportRevisionId",
+          "Selector": "$.Payload.report_revision_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportUpdateTime",
+          "Selector": "$.Payload.report_update_time",
+          "Type": "String"
+        },
+        {
+          "Name": "CheckedAt",
+          "Selector": "$.Payload.checked_at",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportsParent",
+          "Selector": "$.Payload.reports_parent",
+          "Type": "String"
+        },
+        {
+          "Name": "ReportSelector",
+          "Selector": "$.Payload.report_selector",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "AssertCompliance",
+      "action": "aws:executeScript",
+      "description": "Reports the result, and fails the automation unless Google Cloud reported the installation complete. A VM still working, as VM Manager can take 24 hours, and one that failed get different messages. A VM the OS policy does not target is a success. A failure prints the end of the run log, or the OS Config agent's console lines.",
+      "timeoutSeconds": 60,
+      "onFailure": "step:CleanupMetadata",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "assert_compliance",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "verdict": "{{ GetComplianceReport.Verdict }}",
+          "compliance_detail": "{{ GetComplianceReport.ComplianceDetail }}",
+          "max_wait_minutes": 1200,
+          "wait_started_at": "{{ CheckCompliance.CheckedAt }}",
+          "wait_ended_at": "{{ GetComplianceReport.CheckedAt }}"
+        },
+        "Script": "import json\nfrom datetime import datetime\n\nfrom ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.utils.exception_mapper import step_handler\nfrom ssm_gcp.exceptions import ServiceRequestError, ValidationException\nfrom ssm_gcp.providers import (\n    VERDICT_COMPLIANT,\n    VERDICT_FAILED,\n    VERDICT_NOT_TARGETED\n)\nfrom gcp_verify.report.verdict import (\n    build_failure_message,\n    build_not_targeted_message,\n    build_timeout_message\n)\nfrom ssm_gcp.providers import log_tail\n\nOPERATION = 'verifying the SSM Agent installation'\nEXECUTION_LOG_CHARS = 4096\nVM_LOG_HEADER = '--- the end of what the virtual machine recorded ---'\n\n_OUTCOMES = {\n    VERDICT_COMPLIANT: \"verified\",\n    VERDICT_FAILED: \"not_installed\",\n    VERDICT_NOT_TARGETED: \"not_targeted\"\n}\n\n@step_handler\ndef assert_compliance(events, context):\n    \"\"\"Turn the last verdict into a result or into a failure.\n    \"\"\"\n    verdict = events.get(\"verdict\")\n    detail = _detail_map(events.get(\"compliance_detail\"))\n    compliance_state = detail.get(\"compliance_state\") or \"\"\n    reason = detail.get(\"reason\") or \"\"\n    failure_detail = detail.get(\"failure_detail\") or \"\"\n    os_short_name = detail.get(\"os_short_name\") or \"\"\n    enforcement_log = detail.get(\"enforcement_log\") or \"\"\n    osconfig_agent_log = detail.get(\"osconfig_agent_log\") or \"\"\n    osconfig_agent_log_state = detail.get(\"osconfig_agent_log_state\") or \"\"\n    max_wait_minutes = _whole_number(\n        events.get(\"max_wait_minutes\"), \"max_wait_minutes\"\n    )\n    waited_minutes = _minutes_between(\n        events.get(\"wait_started_at\"), events.get(\"wait_ended_at\")\n    )\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"verdict\": str(verdict or \"\"),\n      \"compliance_state\": compliance_state or \"NONE\",\n      \"compliance_state_reason\": reason,\n      \"outcome\": _OUTCOMES.get(str(verdict or \"\"), \"timed_out\"),\n      \"max_wait_minutes\": str(max_wait_minutes),\n      \"waited_minutes\": \"\" if waited_minutes is None else str(waited_minutes)\n    }\n\n    if verdict == VERDICT_COMPLIANT:\n        print(\n            json.dumps(\n                {\n                    \"operation\": OPERATION,\n                    \"verdict\": str(verdict),\n                    \"compliance_state\": compliance_state,\n                    \"compliance_state_reason\": reason,\n                    \"outcome\": aws_log[\"outcome\"]\n                }\n            )\n        )\n        return {\n            \"compliance_state\": compliance_state,\n            \"verdict\": str(verdict),\n            \"reason\": reason,\n            \"aws_log\": aws_log\n        }\n\n    if verdict == VERDICT_NOT_TARGETED:\n        print(\n            json.dumps(\n                {\n                    \"operation\": OPERATION,\n                    \"verdict\": str(verdict),\n                    \"compliance_state_reason\": reason,\n                    \"os_short_name\": os_short_name,\n                    \"outcome\": aws_log[\"outcome\"],\n                    \"message\": build_not_targeted_message(\n                        os_short_name, reason\n                    )\n                }\n            )\n        )\n        return {\n            \"compliance_state\": compliance_state,\n            \"verdict\": str(verdict),\n            \"reason\": reason,\n            \"aws_log\": aws_log\n        }\n\n    if verdict == VERDICT_FAILED:\n        message = build_failure_message(\n            reason,\n            failure_detail,\n            enforcement_log=enforcement_log,\n            agent_log_state=osconfig_agent_log_state\n        )\n        error = ValidationException(message)\n    else:\n        message = build_timeout_message(\n            reason, max_wait_minutes, waited_minutes=waited_minutes\n        )\n        error = ServiceRequestError(message)\n\n    line = json.dumps(\n        {\n            \"operation\": OPERATION,\n            \"verdict\": str(verdict or \"\"),\n            \"compliance_state\": compliance_state,\n            \"compliance_state_reason\": reason,\n            \"outcome\": aws_log[\"outcome\"],\n            \"failure_detail\": failure_detail,\n            \"message\": message\n        }\n    )\n    _print_vm_log(enforcement_log or osconfig_agent_log, len(line))\n    print(line)\n\n    raise error\n\ndef _print_vm_log(text, reserved):\n    if not text:\n        return\n\n    budget = max(EXECUTION_LOG_CHARS - reserved - len(VM_LOG_HEADER) - 64, 1024)\n    print(VM_LOG_HEADER)\n    print(log_tail(text, budget))\n\ndef _detail_map(value):\n    \"\"\"Given the recorded compliance detail, returns it as a mapping.\n    \"\"\"\n    if isinstance(value, dict):\n        return value\n\n    if isinstance(value, str) and value.strip():\n        try:\n            parsed = json.loads(value)\n        except ValueError:\n            return {}\n        if isinstance(parsed, dict):\n            return parsed\n\n    return {}\n\ndef _minutes_between(started, ended):\n    \"\"\"Given two step timestamps, returns the whole minutes between them, or None.\"\"\"\n    try:\n        elapsed = datetime.fromisoformat(str(ended)) - datetime.fromisoformat(str(started))\n    except (TypeError, ValueError):\n        return None\n    return max(int(elapsed.total_seconds() // 60), 0)\n\ndef _whole_number(value, name):\n    \"\"\"Given a step input, returns it as an int or raises naming it.\"\"\"\n    try:\n        return int(str(value).strip())\n    except (TypeError, ValueError):\n        raise ValidationException(\n            f\"The {name} input must be a whole number.\"\n        )\n"
+      },
+      "outputs": [
+        {
+          "Name": "ComplianceState",
+          "Selector": "$.Payload.compliance_state",
+          "Type": "String"
+        },
+        {
+          "Name": "Verdict",
+          "Selector": "$.Payload.verdict",
+          "Type": "String"
+        },
+        {
+          "Name": "Reason",
+          "Selector": "$.Payload.reason",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "ResolveInstanceId",
+      "action": "aws:executeScript",
+      "maxAttempts": 3,
+      "description": "Finds the SSM managed instance SetupAndActivation registered for this VM by its SourceId, {ProjectId}:{Zone}:{numeric VM id}, with DescribeInstanceInformation, and returns its ID and ping status.",
+      "onFailure": "step:CleanupMetadata",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "resolve_instance_id",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "vm_source_id": "{{ CheckCompliance.VMSourceId }}"
+        },
+        "Script": "from ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom gcp_ssm_agent.providers import find_managed_instance\n\ndef resolve_instance_id(events, context):\n    vm_source_id = events.get(\"vm_source_id\")\n\n    ssm_region = context.get('global:REGION')\n\n    managed_instance = find_managed_instance(\n        source_id=vm_source_id,\n        ssm_region=ssm_region\n    )\n\n    if not managed_instance:\n        raise Exception(\n            f\"No SSM managed instance found with source ID {vm_source_id}. The VM may not have registered yet.\"\n        )\n    \n    managed_instance_id = managed_instance[\"InstanceId\"]\n    ping_status = managed_instance[\"PingStatus\"]\n\n    aws_log = {\n      \"boto3_version\": boto3_version,\n      \"botocore_version\": botocore_version,\n      \"google_auth_version\": google_auth_version,\n      \"source_id\": vm_source_id,\n      \"instance_id\": managed_instance_id,\n      \"ping_status\": ping_status\n    }\n\n    return {\n        \"instance_id\": managed_instance_id,\n        \"ping_status\": ping_status,\n        \"aws_log\": aws_log\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "InstanceId",
+          "Selector": "$.Payload.instance_id",
+          "Type": "String"
+        },
+        {
+          "Name": "PingStatus",
+          "Selector": "$.Payload.ping_status",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "ShouldWaitForSSMOnline",
+      "action": "aws:branch",
+      "description": "Checks if the instance is online in SSM and skips waiting if it is already online.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "ApplyManagedLabel",
+            "Variable": "{{ ResolveInstanceId.PingStatus }}",
+            "StringEquals": "Online"
+          }
+        ],
+        "Default": "WaitForSSMOnline"
+      }
+    },
+    {
+      "name": "WaitForSSMOnline",
+      "action": "aws:waitForAwsResourceProperty",
+      "description": "Waits for the newly registered instance to report Online status in Systems Manager.",
+      "timeoutSeconds": 3600,
+      "onFailure": "step:CleanupMetadata",
+      "isCritical": true,
+      "inputs": {
+        "Service": "ssm",
+        "Api": "DescribeInstanceInformation",
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "{{ ResolveInstanceId.InstanceId }}"
+            ]
+          }
+        ],
+        "PropertySelector": "$.InstanceInformationList[0].PingStatus",
+        "DesiredValues": [
+          "Online"
+        ]
+      }
+    },
+    {
+      "name": "ApplyManagedLabel",
+      "action": "aws:executeScript",
+      "description": "Labels the Online VM ssm-managed, which the OS policy orchestrator excludes.",
+      "timeoutSeconds": 180,
+      "onFailure": "step:CleanupMetadata",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "apply_managed_label",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "project_id": "{{ CheckCompliance.ProjectId }}",
+          "zone": "{{ CheckCompliance.Zone }}",
+          "instance_name": "{{ CheckCompliance.InstanceName }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "from ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.providers import (\n    credential_source,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n)\nfrom gcp_ssm_agent.providers import add_ssm_managed_label\n\nDOCUMENT_NAME = 'AWS-InstallSSMAgentOnGCP-VerifyVMStatus'\n\ndef apply_managed_label(events, context):\n    \"\"\"Apply the ssm-managed:true label to the target GCP VM.\"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    project_id = events.get(\"project_id\")\n    zone = events.get(\"zone\")\n    instance_name = events.get(\"instance_name\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\") or None\n\n    connector_config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region,\n    )\n\n    credentials = resolve_gcp_credentials(\n        connector_config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=DOCUMENT_NAME,\n    )\n\n    add_ssm_managed_label(\n        credentials=credentials,\n        project_id=project_id,\n        zone=zone,\n        instance_name=instance_name,\n    )\n\n    aws_log = {\n        \"credential_source\": credential_source(),\n        \"label_applied\": \"true\",\n    }\n\n    return {\n        \"label_applied\": \"true\",\n        \"aws_log\": aws_log\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "LabelApplied",
+          "Selector": "$.Payload.label_applied",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "CleanupMetadata",
+      "action": "aws:executeScript",
+      "description": "Removes the single-use hybrid-activation credentials SetupAndActivation wrote to the VM's metadata. It runs on success once the instance is Online, and as the onFailure target of the verification steps, which stay critical, so a failure still fails with its own error. It reads the VM from GCPVmResourceId, because a step that failed has no outputs. A VM without them is a no-op.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "cleanup_metadata",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "resource_id": "{{ GCPVmResourceId }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "from ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.providers import (\n    credential_source,\n    parse_vm_resource_id,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n)\nfrom gcp_ssm_agent.providers import (\n    SSM_ACTIVATION_METADATA_KEYS,\n    remove_vm_metadata,\n)\n\nDOCUMENT_NAME = 'AWS-InstallSSMAgentOnGCP-VerifyVMStatus'\n\ndef cleanup_metadata(events, context):\n    \"\"\"Remove the ssm-activation-* metadata the activation runbook wrote.\"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    resource_id = events.get(\"resource_id\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n    if not resource_id:\n        raise ValueError(\"The GCPVmResourceId parameter is required but was not provided.\")\n\n    target = parse_vm_resource_id(resource_id)\n    project_id = target[\"project_id\"]\n    zone = target[\"zone\"]\n    instance_name = target[\"instance_name\"]\n\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\") or None\n\n    connector_config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region,\n    )\n\n    credentials = resolve_gcp_credentials(\n        connector_config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=DOCUMENT_NAME,\n    )\n\n    removed_keys = remove_vm_metadata(\n        credentials=credentials,\n        project_id=project_id,\n        zone=zone,\n        instance_name=instance_name,\n        keys=SSM_ACTIVATION_METADATA_KEYS,\n    )\n\n    return {\n        \"metadata_removed\": str(bool(removed_keys)).lower(),\n        \"aws_log\": {\n            \"credential_source\": credential_source(),\n            \"metadata_removed\": str(bool(removed_keys)).lower(),\n            \"removed_key_count\": str(len(removed_keys))\n        }\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "MetadataRemoved",
+          "Selector": "$.Payload.metadata_removed",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ],
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "AssertCompliance.ComplianceState",
+    "AssertCompliance.Verdict",
+    "AssertCompliance.Reason",
+    "ApplyManagedLabel.LabelApplied",
+    "CheckCompliance.VmFound",
+    "CheckCompliance.ActivationId",
+    "CheckCompliance.MetadataFound"
+  ]
+}

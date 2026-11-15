@@ -1,0 +1,188 @@
+{
+  "description": "Orchestrates the full deployment of AWS SSM Agent to GCP Compute Engine\nVMs by executing three child runbooks in sequence:\n\n1. **SetupAndActivation** - Authenticates to GCP, creates an SSM activation,\n    and writes the activation metadata to the VM's metadata (fans out per\n    VM in GCPVmResourceIds, one execution per resource ID)\n2. **ApplyOSPolicy** - Creates GCP VM Manager policy orchestrators that roll\n    OS Policy assignments out across every project in GCPProjectIds and every\n    zone of every region in GCPRegions (runs once)\n3. **VerifyVMStatus** - Waits for each VM to come online in SSM and checks\n    OS Policy compliance status (fans out per VM)",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "2fbaecd120934e5170319ad6559b8c2c45317fca480242a559e4ed9acbf50770"
+      }
+    }
+  },
+  "parameters": {
+    "CloudConnector": {
+      "type": "String",
+      "description": "(Required) The ID of the Systems Manager Cloud Connector that contains your Google Cloud organization, project, and workload identity configuration. This connector provides the credentials needed to authenticate with Google Cloud.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "ManagedInstanceIamRole": {
+      "type": "String",
+      "description": "(Required) The name of the IAM role that enables the managed instance to communicate with AWS Systems Manager. You can specify a plain role name or include the service-role/ path prefix (for example, service-role/AmazonEC2RunCommandRoleForManagedInstances). Maximum 64 characters.",
+      "allowedPattern": "^[\\p{L}\\p{N}+=,.@\\-_/]{1,64}$"
+    },
+    "ManagedInstanceTags": {
+      "type": "MapList",
+      "default": [],
+      "maxItems": 100,
+      "description": "(Optional) Tags to apply to the managed instance in Systems Manager. Each tag must have a Key and Value. Tag keys cannot start with \"aws:\" or use the reserved key \"CloudConnector\".",
+      "allowedPattern": "^\\{[\\s]*\"Key\"[\\s]*:[\\s]*\"(?![aA][wW][sS]:)(?!CloudConnector\")[^\"]{1,128}\"[\\s]*,[\\s]*\"Value\"[\\s]*:[\\s]*\"[^\"]{0,256}\"[\\s]*\\}$"
+    },
+    "GCPProjectIds": {
+      "type": "StringList",
+      "description": "(Optional) The Google Cloud projects the OS policy orchestrator is scoped to. Each project must be in the scope of the Cloud Connector. If unspecified, the projects configured on the Cloud Connector are used.",
+      "default": [],
+      "maxItems": 50,
+      "allowedPattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+    },
+    "GCPRegions": {
+      "type": "StringList",
+      "description": "(Optional) The Google Cloud regions the OS policy orchestrator is scoped to, for example us-central1. Each region is expanded into its zones. If unspecified, the orchestrator covers every zone of every project in scope.",
+      "default": [],
+      "maxItems": 50,
+      "allowedPattern": "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"
+    },
+    "RolloutPercentage": {
+      "type": "Integer",
+      "description": "(Optional) The maximum percentage of target virtual machines per zone that Google Cloud updates at a time. Defaults to 100.",
+      "default": 100,
+      "allowedPattern": "^([1-9][0-9]?|100)$"
+    },
+    "RolloutWaitTime": {
+      "type": "Integer",
+      "description": "(Optional) The number of seconds Google Cloud waits after finishing one rollout wave before starting the next. Defaults to 0.",
+      "default": 0,
+      "allowedPattern": "^\\d+$"
+    },
+    "ForceReinstall": {
+      "type": "Boolean",
+      "description": "(Optional) If set to true, overrides an existing SSM Agent registration on the GCP VM. Default set to false skips the registration if GCP VM is registered to SSM.",
+      "default": false
+    },
+    "OrchestratorName": {
+      "type": "String",
+      "description": "(Optional) The ID of the Google Cloud OS Policy Orchestrator to create or update: 2 to 63 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit. The OS policy assignment it manages takes the same ID. The orchestrator goes under the same organization or project either way. If this automation already created an orchestrator with this ID there for another Cloud Connector, that orchestrator is updated and its scope replaced. A run with a different ID creates a new orchestrator and leaves the previous one in place, still applying its OS policy. If unspecified, the ID is aws-ssm-agent-orchestrator- followed by the first 8 characters of the Cloud Connector ID.",
+      "default": "",
+      "allowedPattern": "^$|^[a-z][a-z0-9-]{0,61}[a-z0-9]$"
+    },
+    "SetupMaxConcurrency": {
+      "type": "String",
+      "description": "(Optional) The maximum number of virtual machines the SetupAndActivation step verifies at a time, as a number or as a percentage of the virtual machines it verifies, for example 50 or 10%. Each verification reads the Google Cloud OS Config API, so a higher value uses more of the project's OS Config read quota.",
+      "default": "100",
+      "allowedPattern": "^([1-9][0-9]{0,6}|[1-9][0-9]?%|100%)$"
+    },
+    "VerifyMaxConcurrency": {
+      "type": "String",
+      "description": "(Optional) The maximum number of virtual machines the VerifyVMStatus step verifies at a time, as a number or as a percentage of the virtual machines it verifies, for example 50 or 10%. Each verification reads the Google Cloud OS Config API, so a higher value uses more of the project's OS Config read quota.",
+      "default": "80",
+      "allowedPattern": "^([1-9][0-9]{0,6}|[1-9][0-9]?%|100%)$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The ARN of the IAM role that allows Automation to perform actions on your behalf, including starting the child automation executions and the actions each child runbook performs."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "SetupAndActivation",
+      "action": "aws:executeAutomation",
+      "onFailure": "Continue",
+      "description": "Authenticates to GCP via Workload Identity Federation, creates an SSM hybrid activation for the target VM, and delivers activation metadata via instance metadata. Fans out per VM. Runs with onFailure: Continue so that per-target failures (for example VMs that no longer exist) still let CheckTargets evaluate how many targets resolved successfully.",
+      "inputs": {
+        "DocumentName": "AWS-InstallSSMAgentOnGCP-SetupAndActivation",
+        "RuntimeParameters": {
+          "CloudConnector": "{{ CloudConnector }}",
+          "ManagedInstanceIamRole": "{{ ManagedInstanceIamRole }}",
+          "ManagedInstanceTags": "{{ ManagedInstanceTags }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "TargetParameterName": "GCPVmResourceId",
+        "MaxConcurrency": "{{ SetupMaxConcurrency }}",
+        "Targets": [
+          {
+            "Key": "CloudConnector",
+            "Values": [
+              "{\"cloudConnectorId\":\"{{ CloudConnector }}\",\"ssmManagedNodeFilter\":\"UNMANAGED\"}"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "CheckTargets",
+      "action": "aws:executeScript",
+      "onFailure": "Abort",
+      "isCritical": true,
+      "timeoutSeconds": 120,
+      "description": "Reads the TargetsSummary rate-control counters from the SetupAndActivation child execution via GetAutomationExecution, and reports how many targets it resolved that did not fail (ValidTargetCount = TotalCount - FailedCount). SetupAndActivation fails per target on VMs that do not exist, so those are not counted.",
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "check_targets",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "automation_execution_id": "{{ SetupAndActivation.ExecutionId }}"
+        },
+        "Script": "from providers.dependency_manager import DependencyManager\nboto3_version, botocore_version = DependencyManager.setup()\nimport boto3\n\ndef check_targets(events, context):\n    \"\"\"Return the count of SetupAndActivation targets that did not fail.\"\"\"\n    ssm_region = context.get('global:REGION')\n    execution_id = events.get(\"automation_execution_id\")\n\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n    if not execution_id:\n        raise ValueError(\"The SetupAndActivation execution id is required but was not provided.\")\n\n    config = {\"region_name\": ssm_region}\n    ssm = boto3.client(\"ssm\", **config)\n\n    execution = ssm.get_automation_execution(\n        AutomationExecutionId=execution_id\n    )[\"AutomationExecution\"]\n\n    summary = execution.get(\"TargetsSummary\")\n\n    total_count = int(summary.get(\"TotalCount\"))\n    failed_count = int(summary.get(\"FailedCount\"))\n    \n    valid_targets = total_count - failed_count\n\n    skip_os_policy = valid_targets == 0\n\n    return {\n        \"valid_target_count\": valid_targets,\n        \"skip_os_policy\": skip_os_policy,\n        \"aws_log\": {\n            \"boto3_version\": boto3_version,\n            \"botocore_version\": botocore_version,\n            \"execution_id\": execution_id,\n            \"total_count\": str(total_count),\n            \"failed_count\": str(failed_count),\n            \"valid_target_count\": str(valid_targets),\n            \"skip_os_policy\": str(skip_os_policy).lower(),\n        },\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "ValidTargetCount",
+          "Selector": "$.Payload.valid_target_count",
+          "Type": "Integer"
+        },
+        {
+          "Name": "SkipOSPolicy",
+          "Selector": "$.Payload.skip_os_policy",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "ApplyOSPolicy",
+      "action": "aws:executeAutomation",
+      "description": "Creates GCP VM Manager policy orchestrators that install and register the SSM agent on Linux and Windows VMs across all supplied projects and regions. Runs once. When CheckTargets found no valid targets, SkipOSPolicy is true and the child skips the rollout but still returns the orchestrator name so VerifyVMStatus can locate it.",
+      "inputs": {
+        "DocumentName": "AWS-InstallSSMAgentOnGCP-ApplyOSPolicy",
+        "RuntimeParameters": {
+          "CloudConnector": "{{ CloudConnector }}",
+          "GCPProjectIds": "{{ GCPProjectIds }}",
+          "GCPRegions": "{{ GCPRegions }}",
+          "RolloutPercentage": "{{ RolloutPercentage }}",
+          "RolloutWaitTime": "{{ RolloutWaitTime }}",
+          "ForceReinstall": "{{ ForceReinstall }}",
+          "OrchestratorName": "{{ OrchestratorName }}",
+          "SkipOSPolicy": "{{ CheckTargets.SkipOSPolicy }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        }
+      }
+    },
+    {
+      "name": "VerifyVMStatus",
+      "action": "aws:executeAutomation",
+      "description": "Waits for the VM to come online in SSM and checks OS Policy compliance status. Fans out per VM.",
+      "inputs": {
+        "DocumentName": "AWS-InstallSSMAgentOnGCP-VerifyVMStatus",
+        "RuntimeParameters": {
+          "CloudConnector": "{{ CloudConnector }}",
+          "OSPolicyOrchestratorInfo": "{{ ApplyOSPolicy.Output }}",
+          "AutomationAssumeRole": "{{ AutomationAssumeRole }}"
+        },
+        "TargetParameterName": "GCPVmResourceId",
+        "MaxConcurrency": "{{ VerifyMaxConcurrency }}",
+        "Targets": [
+          {
+            "Key": "CloudConnector",
+            "Values": [
+              "{\"cloudConnectorId\":\"{{ CloudConnector }}\",\"excludesLabels\":[\"ssm-managed\"]}"
+            ]
+          }
+        ]
+      },
+      "isEnd": true
+    }
+  ]
+}

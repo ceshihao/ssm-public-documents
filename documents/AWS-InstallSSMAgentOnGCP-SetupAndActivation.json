@@ -1,0 +1,199 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Creates an AWS Systems Manager hybrid activation for a Google Cloud virtual machine and delivers the activation credentials to the VM so it can be registered as a managed instance. The document authenticates to Google Cloud using a configured Cloud Connector, validates that the target VM is running, verifies that the OS Config API (VM Manager) is enabled, removes any stale ssm-managed label so a VM that was registered previously but is no longer managed can be registered again, creates the SSM activation, and writes the activation credentials to the VM's instance metadata. If the target VM is not found (for example, it was deleted, or it was returned by target resolution but is not yet visible due to eventual consistency), this child execution fails so the VM is counted as not set up; the parent automation tolerates the failure via MaxErrors. This runbook performs setup and activation only; a companion OS Policy runbook installs the SSM Agent on the target VM.\n",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "files": {
+    "attachments.zip": {
+      "checksums": {
+        "sha256": "9114ea8040c97e4cdee6d80526a7a286099de68a67504b55637e1f3bd97abee1"
+      }
+    }
+  },
+  "parameters": {
+    "CloudConnector": {
+      "type": "String",
+      "description": "(Required) The ID of the Systems Manager Cloud Connector that contains your Google Cloud organization, project, and workload identity configuration. This connector provides the credentials needed to authenticate with Google Cloud.",
+      "allowedPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "GCPVmResourceId": {
+      "type": "String",
+      "description": "(Required) The relative resource name of the target Google Cloud virtual machine. Format: projects/{project-id}/zones/{zone}/instances/{instance-name}. The optional //compute.googleapis.com/ prefix is accepted. The VM must be in a RUNNING state and must have VM Manager enabled.",
+      "allowedPattern": "^(//compute\\.googleapis\\.com/)?projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/zones/[a-z]+-[a-z]+[0-9]+-[a-z]/instances/[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"
+    },
+    "ManagedInstanceIamRole": {
+      "type": "String",
+      "description": "(Required) The name of the IAM role that enables the managed instance to communicate with AWS Systems Manager. You can specify a plain role name or include the service-role/ path prefix (for example, service-role/AmazonEC2RunCommandRoleForManagedInstances). Maximum 64 characters.",
+      "allowedPattern": "^[\\p{L}\\p{N}+=,.@\\-_/]{1,64}$"
+    },
+    "ManagedInstanceTags": {
+      "type": "MapList",
+      "default": [],
+      "maxItems": 100,
+      "description": "(Optional) Tags to apply to the managed instance in Systems Manager. Each tag must have a Key and Value. Tags are applied when the instance is first registered or when it is already Online with Google Cloud. Tag keys cannot start with \"aws:\" or use the reserved key \"CloudConnector\".",
+      "allowedPattern": "^\\{[\\s]*\"Key\"[\\s]*:[\\s]*\"(?![aA][wW][sS]:)(?!CloudConnector\")[^\"]{1,128}\"[\\s]*,[\\s]*\"Value\"[\\s]*:[\\s]*\"[^\"]{0,256}\"[\\s]*\\}$"
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Required) The Amazon Resource Name (ARN) of the IAM role that allows Systems Manager Automation to perform actions on your behalf. This role must have permissions to create activations, read the target virtual machine, and assume the Cloud Connector role."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "GetGCPConfiguration",
+      "action": "aws:executeScript",
+      "description": "Retrieves Google Cloud credentials from the Cloud Connector, validates that the target VM exists and is running, and returns the configuration needed for subsequent steps.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "setup_gcp_configuration",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "resource_id": "{{ GCPVmResourceId }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "from ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.providers import (\n    check_vm_manager_enabled,\n    credential_source,\n    get_instance,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n    validate_gcp_vm,\n    validate_project_in_scope,\n)\nfrom gcp_ssm_agent.providers import (\n    parse_gcp_resource_id,\n)\nfrom ssm_gcp.exceptions import ValidationException\n\ndef setup_gcp_configuration(events, context):\n    \"\"\"Setup GCP configuration from Cloud Connector and validate VM\"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    resource_id = events.get(\"resource_id\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n    if not resource_id:\n        raise ValueError(\"The GCPVmResourceId parameter is required but was not provided.\")\n\n    connector_config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region,\n    )\n\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\") or None\n\n    credentials = resolve_gcp_credentials(\n        connector_config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=\"AWS-InstallSSMAgentOnGCP-SetupAndActivation\",\n    )\n\n    organization_id = connector_config[\"organization_id\"] or \"\"\n\n    parsed = parse_gcp_resource_id(resource_id)\n    project_id = parsed[\"project_id\"]\n    zone = parsed[\"zone\"]\n    instance_name = parsed[\"instance_name\"]\n\n    validate_project_in_scope(connector_config, project_id)\n\n    base_result = {\n        \"organization_id\": organization_id,\n        \"workload_identity_pool_provider\": connector_config[\"workload_identity_pool_provider\"],\n        \"service_account_email\": connector_config[\"service_account_email\"],\n        \"cloud_connector_id\": cloud_connector_id,\n        \"project_id\": project_id,\n        \"zone\": zone,\n        \"instance_name\": instance_name,\n    }\n\n    instance = get_instance(\n        project_id,\n        zone,\n        instance_name,\n        credentials,\n        tolerate_status=(404,),\n    )\n\n    if instance is None:\n        raise ValidationException(\n            f\"The target Google Cloud virtual machine was not found: {resource_id}. \"\n            \"It may have been deleted, or it was returned by target resolution but \"\n            \"is not yet visible due to eventual consistency. This child execution \"\n            \"fails so the virtual machine is counted as not set up; the parent \"\n            \"automation tolerates it via MaxErrors.\"\n        )\n\n    vm_manager_source = check_vm_manager_enabled(\n        instance,\n        project_id,\n        credentials\n    )\n\n    vm_info = validate_gcp_vm(instance)\n\n    aws_log = {\n        \"boto3_version\": boto3_version,\n        \"botocore_version\": botocore_version,\n        \"google_auth_version\": google_auth_version,\n        \"credential_source\": credential_source(),\n        \"vm_found\": \"true\",\n        \"os_type\": vm_info[\"os_type\"],\n        \"zone\": zone,\n        \"power_state\": vm_info[\"power_state\"],\n        \"machine_type\": vm_info[\"machine_type\"],\n        \"vm_manager_source\": vm_manager_source,\n    }\n\n    return {\n        **base_result,\n        \"vm_found\": True,\n        \"os_type\": vm_info[\"os_type\"],\n        \"power_state\": vm_info[\"power_state\"],\n        \"machine_type\": vm_info[\"machine_type\"],\n        \"vm_manager_source\": vm_manager_source,\n        \"aws_log\": aws_log,\n    }\n"
+      },
+      "outputs": [
+        {
+          "Name": "OrganizationId",
+          "Selector": "$.Payload.organization_id",
+          "Type": "String"
+        },
+        {
+          "Name": "WorkloadIdentityPoolProvider",
+          "Selector": "$.Payload.workload_identity_pool_provider",
+          "Type": "String"
+        },
+        {
+          "Name": "ServiceAccountEmail",
+          "Selector": "$.Payload.service_account_email",
+          "Type": "String"
+        },
+        {
+          "Name": "CloudConnector",
+          "Selector": "$.Payload.cloud_connector_id",
+          "Type": "String"
+        },
+        {
+          "Name": "ProjectId",
+          "Selector": "$.Payload.project_id",
+          "Type": "String"
+        },
+        {
+          "Name": "Zone",
+          "Selector": "$.Payload.zone",
+          "Type": "String"
+        },
+        {
+          "Name": "InstanceName",
+          "Selector": "$.Payload.instance_name",
+          "Type": "String"
+        },
+        {
+          "Name": "VmFound",
+          "Selector": "$.Payload.vm_found",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "OSType",
+          "Selector": "$.Payload.os_type",
+          "Type": "String"
+        },
+        {
+          "Name": "PowerState",
+          "Selector": "$.Payload.power_state",
+          "Type": "String"
+        },
+        {
+          "Name": "MachineType",
+          "Selector": "$.Payload.machine_type",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CheckManagedInstanceLabel",
+      "action": "aws:executeScript",
+      "description": "Checks the VM for the ssm-managed label and removes it if present, so an instance that was registered previously but is no longer managed can be registered again.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "get_managed_instance_label",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "project_id": "{{ GetGCPConfiguration.ProjectId }}",
+          "zone": "{{ GetGCPConfiguration.Zone }}",
+          "instance_name": "{{ GetGCPConfiguration.InstanceName }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "from ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.providers import (\n    credential_source,\n    get_instance,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n)\nfrom gcp_ssm_agent.providers import (\n    update_vm_labels,\n)\n\n# Label the SSM Agent install applies to a VM to mark it as managed.\nSSM_MANAGED_LABEL_KEY = \"ssm-managed\"\n\ndef get_managed_instance_label(events, context):\n    \"\"\"Check the VM's labels and report whether the ssm-managed label exists.\"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    project_id = events.get(\"project_id\")\n    zone = events.get(\"zone\")\n    instance_name = events.get(\"instance_name\")\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\") or None\n\n    connector_config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region,\n    )\n\n    credentials = resolve_gcp_credentials(\n        connector_config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=\"AWS-InstallSSMAgentOnGCP-SetupAndActivation\",\n    )\n\n    vm_instance = get_instance(project_id, zone, instance_name, credentials)\n\n    vm_labels = dict(vm_instance.labels)\n    vm_labels_fingerprint = vm_instance.label_fingerprint\n\n    ssm_managed_label_removed = False\n    if SSM_MANAGED_LABEL_KEY in vm_labels:\n        del vm_labels[SSM_MANAGED_LABEL_KEY]\n\n        update_vm_labels(\n            credentials=credentials,\n            project_id=project_id,\n            zone=zone,\n            instance_name=instance_name,\n            new_labels=vm_labels,\n            label_fingerprint=vm_labels_fingerprint\n        )\n        ssm_managed_label_removed = True\n\n    return {\n        \"ssm_managed_label_removed\": ssm_managed_label_removed,\n        \"aws_log\": {\n            \"credential_source\": credential_source(),\n            \"ssm_managed_label_removed\": str(ssm_managed_label_removed).lower(),\n        },\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "SsmManagedLabelRemoved",
+          "Selector": "$.Payload.ssm_managed_label_removed",
+          "Type": "Boolean"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ]
+    },
+    {
+      "name": "CreateActivation",
+      "action": "aws:executeScript",
+      "description": "Creates an SSM hybrid activation for the target VM and writes the activation credentials to the VM's instance metadata.",
+      "timeoutSeconds": 180,
+      "onFailure": "Abort",
+      "isCritical": true,
+      "inputs": {
+        "Runtime": "python3.12",
+        "Handler": "create_activation",
+        "CloudConnector": "{{ CloudConnector }}",
+        "Attachment": "attachments.zip",
+        "InputPayload": {
+          "cloud_connector_id": "{{ CloudConnector }}",
+          "project_id": "{{ GetGCPConfiguration.ProjectId }}",
+          "zone": "{{ GetGCPConfiguration.Zone }}",
+          "instance_name": "{{ GetGCPConfiguration.InstanceName }}",
+          "managed_instance_iam_role": "{{ ManagedInstanceIamRole }}",
+          "managed_instance_tags": "{{ ManagedInstanceTags }}",
+          "automation_assume_role_arn": "{{ AutomationAssumeRole }}"
+        },
+        "Script": "from ssm_gcp.providers import DependencyManager\nboto3_version, botocore_version, google_auth_version = DependencyManager.setup()\nfrom ssm_gcp.providers import (\n    credential_source,\n    resolve_cloud_connector_config,\n    resolve_gcp_credentials,\n)\nfrom gcp_ssm_agent.providers import (\n    create_ssm_activation,\n    set_vm_metadata,\n)\n\ndef create_activation(events, context):\n    \"\"\"Create an SSM activation and store its credentials in the VM's metadata.\"\"\"\n    ssm_region = context.get('global:REGION')\n    if not ssm_region:\n        raise ValueError(\"Could not determine the AWS Region for this automation execution.\")\n\n    cloud_connector_id = events.get(\"cloud_connector_id\")\n    project_id = events.get(\"project_id\")\n    zone = events.get(\"zone\")\n    instance_name = events.get(\"instance_name\")\n    managed_instance_iam_role = events.get(\"managed_instance_iam_role\")\n    managed_instance_tags = events.get(\"managed_instance_tags\") or None\n\n    if not cloud_connector_id:\n        raise ValueError(\"The CloudConnector parameter is required but was not provided.\")\n\n    automation_assume_role_arn = events.get(\"automation_assume_role_arn\") or None\n\n    vm_description = f\"Google Cloud VM: {project_id}/{instance_name}\"\n    source_instance_name = f\"{project_id}:{zone}:{instance_name}\"\n\n    connector_config = resolve_cloud_connector_config(\n        cloud_connector_id=cloud_connector_id,\n        ssm_region=ssm_region,\n    )\n\n    credentials = resolve_gcp_credentials(\n        connector_config,\n        automation_assume_role_arn=automation_assume_role_arn,\n        role_session_name=\"AWS-InstallSSMAgentOnGCP-SetupAndActivation\",\n    )\n\n    activation = create_ssm_activation(\n        vm_name=source_instance_name,\n        vm_description=vm_description,\n        cloud_connector_id=cloud_connector_id,\n        iam_role=managed_instance_iam_role,\n        ssm_region=ssm_region,\n        managed_instance_tags=managed_instance_tags,\n    )\n\n    set_vm_metadata(\n        credentials=credentials,\n        project_id=project_id,\n        zone=zone,\n        instance_name=instance_name,\n        metadata={\n            \"ssm-activation-id\": activation[\"activation_id\"],\n            \"ssm-activation-code\": activation[\"activation_code\"],\n            \"ssm-activation-hash\": activation[\"activation_hash\"],\n            \"ssm-region\": ssm_region,\n        },\n    )\n\n    return {\n        \"activation_id\": activation[\"activation_id\"],\n        \"aws_log\": {\n            \"credential_source\": credential_source(),\n            \"activation_id\": activation[\"activation_id\"],\n        },\n    }"
+      },
+      "outputs": [
+        {
+          "Name": "ActivationId",
+          "Selector": "$.Payload.activation_id",
+          "Type": "String"
+        },
+        {
+          "Name": "AWSLog",
+          "Selector": "$.Payload.aws_log",
+          "Type": "StringMap"
+        }
+      ],
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "CreateActivation.ActivationId",
+    "GetGCPConfiguration.VmFound"
+  ]
+}
